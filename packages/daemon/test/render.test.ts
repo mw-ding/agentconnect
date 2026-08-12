@@ -75,6 +75,21 @@ describe('OutputConverger', () => {
     expect(actions.some((a) => a.kind === 'progress')).toBe(true)
   })
 
+  it('flushes preceding text before sending an image chunk', () => {
+    const c = new OutputConverger('medium')
+    c.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Here it is:' } } as any)
+
+    expect(
+      c.onUpdate({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }
+      } as any)
+    ).toEqual([
+      { kind: 'post', text: 'Here it is:' },
+      { kind: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }
+    ])
+  })
+
   it('low mode: tool_call flushes buffered text then emits set-status with the title + loading_messages', () => {
     const c = new OutputConverger('low')
     c.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial' } } as any)

@@ -359,6 +359,9 @@ type AppLike = {
       update: (a: unknown) => Promise<{ ts?: string }>
       delete: (a: unknown) => Promise<unknown>
     }
+    files: {
+      uploadV2: (a: unknown) => Promise<unknown>
+    }
     conversations: {
       open: (a: unknown) => Promise<{ channel?: { id?: string } }>
       info: (a: unknown) => Promise<{
@@ -502,6 +505,21 @@ const CUSTOM_USERNAME_REPROBE_MS = 5 * 60_000
 function proxyDispatcher(): ProxyAgent | undefined {
   const url = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY
   return url ? new ProxyAgent(url) : undefined
+}
+
+function imageExtension(mimeType: string): string {
+  switch (mimeType) {
+    case 'image/png':
+      return 'png'
+    case 'image/jpeg':
+      return 'jpg'
+    case 'image/webp':
+      return 'webp'
+    case 'image/gif':
+      return 'gif'
+    default:
+      return 'img'
+  }
 }
 
 function fetchWithDispatcher(dispatcher: Dispatcher): FetchFunction {
@@ -975,6 +993,36 @@ export class SlackConnection implements PlatformConnection {
         options
       )
       return res?.ts
+    })
+  }
+
+  async postImage(channel: string, data: Buffer, mimeType: string, threadTs?: string): Promise<void> {
+    await this.queue.enqueue(async () => {
+      try {
+        if (threadTs) {
+          try {
+            await this.app.client.chat.getPermalink({ channel, message_ts: threadTs })
+          } catch (err) {
+            if (slackApiErrorCode(err) === 'message_not_found') {
+              this.deps.log?.info(`slack: skipped image reply to deleted root ch=${channel} thread=${threadTs}`)
+              return
+            }
+            throw err
+          }
+        }
+        await this.app.client.files.uploadV2({
+          channel_id: channel,
+          thread_ts: threadTs,
+          file: data,
+          filename: `generated-image.${imageExtension(mimeType)}`,
+          title: 'Generated image'
+        })
+        await this.postPermissionUpdateCard(channel, threadTs)
+      } catch (err) {
+        this.rememberMissingScopes(err)
+        await this.postPermissionUpdateCard(channel, threadTs)
+        this.deps.log?.debug(`slack: image upload failed (ch=${channel}): ${(err as Error).message}`)
+      }
     })
   }
 

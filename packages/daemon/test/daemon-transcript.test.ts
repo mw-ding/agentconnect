@@ -95,6 +95,7 @@ function makeRoutable(daemon: Daemon) {
     setStatus: vi.fn(async () => {}),
     // Hand back a distinct ts per post so transcript rows don't collide on PK.
     postMessage: vi.fn(async () => `reply-${++n}`),
+    postImage: vi.fn(async () => {}),
     postBlocks: vi.fn(async () => 'status-bar'),
     updateBlocks: vi.fn(async () => {})
   }
@@ -172,6 +173,21 @@ describe('Daemon transcript records the agent reply', () => {
       { ts: '100', sender: 'U1', kind: 'text', text: 'question?' },
       { ts: 'reply-1', sender: 'bot-a', kind: 'text', text: 'here is my answer' }
     ])
+    await daemon.stop()
+  }, 15_000)
+
+  it('uploads an ACP image reply to the Slack thread', async () => {
+    const { factory } = streamingHost([
+      text('Here it is:'),
+      { sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' } }
+    ])
+    const daemon = new Daemon({ root: scaffold('medium'), hostFactory: factory })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'make an image'), 'int-a')
+
+    expect(conn.postImage).toHaveBeenCalledWith('C1', Buffer.from('hello'), 'image/png', 'T1')
     await daemon.stop()
   }, 15_000)
 

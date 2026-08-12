@@ -133,6 +133,37 @@ describe('SlackConnection.downloadFile', () => {
   })
 })
 
+describe('SlackConnection.postImage', () => {
+  it('uploads an ACP image into the originating thread', async () => {
+    const uploadV2 = vi.fn(async () => ({}))
+    const getPermalink = vi.fn(async () => ({ permalink: 'https://example.slack.com/thread' }))
+    const conn = new SlackConnection(
+      { ...deps(), sendIntervalMs: 0 } as any,
+      () =>
+        ({
+          message() {},
+          event() {},
+          action() {},
+          shortcut() {},
+          client: { chat: { getPermalink }, files: { uploadV2 } },
+          start: async () => {},
+          stop: async () => {}
+        }) as any
+    )
+
+    await conn.postImage('C1', Buffer.from('image bytes'), 'image/png', '1700000000.000001')
+
+    expect(getPermalink).toHaveBeenCalledWith({ channel: 'C1', message_ts: '1700000000.000001' })
+    expect(uploadV2).toHaveBeenCalledWith({
+      channel_id: 'C1',
+      thread_ts: '1700000000.000001',
+      file: Buffer.from('image bytes'),
+      filename: 'generated-image.png',
+      title: 'Generated image'
+    })
+  })
+})
+
 describe('SlackConnection.openDirectMessage', () => {
   it('resolves a Slack member to the app DM channel', async () => {
     const open = vi.fn(async () => ({ channel: { id: 'D123' } }))

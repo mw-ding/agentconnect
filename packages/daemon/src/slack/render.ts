@@ -47,6 +47,7 @@ export type SlackAction =
   // used by `minimal` mode to keep the full audit trail while the channel shows only the
   // single collapsed `live-reply` message.
   | { kind: 'post'; text: string; attributed?: boolean; recordOnly?: boolean }
+  | { kind: 'image'; data: string; mimeType: string }
   // `live-reply` is `minimal` mode's single, in-place agent reply: posted once then
   // chat.update-ed as the turn streams (same post-once/edit-thereafter contract as
   // `progress`), collapsing what would otherwise be many `post` messages into one that
@@ -1032,7 +1033,14 @@ export class OutputConverger {
   onUpdate(update: SessionUpdate): SlackAction[] {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
-        const content = (update as { content?: { type?: string; text?: string } }).content
+        const content = (update as { content?: { type?: string; text?: string; data?: string; mimeType?: string } })
+          .content
+        if (content?.type === 'image' && content.data && content.mimeType) {
+          const textActions = this.mode === 'minimal' ? this.closeSegment() : this.flush()
+          return this.mode === 'none'
+            ? textActions
+            : [...textActions, { kind: 'image', data: content.data, mimeType: content.mimeType }]
+        }
         const text = content?.type === 'text' ? (content.text ?? '') : ''
         // minimal: a chunk arriving after a tool boundary opens a new segment that REPLACES
         // the previous one in the single live message (the previous was already recorded).

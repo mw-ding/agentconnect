@@ -443,6 +443,9 @@ export async function applySlackAction<TTurn extends SlackTurn>(
       })
       return
     }
+    case 'image':
+      await conn.postImage(p.channel, Buffer.from(action.data, 'base64'), action.mimeType, p.thread)
+      return
     case 'notice':
     case 'tool-output':
       // Both post to the thread but are NOT recorded into the transcript — notices are
