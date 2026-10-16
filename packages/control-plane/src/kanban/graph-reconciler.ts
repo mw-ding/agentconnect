@@ -1,7 +1,7 @@
 // Kanban graph reconciler (issue #2 M1): promotes todo cards whose blockers all completed, then writes the status label.
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
 import { STATUS_LABEL_PREFIX, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
-import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
+import type { CardGraph, CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 
 export interface GraphReconcilerLog {
   debug(obj: unknown, msg?: string): void
@@ -49,20 +49,30 @@ export class KanbanGraphReconciler {
     const residueOnly = card.status === 'ready'
     if (card.status === 'todo') {
       if (planGraphPromotion(card.status, graph) !== 'promote') return
+    } else if (card.status !== 'ready') {
+      return
+    }
+    const observed = await this.deps.store.readCard(repo, issueNumber)
+    if (!observed) return
+    if (!residueOnly) {
+      const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
+      // Human label moves are authoritative; M1 does not sync them to the DB.
+      if (observed.state !== 'open' || statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
       if (!(await this.deps.cards.casStatus(card.id, card.stateRevision, 'ready'))) {
         this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
         return
       }
-    } else if (card.status !== 'ready') {
-      return
     }
-    await this.writeReadyLabels(repo, issueNumber, residueOnly)
+    await this.writeReadyLabels(repo, issueNumber, residueOnly, observed)
   }
 
   /** Writes the ready label; for an already-ready card only finishes residue of a crashed earlier write. */
-  private async writeReadyLabels(repo: KanbanRepoRef, issueNumber: number, residueOnly: boolean): Promise<void> {
-    const observed = await this.deps.store.readCard(repo, issueNumber)
-    if (!observed) return
+  private async writeReadyLabels(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    residueOnly: boolean,
+    observed: CardIssue
+  ): Promise<void> {
     const keep = statusLabel('ready')
     const stale = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
     const hasKeep = observed.labels.includes(keep)

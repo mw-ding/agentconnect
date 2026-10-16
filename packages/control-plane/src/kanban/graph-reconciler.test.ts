@@ -50,7 +50,7 @@ describe('planGraphPromotion', () => {
 })
 
 function make(
-  initial: Record<number, { status: KanbanStatus; labels: string[] }>,
+  initial: Record<number, { status: KanbanStatus; labels: string[]; state?: CardIssue['state'] }>,
   graphs: Record<number, CardGraph> = {},
   casResult = true
 ) {
@@ -81,7 +81,14 @@ function make(
   const store = {
     readCard: vi.fn(async (_r: unknown, n: number): Promise<CardIssue | null> =>
       labels.has(n)
-        ? { issueId: BigInt(n), nodeId: 'n', number: n, state: 'open', stateReason: null, labels: labels.get(n)! }
+        ? {
+            issueId: BigInt(n),
+            nodeId: 'n',
+            number: n,
+            state: initial[n]!.state ?? 'open',
+            stateReason: null,
+            labels: labels.get(n)!
+          }
         : null
     ),
     readGraph: vi.fn(async (_r: unknown, n: number) => graphs[n] ?? graph()),
@@ -104,7 +111,10 @@ describe('KanbanGraphReconciler', () => {
     const g = graph({ blockedBy: [done] })
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.store.readCard).toHaveBeenCalledOnce()
+    expect(h.store.readCard.mock.invocationCallOrder[0]).toBeLessThan(h.cards.casStatus.mock.invocationCallOrder[0]!)
     expect(h.store.applyPlan).toHaveBeenCalledOnce()
+    expect(h.store.applyPlan.mock.calls[0]![2]).toBe(await h.store.readCard.mock.results[0]!.value)
     const plan = h.store.applyPlan.mock.calls[0]![3]
     expect(plan).toMatchObject({
       outcome: 'accepted',
@@ -117,6 +127,31 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.store.applyPlan).toHaveBeenCalledOnce()
+  })
+
+  it.each<{ labels: string[]; state: CardIssue['state'] }>([
+    { labels: ['ac/status:blocked', 'ac/agent:eng'], state: 'open' },
+    { labels: ['ac/status:triage'], state: 'open' },
+    { labels: ['ac/status:archived'], state: 'closed' },
+    { labels: ['ac/status:todo', 'ac/status:blocked'], state: 'open' },
+    { labels: ['ac/status:todo'], state: 'closed' },
+    { labels: ['ac/agent:eng'], state: 'open' }
+  ])('does not promote a DB todo with $labels on an $state issue', async ({ labels, state }) => {
+    const h = make({ 7: { status: 'todo', labels, state } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.cards.casStatus).not.toHaveBeenCalled()
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
+    expect(h.labels.get(7)).toEqual(labels)
+  })
+
+  it('does not promote a DB todo when the issue is missing', async () => {
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    h.store.readCard.mockResolvedValueOnce(null)
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.cards.casStatus).not.toHaveBeenCalled()
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
   })
 
   it('leaves a ready card alone when a human moved its label to blocked', async () => {
