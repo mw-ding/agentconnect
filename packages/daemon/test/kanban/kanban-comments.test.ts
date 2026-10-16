@@ -177,4 +177,79 @@ describe('KanbanCommentPublisher', () => {
     expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('direction=desc')
     expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
   })
+
+  it('defers a timed-out marker lookup without posting and still drains the next comment', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1 })
+    const otherReport: KanbanReport = { ...report, leaseId: '55555555-5555-4555-8555-555555555555' }
+    const other: KanbanTerminalEntry = { ...entry, report: otherReport, issueNumber: 43, summary: 'second card' }
+    store.rows.set(otherReport.leaseId, {
+      entry: other,
+      attempts: 0,
+      attempted: false,
+      recordedAt: 2,
+      nextAt: 0
+    })
+    const posts: string[] = []
+    let bodyCancelled = false
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      const target = String(url)
+      if ((init?.method ?? 'GET') !== 'GET') {
+        posts.push(target)
+        return new Response(JSON.stringify({ id: 7 }), { status: 201 })
+      }
+      // Headers arrive, then the body never ends. Only the lookup abort should cancel it.
+      const stream = new ReadableStream({
+        pull() {
+          return new Promise(() => undefined)
+        },
+        cancel() {
+          bodyCancelled = true
+        }
+      })
+      return new Response(stream, { status: 200 })
+    })
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => 1_000 },
+      log: { info: vi.fn(), warn: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test',
+      markerLookupTimeoutMs: 50
+    })
+    await publisher.drain()
+    expect(bodyCancelled).toBe(true)
+    expect(fetchImpl.mock.calls[0]?.[1]).toMatchObject({ signal: expect.any(AbortSignal) })
+    expect(posts).toEqual(['https://api.test/repos/acme/web/issues/43/comments'])
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
+    expect(store.rows.has(otherReport.leaseId)).toBe(false)
+  })
+
+  it('defers when the marker fetch itself never returns', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1 })
+    const fetchImpl = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal
+          const abort = () => reject(signal?.reason ?? new DOMException('The operation was aborted', 'TimeoutError'))
+          if (!signal) return
+          if (signal.aborted) abort()
+          else signal.addEventListener('abort', abort, { once: true })
+        })
+    )
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => 1_000 },
+      log: { info: vi.fn(), warn: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test',
+      markerLookupTimeoutMs: 50
+    })
+    await publisher.drain()
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
+  })
 })
