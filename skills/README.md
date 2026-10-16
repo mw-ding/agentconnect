@@ -1,0 +1,1 @@
+This directory is an **AgentConnect skill source tree** for the GitHub Kanban P0 pilot. In the Console, add a public GitHub skill source pointing at this repository with subdirectory `skills/` (or select individual skills such as `kanban-label-protocol`). See [docs/designs/kanban-p0-pilot.md](../docs/designs/kanban-p0-pilot.md).
