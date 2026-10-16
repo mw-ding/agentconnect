@@ -69,7 +69,7 @@ export {
 export { PresetAgentBackfill } from './preset-agent-backfill.js'
 export { PgCronRepo } from './repositories/cron.repo.js'
 export { PgHookRepo, PgHookSecretStore } from './repositories/hook.repo.js'
-export { PgKanbanBoardRepo } from './repositories/kanban.repo.js'
+export { PgKanbanBoardRepo, PgKanbanCardRepo } from './repositories/kanban.repo.js'
 export { PgRuntimeProfileRepo } from './repositories/runtime-profile.repo.js'
 export { PgAuditRepo } from './repositories/audit.repo.js'
 export { PgUserRepo } from './repositories/user.repo.js'
