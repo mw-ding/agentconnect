@@ -35,7 +35,7 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
 
 const TOKEN = process.env.GITHUB_TOKEN
-const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN
+const enabled = !process.env.CI && process.env.KANBAN_E2E === '1' && !!TOKEN
 const OWNER = 'mw-ding'
 const FULL = `${OWNER}/agentconnect`
 const REPO_ID = 1332342098n
@@ -110,6 +110,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let smee: SmeeClient | undefined
   let hookId: number | undefined
   const createdHookIds: number[] = []
+  const createdLabels: string[] = []
   const hookMarker = `kanban-e2e-${randomUUID()}`
   let smeeUp = false
   let smeeSkipReason = ''
@@ -208,8 +209,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     for (const name of ['triage', 'ready', 'running', 'review', 'done'].map((s) => `ac/status:${s}`)) {
       // Read before creating so existing repository labels are never modified.
       const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100`)
-      if (!labels.some((label) => label.name === name))
+      if (!labels.some((label) => label.name === name)) {
         await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
+        createdLabels.push(name)
+      }
     }
     root = mkdtempSync(join(tmpdir(), 'kanban-dispatch-e2e-'))
     const agentDir = join(root, 'agents', agentId)
@@ -489,6 +492,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         await link?.close()
       })(),
       deleteCreatedHooks(),
+      ...createdLabels.map(async (name) => {
+        await gh('DELETE', `/repos/${FULL}/labels/${encodeURIComponent(name)}`)
+        phase('cleanup: deleted label this run created', { label: name })
+      }),
       ...issues.map(async (number) => {
         await gh('PATCH', `/repos/${FULL}/issues/${number}`, { state: 'closed', state_reason: 'not_planned' })
         const closed = await issue(number)
