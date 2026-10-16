@@ -101,6 +101,81 @@ const modes = async (boardId: string, cardId: string) => ({
 })
 
 describe('Kanban run-mode routes — an interactive owner', () => {
+  it('audits each board default change with the human actor and previous mode', async () => {
+    const { board } = await seedBoard()
+    const { app, close } = buildOidcApp()
+    const headers = await ownerHeaders()
+    try {
+      for (const mode of ['write', 'read'] as const) {
+        const response = await app.inject({ method: 'PUT', url: boardUrl(board.id), headers, payload: { mode } })
+        expect(response.statusCode).toBe(200)
+      }
+      const events = await prisma.auditEvent.findMany({
+        where: { orgId: DEFAULT_ORG_ID, kind: 'kanban_mode_change' },
+        orderBy: { id: 'asc' }
+      })
+      expect(events).toMatchObject([
+        {
+          actorUserId: DEFAULT_OWNER_ID,
+          orgId: DEFAULT_ORG_ID,
+          details: { boardId: board.id, oldMode: 'read', newMode: 'write' }
+        },
+        {
+          actorUserId: DEFAULT_OWNER_ID,
+          orgId: DEFAULT_ORG_ID,
+          details: { boardId: board.id, oldMode: 'write', newMode: 'read' }
+        }
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  it('audits card override changes and clearing while advancing only the mode revision', async () => {
+    const { board, card } = await seedBoard()
+    const { app, close } = buildOidcApp()
+    const headers = await ownerHeaders()
+    try {
+      for (const mode of ['write', 'read', null] as const) {
+        const response = await app.inject({
+          method: 'PUT',
+          url: cardUrl(board.id, card.id),
+          headers,
+          payload: { mode }
+        })
+        expect(response.statusCode).toBe(200)
+      }
+      const events = await prisma.auditEvent.findMany({
+        where: { orgId: DEFAULT_ORG_ID, kind: 'kanban_mode_change' },
+        orderBy: { id: 'asc' }
+      })
+      expect(events).toMatchObject([
+        {
+          actorUserId: DEFAULT_OWNER_ID,
+          orgId: DEFAULT_ORG_ID,
+          details: { boardId: board.id, cardId: card.id, oldMode: null, newMode: 'write' }
+        },
+        {
+          actorUserId: DEFAULT_OWNER_ID,
+          orgId: DEFAULT_ORG_ID,
+          details: { boardId: board.id, cardId: card.id, oldMode: 'write', newMode: 'read' }
+        },
+        {
+          actorUserId: DEFAULT_OWNER_ID,
+          orgId: DEFAULT_ORG_ID,
+          details: { boardId: board.id, cardId: card.id, oldMode: 'read', newMode: null }
+        }
+      ])
+      expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
+        mode: null,
+        modeRevision: 3,
+        stateRevision: card.stateRevision
+      })
+    } finally {
+      await close()
+    }
+  })
+
   it('sets the board default and sets then clears a card override', async () => {
     const { board, card } = await seedBoard()
     const { app, close } = buildOidcApp()
@@ -153,6 +228,7 @@ describe('Kanban run-mode routes — an interactive owner', () => {
       expect((await put(boardUrl('00000000-0000-4000-8000-000000000000'), { mode: 'write' })).statusCode).toBe(404)
       expect(await modes(foreign.board.id, foreign.card.id)).toEqual({ board: 'read', card: null })
       expect(await modes(board.id, card.id)).toEqual({ board: 'read', card: null })
+      expect(await prisma.auditEvent.count({ where: { kind: 'kanban_mode_change' } })).toBe(0)
     } finally {
       await close()
     }
@@ -175,6 +251,7 @@ describe('Kanban run-mode routes — every non-interactive or non-owner caller i
       ]
       expect(res.map((r) => r.statusCode)).toEqual([status, status])
       expect(await modes(board.id, card.id)).toEqual({ board: 'read', card: null })
+      expect(await prisma.auditEvent.count({ where: { kind: 'kanban_mode_change' } })).toBe(0)
     } finally {
       await app.close()
     }

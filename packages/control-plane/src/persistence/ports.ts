@@ -119,6 +119,7 @@ export type AuditKind =
   | 'hook_change'
   | 'agent_repo_change'
   | 'org_invite_change'
+  | 'kanban_mode_change'
   | 'protocol_error'
   | 'api_key_create'
   | 'api_key_rotate'
