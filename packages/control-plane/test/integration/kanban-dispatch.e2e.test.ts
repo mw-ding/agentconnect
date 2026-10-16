@@ -109,6 +109,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let link: RelayCpLink | undefined
   let smee: SmeeClient | undefined
   let hookId: number | undefined
+  const createdHookIds: number[] = []
+  const hookMarker = `kanban-e2e-${randomUUID()}`
   let smeeUp = false
   let smeeSkipReason = ''
   let webhookSecret = ''
@@ -486,12 +488,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         await smee?.stop()
         await link?.close()
       })(),
-      (async () => {
-        if (hookId === undefined) return
-        await gh('DELETE', `/repos/${FULL}/hooks/${hookId}`)
-        phase('cleanup: temporary repository webhook deleted', { hookId })
-        hookId = undefined
-      })(),
+      deleteCreatedHooks(),
       ...issues.map(async (number) => {
         await gh('PATCH', `/repos/${FULL}/issues/${number}`, { state: 'closed', state_reason: 'not_planned' })
         const closed = await issue(number)
@@ -797,26 +794,34 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     return new URL(location, 'https://smee.io').href
   }
 
-  async function deleteStaleHooks(): Promise<void> {
-    const hooks = await gh<Array<{ id: number; config?: { url?: string } }>>('GET', `/repos/${FULL}/hooks`)
-    for (const hook of hooks) {
-      const url = hook.config?.url ?? ''
-      if (!url.includes('smee.io') && !url.includes('example.invalid/kanban-e2e-webhook')) continue
-      await gh('DELETE', `/repos/${FULL}/hooks/${hook.id}`)
-      phase('setup: deleted stale kanban-e2e webhook', { hookId: hook.id })
+  function markWebhookUrl(url: string): string {
+    const marked = new URL(url)
+    marked.searchParams.set('ac-kanban-e2e', hookMarker)
+    return marked.href
+  }
+
+  async function deleteCreatedHooks(): Promise<void> {
+    for (const id of createdHookIds) {
+      const hook = await gh<{ config?: { url?: string } }>('GET', `/repos/${FULL}/hooks/${id}`).catch(() => undefined)
+      if (!hook?.config?.url?.includes(hookMarker)) continue
+      await gh('DELETE', `/repos/${FULL}/hooks/${id}`)
+      phase('cleanup: temporary repository webhook deleted', { hookId: id })
     }
+    createdHookIds.length = 0
+    hookId = undefined
   }
 
   async function createHook(url: string): Promise<void> {
-    await deleteStaleHooks()
+    const marked = markWebhookUrl(url)
     const created = await gh<{ id: number }>('POST', `/repos/${FULL}/hooks`, {
       name: 'web',
       active: true,
       events: ['issues', 'issue_comment', 'label'],
-      config: { url, content_type: 'json', secret: webhookSecret, insecure_ssl: '0' }
+      config: { url: marked, content_type: 'json', secret: webhookSecret, insecure_ssl: '0' }
     })
+    createdHookIds.push(created.id)
     hookId = created.id
-    phase('setup: temporary repository webhook created', { hookId, url })
+    phase('setup: temporary repository webhook created', { hookId, url: marked })
   }
 
   async function discoverInstallationId(appCfg: GithubAppConfig | undefined): Promise<bigint | undefined> {
