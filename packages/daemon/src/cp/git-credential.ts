@@ -31,7 +31,7 @@
  * and an UNEXPIRED cached token keeps serving — CP downtime only breaks remote
  * git once the hour runs out.
  */
-import type { GitCredCapability, GitCredGrant } from '@agentconnect.md/protocol'
+import type { GitCredCapability, GitCredGrant, GitCredRequest } from '@agentconnect.md/protocol'
 
 /** Hand out only while more than this remains (nests under the CP's 15min floor). */
 const HANDOUT_MIN_MS = 10 * 60 * 1000
@@ -61,6 +61,9 @@ const keyOf = (agentId: string, plane: CachePlane, repo?: string): string =>
  *  it gets its own keyspace). One per (agent, repo). */
 const POST_KEY = (agentId: string, repo: string): string => `post\u0000${agentId}\u0000${repo.toLowerCase()}`
 
+/** Cache key for a Kanban summary comment token (issues write, one repo). One per (agent, repo). */
+const KANBAN_KEY = (agentId: string, repo: string): string => `kanban\u0000${agentId}\u0000${repo.toLowerCase()}`
+
 export class GitCredUnavailableError extends Error {
   constructor(
     message: string,
@@ -83,15 +86,7 @@ interface Entry {
 
 export interface GitCredentialCacheDeps {
   /** D→C `gitcred/request` — throws WireError-shaped errors (`code`, `retryable`). */
-  request: (payload: {
-    agentId: string
-    reason?: 'clone' | 'fetch' | 'pull' | 'push' | 'helper'
-    capabilities?: GitCredCapability[]
-    repoFullName?: string
-    purpose?: 'github_hook_reply'
-    hookId?: string
-    forceRefresh?: boolean
-  }) => Promise<GitCredGrant>
+  request: (payload: GitCredRequest) => Promise<GitCredGrant>
   log: { warn: (msg: string) => void }
   /** Rolling-upgrade gate: old CPs reject the new enum value, so request Actions
    *  only after register/ok advertises support. The cache key changes with this
@@ -107,6 +102,8 @@ export class GitCredentialCache {
   /** Poster keys whose next successful CP mint must bypass the CP token cache
    *  after GitHub rejected the previous grant with 401/403. */
   private readonly refreshPosts = new Set<string>()
+  /** Kanban comment keys that must bypass the CP token cache after a 401/403. */
+  private readonly refreshKanban = new Set<string>()
   /** Workspace keys the CP told us to stop asking for (agent-level
    *  SCOPE_DENIED — moved/mode-off). Per KEY, so a gh-plane denial never
    *  silences the git plane. */
@@ -170,6 +167,33 @@ export class GitCredentialCache {
 
   /** Drop the cached GithubPoster token after GitHub rejects it. Matching the
    *  presented token avoids deleting a newer grant that won a concurrent race. */
+  /** Issues-write token for one accepted Kanban run's summary comment. The CP rechecks the lease. */
+  async getKanbanCommentToken(agentId: string, repo: string, leaseId: string): Promise<Entry> {
+    const key = KANBAN_KEY(agentId, repo)
+    const forceRefresh = this.refreshKanban.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      capabilities: ['issues'],
+      repoFullName: repo,
+      purpose: 'kanban_card_write',
+      leaseId,
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshKanban.delete(key)
+    return entry
+  }
+
+  /** Drop the cached Kanban comment token after GitHub rejects it. */
+  invalidateKanbanComment(agentId: string, repo: string, presentedToken?: string): void {
+    const key = KANBAN_KEY(agentId, repo)
+    const entry = this.entries.get(key)
+    if (!entry) return
+    if (presentedToken !== undefined && entry.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshKanban.add(key)
+  }
+
   invalidatePost(agentId: string, repo: string, presentedToken?: string): void {
     const key = POST_KEY(agentId, repo)
     const entry = this.entries.get(key)
@@ -245,6 +269,7 @@ export class GitCredentialCache {
     for (const key of [...this.deniedRepos.keys()]) if (key.includes(marker)) this.deniedRepos.delete(key)
     for (const key of [...this.denied]) if (key.includes(marker)) this.denied.delete(key)
     for (const key of [...this.refreshPosts]) if (key.includes(marker)) this.refreshPosts.delete(key)
+    for (const key of [...this.refreshKanban]) if (key.includes(marker)) this.refreshKanban.delete(key)
   }
 
   private async fetch(key: string, payload: Parameters<GitCredentialCacheDeps['request']>[0]): Promise<Entry> {

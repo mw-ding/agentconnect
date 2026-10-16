@@ -120,6 +120,8 @@ export class KanbanWorker {
     if (!this.stopped) return
     this.stopped = false
     this.requeueOrphans()
+    // Comments recorded before a restart are already due; don't wait a heartbeat to post them.
+    this.drainComments()
     this.arm()
   }
 

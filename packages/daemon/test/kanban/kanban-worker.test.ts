@@ -264,8 +264,8 @@ describe('Kanban worker leases', () => {
     h.cp.report.mockResolvedValueOnce({ leaseId: dispatch.leaseId, accepted: false })
     await h.settle()
     expect(h.terminals.has(dispatch.leaseId)).toBe(false)
-    // Only the tick's retry pass wakes the publisher; no accepted report woke it.
-    expect(h.comments.drain).toHaveBeenCalledTimes(1)
+    // Start drains recovered comments; the tick drains again. Neither accepted a report.
+    expect(h.comments.drain).toHaveBeenCalledTimes(2)
     h.worker.stop()
 
     const g = harness()

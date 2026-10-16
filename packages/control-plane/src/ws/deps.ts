@@ -116,7 +116,7 @@ export interface DaemonWsDeps {
   /** R2a metadata-only lifecycle → informational Check projection. */
   githubRunCoordinator?: GithubRunCoordinator
   /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
-  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport'>
+  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport' | 'commentGrant'>
   /** The current relay roster, injected into `register/ok.relays` so a (re)connecting
    *  daemon converges to the relays it should dial (shared-bot-relay.md §5). */
   relayRoster: () => Promise<RelayRosterEntry[]>

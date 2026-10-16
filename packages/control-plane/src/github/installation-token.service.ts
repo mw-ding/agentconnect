@@ -150,6 +150,23 @@ export class InstallationTokenService {
     return this.mintPermissionLevels(installationId, repoFullName, { checks: 'read', pull_requests: 'read' }, repoId)
   }
 
+  // Daemon Kanban summary token (issue #2 D3): issues write on one repo, cached apart from the CP's own card token.
+  async mintKanbanComment(
+    installationId: bigint,
+    repoFullName: string,
+    repoId: bigint,
+    forceRefresh = false
+  ): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(
+      installationId,
+      repoFullName,
+      { issues: 'write' },
+      repoId,
+      forceRefresh,
+      'kanban_card_write'
+    )
+  }
+
   // CP-only Kanban card token (issue #2 D3): issues on one repo id, cached apart from any daemon grant of the same shape.
   async mintKanbanCard(
     installationId: bigint,
@@ -177,7 +194,7 @@ export class InstallationTokenService {
     levels: InternalPermissionLevels,
     repoId?: bigint,
     forceRefresh = false,
-    purpose?: 'kanban_card'
+    purpose?: 'kanban_card' | 'kanban_card_write'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =

@@ -1,4 +1,5 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
+import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { buildKanbanMessage, isKanbanLabelMutation } from './messages/kanban-message.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
@@ -1956,6 +1957,7 @@ export class Daemon {
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
   private kanban?: KanbanWorker
+  private kanbanCommentPoster?: KanbanCommentPublisher
   private agents = new Map<string, LoadedAgent>()
   private fileAgents = new Map<string, LoadedAgent>()
   private hosts = new Map<string, AcpHost>()
@@ -20500,7 +20502,23 @@ export class Daemon {
       probe: {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: (agentId, sessionId) => (this.sessionSdkQuiescent(agentId, sessionId) ? 0 : 1)
-      }
+      },
+      comments: this.kanbanComments()
+    }))
+  }
+
+  /** Posts accepted summaries. The token is minted only after the CP has accepted that lease. */
+  private kanbanComments(): KanbanCommentPublisher {
+    return (this.kanbanCommentPoster ??= new KanbanCommentPublisher({
+      clock: this.clock,
+      log: this.log,
+      store: this.store,
+      token: (entry) =>
+        this.gitCreds
+          .getKanbanCommentToken(entry.report.agentId, entry.repoFullName, entry.report.leaseId)
+          .then((grant) => grant.token),
+      invalidateToken: (entry, token) =>
+        this.gitCreds.invalidateKanbanComment(entry.report.agentId, entry.repoFullName, token)
     }))
   }
 

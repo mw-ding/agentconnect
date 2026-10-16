@@ -52,10 +52,12 @@ export const GitCredRequest = z.object({
   capabilities: z.array(GitCredCapability).nonempty().optional(),
   // The daemon-owned GithubPoster is a narrower consumer than an agent's git/
   // gh tools: its token never enters the agent environment and may only back
-  // the one final comment for an enabled GitHub hook turn. Marking that purpose
-  // explicitly lets the CP apply the hook authorization instead of incorrectly
-  // clamping the comment token to the workspace contents gitAccess.
-  purpose: z.literal('github_hook_reply').optional(),
+  // the one final comment for an enabled GitHub hook turn, or the one Kanban
+  // summary comment. Marking that purpose lets the CP apply hook or lease
+  // authorization instead of clamping the token to workspace contents gitAccess.
+  purpose: z.enum(['github_hook_reply', 'kanban_card_write']).optional(),
+  // The accepted Kanban run whose summary this token may post. The CP rechecks it.
+  leaseId: z.string().uuid().optional(),
   // Trusted hook identity copied from the relay-delivered rd/msg. Required by
   // the CP for purpose=github_hook_reply so authorization stays rename-safe on
   // HookDef.repoId instead of comparing mutable owner/repo display names.

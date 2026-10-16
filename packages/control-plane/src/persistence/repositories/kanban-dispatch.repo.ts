@@ -1,5 +1,6 @@
 // PgKanbanDispatchRepo (issue #2 D2): the board row is the claim mutex (SKIP LOCKED), card rows are skipped while another writer holds them.
 import { randomUUID } from 'node:crypto'
+import type { KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
@@ -529,5 +530,47 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       ...r,
       agentDaemonId: agentRowId === null ? undefined : agentDaemonId
     }))
+  }
+
+  async isIdempotentReport(daemonId: string, report: KanbanReport): Promise<boolean> {
+    const rows = await this.db.$queryRaw<Array<{ leaseId: string }>>(Prisma.sql`
+      SELECT r."leaseId" FROM "kanban_run" r
+      WHERE r."leaseId" = ${report.leaseId}::uuid
+        AND r."daemonId" = ${daemonId}::uuid
+        AND r."agentId" = ${report.agentId}::uuid
+        AND r."cardId" = ${report.cardId}::uuid
+        AND r."attempt" = ${report.attempt}
+        AND r."dispatchRevision" = ${BigInt(report.dispatchRevision)}
+        AND r."outcome" = ${report.outcome}::"KanbanRunOutcome"
+        AND r."endedAt" IS NOT NULL
+    `)
+    return rows.length === 1
+  }
+
+  async kanbanCommentGrant(
+    daemonId: string,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null> {
+    // The accepting write already fenced the epoch. A restarted daemon keeps the same id and a new epoch, and still owes the comment.
+    const rows = await this.db.$queryRaw<Array<{ repoId: bigint }>>(Prisma.sql`
+      SELECT b."repoId" FROM "kanban_run" r
+      JOIN "kanban_card" c ON c."id" = r."cardId"
+      JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE r."leaseId" = ${leaseId}::uuid
+        AND r."daemonId" = ${daemonId}::uuid
+        AND r."agentId" = ${agentId}::uuid
+        AND r."endedAt" IS NOT NULL
+        AND r."outcome" IN (
+          'completed'::"KanbanRunOutcome",
+          'review_requested'::"KanbanRunOutcome",
+          'blocked'::"KanbanRunOutcome",
+          'failed'::"KanbanRunOutcome"
+        )
+        AND b."repoFullName" = ${repoFullName}
+    `)
+    const row = rows[0]
+    return row ? { repoId: row.repoId } : null
   }
 }
