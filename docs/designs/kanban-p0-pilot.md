@@ -151,16 +151,25 @@ With 100 parked cards, the first hour is capped at 25 reads per tick, and steady
 state is about one read per card per hour.
 
 If the graph promotion's ready-label write fails, recovery decides what landed. The
-reconciler first reads the issue's newest event id (the events cursor), then moves
-the card from `todo` to `ready` and opens the intent in one conditional write:
-`promotionPending`, `promotionEventCursor`, and `promotionStartedAt`. A claim
+reconciler first reads the issue's newest event id (the events cursor). If the
+`Link: rel="last"` page is empty, it walks back to the newest non-empty page. A read
+that finds no event within the page bound fails before anything is written, so the
+cursor never falls back to 0. The reconciler then moves the card from `todo` to
+`ready` and opens the intent in one conditional write: `promotionPending`,
+`promotionEventCursor`, `promotionStartedAt`, and `promotionWatchUntil` (10 minutes
+out). That write refuses a card that already has an open intent or carries
+`needsAttention`. The reconciler skips both kinds of card before it reads anything,
+so a redelivered graph event can neither reset an open intent's caps, cursor, and
+start time nor promote a card that is waiting for a human. A claim
 therefore never sees a `ready` card without its intent, even across a crash. A
 claim skips any card with the intent set, so the leftover of a crash after the ready
 POST is never dispatched. The next recovery check is a minute out, so a tick cannot
 settle the card while the write is running. When the ready POST returns success the
 CP sets `promotionPostAccepted`. A successful write clears the intent. A failed one
-moves the card back to `todo`, keeps the intent, makes the next check due at once,
-and fails the doorbell. The write may still have half-landed. For example, the ready
+moves the card back to `todo`, keeps the intent, restarts the watch 10 minutes from
+the rollback, makes the next check due at once, and fails the doorbell. The write may
+still have half-landed, or a timed-out POST may still commit on GitHub after the
+rollback. For example, the ready
 label was added and GitHub applied the `todo` removal, but the DELETE timed out. The
 next tick re-reads due flagged cards within the recovery batch limit. While the
 intent is open, the reconciler does not strip a leftover `todo` label, because that
@@ -184,8 +193,15 @@ would finish the write before attribution.
 - **Graph readiness.** Every blocker must still be closed as completed.
 
 If the issue carries no `ready` label (the POST did not land, or a human moved the
-card), the intent clears and the card stays `todo`. A redelivered graph doorbell
-promotes it again. Every other failed check hands the card to a human. The CP moves
+card), the outcome depends on whether the POST was acknowledged. With
+`promotionPostAccepted` set, nothing more can land, so the intent clears and the card
+stays `todo`. Without it, the card is in the rolled-back watch until
+`promotionWatchUntil`. An empty read inside the watch only counts as a check, and the
+first empty read after the watch clears the intent. A late POST that lands inside the
+watch, or after it but before that closing read, shows up as an App ready-add with
+no acknowledged POST, so the next read escalates the card as `unattributed`. It is
+never cleared silently. Once the intent clears, a redelivered graph doorbell promotes
+the card again. Every other failed check hands the card to a human. The CP moves
 the card back to `todo`, clears the intent, sets `needsAttention` with an
 `attentionReason`, logs a warning, and posts a fixed, body-free issue comment so the
 board shows it. The reasons are:
@@ -202,8 +218,13 @@ checks, or 6 hours after the intent opened, the card escalates as `unresolved`. 
 non-human doorbell does not reset the backoff or read early. A human status doorbell
 reads at once and still counts toward the cap. A `needsAttention` card is parked like
 a mismatch, so it is human-only: tick recovery and the label doorbell un-park it only
-when a human `User` re-adds `ac/status:ready` or sets another single status. A stale
-graph CAS cannot re-promote it, because escalation bumps the state revision. Any
+when a human `User` makes the latest status edit. That edit is either a fresh add of
+`ac/status:ready` (the comment asks the human to remove and re-add it, because an
+unattributed `ready` is often still on the issue) or another single status. No
+automatic path clears the flag. The graph reconciler skips flagged cards, and the
+promotion write refuses them, so closed blockers plus todo-only labels do not
+re-promote one. A stale graph CAS cannot either, because escalation bumps the state
+revision. Any
 later status change clears the intent and the flag. They therefore cannot authorize
 a future promotion once the card returns to `todo`.
 
@@ -267,6 +288,11 @@ only a CP log line.
   any second App ready-add or other App `ac/*` write in the window escalates the card
   instead. Closing this would need a per-write identity GitHub does not expose, such
   as a separate App for the control plane.
+- **The late-landing watch is finite.** A timed-out POST that commits on GitHub after
+  the watch's closing read leaves GitHub on `ready` and the card on `todo` with
+  nothing pending or flagged. The relay ignores App senders, and the reconciler does
+  not promote over existing `ready` labels. The window is 10 minutes from the rollback,
+  plus the wait for the next backoff step, against a 10-second request timeout.
 - **Escalation comments are best-effort.** If the comment POST fails, the card still
   carries `needsAttention` and a warning is logged, but nothing shows on the issue.
   The console does not surface the flag yet.
