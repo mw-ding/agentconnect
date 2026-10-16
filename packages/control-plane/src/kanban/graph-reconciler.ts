@@ -46,6 +46,7 @@ export class KanbanGraphReconciler {
   ): Promise<void> {
     const card = await this.deps.cards.findByIssueNumber(board.id, issueNumber)
     if (!card) return
+    const residueOnly = card.status === 'ready'
     if (card.status === 'todo') {
       if (planGraphPromotion(card.status, graph) !== 'promote') return
       if (!(await this.deps.cards.casStatus(card.id, card.stateRevision, 'ready'))) {
@@ -55,7 +56,7 @@ export class KanbanGraphReconciler {
     } else if (card.status !== 'ready') {
       return
     }
-    await this.writeReadyLabels(repo, issueNumber, card.status === 'ready')
+    await this.writeReadyLabels(repo, issueNumber, residueOnly)
   }
 
   /** Writes the ready label; for an already-ready card only finishes residue of a crashed earlier write. */
@@ -65,8 +66,8 @@ export class KanbanGraphReconciler {
     const keep = statusLabel('ready')
     const stale = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
     const hasKeep = observed.labels.includes(keep)
-    // Add-then-remove can crash with ready plus a stray status label, so repair unless exactly [ready].
-    if (residueOnly && hasKeep && stale.length === 0) return
+    // Already-ready: repair only ready+stray (add-then-remove crash); a human label move is authoritative since M1 does not sync it to DB.
+    if (residueOnly && (!hasKeep || stale.length === 0)) return
     const plan: LabelPlan = {
       outcome: 'accepted',
       status: 'ready',

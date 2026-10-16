@@ -119,12 +119,19 @@ describe('KanbanGraphReconciler', () => {
     expect(h.store.applyPlan).toHaveBeenCalledOnce()
   })
 
-  it('finishes the label write for a ready card whose labels still say todo', async () => {
-    const h = make({ 7: { status: 'ready', labels: todoLabels } })
+  it('leaves a ready card alone when a human moved its label to blocked', async () => {
+    const h = make({ 7: { status: 'ready', labels: ['ac/status:blocked', 'ac/agent:eng'] } })
     await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
     expect(h.cards.casStatus).not.toHaveBeenCalled()
-    expect(h.store.applyPlan).toHaveBeenCalledOnce()
-    expect(h.labels.get(7)).toContain('ac/status:ready')
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.labels.get(7)).toEqual(['ac/status:blocked', 'ac/agent:eng'])
+  })
+
+  it('does not re-add ready to a ready card whose only status label is todo', async () => {
+    const h = make({ 7: { status: 'ready', labels: ['ac/status:todo'] } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.labels.get(7)).toEqual(['ac/status:todo'])
   })
 
   it('repairs the duplicate left when a write fails between add and remove', async () => {
