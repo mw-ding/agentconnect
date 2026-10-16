@@ -492,6 +492,27 @@ describe('half-landed promotion attribution (events after the pre-POST cursor)',
     expect(await harness({ [`GET ${eventsPath(1)}`]: () => eventsPage([]) }).store.lastEventId(REPO, 7)).toBe(0)
   })
 
+  it('walks back from an empty rel="last" page to the newest event instead of falling to cursor 0', async () => {
+    const filler = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ id: from + i, event: 'closed' }))
+    const h = harness({
+      [`GET ${eventsPath(1)}`]: () => eventsPage(filler(1, 100), 3),
+      [`GET ${eventsPath(2)}`]: () => eventsPage(filler(101, 100), 3),
+      [`GET ${eventsPath(3)}`]: () => eventsPage([], 3)
+    })
+    expect(await h.store.lastEventId(REPO, 7)).toBe(200)
+    expect(h.calls.map((c) => c.url.replace('https://api.test', ''))).toEqual([
+      eventsPath(1),
+      eventsPath(3),
+      eventsPath(2)
+    ])
+  })
+
+  it('throws rather than anchor at 0 when every page within the bound is empty', async () => {
+    const routes: Record<string, () => Response> = {}
+    for (let page = 1; page <= 12; page++) routes[`GET ${eventsPath(page)}`] = () => eventsPage([], 12)
+    await expect(harness(routes).store.lastEventId(REPO, 7)).rejects.toThrow('page bound')
+  })
+
   it('is inconclusive when the window reaches past the page bound (1,000+ events since the cursor)', async () => {
     const routes: Record<string, () => Response> = {}
     for (let page = 1; page <= 12; page++) {

@@ -80,7 +80,8 @@ type PendingOutcome = 'adopt' | 'clear' | 'inconclusive' | PromotionAttention
 export function attentionComment(reason: PromotionAttention): string {
   return (
     `AgentConnect Kanban: this card's automatic promotion to \`ac/status:ready\` could not be confirmed ` +
-    `(${reason}), so it was not dispatched. Re-add \`ac/status:ready\` yourself, or set another status, to continue.`
+    `(${reason}), so it was not dispatched. Remove and re-add \`ac/status:ready\` yourself (even if it is ` +
+    `already present), or set another status, to continue.`
   )
 }
 

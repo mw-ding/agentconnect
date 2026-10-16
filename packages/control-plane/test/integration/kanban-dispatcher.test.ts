@@ -961,6 +961,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(comments).toHaveLength(1)
     expect(comments[0]).toMatchObject({ addLabels: [], removeLabels: [] })
     expect(comments[0]!.comment).toContain(`(${reason})`)
+    // An unattributed ready is often still on the issue, so only a fresh human add counts.
+    expect(comments[0]!.comment).toContain('Remove and re-add `ac/status:ready`')
     expect(h.sent).toEqual([])
     expect(await prisma.kanbanRun.count()).toBe(0)
   }

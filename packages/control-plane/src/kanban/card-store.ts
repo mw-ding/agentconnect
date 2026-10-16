@@ -224,7 +224,9 @@ export class GithubCardStore implements CardStore {
   }
 
   async lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number> {
-    const events = (await this.recentEvents(repo, issueNumber, () => true)) ?? []
+    // An empty `rel="last"` page walks back to the newest non-empty one; cursor 0 would admit every older App write.
+    const events = await this.recentEvents(repo, issueNumber, (seen) => seen.length > 0)
+    if (!events) throw new Error('kanban: no issue event within the page bound to anchor the promotion cursor')
     return events.reduce((max, event) => Math.max(max, event.id), 0)
   }
 
