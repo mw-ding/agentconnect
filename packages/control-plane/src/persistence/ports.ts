@@ -5235,7 +5235,7 @@ export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
-  /** After the ready CAS, record the in-flight write so a crash cannot claim the card. */
+  /** CAS todo to ready and open the in-flight intent in one write, so a claim or crash never sees one without the other. */
   beginPromotion(cardId: string, expectedStateRevision: bigint, notBefore: Date, notAfter: Date): Promise<boolean>
   /** Store the ready-label event id, and tighten the search window, while the intent is still open. */
   notePromotionEvent(

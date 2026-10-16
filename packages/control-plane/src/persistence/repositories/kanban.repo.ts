@@ -142,9 +142,13 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
     notBefore: Date,
     notAfter: Date
   ): Promise<boolean> {
+    // The ready CAS and the intent are one write, so no claim or crash can see ready without the intent.
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
+      where: { id: cardId, stateRevision: expectedStateRevision, status: 'todo' },
       data: {
+        status: 'ready',
+        stateRevision: { increment: 1 },
+        githubSyncedAt: new Date(),
         promotionPending: true,
         promotionReadyEventId: null,
         promotionWriteStartedAt: notBefore,

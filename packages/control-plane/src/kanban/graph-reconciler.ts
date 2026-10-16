@@ -16,7 +16,8 @@ export interface GraphReconcilerLog {
 }
 
 export interface KanbanGraphReconcilerDeps {
-  cards: KanbanCardRepo
+  // No bare casStatus: a promotion's ready move and its intent land only together, through beginPromotion.
+  cards: Omit<KanbanCardRepo, 'casStatus'>
   store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'identifyReadyEvent'>
   log: GraphReconcilerLog
   /** Defaults to the wall clock. Tests pass the fake clock so the write-start matches scripted event times. */
@@ -72,17 +73,12 @@ export class KanbanGraphReconciler {
     const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
     // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
     if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
-    if (!(await this.deps.cards.casStatus(card.id, card.stateRevision, 'ready'))) {
-      this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
-      return
-    }
     const revision = card.stateRevision + 1n
     const writeStartedAt = new Date(this.deps.clock?.now() ?? Date.now())
     // Provisional window until the POST's Date header tightens it. Held off the tick so this write is not settled early.
     let bounds = promotionEventWindow(writeStartedAt, null, writeStartedAt.getTime())
-    if (!(await this.deps.cards.beginPromotion(card.id, revision, bounds.notBefore, bounds.notAfter))) {
-      await this.deps.cards.revertPromotion(card.id, revision, null, null, null).catch(() => false)
-      this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the intent')
+    if (!(await this.deps.cards.beginPromotion(card.id, card.stateRevision, bounds.notBefore, bounds.notAfter))) {
+      this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
       return
     }
     let readyEventId: number | null = null

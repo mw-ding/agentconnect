@@ -685,10 +685,16 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const c = await seedCard(boardId, { status: 'todo' })
     const cards = new PgKanbanCardRepo(prisma)
     const rev = (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).stateRevision
-    expect(await cards.casStatus(c.id, rev, 'ready')).toBe(true)
     const notBefore = new Date('2026-10-16T00:00:00.000Z')
     const notAfter = new Date('2026-10-16T00:00:11.000Z')
-    expect(await cards.beginPromotion(c.id, rev + 1n, notBefore, notAfter)).toBe(true)
+    expect(await cards.beginPromotion(c.id, rev, notBefore, notAfter)).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      status: 'ready',
+      stateRevision: rev + 1n,
+      promotionPending: true
+    })
+    // A stale revision or a card that is no longer todo loses the CAS and opens no intent.
+    expect(await cards.beginPromotion(c.id, rev, notBefore, notAfter)).toBe(false)
     expect(await repo().claim(boardId, live)).toEqual([])
     // The in-flight intent is not due yet, so a tick cannot settle it under the write.
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([])
@@ -708,6 +714,27 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     expect(await repo().getPendingPromotion(boardId, c.issueNumber)).toMatchObject({ promotionReadyEventId: 99n })
     expect(await cards.clearPromotionIntent(c.id)).toBe(true)
     expect(await repo().claim(boardId, live)).toHaveLength(1)
+  })
+
+  it('never lets a concurrent claim land between the ready CAS and the promotion intent', async () => {
+    const boardId = await seedBoard()
+    const cards = new PgKanbanCardRepo(prisma)
+    const todo = await Promise.all(Array.from({ length: 8 }, () => seedCard(boardId, { status: 'todo' })))
+    const window = [new Date('2026-10-16T00:00:00.000Z'), new Date('2026-10-16T00:00:11.000Z')] as const
+    const claims: Promise<unknown[]>[] = []
+    const begins = todo.map(async (c, i) => {
+      if (i % 2 === 0) claims.push(repo().claim(boardId, live))
+      return cards.beginPromotion(c.id, 1n, ...window)
+    })
+    expect(await Promise.all(begins)).toEqual(todo.map(() => true))
+    claims.push(repo().claim(boardId, live))
+    expect((await Promise.all(claims)).flat()).toEqual([])
+    const rows = await prisma.kanbanCard.findMany({
+      where: { boardId },
+      select: { status: true, promotionPending: true }
+    })
+    expect(rows.every((r) => r.status === 'ready' && r.promotionPending)).toBe(true)
+    expect(await prisma.kanbanRun.count()).toBe(0)
   })
 
   it('resets the backoff when the card is claimed again', async () => {
