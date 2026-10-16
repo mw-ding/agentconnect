@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import type { GitCredGrant } from '@agentconnect.md/protocol'
-import { GitCredentialCache, GitCredUnavailableError } from '../../src/cp/git-credential.js'
+import { GitCredentialCache, GitCredUnavailableError, type KanbanCredentialRun } from '../../src/cp/git-credential.js'
 
 const AGENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const HOOK = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
@@ -351,6 +351,71 @@ describe('GitCredentialCache', () => {
       await h.cache.get(AGENT, 'helper', { repo: 'other-org/tools' })
       h.cache.remove(AGENT)
       expect((await h.cache.get(AGENT, 'helper', { repo: 'other-org/tools' })).token).toBe('ghs_2')
+    })
+  })
+
+  describe('Kanban run scope', () => {
+    const WRITE_LEASE = '44444444-4444-4444-8444-444444444444'
+    const READ_LEASE = '55555555-5555-4555-8555-555555555555'
+    const REPO = 'acme/web'
+
+    function scoped(runs: KanbanCredentialRun[], workspaceRepoOf?: (agentId: string) => string | undefined) {
+      let calls = 0
+      const cache = new GitCredentialCache({
+        request: async (payload) => {
+          calls += 1
+          const repoFullName = payload.repoFullName ?? workspaceRepoOf?.(payload.agentId) ?? 'acme/infra'
+          return { ...grant(`ghs_${calls}`, 3540), repoFullName, access: calls === 1 ? 'write' : 'read' }
+        },
+        log: { warn: () => {} },
+        monoNow: () => 0,
+        kanbanRuns: () => runs,
+        ...(workspaceRepoOf ? { workspaceRepoOf } : {})
+      })
+      return { cache, calls: () => calls }
+    }
+
+    it('asks the CP for a read lease instead of serving a cached ordinary write token', async () => {
+      const runs: KanbanCredentialRun[] = []
+      const h = scoped(runs)
+      const write = await h.cache.get(AGENT, 'helper', { plane: 'gh', repo: REPO })
+      expect(write).toMatchObject({ token: 'ghs_1', access: 'write' })
+
+      runs.push({ agentId: AGENT, repoFullName: REPO, leaseId: READ_LEASE, mode: 'read' })
+      const read = await h.cache.get(AGENT, 'helper', { plane: 'gh', repo: REPO })
+      expect(h.calls()).toBe(2)
+      expect(read.token).toBe('ghs_2')
+      expect(read.token).not.toBe(write.token)
+      expect(read.access).toBe('read')
+
+      expect((await h.cache.get(AGENT, 'helper', { plane: 'gh', repo: REPO })).token).toBe('ghs_2')
+      expect(h.calls()).toBe(2)
+    })
+
+    it('asks the CP again when a write lease is followed by a read lease on the same repo', async () => {
+      const runs: KanbanCredentialRun[] = [{ agentId: AGENT, repoFullName: REPO, leaseId: WRITE_LEASE, mode: 'write' }]
+      const h = scoped(runs)
+      const write = await h.cache.get(AGENT, 'helper', { repo: REPO })
+      expect(write.token).toBe('ghs_1')
+
+      runs[0] = { agentId: AGENT, repoFullName: REPO, leaseId: READ_LEASE, mode: 'read' }
+      const read = await h.cache.get(AGENT, 'helper', { repo: REPO })
+      expect(h.calls()).toBe(2)
+      expect(read.token).toBe('ghs_2')
+      expect(read.token).not.toBe(write.token)
+    })
+
+    it('treats a repo-less helper request as the workspace repo while a read lease is open', async () => {
+      const runs: KanbanCredentialRun[] = []
+      const h = scoped(runs, () => REPO)
+      const write = await h.cache.get(AGENT, 'helper')
+      expect(write.token).toBe('ghs_1')
+
+      runs.push({ agentId: AGENT, repoFullName: 'ACME/Web', leaseId: READ_LEASE, mode: 'read' })
+      const read = await h.cache.get(AGENT, 'helper')
+      expect(h.calls()).toBe(2)
+      expect(read.token).toBe('ghs_2')
+      expect(read.token).not.toBe(write.token)
     })
   })
 })
