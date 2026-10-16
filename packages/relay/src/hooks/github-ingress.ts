@@ -85,13 +85,11 @@ export interface GithubIngressDeps {
 interface GithubPayload {
   action?: string
   changes?: { base?: unknown }
-  /** The label a `labeled` action just applied. */
+  /** The label a `labeled` action just applied, or an `unlabeled` action removed. */
   label?: { name?: string }
   installation?: { id?: number }
   repository?: GithubRepositoryRef
   sender?: { login?: string; type?: string; avatar_url?: string }
-  /** The label an `issues:labeled`/`unlabeled` delivery added or removed. */
-  label?: { name?: string }
   requested_reviewer?: { login?: string; type?: string }
   requested_action?: { identifier?: string }
   issue?: GithubSubject
@@ -1192,7 +1190,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       // A card-status change also rings the Kanban doorbell; hook matching below still runs for the same delivery.
       const issuePoke = githubIssueDoorbell(event, payload, deliveryKey)
       if (issuePoke) {
-        deps.graphDoorbell(issuePoke)
+        deps.graphDoorbell?.(issuePoke)
         if (issuePoke.numbers.length > 0) {
           deps.log.info(
             `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`

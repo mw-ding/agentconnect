@@ -449,7 +449,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await snapshot('b/c: lease ACK persisted and running label observed', c.id, created.number)
       const lease = worker.get(d.leaseId)!
       expect(lease.sessionId).toBeTruthy()
-      expect(local.getSession(lease.sessionKey)).toMatchObject({
+      expect(await local.getSession(lease.sessionKey)).toMatchObject({
         externalProvider: 'github',
         externalResourceKey: String(REPO_ID)
       })
@@ -457,7 +457,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         lease.sessionId,
         expect.stringMatching(/^(read-only|plan)$/)
       )
-      expect(worker.dispatch(d)).toEqual({ leaseId: d.leaseId, accepted: true })
+      expect(await worker.dispatch(d)).toEqual({ leaseId: d.leaseId, accepted: true })
       expect(host.prompt).toHaveBeenCalledTimes(promptCount + 1)
       await worker.tick()
       expect(await run(d.leaseId)).toMatchObject({ heartbeatAt: expect.any(Date), sessionId: lease.sessionId })
@@ -535,16 +535,16 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       expect(worker.recordTerminal(d.leaseId, { outcome })).toBe(true)
       releaseTurn!()
       releaseTurn = undefined
-      await vi.waitFor(() => expect(local.listKanbanReports(10)).toHaveLength(1), { timeout: 30_000 })
-      expect(local.listKanbanReports(10)[0]).toMatchObject({ leaseId: d.leaseId, outcome })
+      await vi.waitFor(async () => expect(await local.listKanbanReports(10)).toHaveLength(1), { timeout: 30_000 })
+      expect((await local.listKanbanReports(10))[0]).toMatchObject({ leaseId: d.leaseId, outcome })
       expect((await run(d.leaseId)).endedAt).toBeNull()
       phase('e: injected M3 terminal outcome persisted to real SQLite outbox while CP link offline', { outcome })
       cpReady = true
       await worker.flush()
       await dispatcher.settle()
       expect(reports.at(-1)).toMatchObject({ leaseId: d.leaseId, outcome })
-      expect(local.listKanbanReports(10)).toHaveLength(0)
-      expect(local.hasKanbanReport(d.leaseId)).toBe(true)
+      expect(await local.listKanbanReports(10)).toHaveLength(0)
+      expect(await local.hasKanbanReport(d.leaseId)).toBe(true)
       expect(await run(d.leaseId)).toMatchObject({ outcome, endedAt: expect.any(Date) })
       const target = outcome === 'completed' ? 'done' : 'review'
       expect((await card(c.id)).status).toBe(target)
