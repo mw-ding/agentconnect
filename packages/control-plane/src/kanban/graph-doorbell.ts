@@ -1,4 +1,4 @@
-// Kanban graph doorbell (issue #2 spike §3): a body-free `rc/github-graph` poke makes the CP re-read the graph from GitHub.
+// Kanban doorbell (issue #2 spike §3): a body-free `rc/github-graph` poke makes the CP re-read a graph or card.
 import type { RcGithubGraph } from '@agentconnect.md/protocol'
 import type { GithubInstallationRepo, KanbanBoardRecord, KanbanBoardRepo } from '../persistence/ports.js'
 import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
@@ -22,6 +22,8 @@ export interface KanbanGraphDoorbellDeps {
     issueNumber: number,
     graph: CardGraph
   ) => void | Promise<void>
+  /** An `issues` status change: no graph read, the card itself is re-read; a throw leaves the GUID un-landed too. */
+  onCard?: (board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number) => void | Promise<void>
   log: GraphDoorbellLog
 }
 
@@ -67,17 +69,17 @@ export class KanbanGraphDoorbell {
   }
 
   private async handle(m: RcGithubGraph): Promise<void> {
+    if (m.numbers.length === 0) {
+      // Cross-repo ids only (the periodic board tick reconciles those), or an `issues` seen-only marker: land it.
+      this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
+      return
+    }
     const boards = await this.deps.boards.listEnabledByRepoId(BigInt(m.repoId))
     if (boards.length === 0) return
     // The verified installation must belong to the board's org (decision 6), and must still be live.
     const installation = await this.deps.installations.getByInstallationId(BigInt(m.installationId))
     if (!installation || installation.revokedAt || installation.suspendedAt) {
       this.deps.log.debug({ installationId: m.installationId }, 'kanban graph doorbell: installation not live')
-      return
-    }
-    if (m.numbers.length === 0) {
-      // Cross-repo ids only; the periodic board tick reconciles those.
-      this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
       return
     }
     const reads: Promise<void>[] = []
@@ -88,7 +90,13 @@ export class KanbanGraphDoorbell {
         repoId: board.repoId,
         repoFullName: board.repoFullName
       }
-      for (const issueNumber of m.numbers) reads.push(this.schedule(board, repo, issueNumber))
+      for (const issueNumber of m.numbers) {
+        reads.push(
+          m.event === 'issues'
+            ? (async () => this.deps.onCard?.(board, repo, issueNumber))()
+            : this.schedule(board, repo, issueNumber)
+        )
+      }
     }
     // Every read+apply must succeed before the GUID lands; allSettled first so no sibling rejection goes unhandled.
     const results = await Promise.allSettled(reads)

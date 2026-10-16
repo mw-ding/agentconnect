@@ -6,8 +6,20 @@ import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
-import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
-import type { CardGraph, CardIssue, KanbanRepoRef } from '../../src/kanban/card-store.js'
+import {
+  KanbanDispatcher,
+  MAX_PROMOTION_AGE_MS,
+  MAX_PROMOTION_CHECKS,
+  WRITE_MODE_LABEL
+} from '../../src/kanban/dispatcher.js'
+import {
+  judgePromotion,
+  type CardGraph,
+  type CardIssue,
+  type KanbanRepoRef,
+  type LabelEvent,
+  type LabelWriteObserver
+} from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
@@ -19,15 +31,65 @@ const D2 = 'd2222222-2222-4222-8222-222222222222'
 const A1 = 'a1111111-1111-4111-8111-111111111111'
 const REPO_ID = 987654321n
 const T0 = Date.parse('2026-10-15T12:00:00.000Z')
+const APP_SLUG = 'agentconnect'
+/** Who GitHub's issue events name for a label write: a person, this App's bot (CP and agents alike), or another bot. */
+const ACTORS = {
+  human: { type: 'User', login: 'maintainer' },
+  app: { type: 'Bot', login: `${APP_SLUG}[bot]` },
+  other: { type: 'Bot', login: 'renovate[bot]' }
+} as const
 
 class FakeStore {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   /** Who last set each issue's status label; unset means a human. */
   readonly statusActors = new Map<number, 'human' | 'bot'>()
+  /** The issue events API: label adds/removes with their actor, replayed by the real attribution check. */
+  readonly events = new Map<number, LabelEvent[]>()
+  readonly graphs = new Map<number, CardGraph>()
   readonly reads: number[] = []
+  private eventId = 0
   async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
     return (this.statusActors.get(n) ?? 'human') === 'human'
+  }
+  /** Issues whose event window cannot be read in full (for example 1,000+ events since the cursor). */
+  readonly unreadable = new Set<number>()
+  async lastEventId(_repo: KanbanRepoRef, n: number): Promise<number> {
+    return (this.events.get(n) ?? []).reduce((max, event) => Math.max(max, event.id), 0)
+  }
+  async promotionVerdict(_repo: KanbanRepoRef, n: number, cursor: number, postAccepted: boolean) {
+    if (this.unreadable.has(n)) return 'inconclusive' as const
+    return judgePromotion(this.events.get(n) ?? [], APP_SLUG, cursor, postAccepted)
+  }
+  async readGraph(_repo: KanbanRepoRef, n: number): Promise<CardGraph> {
+    return this.graphs.get(n) ?? emptyGraph()
+  }
+  /** Set an issue's labels as `actor`, recording the add-then-remove events GitHub would. */
+  relabel(n: number, labels: string[], actor: keyof typeof ACTORS): void {
+    const i = this.issues.get(n)!
+    this.statusActors.set(n, actor === 'human' ? 'human' : 'bot')
+    this.record(
+      n,
+      labels.filter((l) => !i.labels.includes(l)),
+      i.labels.filter((l) => !labels.includes(l)),
+      actor
+    )
+    i.labels = [...labels]
+  }
+  private record(n: number, added: string[], removed: string[], actor: keyof typeof ACTORS): void {
+    const events = this.events.get(n) ?? []
+    for (const name of added)
+      events.push({
+        id: ++this.eventId,
+        event: 'labeled',
+        created_at: new Date(T0 + this.eventId * 1000).toISOString(),
+        label: { name },
+        actor: ACTORS[actor]
+      })
+    for (const name of removed) {
+      events.push({ id: ++this.eventId, event: 'unlabeled', label: { name }, actor: ACTORS[actor] })
+    }
+    this.events.set(n, events)
   }
   async readCard(_repo: KanbanRepoRef, n: number): Promise<CardIssue | null> {
     this.reads.push(n)
@@ -42,9 +104,17 @@ class FakeStore {
         }
       : null
   }
-  async applyPlan(_repo: KanbanRepoRef, n: number, _observed: ObservedIssue, plan: LabelPlan): Promise<void> {
+  async applyPlan(
+    _repo: KanbanRepoRef,
+    n: number,
+    _observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void> {
     this.writes.push(plan)
     const i = this.issues.get(n)!
+    this.record(n, plan.addLabels, plan.removeLabels, 'app')
+    for (const label of plan.addLabels) await onLabelAdded?.(label)
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
       i.state = plan.issueState.state
@@ -118,7 +188,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, log, sent, repo, dispatcher, addCard, reportFor, card, run }
+  return { board, clock, store, graphs: store.graphs, log, sent, repo, dispatcher, addCard, reportFor, card, run }
 }
 
 describe('KanbanDispatcher — dispatch (real Postgres)', () => {
@@ -661,12 +731,9 @@ const completedBlocker = {
 
 async function graphHarness() {
   const h = await harness()
-  const graphs = new Map<number, CardGraph>()
-  const store = Object.assign(h.store, {
-    readGraph: async (_repo: KanbanRepoRef, n: number) => graphs.get(n) ?? emptyGraph()
-  })
+  const { graphs, store } = h
   const log = { debug: vi.fn(), warn: vi.fn() }
-  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
+  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log, clock: h.clock })
   const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
   const poke = vi.spyOn(h.dispatcher, 'poke')
   const bell = new KanbanGraphDoorbell({
@@ -678,7 +745,11 @@ async function graphHarness() {
     store,
     onGraph: async (board, repo, n, graph) => {
       await reconciler.apply(board, repo, n, graph)
-      await h.dispatcher.ingestCard(board.id, n)
+      await h.dispatcher.onCardChanged(board.id, n, 'graph')
+      h.dispatcher.poke(board.id)
+    },
+    onCard: async (board, _repo, n) => {
+      await h.dispatcher.onCardChanged(board.id, n, 'human')
       h.dispatcher.poke(board.id)
     },
     log
@@ -696,8 +767,80 @@ async function graphHarness() {
     await bell.settle()
     await h.dispatcher.settle()
   }
-  return { ...h, graphs, store, bell, ring, ingest, poke }
+  // The relay's `issues` doorbell for a human status relabel; it never reads the graph.
+  const ringLabel = async (n: number, deliveryKey = 'label-1') => {
+    bell.poke({
+      deliveryKey,
+      installationId: '77',
+      repoId: REPO_ID.toString(),
+      event: 'issues',
+      action: 'labeled',
+      ids: [String(n)],
+      numbers: [n]
+    })
+    await bell.settle()
+    await h.dispatcher.settle()
+  }
+  return { ...h, graphs, store, bell, ring, ringLabel, ingest, poke }
 }
+
+describe('Kanban card-status doorbell un-parks a re-readied card at once (real Postgres)', () => {
+  // Park a card in blocked, then let recovery back it off to the one-hour ceiling.
+  const parkAtCeiling = async (h: Awaited<ReturnType<typeof graphHarness>>) => {
+    const c = await h.addCard(['ac/status:blocked'])
+    await h.dispatcher.tick()
+    for (let i = 0; i < 8; i++) {
+      const { recoveryCheckAt } = await h.card(c.id)
+      if (recoveryCheckAt) h.clock.advance(recoveryCheckAt.getTime() - h.clock.now())
+      await h.dispatcher.tick()
+    }
+    const parked = await h.card(c.id)
+    expect(parked.status).toBe('blocked')
+    expect(parked.recoveryCheckAt!.getTime() - h.clock.now()).toBe(60 * 60_000)
+    return c
+  }
+
+  it('dispatches a human-re-readied card on the labeled webhook instead of after the backoff', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    await h.ringLabel(c.issueNumber)
+    expect(h.store.reads.at(-2)).toBe(c.issueNumber)
+    expect(h.sent.map(({ d }) => d)).toEqual([expect.objectContaining({ cardId: c.id, attempt: 2 })])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', recoveryCheckAt: null, recoveryChecks: 0 })
+    expect(h.bell.landedDeliveryKeys(['label-1'])).toEqual(new Set(['label-1']))
+  })
+
+  it('resets the backoff on the webhook even when the change cannot un-park the card', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    h.store.statusActors.set(c.issueNumber, 'bot')
+    await h.ringLabel(c.issueNumber)
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'blocked', recoveryCheckAt: null, recoveryChecks: 0 })
+    // The very next tick re-reads it, so a human fix moments later is not stuck behind the old hour.
+    const reads = h.store.reads.length
+    await h.dispatcher.tick()
+    expect(h.store.reads.length).toBe(reads + 1)
+    h.store.statusActors.set(c.issueNumber, 'human')
+    h.clock.advance(60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
+  })
+
+  it('restarts the backoff when a tick read sees GitHub changed, even without a webhook', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked', 'ac/status:triage']
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    const card = await h.card(c.id)
+    expect(card).toMatchObject({ status: 'blocked', recoveryChecks: 1 })
+    expect(card.recoveryCheckAt!.getTime() - h.clock.now()).toBe(60_000)
+  })
+})
 
 describe('Kanban graph reconciliation composed with dispatch (real Postgres)', () => {
   it('promotes despite a mode change between reading the card and the status CAS', async () => {
@@ -766,22 +909,26 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe('running')
   })
 
-  it.each([
-    { name: 'add landed, removal failed', partial: true },
-    { name: 'add failed', partial: false }
-  ])('rolls back a failed promotion after a mode change ($name); redelivery promotes', async ({ partial }) => {
-    const h = await graphHarness()
+  // A failed promotion write: nothing landed, or labels landed and then a later step failed. `acked` is whether the ready POST returned.
+  const failPromotion = async (
+    h: Awaited<ReturnType<typeof graphHarness>>,
+    landed: string[] | null,
+    { changeMode = false, acked = landed !== null } = {}
+  ) => {
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
     h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
-      .mockImplementationOnce(async () => {
-        expect(
-          await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
-        ).toBe(true)
-        if (partial) h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
-        throw new Error('label write failed')
+      .mockImplementationOnce(async (_repo, _n, _observed, _plan, onLabelAdded) => {
+        // #19: an owner flips the card's write mode while the promotion is in flight.
+        if (changeMode)
+          expect(
+            await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
+          ).toBe(true)
+        if (landed) h.store.relabel(c.issueNumber, landed, 'app')
+        if (acked) await onLabelAdded?.('ac/status:ready')
+        throw new Error('label write timed out')
       })
       .mockImplementation(apply)
     await h.ring(c.issueNumber)
@@ -789,21 +936,416 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.ingest).not.toHaveBeenCalled()
     expect(h.poke).not.toHaveBeenCalled()
     expect(h.sent).toEqual([])
-    // The undone promotion leaves DB todo, so a tick before redelivery neither dispatches nor mismatches the card.
+    // The undone promotion leaves DB todo, flagged for recovery, so no claim can mismatch it.
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, promotionPostAccepted: acked })
+    return c
+  }
+
+  // The card was handed to a human: todo, unclaimable, flagged with `reason`, logged, and commented on GitHub.
+  const expectEscalated = async (
+    h: Awaited<ReturnType<typeof graphHarness>>,
+    c: { id: string; issueNumber: number },
+    reason: string
+  ) => {
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      promotionPending: false,
+      needsAttention: true,
+      attentionReason: reason
+    })
+    expect(h.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ boardId: h.board.id, issueNumber: c.issueNumber, reason }),
+      'kanban: pending promotion needs human attention'
+    )
+    const comments = h.store.writes.filter((plan) => plan.comment)
+    expect(comments).toHaveLength(1)
+    expect(comments[0]).toMatchObject({ addLabels: [], removeLabels: [] })
+    expect(comments[0]!.comment).toContain(`(${reason})`)
+    // An unattributed ready is often still on the issue, so only a fresh human add counts.
+    expect(comments[0]!.comment).toContain('Remove and re-add `ac/status:ready`')
+    expect(h.sent).toEqual([])
+    expect(await prisma.kanbanRun.count()).toBe(0)
+  }
+
+  // Run recovery reads until the late-landing watch has passed and the closing read is done.
+  const outlastWatch = async (h: Awaited<ReturnType<typeof graphHarness>>, c: { id: string }) => {
+    const { promotionWatchUntil } = await h.card(c.id)
+    h.clock.advance(Math.max(0, promotionWatchUntil!.getTime() - h.clock.now()))
+    const { recoveryCheckAt } = await h.card(c.id)
+    if (recoveryCheckAt) h.clock.advance(Math.max(0, recoveryCheckAt.getTime() - h.clock.now()))
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+  }
+
+  it.each([
+    { name: 'add landed, removal failed', landed: ['ac/status:todo', 'ac/status:ready'] },
+    { name: 'removal landed but timed out', landed: ['ac/status:ready'] }
+  ])('the next tick adopts a half-landed promotion ($name) without waiting for redelivery', async ({ landed }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, landed)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false, needsAttention: false })
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:running'])
+    expect(h.log.info).toHaveBeenCalledWith(
+      { boardId: h.board.id, issueNumber: c.issueNumber },
+      'kanban: adopted a half-landed graph promotion'
+    )
+  })
+
+  // Vera's blocker 1: the POST timed out, then an agent (the shared App identity) adds ready inside the window.
+  it.each([
+    { name: 'the POST never landed', landed: null, agent: ['ac/status:ready'] },
+    { name: 'the POST never landed (agent left todo)', landed: null, agent: ['ac/status:todo', 'ac/status:ready'] },
+    { name: 'the POST landed unacknowledged', landed: ['ac/status:todo', 'ac/status:ready'], agent: null }
+  ])('never adopts an App ready-add after a timed-out POST ($name)', async ({ landed, agent }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, landed, { acked: false })
+    if (agent) h.store.relabel(c.issueNumber, agent, 'app')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unattributed')
+    // Neither a graph doorbell nor a later tick dispatches it; an agent label never un-parks the flag.
+    await h.ring(c.issueNumber, 'graph-2')
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect((await h.card(c.id)).needsAttention).toBe(true)
+  })
+
+  it.each([{ labels: ['ac/status:ready'] }, { labels: ['ac/status:todo', 'ac/status:ready'] }])(
+    'escalates at once, not retrying forever, when an agent re-adds $labels after a human removal (two App ready-adds)',
+    async ({ labels }) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, labels)
+      h.store.relabel(
+        c.issueNumber,
+        labels.filter((label) => label !== 'ac/status:ready'),
+        'human'
+      )
+      h.store.relabel(c.issueNumber, labels, 'app')
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      await expectEscalated(h, c, 'unattributed')
+      await h.ring(c.issueNumber, 'graph-2')
+      expect(h.sent).toEqual([])
+    }
+  )
+
+  it('a human re-adding ready un-parks an escalated card through the label doorbell', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unattributed')
+    h.store.relabel(c.issueNumber, [], 'human')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
+    await h.ringLabel(c.issueNumber)
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', needsAttention: false, attentionReason: null })
+  })
+
+  // Vera's round-5 blocker 2: todo-only labels on a flagged card (an agent relabel here) must not let the graph promote it.
+  it('never promotes a flagged card on a graph event, even with todo-only labels and closed blockers', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unattributed')
+    h.store.relabel(c.issueNumber, ['ac/status:todo'], 'app')
+    const flagged = await h.card(c.id)
+    const writes = h.store.writes.length
+    await h.ring(c.issueNumber, 'graph-2')
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.store.writes).toHaveLength(writes)
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:todo'])
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: flagged.stateRevision,
+      promotionPending: false,
+      needsAttention: true,
+      attentionReason: 'unattributed'
+    })
+    expect(h.sent).toEqual([])
+  })
+
+  // Vera's round-5 blocker 3: a redelivered graph event must not restart an open intent and with it the caps.
+  it('a repeated graph event on a pending promotion is a no-op that keeps its checks, start, and cursor', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
+    await h.dispatcher.tick()
+    const pending = await h.card(c.id)
+    expect(pending).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })
+    const cursorReads = vi.spyOn(h.store, 'lastEventId')
+    const writes = h.store.writes.length
+    h.clock.advance(1000)
+    await h.ring(c.issueNumber, 'graph-2')
+    await h.ring(c.issueNumber, 'graph-3')
+    expect(cursorReads).not.toHaveBeenCalled()
+    expect(h.store.writes).toHaveLength(writes)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: pending.stateRevision,
+      promotionPending: true,
+      promotionChecks: 1,
+      promotionStartedAt: pending.promotionStartedAt,
+      promotionEventCursor: pending.promotionEventCursor,
+      recoveryCheckAt: pending.recoveryCheckAt
+    })
+    expect(h.sent).toEqual([])
+  })
+
+  it('a graph doorbell does not skip a pending promotion backoff, and a human doorbell does', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.store.events.set(c.issueNumber, [])
+    await h.dispatcher.tick()
+    const backed = await h.card(c.id)
+    expect(backed.recoveryChecks).toBe(1)
+    const reads = h.store.reads.length
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'graph')).toBe(false)
+    expect(h.store.reads.length).toBe(reads)
+    expect(await h.card(c.id)).toMatchObject({ recoveryChecks: 1, recoveryCheckAt: backed.recoveryCheckAt })
+    h.clock.advance(1000)
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(false)
+    expect(h.store.reads.length).toBeGreaterThan(reads)
+    const afterHuman = await h.card(c.id)
+    expect(afterHuman).toMatchObject({ promotionPending: true, recoveryChecks: 1, promotionChecks: 2 })
+    expect(afterHuman.recoveryCheckAt!.getTime()).not.toBe(backed.recoveryCheckAt!.getTime())
+  })
+
+  it.each(['tick', 'doorbell'] as const)(
+    'a thrown %s read preserves the intent and a later tick repairs',
+    async (trigger) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, ['ac/status:ready'])
+      const { promotionEventCursor } = await h.card(c.id)
+      vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
+      if (trigger === 'doorbell')
+        await expect(h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).rejects.toThrow('GitHub 503')
+      else await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({
+        status: 'todo',
+        promotionPending: true,
+        promotionEventCursor,
+        promotionPostAccepted: true,
+        recoveryChecks: 1,
+        promotionChecks: 1
+      })
+      const reads = h.store.reads.length
+      await h.dispatcher.tick()
+      expect(h.store.reads.length).toBe(reads)
+      expect(h.sent).toEqual([])
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+      expect(await h.card(c.id)).toMatchObject({
+        status: 'running',
+        promotionPending: false,
+        promotionEventCursor: null
+      })
+    }
+  )
+
+  it.each(['tick', 'doorbell'] as const)(
+    'lagging events on a %s keep pending and back off until a later tick repairs',
+    async (trigger) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'])
+      const events = h.store.events.get(c.issueNumber)!
+      h.store.events.set(c.issueNumber, [])
+      if (trigger === 'doorbell') expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).toBe(false)
+      else await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, recoveryChecks: 1 })
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({ promotionPending: true, recoveryChecks: 2 })
+      const reads = h.store.reads.length
+      h.store.events.set(c.issueNumber, events)
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      expect(h.store.reads.length).toBe(reads)
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+      expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+    }
+  )
+
+  // Vera's blocker 2: inputs that never become conclusive must surface instead of stranding the card.
+  it.each([
+    { name: 'events that never show the add', hide: 'events' as const },
+    { name: 'a window past the 1,000-event read bound', hide: 'unreadable' as const }
+  ])('escalates after $name once the check cap is spent', async ({ hide }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'])
+    if (hide === 'events') h.store.events.set(c.issueNumber, [])
+    else h.store.unreadable.add(c.issueNumber)
+    // Human doorbells keep resetting the backoff, so the count cap, not the age cap, is what ends it.
+    for (let check = 1; check < MAX_PROMOTION_CHECKS; check++) {
+      h.clock.advance(1000)
+      expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(false)
+      expect(await h.card(c.id)).toMatchObject({ promotionPending: true, promotionChecks: check })
+    }
+    expect(h.log.warn).not.toHaveBeenCalledWith(expect.anything(), 'kanban: pending promotion needs human attention')
+    h.clock.advance(1000)
+    await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')
+    await expectEscalated(h, c, 'unresolved')
+    expect(h.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ checks: MAX_PROMOTION_CHECKS - 1 }),
+      'kanban: pending promotion needs human attention'
+    )
+  })
+
+  it('escalates an inconclusive promotion by age even when its reads keep throwing', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.store.events.set(c.issueNumber, [])
+    await h.dispatcher.tick()
+    expect(await h.card(c.id)).toMatchObject({ promotionPending: true, promotionChecks: 1 })
+    vi.spyOn(h.store, 'readCard').mockRejectedValue(new Error('GitHub 503'))
+    h.clock.advance(MAX_PROMOTION_AGE_MS)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unresolved')
+  })
+
+  it('a failed promotion rollback keeps a concurrent mode change (#19) and still flags the card', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'], { changeMode: true })
     expect(await h.card(c.id)).toMatchObject({
       status: 'todo',
       stateRevision: c.stateRevision + 2n,
       mode: 'read',
-      modeRevision: 1
+      modeRevision: 1,
+      promotionPending: true
     })
+  })
+
+  it('a redelivered doorbell adopts a ready label that landed before its removal timed out', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    await h.ring(c.issueNumber)
+    expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+  })
+
+  it('a promotion whose add failed is watched, then cleared to todo once the window passes; redelivery promotes', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null)
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
     expect(await prisma.kanbanRun.count()).toBe(0)
+    // The timed-out POST may still land, so the first empty read keeps watching instead of clearing.
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })
+    await outlastWatch(h, c)
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
+    // The recovery read happened once; the cleared flag is not re-read on later ticks.
+    const reads = h.store.reads.length
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    expect(h.store.reads.length).toBe(reads)
     await h.ring(c.issueNumber)
     expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
     expect(h.sent[0]?.d.cardId).toBe(c.id)
     expect((await h.card(c.id)).status).toBe('running')
+  })
+
+  it('never adopts a pending promotion that a human moved elsewhere on GitHub', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null)
+    h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await outlastWatch(h, c)
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
+  })
+
+  // Vera's round-5 blocker 1: the timed-out POST commits on GitHub after the rollback and after empty recovery reads.
+  it.each([
+    { name: 'inside the watch', landsAtMinute: 2 },
+    { name: 'after the watch ends, before its closing read', landsAtMinute: 11 }
+  ])('flags a card whose timed-out ready POST lands late ($name)', async ({ landsAtMinute }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    for (let minute = 0; minute <= 20; minute++) {
+      if (minute > 0) h.clock.advance(60_000)
+      if (minute === landsAtMinute) h.store.relabel(c.issueNumber, ['ac/status:todo', 'ac/status:ready'], 'app')
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      const card = await h.card(c.id)
+      if (card.needsAttention) break
+      // Until the label lands, every read is empty, and the card is watched rather than cleared.
+      expect(card).toMatchObject({ status: 'todo', promotionPending: true })
+    }
+    await expectEscalated(h, c, 'unattributed')
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:todo', 'ac/status:ready'])
+  })
+
+  // Vera's #18 sequence: the promotion write fails, a human parks the card, then an agent (the App bot) or another bot readies it.
+  it.each([
+    { swapper: 'app' as const, doorbell: false },
+    { swapper: 'app' as const, doorbell: true },
+    { swapper: 'other' as const, doorbell: false }
+  ])(
+    'a $swapper swap to ready after a human park is never dispatched (human doorbell rang: $doorbell)',
+    async ({ swapper, doorbell }) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, null)
+      h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
+      if (doorbell) {
+        await h.ringLabel(c.issueNumber)
+        // The unacknowledged POST could still land on top of the park, so the intent stays watched.
+        expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true })
+      }
+      h.store.relabel(c.issueNumber, ['ac/status:ready'], swapper)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      // A later graph doorbell for the card does not adopt the bot's ready either.
+      await h.ring(c.issueNumber, 'graph-2')
+      h.clock.advance(60 * 60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent).toEqual([])
+      expect(await prisma.kanbanRun.count()).toBe(0)
+      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+      expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:ready'])
+      // The watched promotion saw the swap, so it went to a human rather than silently to todo.
+      await expectEscalated(h, c, 'unattributed')
+    }
+  )
+
+  it('adopts a pending promotion a human finished by hand', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null)
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+  })
+
+  it('escalates a half-landed promotion once a blocker has reopened', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.graphs.set(c.issueNumber, {
+      ...emptyGraph(),
+      blockedBy: [{ ...completedBlocker, state: 'open', stateReason: null }]
+    })
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'blockers_reopened')
   })
 
   it('rejects a stale graph CAS after mismatch ingest advances the card revision', async () => {

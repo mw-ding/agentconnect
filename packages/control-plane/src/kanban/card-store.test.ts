@@ -1,7 +1,15 @@
 // GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, per-label add/remove writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from '../github/api.js'
-import { GithubCardStore, isHumanActor, type KanbanRepoRef } from './card-store.js'
+import {
+  GithubCardStore,
+  isAppActor,
+  isHumanActor,
+  judgePromotion,
+  lastPageFromLink,
+  type KanbanRepoRef,
+  type LabelEvent
+} from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
 
@@ -14,7 +22,7 @@ interface Call {
   body: unknown
 }
 
-function harness(routes: Record<string, () => Response>) {
+function harness(routes: Record<string, () => Response>, appSlug?: string) {
   const calls: Call[] = []
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? 'GET'
@@ -36,12 +44,26 @@ function harness(routes: Record<string, () => Response>) {
     repoFullName,
     access: 'read' as const
   }))
-  const store = new GithubCardStore({ tokens: { mintKanbanCard }, fetchImpl, baseUrl: 'https://api.test' })
+  const store = new GithubCardStore({
+    tokens: { mintKanbanCard },
+    fetchImpl,
+    baseUrl: 'https://api.test',
+    ...(appSlug ? { appSlug } : {})
+  })
   return { store, calls, mintKanbanCard }
 }
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+}
+
+const eventsPath = (page: number) => `/repositories/42/issues/7/events?per_page=100&page=${page}`
+
+/** One events page as GitHub serves it, with `Link: rel="last"` when the history spans several pages. */
+function eventsPage(events: unknown[], last?: number): Response {
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (last && last > 1) headers.link = `<https://api.github.com${eventsPath(last)}>; rel="last"`
+  return new Response(JSON.stringify(events), { headers })
 }
 
 const issue = (over: Record<string, unknown> = {}) => ({
@@ -264,20 +286,36 @@ describe('status label attribution', () => {
     expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
   })
 
-  it('reads past a full page to find a later bot write', async () => {
+  it('reads the last page first and finds a later bot write without walking the history', async () => {
     const h = harness({
-      [EVENTS]: () => json([ev(1, human), ...Array.from({ length: 99 }, (_, i) => ({ id: i + 2, event: 'closed' }))]),
-      'GET /repositories/42/issues/7/events?per_page=100&page=2': () => json([ev(101, bot)])
+      [EVENTS]: () =>
+        eventsPage([ev(1, human), ...Array.from({ length: 99 }, (_, i) => ({ id: i + 2, event: 'closed' }))], 30),
+      [`GET ${eventsPath(30)}`]: () => eventsPage([ev(2901, human), ev(2902, bot)], 30)
     })
     expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
-    expect(h.calls).toHaveLength(2)
+    expect(h.calls.map((c) => c.url.replace('https://api.test', ''))).toEqual([eventsPath(1), eventsPath(30)])
+  })
+
+  it('walks backward from the last page until it sees the latest status change and add', async () => {
+    const filler = (page: number) => Array.from({ length: 100 }, (_, i) => ({ id: page * 100 + i, event: 'closed' }))
+    const h = harness({
+      [EVENTS]: () => eventsPage(filler(0), 4),
+      [`GET ${eventsPath(2)}`]: () => eventsPage([...filler(1).slice(1), ev(199, human)], 4),
+      [`GET ${eventsPath(3)}`]: () => eventsPage(filler(2), 4),
+      [`GET ${eventsPath(4)}`]: () => eventsPage(filler(3).slice(0, 5), 4)
+    })
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(true)
+    expect(h.calls.map((c) => c.url.replace('https://api.test', ''))).toEqual([1, 4, 3, 2].map(eventsPath))
   })
 
   it('fails closed past the history bound and on a read failure', async () => {
-    const routes: Record<string, () => Response> = {}
-    for (let page = 1; page <= 10; page++) {
-      routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
-        json(Array.from({ length: 100 }, (_, i) => ev((page - 1) * 100 + i, human)))
+    const routes: Record<string, () => Response> = { [EVENTS]: () => eventsPage([ev(1, human)], 12) }
+    for (let page = 2; page <= 12; page++) {
+      routes[`GET ${eventsPath(page)}`] = () =>
+        eventsPage(
+          Array.from({ length: 100 }, (_, i) => ({ id: page * 100 + i, event: 'closed' })),
+          12
+        )
     }
     const h = harness(routes)
     expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
@@ -290,5 +328,204 @@ describe('status label attribution', () => {
     expect(isHumanActor({ actor: { type: 'User' } })).toBe(false)
     expect(isHumanActor({ actor: bot })).toBe(false)
     expect(isHumanActor({ actor: undefined })).toBe(false)
+  })
+})
+
+describe('label write receipts', () => {
+  it('notifies after the ready POST and before a later removal fails', async () => {
+    const h = harness({
+      'POST /repositories/42/issues/7/labels': () => json([{ id: 1, name: 'ac/status:ready' }]),
+      'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Atodo': () => json({ message: 'unavailable' }, 503)
+    })
+    const added = vi.fn()
+    await expect(
+      h.store.applyPlan(
+        REPO,
+        7,
+        { state: 'open', labels: ['ac/status:todo'] },
+        {
+          outcome: 'accepted',
+          status: 'ready',
+          releaseLease: false,
+          addLabels: ['ac/status:ready'],
+          removeLabels: ['ac/status:todo']
+        },
+        added
+      )
+    ).rejects.toThrow()
+    expect(added).toHaveBeenCalledWith('ac/status:ready')
+    expect(h.calls.map((call) => call.method)).toEqual(['POST', 'DELETE'])
+  })
+
+  it('does not notify when the ready POST times out or is refused', async () => {
+    for (const response of [() => json({ message: 'unavailable' }, 503), () => json({ message: 'nope' }, 422)]) {
+      const h = harness({ 'POST /repositories/42/issues/7/labels': response })
+      const added = vi.fn()
+      const plan = {
+        outcome: 'accepted' as const,
+        status: 'ready' as const,
+        releaseLease: false,
+        addLabels: ['ac/status:ready'],
+        removeLabels: []
+      }
+      await expect(h.store.applyPlan(REPO, 7, { state: 'open', labels: [] }, plan, added)).rejects.toThrow()
+      expect(added).not.toHaveBeenCalled()
+    }
+  })
+})
+
+describe('half-landed promotion attribution (events after the pre-POST cursor)', () => {
+  const human = { type: 'User', login: 'maintainer' }
+  const app = { type: 'Bot', login: 'AgentConnect[bot]' }
+  const other = { type: 'Bot', login: 'renovate[bot]' }
+  const CURSOR = 500
+  let id = CURSOR
+  const add = (name: string, actor: unknown): LabelEvent => ({
+    id: ++id,
+    event: 'labeled',
+    label: { name: name.includes('/') ? name : `ac/status:${name}` },
+    actor: actor as LabelEvent['actor']
+  })
+  const del = (name: string, actor: unknown): LabelEvent => ({ ...add(name, actor), event: 'unlabeled' })
+  const state = (event: 'closed' | 'reopened', actor: unknown): LabelEvent => ({
+    id: ++id,
+    event,
+    actor: actor as LabelEvent['actor']
+  })
+  // History before the cursor: a human filed the card as todo; it never counts toward the window.
+  const before = (): LabelEvent[] => [{ id: 10, event: 'labeled', label: { name: 'ac/status:todo' }, actor: human }]
+
+  it.each([
+    ['our add, then our todo removal', () => [add('ready', app), del('todo', app)], true, 'adopt'],
+    ['our add while the removal is still pending (residue)', () => [add('ready', app)], true, 'adopt'],
+    ['a human finished it by hand', () => [add('ready', human), del('todo', human)], false, 'adopt'],
+    [
+      'a human re-added ready after an agent swap',
+      () => [add('ready', app), del('ready', human), add('ready', human)],
+      false,
+      'adopt'
+    ],
+    [
+      'unrelated non-managed labels are ignored',
+      () => [{ ...add('ready', other), label: { name: 'bug' } }, add('ready', app)],
+      true,
+      'adopt'
+    ],
+    ['no ready add visible yet (lag)', () => [], true, 'inconclusive'],
+    ['only our removal is visible yet', () => [del('todo', app)], true, 'inconclusive'],
+    // Blocker 1: the POST timed out, so an App ready-add in the window may be an agent's.
+    ['timed-out POST with an agent ready-add in the window', () => [add('ready', app)], false, 'reject'],
+    ['timed-out POST with an agent add and removal', () => [add('ready', app), del('todo', app)], false, 'reject'],
+    // Two App ready events: ours and an agent's are indistinguishable.
+    [
+      'two App ready-adds after a human removal',
+      () => [add('ready', app), del('ready', human), add('ready', app)],
+      true,
+      'reject'
+    ],
+    [
+      'another App ac/* write in the window',
+      () => [add('ready', app), del('todo', app), add('ac/mode:write', app)],
+      true,
+      'reject'
+    ],
+    [
+      'an App status change after our add',
+      () => [add('ready', app), add('blocked', app), del('blocked', app)],
+      true,
+      'reject'
+    ],
+    [
+      'App reopened the issue',
+      () => [state('closed', human), state('reopened', app), add('ready', app)],
+      true,
+      'reject'
+    ],
+    ['a removal that is not our todo', () => [add('ready', app), del('triage', app)], true, 'reject'],
+    ['another bot added ready', () => [add('ready', other)], true, 'reject'],
+    ['another bot touched status later', () => [add('ready', app), add('triage', other)], true, 'reject'],
+    [
+      'human park, then an agent swap to ready',
+      () => [add('blocked', human), del('todo', human), add('ready', app), del('blocked', app)],
+      true,
+      'reject'
+    ]
+  ] as const)('%s', (_name, window, postAccepted, expected) => {
+    expect(judgePromotion([...before(), ...window()], 'agentconnect', CURSOR, postAccepted)).toBe(expected)
+  })
+
+  it('ignores App events at or before the cursor and never trusts an App write without a slug', () => {
+    const old = { id: CURSOR, event: 'labeled', label: { name: 'ac/status:ready' }, actor: app } as LabelEvent
+    expect(judgePromotion([old, add('ready', app)], 'agentconnect', CURSOR, true)).toBe('adopt')
+    expect(judgePromotion([old], 'agentconnect', CURSOR, true)).toBe('inconclusive')
+    expect(judgePromotion([add('ready', app)], undefined, CURSOR, true)).toBe('reject')
+    expect(isAppActor({ actor: { type: 'User', login: 'agentconnect[bot]' } }, 'agentconnect')).toBe(false)
+  })
+
+  it('parses only the rel="last" page from a Link header', () => {
+    const link = `<https://api.github.com${eventsPath(2)}>; rel="next", <https://api.github.com${eventsPath(9)}>; rel="last"`
+    expect(lastPageFromLink(link)).toBe(9)
+    expect(lastPageFromLink(`<https://api.github.com${eventsPath(2)}>; rel="next"`)).toBeNull()
+    expect(lastPageFromLink(null)).toBeNull()
+  })
+
+  it('reads the cursor from the last page, and the window back to the cursor', async () => {
+    const filler = (from: number, n: number) =>
+      Array.from({ length: n }, (_, i) => ({ id: from + i, event: 'closed', actor: human }))
+    const h = harness(
+      {
+        [`GET ${eventsPath(1)}`]: () => eventsPage(filler(1, 100), 15),
+        [`GET ${eventsPath(14)}`]: () => eventsPage(filler(1301, 100), 15),
+        [`GET ${eventsPath(15)}`]: () =>
+          eventsPage([...filler(1401, 30), { ...add('ready', app), id: 1431 }, { ...del('todo', app), id: 1432 }], 15)
+      },
+      'agentconnect'
+    )
+    expect(await h.store.lastEventId(REPO, 7)).toBe(1432)
+    expect(h.calls.map((c) => c.url.replace('https://api.test', ''))).toEqual([eventsPath(1), eventsPath(15)])
+    h.calls.length = 0
+    // Over 1,400 events in all, yet the window after a recent cursor is one page back.
+    expect(await h.store.promotionVerdict(REPO, 7, 1420, true)).toBe('adopt')
+    expect(await h.store.promotionVerdict(REPO, 7, 1420, false)).toBe('reject')
+    expect(await h.store.promotionVerdict(REPO, 7, 1431, true)).toBe('inconclusive')
+    expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
+    expect(await harness({ [`GET ${eventsPath(1)}`]: () => eventsPage([]) }).store.lastEventId(REPO, 7)).toBe(0)
+  })
+
+  it('walks back from an empty rel="last" page to the newest event instead of falling to cursor 0', async () => {
+    const filler = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ id: from + i, event: 'closed' }))
+    const h = harness({
+      [`GET ${eventsPath(1)}`]: () => eventsPage(filler(1, 100), 3),
+      [`GET ${eventsPath(2)}`]: () => eventsPage(filler(101, 100), 3),
+      [`GET ${eventsPath(3)}`]: () => eventsPage([], 3)
+    })
+    expect(await h.store.lastEventId(REPO, 7)).toBe(200)
+    expect(h.calls.map((c) => c.url.replace('https://api.test', ''))).toEqual([
+      eventsPath(1),
+      eventsPath(3),
+      eventsPath(2)
+    ])
+  })
+
+  it('throws rather than anchor at 0 when every page within the bound is empty', async () => {
+    const routes: Record<string, () => Response> = {}
+    for (let page = 1; page <= 12; page++) routes[`GET ${eventsPath(page)}`] = () => eventsPage([], 12)
+    await expect(harness(routes).store.lastEventId(REPO, 7)).rejects.toThrow('page bound')
+  })
+
+  it('is inconclusive when the window reaches past the page bound (1,000+ events since the cursor)', async () => {
+    const routes: Record<string, () => Response> = {}
+    for (let page = 1; page <= 12; page++) {
+      routes[`GET ${eventsPath(page)}`] = () =>
+        eventsPage(
+          Array.from({ length: 100 }, (_, i) =>
+            page === 12 && i === 99 ? add('ready', app) : { id: page * 100 + i, event: 'closed' }
+          ),
+          12
+        )
+    }
+    const h = harness(routes, 'agentconnect')
+    expect(await h.store.promotionVerdict(REPO, 7, 50, true)).toBe('inconclusive')
+    expect(h.calls).toHaveLength(10)
   })
 })

@@ -91,7 +91,114 @@ describe('gh wrapper shim', () => {
       args: ['api', '--hostname', 'github.com', '/user'],
       env: { GH_HOST: 'GitHub.com' },
       ok: true
-    }
+    },
+    {
+      name: 'a github.com decoy inside --raw-field after the real flag',
+      args: ['api', '--hostname', 'attacker.example.com', '--raw-field', '--hostname=github.com', '/user'],
+      env: {},
+      ok: false
+    },
+    {
+      name: 'a github.com decoy inside -f before the real flag',
+      args: ['api', '-f', '--hostname=github.com', '--hostname=attacker.example.com', '/user'],
+      env: {},
+      ok: false
+    },
+    {
+      name: 'a repeated real flag',
+      args: ['api', '--hostname', 'attacker.example.com', '--hostname', 'github.com', '/user'],
+      env: {},
+      ok: false
+    },
+    { name: 'an empty real flag', args: ['api', '--hostname=', '/user'], env: {}, ok: false },
+    {
+      name: 'a boolean shorthand before the real flag',
+      args: ['api', '-i', '--hostname', 'attacker.example.com', '/user'],
+      env: {},
+      ok: false
+    },
+    {
+      name: 'a boolean long flag before the real flag',
+      args: ['api', '--paginate', '--hostname', 'attacker.example.com', '/user'],
+      env: {},
+      ok: false
+    },
+    {
+      name: 'the real flag before the command name',
+      args: ['--hostname', 'attacker.example.com', 'api', '/user'],
+      env: {},
+      ok: false
+    },
+    { name: 'auth -h', args: ['auth', 'status', '-h', 'attacker.example.com'], env: {}, ok: false },
+    { name: 'auth -h=', args: ['auth', 'token', '-h=attacker.example.com'], env: {}, ok: false },
+    { name: 'auth grouped -ih', args: ['auth', 'login', '-ih', 'attacker.example.com'], env: {}, ok: false },
+    { name: 'auth attached -h', args: ['auth', 'status', '-hattacker.example.com'], env: {}, ok: false },
+    {
+      name: 'auth boolean -f before the real flag',
+      args: ['auth', 'setup-git', '-f', '--hostname', 'attacker.example.com'],
+      env: {},
+      ok: false
+    },
+    {
+      name: 'hostname text inside --raw-field',
+      args: ['api', '--raw-field', '--hostname=attacker.example.com', '/user'],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'hostname text inside -f, -F, -H, -q, --jq, --input, -t',
+      args: [
+        'api',
+        '-f',
+        '--hostname=attacker.example.com',
+        '-F',
+        '--hostname',
+        '-H',
+        '--hostname=attacker.example.com',
+        '-q',
+        '--hostname',
+        '--jq',
+        '--hostname=attacker.example.com',
+        '--input',
+        '--hostname',
+        '-t',
+        '--hostname',
+        '/user'
+      ],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'a flag value that is the bare flag name',
+      args: ['api', '-f', '--hostname', 'x=1', '/user'],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'an attached shorthand value',
+      args: ['api', '-f--hostname=attacker.example.com', '/user'],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'an inline long value',
+      args: ['api', '--field=--hostname=attacker.example.com', '/user'],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'positional text after the -- terminator',
+      args: ['api', '/user', '--', '--hostname', 'attacker.example.com'],
+      env: {},
+      ok: true
+    },
+    {
+      name: 'hostname text inside another command flag value',
+      args: ['issue', 'comment', '5', '--body', '--hostname=attacker.example.com'],
+      env: {},
+      ok: true
+    },
+    { name: '-h is help outside auth', args: ['api', '-h', 'attacker.example.com'], env: {}, ok: true }
   ])('scopes the daemon token to github.com ($name)', ({ args, env, ok }) => {
     root = mkdtempSync(join(tmpdir(), 'gh-shim-'))
     const realBin = join(root, 'real-bin')
