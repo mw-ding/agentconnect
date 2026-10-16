@@ -266,6 +266,7 @@ async function main(): Promise<void> {
     report: (r) => client.emitRunReport(r),
     doorbell: (poke) => client.emitGithubInstallation(poke),
     reportPullRequestFeedback: (signal) => client.reportPullRequestFeedback(signal),
+    graphDoorbell: (poke) => client.emitGithubGraph(poke),
     authorizeComment: (request) => client.authorizeGithubComment(request),
     authorizeRerequest: (request) => client.authorizeGithubRerequest(request),
     authzLimiter: githubAuthzLimiter,

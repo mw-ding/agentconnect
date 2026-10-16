@@ -19,6 +19,7 @@ import {
   RcHookAssign,
   RcRunReport,
   RcGithubInstallation,
+  RcGithubGraph,
   RcGithubRerequest,
   RcGithubRerequestResult,
   RcBotRevoked,
@@ -1113,6 +1114,27 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(r.frame.payload.installationId).toBe('1234567')
     expect(RcGithubInstallation.safeParse({ installationId: '', action: 'created' }).success).toBe(false)
     expect(RcGithubInstallation.safeParse({ installationId: '1', action: '' }).success).toBe(false)
+  })
+
+  it('rc/github-graph is a body-free graph doorbell (ids + numbers only, strict)', () => {
+    const poke = {
+      deliveryKey: 'guid-1',
+      installationId: '1234567',
+      repoId: '42',
+      event: 'issue_dependencies',
+      action: 'blocked_by_added',
+      ids: ['9007199254740993', '17'],
+      numbers: [2, 7]
+    }
+    const r = decodeRelayCpFrame(envelope('rc/github-graph', poke))
+    expect(r.ok).toBe(true)
+    if (!r.ok || r.frame.type !== 'rc/github-graph') throw new Error('narrow')
+    expect(r.frame.payload).toEqual(poke)
+    // A smuggled issue body or title is rejected, never stripped silently.
+    expect(RcGithubGraph.safeParse({ ...poke, body: 'secret' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'issues' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, ids: ['1', '2', '3', '4', '5'] }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, repoId: 'acme/web' }).success).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {

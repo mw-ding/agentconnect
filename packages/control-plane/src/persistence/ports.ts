@@ -7815,3 +7815,20 @@ export interface UploadTicketRepo {
   get(id: string): Promise<UploadTicketState | undefined>
   close(id: string): Promise<void>
 }
+
+// ── Kanban (issue #2 M1) — body-free board metadata; GitHub issues stay the system of record ──
+
+export interface KanbanBoardRecord {
+  id: string
+  orgId: OrgId
+  name: string
+  repoId: bigint
+  repoFullName: string
+}
+
+export interface KanbanBoardRepo {
+  /** Enabled boards watching one repository, across orgs (graph doorbell lookup). */
+  listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
+  /** Distinct repository ids any enabled board watches (redelivery sieve). */
+  listEnabledRepoIds(): Promise<bigint[]>
+}

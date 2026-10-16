@@ -1,5 +1,5 @@
 /** Periodically redelivers eligible GitHub hooks missing a run or proven to fail before daemon admission. */
-import { GITHUB_RELEASE_RESTATED_EVENTS } from '@agentconnect.md/protocol'
+import { GITHUB_GRAPH_EVENTS, GITHUB_RELEASE_RESTATED_EVENTS } from '@agentconnect.md/protocol'
 import type { Clock, TimerHandle } from '../domain/clock.js'
 import type { HookId } from '../domain/ids.js'
 import type { GhHookDeliveryPage } from '../github/service.js'
@@ -16,6 +16,8 @@ const SUBSCRIPTION_EVENTS = new Set([
   'deployment_status',
   'release'
 ])
+/** The Kanban graph doorbell families (relay mirror); they never produce a HookRun, so landing is asked of the graph dep. */
+const GRAPH_EVENTS: ReadonlySet<string> = new Set(GITHUB_GRAPH_EVENTS)
 /** Redeliveries per GUID that landed no run before giving up; counted durably, so a restart cannot reset it. */
 const MAX_ATTEMPTS = 3
 /** Delay before the first sweep of a process — see {@link HookRedeliveryReconciler.start}. */
@@ -51,6 +53,13 @@ export interface HookRedeliveryHooks {
   settleRetryableDeliveryRedeliveries(requestedAt: Date, expiredBefore: Date, maxAttempts: number): Promise<number>
   claimMissingDeliveryRedelivery(deliveryKey: string, requestedAt: Date, maxAttempts: number): Promise<boolean>
   pruneMissingDeliveryRedeliveries(requestedBefore: Date): Promise<number>
+}
+
+export interface HookRedeliveryGraph {
+  /** Repository ids an enabled Kanban board watches. */
+  watchedRepoIds(): Promise<bigint[]>
+  /** The GUIDs whose graph doorbell already reached this CP (in-memory; a restart only costs capped re-asks). */
+  landedDeliveryKeys(deliveryKeys: readonly string[]): Set<string>
 }
 
 export interface HookRedeliveryRelays {
@@ -121,7 +130,8 @@ export class HookRedeliveryReconciler {
     private readonly relays: HookRedeliveryRelays,
     private readonly clock: Clock,
     private readonly cfg: HookRedeliveryConfig,
-    private readonly log?: ReconcilerLog
+    private readonly log?: ReconcilerLog,
+    private readonly graph?: HookRedeliveryGraph
   ) {}
 
   /** Arm the periodic sweep. Idempotent — a second call re-arms from now. The
@@ -195,7 +205,8 @@ export class HookRedeliveryReconciler {
       if (bucket) bucket.push(hook)
       else index.set(key, [hook])
     }
-    if (byRepo.size === 0 && byInstallation.size === 0) {
+    const graphRepos = new Set((this.graph ? await this.graph.watchedRepoIds() : []).map(String))
+    if (byRepo.size === 0 && byInstallation.size === 0 && graphRepos.size === 0) {
       // Nothing to recover — but the interval IS covered (don't accumulate an
       // ever-growing catch-up window while no github hook exists).
       this.coveredUntilMs = newest
@@ -229,10 +240,17 @@ export class HookRedeliveryReconciler {
     }
 
     const matchingHookIds = new Map<string, HookId[]>()
+    const graphGuids = new Set<string>()
     const matching = deliveries.filter((d) => {
-      if (!SUBSCRIPTION_EVENTS.has(d.event)) return false
+      const isGraph = GRAPH_EVENTS.has(d.event)
+      if (!isGraph && !SUBSCRIPTION_EVENTS.has(d.event)) return false
       const at = Date.parse(d.delivered_at)
       if (Number.isNaN(at) || at < now - MAX_LOOKBACK_MS || at > newest) return false
+      if (isGraph) {
+        if (d.repository_id === null || !graphRepos.has(String(d.repository_id))) return false
+        graphGuids.add(d.guid)
+        return true
+      }
       const repoHooks = d.repository_id === null ? [] : (byRepo.get(String(d.repository_id)) ?? [])
       // An installation row fires where its agent has no row of the event's repository and family, as the relay decides.
       const installationHooks =
@@ -254,12 +272,15 @@ export class HookRedeliveryReconciler {
       return
     }
 
-    const landed = await this.hooks.existingDeliveryKeys([...new Set(matching.map((c) => c.guid))])
+    const landed = await this.hooks.existingDeliveryKeys([
+      ...new Set(matching.filter((c) => !graphGuids.has(c.guid)).map((c) => c.guid))
+    ])
+    const graphLanded = this.graph?.landedDeliveryKeys([...graphGuids]) ?? new Set<string>()
     let redelivered = 0
     let oldestFailedAt: number | undefined // a failed GitHub call keeps its slice of the window open for retry
     const seenThisTick = new Set<string>() // one guid may list several attempts — ask once
     for (const d of matching) {
-      if (seenThisTick.has(d.guid)) continue
+      if (seenThisTick.has(d.guid) || graphLanded.has(d.guid)) continue
       const persistedFailure = landed.has(d.guid)
       const deliveredAt = Date.parse(d.delivered_at)
       if (!persistedFailure && deliveredAt < oldest) continue

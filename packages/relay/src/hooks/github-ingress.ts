@@ -1,9 +1,10 @@
-/** GitHub ingress (`POST /webhooks/github`, webhook-triggers-and-github-events.md P2): mandatory signature, installation events ring a doorbell, subscription events match rules by numeric repo id; the payload is never logged. */
+/** GitHub ingress (`POST /webhooks/github`, webhook-triggers-and-github-events.md P2): mandatory signature, installation and Kanban graph events ring body-free doorbells, subscription events match rules by numeric repo id; the payload is never logged. */
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import type { Clock } from '@agentconnect.md/connection'
 import {
   codeHostSubjectBody,
+  GITHUB_GRAPH_EVENTS,
   GITHUB_RELEASE_RESTATED_EVENTS,
   GITHUB_REQUEST_REVIEW_ACTION,
   HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
@@ -14,6 +15,7 @@ import {
   type RcPullRequestFeedback,
   type GithubHookMetadata,
   type HookContext,
+  type RcGithubGraph,
   type RcGithubInstallation,
   type RcHookAssign,
   type RcRunReport,
@@ -50,6 +52,8 @@ const SUBSCRIPTION_EVENTS = new Set([
 ])
 /** The events that ring the installation doorbell instead of matching. */
 const INSTALLATION_EVENTS = new Set(['installation', 'installation_repositories'])
+/** The Kanban graph events that ring the body-free graph doorbell (spike §3). */
+const GRAPH_EVENTS: ReadonlySet<string> = new Set(GITHUB_GRAPH_EVENTS)
 
 export interface GithubIngressDeps {
   table: HookTable
@@ -61,6 +65,8 @@ export interface GithubIngressDeps {
   doorbell: (poke: RcGithubInstallation) => void
   /** Persist body-free PR feedback before the signed webhook is acknowledged. */
   reportPullRequestFeedback?: (signal: RcPullRequestFeedback) => Promise<boolean>
+  /** Emit one body-free `rc/github-graph` Kanban doorbell EVT to the CP (fire-and-forget). */
+  graphDoorbell?: (poke: RcGithubGraph) => void
   /** Resolve every issue/PR actor's live write authority: metadata only, delegated to the CP's GitHub App. */
   authorizeComment: (request: RcGithubCommentAuthz) => Promise<boolean>
   /** Resolve a signed review control through CP-owned durable metadata. */
@@ -118,6 +124,17 @@ interface GithubPayload {
     conclusion?: string | null
     pull_requests?: Array<{ number?: number }>
   }
+  // sub_issues / issue_dependencies — only ids, numbers, and repo identity are ever read.
+  parent_issue_id?: number
+  parent_issue?: GithubGraphIssue
+  parent_issue_repo?: { id?: number }
+  sub_issue_id?: number
+  sub_issue?: GithubGraphIssue
+  blocked_issue_id?: number
+  blocked_issue?: GithubGraphIssue
+  blocking_issue_id?: number
+  blocking_issue?: GithubGraphIssue
+  blocking_issue_repo?: { id?: number }
   workflow_run?: {
     event?: string
     head_sha?: string
@@ -167,7 +184,14 @@ export function githubEventAction(event: string, payload: GithubPayload): string
 interface GithubRepositoryRef {
   id?: number
   full_name?: string
+  url?: string
   owner?: { login?: string; type?: string }
+}
+
+interface GithubGraphIssue {
+  id?: number
+  number?: number
+  repository_url?: string
 }
 
 interface GithubSubject {
@@ -980,6 +1004,64 @@ function reportReviewRequestRequired(deps: GithubIngressDeps, rule: RcHookAssign
   })
 }
 
+function githubNumericId(value: number | undefined): string | undefined {
+  return Number.isSafeInteger(value) && value! > 0 ? String(value) : undefined
+}
+
+/** The issue's number only when it provably lives in the delivery's repository. */
+function sameRepoIssueNumber(
+  payload: GithubPayload,
+  issue: GithubGraphIssue | undefined,
+  issueRepo?: { id?: number }
+): number | undefined {
+  if (!issue || !Number.isSafeInteger(issue.number) || issue.number! <= 0) return undefined
+  if (issueRepo?.id !== undefined && issueRepo.id !== payload.repository?.id) return undefined
+  if (issue.repository_url !== undefined && issue.repository_url !== payload.repository?.url) return undefined
+  return issue.number
+}
+
+/** Reduce a verified graph delivery to the body-free doorbell (exported for unit tests). */
+export function githubGraphDoorbell(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcGithubGraph | undefined {
+  if (event !== 'sub_issues' && event !== 'issue_dependencies') return undefined
+  const installationId = githubNumericId(payload.installation?.id)
+  const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId || !payload.action) return undefined
+  const pairs =
+    event === 'sub_issues'
+      ? [
+          {
+            id: payload.parent_issue_id ?? payload.parent_issue?.id,
+            number: sameRepoIssueNumber(payload, payload.parent_issue, payload.parent_issue_repo)
+          },
+          { id: payload.sub_issue_id ?? payload.sub_issue?.id, number: sameRepoIssueNumber(payload, payload.sub_issue) }
+        ]
+      : [
+          {
+            id: payload.blocked_issue_id ?? payload.blocked_issue?.id,
+            number: sameRepoIssueNumber(payload, payload.blocked_issue)
+          },
+          {
+            id: payload.blocking_issue_id ?? payload.blocking_issue?.id,
+            number: sameRepoIssueNumber(payload, payload.blocking_issue, payload.blocking_issue_repo)
+          }
+        ]
+  const ids = [...new Set(pairs.map((p) => githubNumericId(p.id)).filter((id): id is string => id !== undefined))]
+  const numbers = [...new Set(pairs.map((p) => p.number).filter((n): n is number => n !== undefined))]
+  return {
+    deliveryKey,
+    installationId,
+    repoId,
+    event,
+    action: payload.action.slice(0, 64),
+    ids,
+    numbers
+  }
+}
+
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
   // Own plugin scope, so the raw-body parser the signature needs does not leak onto other JSON routes.
   void app.register(async (scope) => {
@@ -1052,6 +1134,16 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         if (id !== undefined) {
           deps.doorbell({ installationId: String(id), action: payload.action ?? 'unknown' })
           deps.log.info(`github ingress: doorbell ${deliveryKey} installation ${id} (${payload.action ?? 'unknown'})`)
+        }
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      // Kanban graph doorbell (spike §3): ids only, never matched, so the Bot veto is bypassed by design.
+      if (GRAPH_EVENTS.has(event)) {
+        const poke = githubGraphDoorbell(event, payload, deliveryKey)
+        if (poke) {
+          deps.graphDoorbell?.(poke)
+          deps.log.info(`github ingress: graph doorbell ${deliveryKey} repo ${poke.repoId} (${event}:${poke.action})`)
         }
         return reply.code(202).send({ deliveryKey })
       }

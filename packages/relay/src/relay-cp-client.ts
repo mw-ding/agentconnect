@@ -55,6 +55,7 @@ import {
   type RcHookRemove,
   type RcRunReport,
   type RcCodeHostDelivery,
+  type RcGithubGraph,
   type RcGithubInstallation,
   type RcPullRequestFeedback,
   type RcSetChannelAgent,
@@ -459,6 +460,15 @@ export class RelayCpClient {
       throw new WireError('INTERNAL', `expected rc/pull-request-feedback/ok, got ${rep.type}`, false)
     }
     return rep.payload.accepted
+  }
+
+  /** Emit one Kanban graph doorbell EVT (`rc/github-graph`); a drop is recovered by the CP's redelivery sweep. */
+  emitGithubGraph(poke: RcGithubGraph): void {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: dropping rc/github-graph ${poke.deliveryKey} (link ${this.state})`)
+      return
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/github-graph', poke)))
   }
 
   /** Emit `rc/set-channel-agent` (fire-and-forget) — the config modal picked a

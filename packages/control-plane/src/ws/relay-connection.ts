@@ -24,6 +24,7 @@ import type {
   RcGithubRerequest,
   RcGithubRerequestResult,
   RcCodeHostDelivery,
+  RcGithubGraph,
   RcGithubInstallation,
   RcPullRequestFeedback,
   RcRegister,
@@ -120,6 +121,8 @@ export interface RelayConnDeps {
   onPullRequestFeedback?: (m: RcPullRequestFeedback) => Promise<boolean>
   /** Apply a relay `rc/codehost-delivery` observation (gitea-integration.md §6, §7). Fire-and-forget. */
   onCodeHostDelivery?: (m: RcCodeHostDelivery) => Promise<void>
+  /** Apply a body-free Kanban `rc/github-graph` doorbell poke; fire-and-forget like the installation doorbell. */
+  onGithubGraph?: (m: RcGithubGraph) => Promise<void>
   /** The in-memory relay index — this connection registers itself for `rc/daemon-revoke` push. */
   relayReg: RelayRegistry
   /** Resolve a browser webchat token → identity + the agent's CURRENT placement
@@ -241,6 +244,9 @@ export class RelayConnection implements RelayChannel {
         case 'rc/codehost-delivery':
           await this.handleCodeHostDelivery(frame.payload)
           return
+        case 'rc/github-graph':
+          await this.handleGithubGraph(frame.payload)
+          return
         default:
           this.sendError(frame.id, 'PROTOCOL_STATE', `unsupported: ${frame.type}`)
       }
@@ -276,7 +282,8 @@ export class RelayConnection implements RelayChannel {
           type === 'rc/github-installation' ||
           type === 'rc/codehost-delivery' ||
           (type === 'rc/codehost-feedback' && this.features.includes(CODEHOST_FEEDBACK_FEATURE)) ||
-          (type === 'rc/pull-request-feedback' && this.features.includes(PULL_REQUEST_FEEDBACK_FEATURE))
+          (type === 'rc/pull-request-feedback' && this.features.includes(PULL_REQUEST_FEEDBACK_FEATURE)) ||
+          type === 'rc/github-graph'
         )
       default:
         return false
@@ -377,6 +384,14 @@ export class RelayConnection implements RelayChannel {
       this.reply(frame, 'rc/pull-request-feedback/ok', { deliveryKey: signal.deliveryKey, accepted })
     } catch {
       this.sendError(frame.id, 'INTERNAL', 'pull request feedback persistence failed', true)
+    }
+  }
+
+  private async handleGithubGraph(poke: RcGithubGraph): Promise<void> {
+    try {
+      await this.deps.onGithubGraph?.(poke)
+    } catch {
+      // swallowed — a dropped graph poke is recovered by the redelivery sweep and the board tick
     }
   }
 

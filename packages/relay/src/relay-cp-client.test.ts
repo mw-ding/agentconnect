@@ -643,6 +643,25 @@ describe('RelayCpClient', () => {
     expect(client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE)).toBe(true)
   })
 
+  it('emitGithubGraph sends the graph doorbell when READY, drops it otherwise', async () => {
+    const { client, transport } = makeClient()
+    const poke = {
+      deliveryKey: 'guid-1',
+      installationId: '1234567',
+      repoId: '42',
+      event: 'sub_issues' as const,
+      action: 'sub_issue_added',
+      ids: ['1001', '1002'],
+      numbers: [2, 7]
+    }
+    client.emitGithubGraph(poke)
+    expect(transport.sent).toHaveLength(0)
+
+    await handshakeToReady(client, transport)
+    client.emitGithubGraph(poke)
+    expect(transport.lastReq('rc/github-graph')?.payload).toEqual(poke)
+  })
+
   it('emitBotChannels reports the snapshot when READY and signals deferral otherwise', async () => {
     const { client, transport } = makeClient()
     const snapshot = { botId: RELAY_ID, channels: [{ id: 'C1', name: 'deploys' }] }

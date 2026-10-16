@@ -111,6 +111,7 @@ function build(
     /** `null` builds a CP without the tenant handler. */
     onBotTenant?: ConstructorParameters<typeof RelayConnection>[1]['onBotTenant'] | null
     clock?: Clock
+    onGithubGraph?: ConstructorParameters<typeof RelayConnection>[1]['onGithubGraph']
   } = {}
 ) {
   const codec = new ApiKeyCodec({ API_KEY_PEPPER: 'unit-test-pepper-0123456789abcdefghij' })
@@ -138,6 +139,7 @@ function build(
   const onBotTenant = over.onBotTenant ?? vi.fn(async () => ({ applied: true }))
   const onThreadAssign = over.onThreadAssign ?? vi.fn(async () => {})
   const onThreadParticipant = over.onThreadParticipant ?? vi.fn(async () => {})
+  const onGithubGraph = over.onGithubGraph ?? vi.fn(async () => {})
   const relayReg = new RelayRegistry()
 
   const transport = new FakeServerTransport()
@@ -168,6 +170,7 @@ function build(
     onGithubInstallation: vi.fn(async () => {}),
     onPullRequestFeedback,
     onCodeHostFeedback: over.onCodeHostFeedback,
+    onGithubGraph,
     relayReg,
     verifyWebchatToken,
     verifyAgentChatKey,
@@ -192,6 +195,7 @@ function build(
     authorizeGithubComment,
     authorizeGithubRerequest,
     onPullRequestFeedback,
+    onGithubGraph,
     relayReg
   }
 }
@@ -567,6 +571,7 @@ describe('RelayConnection FSM', () => {
       onThreadParticipant: vi.fn(async () => {}),
       threadLookup: vi.fn(async (m) => ({ ...m, target: null, participants: [] })),
       onGithubInstallation: vi.fn(async () => {}),
+      onGithubGraph: vi.fn(async () => {}),
       relayReg,
       verifyWebchatToken,
       verifyAgentChatKey: vi.fn(async () => ({ ok: false, reason: 'not tested' }) as RcVerifyResult),
@@ -598,6 +603,30 @@ describe('RelayConnection FSM', () => {
     // relay↔CP link stays open, unlike other handlers' 1011-on-throw.
     onRunReport.mockRejectedValueOnce(new Error('db down'))
     transport.feed('rc/run-report', { ...report, deliveryKey: 'dk-2' })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(transport.closed).toBeUndefined()
+  })
+
+  it('rc/github-graph in READY reaches onGithubGraph; a throwing handler never closes the link', async () => {
+    const onGithubGraph = vi.fn(async () => {})
+    const { transport } = build({ onGithubGraph })
+    await toReady(transport)
+    const poke = {
+      deliveryKey: 'guid-1',
+      installationId: '1234567',
+      repoId: '42',
+      event: 'sub_issues',
+      action: 'sub_issue_added',
+      ids: ['1001'],
+      numbers: [7]
+    }
+    transport.feed('rc/github-graph', poke)
+    await Promise.resolve()
+    expect(onGithubGraph).toHaveBeenCalledWith(poke)
+
+    onGithubGraph.mockRejectedValueOnce(new Error('github down'))
+    transport.feed('rc/github-graph', { ...poke, deliveryKey: 'guid-2' })
     await Promise.resolve()
     await Promise.resolve()
     expect(transport.closed).toBeUndefined()

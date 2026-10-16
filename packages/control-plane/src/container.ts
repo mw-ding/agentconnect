@@ -79,6 +79,8 @@ import { CodeHostNoteProjectionService } from './codehost/note-projection.servic
 import { githubHookRunSubject } from './github/hook-run-subject.js'
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
+import { GithubCardStore } from './kanban/card-store.js'
+import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -172,6 +174,7 @@ import {
   PgMemberSetRepo,
   PgHookRepo,
   PgHookSecretStore,
+  PgKanbanBoardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -546,6 +549,7 @@ export function buildContainer(
       routableDaemon: (agent: ResolvableAgent): Promise<DaemonId | null> => placementResolver.routableDaemon(agent)
     }),
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
+    kanbanBoard: new PgKanbanBoardRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
@@ -1736,6 +1740,21 @@ export function buildContainer(
       })
     : undefined
 
+  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke; the reconcile seam is a stub in M1.
+  const kanbanGraphDoorbell = github
+    ? new KanbanGraphDoorbell({
+        boards: repos.kanbanBoard,
+        installations: repos.githubInstallation,
+        store: new GithubCardStore({ tokens: github.tokens }),
+        onGraph: (board, issueNumber, graph) =>
+          http.log.debug(
+            { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
+            'kanban: graph re-read'
+          ),
+        log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+      })
+    : undefined
+
   const logtoMgmtCfg = resolveLogtoMgmtConfig(config)
   const socialIdentityMutations = new PgSocialIdentityMutationGate(prisma)
   const githubRepoIdentity =
@@ -2203,7 +2222,13 @@ export function buildContainer(
           graceMs: 2 * 60 * 1000,
           relayStaleMs
         },
-        http.log
+        http.log,
+        kanbanGraphDoorbell
+          ? {
+              watchedRepoIds: () => repos.kanbanBoard.listEnabledRepoIds(),
+              landedDeliveryKeys: (keys) => kanbanGraphDoorbell.landedDeliveryKeys(keys)
+            }
+          : undefined
       )
     : undefined
 
@@ -3054,6 +3079,13 @@ export function buildContainer(
       }
       installationDoorbell.poke(m)
     },
+    onGithubGraph: async (m) => {
+      if (!kanbanGraphDoorbell) {
+        http.log.debug({ repoId: m.repoId }, 'relay: graph doorbell ignored — GITHUB_APP_* not configured')
+        return
+      }
+      kanbanGraphDoorbell.poke(m)
+    },
     config: {
       RELAY_WS_PATH: config.RELAY_WS_PATH,
       HEARTBEAT_SEC: config.HEARTBEAT_SEC
@@ -3116,6 +3148,7 @@ export function buildContainer(
       gitlabConvergeSweeper?.stop()
       giteaConvergeSweeper.stop()
       installationDoorbell?.stop()
+      kanbanGraphDoorbell?.stop()
       for (const reaper of pendingInstallReapers) reaper.stop()
       relaySweeper.stop()
       dutyRecompute.stop()
@@ -3132,7 +3165,8 @@ export function buildContainer(
         sessionAccessWarmer.settle(),
         dutyRecompute.settle(),
         ...(sessionPullRequestFeedback ? [sessionPullRequestFeedback.settle()] : []),
-        ...(installationDoorbell ? [installationDoorbell.settle()] : [])
+        ...(installationDoorbell ? [installationDoorbell.settle()] : []),
+        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : [])
       ])
       await rootPrisma.$disconnect()
     }
