@@ -5180,3 +5180,20 @@ export interface KanbanDispatchRepo {
   /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
 }
+
+export interface KanbanCardRecord {
+  id: string
+  boardId: string
+  issueId: bigint
+  issueNumber: number
+  status: KanbanStatus
+  stateRevision: bigint
+  /** An open (un-ended) run holds the card. */
+  leased: boolean
+}
+
+export interface KanbanCardRepo {
+  findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
+  /** Move status only if stateRevision still matches; false means a racing writer won. */
+  casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
+}

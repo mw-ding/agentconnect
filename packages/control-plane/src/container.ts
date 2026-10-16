@@ -34,6 +34,7 @@ import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconcile
 import { GithubCardStore } from './kanban/card-store.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
+import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
 import { type Clock, systemClock } from './domain/clock.js'
@@ -104,6 +105,7 @@ import {
   PgHookSecretStore,
   PgKanbanBoardRepo,
   PgKanbanDispatchRepo,
+  PgKanbanCardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -370,6 +372,7 @@ export function buildContainer(
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
     kanbanBoard: new PgKanbanBoardRepo(prisma),
     kanbanDispatch: new PgKanbanDispatchRepo(prisma),
+    kanbanCard: new PgKanbanCardRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Under WAITLIST_MODE, JIT signup does NOT mint a personal org — that happens
@@ -876,21 +879,26 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke, then rings the board's dispatcher.
+  const kanbanGraphLog = {
+    debug: (o: unknown, m?: string) => http.log.debug(o, m),
+    warn: (o: unknown, m?: string) => http.log.warn(o, m)
+  }
+  const kanbanGraphReconciler = kanbanCardStore
+    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    : undefined
+
+  // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
   const kanbanGraphDoorbell = kanbanCardStore
     ? new KanbanGraphDoorbell({
         boards: repos.kanbanBoard,
         installations: repos.githubInstallation,
         store: kanbanCardStore,
-        onGraph: async (board, issueNumber, graph) => {
-          http.log.debug(
-            { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
-            'kanban: graph re-read'
-          )
+        onGraph: async (board, repo, issueNumber, graph) => {
+          await kanbanGraphReconciler?.apply(board, repo, issueNumber, graph)
           await kanbanDispatcher?.ingestCard(board.id, issueNumber)
           kanbanDispatcher?.poke(board.id)
         },
-        log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+        log: kanbanGraphLog
       })
     : undefined
 

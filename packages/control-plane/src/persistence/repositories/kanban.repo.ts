@@ -1,7 +1,8 @@
-// PgKanbanBoardRepo — the Kanban board reads the graph doorbell and redelivery sweep need (issue #2 M1).
+// Kanban repos (issue #2 M1): PgKanbanBoardRepo serves the doorbell and redelivery sweep; PgKanbanCardRepo the graph reconciler.
 import { OrgId } from '../../domain/ids.js'
 import type { PrismaLike } from '../prisma.js'
-import type { KanbanBoardRecord, KanbanBoardRepo } from '../ports.js'
+import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import type { KanbanBoardRecord, KanbanBoardRepo, KanbanCardRecord, KanbanCardRepo } from '../ports.js'
 
 const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
 
@@ -49,5 +50,35 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo {
       distinct: ['repoId']
     })
     return rows.map((r) => r.repoId)
+  }
+}
+
+export class PgKanbanCardRepo implements KanbanCardRepo {
+  constructor(private readonly db: PrismaLike) {}
+
+  async findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null> {
+    const row = await this.db.kanbanCard.findUnique({
+      where: { boardId_issueNumber: { boardId, issueNumber } },
+      select: {
+        id: true,
+        boardId: true,
+        issueId: true,
+        issueNumber: true,
+        status: true,
+        stateRevision: true,
+        runs: { where: { endedAt: null }, select: { id: true }, take: 1 }
+      }
+    })
+    if (!row || !isKanbanStatus(row.status)) return null
+    const { runs, ...card } = row
+    return { ...card, status: row.status, leased: runs.length > 0 }
+  }
+
+  async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, stateRevision: expectedStateRevision },
+      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date() }
+    })
+    return count === 1
   }
 }

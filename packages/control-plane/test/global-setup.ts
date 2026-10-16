@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
 import { execa } from 'execa'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../src/generated/prisma/client.js'
 import type { ProvidedContext } from 'vitest'
 import { integrationTestWorkerCount } from './integration-workers.js'
 
@@ -31,31 +33,45 @@ function databaseUrl(baseUrl: string, database: string): string {
   return url.toString()
 }
 
+// TEST_DATABASE_URL path: no Docker; clone through Prisma's pg adapter on the maintenance database (the template must have no other sessions).
+async function cloneWorkerDatabasesLocal(baseUrl: string, workers: number): Promise<string[]> {
+  const templateDb = decodeURIComponent(new URL(baseUrl).pathname.slice(1))
+  const admin = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl(baseUrl, 'postgres') }) })
+  const urls: string[] = []
+  try {
+    for (let poolId = 1; poolId <= workers; poolId += 1) {
+      const database = workerDatabaseName(poolId)
+      await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`)
+      await admin.$executeRawUnsafe(`CREATE DATABASE "${database}" WITH TEMPLATE "${templateDb.replaceAll('"', '""')}"`)
+      localWorkerDatabases.push(database)
+      urls.push(databaseUrl(baseUrl, database))
+    }
+  } finally {
+    await admin.$disconnect()
+  }
+  return urls
+}
+
 async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<string[]> {
-  if (!container && !localBaseUrl) throw new Error('Postgres is not running')
+  if (!container) throw new Error('Postgres container is not running')
 
   const urls: string[] = []
   for (let poolId = 1; poolId <= workers; poolId += 1) {
     const database = workerDatabaseName(poolId)
-    const template = new URL(baseUrl).pathname.slice(1)
-    const sql = `CREATE DATABASE "${database}" WITH TEMPLATE "${template.replaceAll('"', '""')}"`
-    if (container) {
-      const result = await container.exec([
-        'psql',
-        '-v',
-        'ON_ERROR_STOP=1',
-        '-U',
-        container.getUsername(),
-        '-d',
-        'postgres',
-        '-c',
-        sql
-      ])
-      if (result.exitCode !== 0) throw new Error(`failed to create ${database}: ${result.output}`)
-    } else {
-      await execa('psql', [databaseUrl(baseUrl, 'postgres'), '-v', 'ON_ERROR_STOP=1', '-c', sql])
-      localWorkerDatabases.push(database)
-    }
+    const template = decodeURIComponent(new URL(baseUrl).pathname.slice(1))
+    const sql = `CREATE DATABASE "${database}" WITH TEMPLATE "${template.replaceAll('"', '""')}" OWNER "${container.getUsername().replaceAll('"', '""')}"`
+    const result = await container.exec([
+      'psql',
+      '-v',
+      'ON_ERROR_STOP=1',
+      '-U',
+      container.getUsername(),
+      '-d',
+      'postgres',
+      '-c',
+      sql
+    ])
+    if (result.exitCode !== 0) throw new Error(`failed to create ${database}: ${result.output}`)
     urls.push(databaseUrl(baseUrl, database))
   }
   return urls
@@ -63,8 +79,13 @@ async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<s
 
 export async function setup({ provide }: GlobalSetupContext): Promise<void> {
   localBaseUrl = process.env.TEST_DATABASE_URL
-  if (!localBaseUrl) container = await new PostgreSqlContainer('postgres:16-alpine').start()
-  const url = localBaseUrl ?? container!.getConnectionUri()
+  let url: string
+  if (localBaseUrl) {
+    url = localBaseUrl
+  } else {
+    container = await new PostgreSqlContainer('postgres:16-alpine').start()
+    url = container.getConnectionUri()
+  }
 
   // Apply committed migrations (the hand-edited SQL included) to real Postgres.
   await execa('pnpm', ['exec', 'prisma', 'migrate', 'deploy', '--schema', schemaPath], {
@@ -81,20 +102,24 @@ export async function setup({ provide }: GlobalSetupContext): Promise<void> {
   })
 
   // Each worker gets a private clone so concurrent truncation cannot corrupt another test.
-  const databaseUrls = await cloneWorkerDatabases(url, integrationTestWorkerCount())
+  const workers = integrationTestWorkerCount()
+  const databaseUrls = localBaseUrl
+    ? await cloneWorkerDatabasesLocal(url, workers)
+    : await cloneWorkerDatabases(url, workers)
   provide('databaseUrls', databaseUrls)
 }
 
 export async function teardown(): Promise<void> {
   if (localBaseUrl) {
-    for (const database of localWorkerDatabases) {
-      await execa('psql', [
-        databaseUrl(localBaseUrl, 'postgres'),
-        '-v',
-        'ON_ERROR_STOP=1',
-        '-c',
-        `DROP DATABASE "${database}" WITH (FORCE)`
-      ])
+    const admin = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: databaseUrl(localBaseUrl, 'postgres') })
+    })
+    try {
+      for (const database of localWorkerDatabases) {
+        await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`)
+      }
+    } finally {
+      await admin.$disconnect()
     }
     localWorkerDatabases.length = 0
   }

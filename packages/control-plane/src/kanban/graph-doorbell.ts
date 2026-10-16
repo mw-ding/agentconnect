@@ -15,8 +15,13 @@ export interface KanbanGraphDoorbellDeps {
   boards: Pick<KanbanBoardRepo, 'listEnabledByRepoId'>
   installations: Pick<GithubInstallationRepo, 'getByInstallationId'>
   store: Pick<CardStore, 'readGraph'>
-  /** M1 stub seam: the re-read graph goes here; the drift reconciler that applies it lands with M1's remainder. */
-  onGraph?: (board: KanbanBoardRecord, issueNumber: number, graph: CardGraph) => void | Promise<void>
+  /** The re-read graph is applied here; a throw leaves the GUID un-landed so the redelivery sweep re-asks. */
+  onGraph?: (
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    graph: CardGraph
+  ) => void | Promise<void>
   log: GraphDoorbellLog
 }
 
@@ -75,6 +80,7 @@ export class KanbanGraphDoorbell {
       this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
       return
     }
+    const reads: Promise<void>[] = []
     for (const board of boards) {
       if (board.orgId !== installation.orgId) continue
       const repo = {
@@ -82,28 +88,36 @@ export class KanbanGraphDoorbell {
         repoId: board.repoId,
         repoFullName: board.repoFullName
       }
-      for (const issueNumber of m.numbers) this.schedule(board, repo, issueNumber)
+      for (const issueNumber of m.numbers) reads.push(this.schedule(board, repo, issueNumber))
     }
+    // Every read+apply must succeed before the GUID lands; allSettled first so no sibling rejection goes unhandled.
+    const results = await Promise.allSettled(reads)
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (failed) throw failed.reason
   }
 
-  private schedule(board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number): void {
+  private schedule(board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number): Promise<void> {
     const key = `${board.id}#${issueNumber}`
-    if (this.inflight.has(key)) {
+    const running = this.inflight.get(key)
+    if (running) {
+      // The in-flight promise includes the trailing re-read, so awaiting it covers this poke too.
       this.rerun.add(key)
-      return
+      return running
     }
     const run = async (): Promise<void> => {
       do {
         this.rerun.delete(key)
         const graph = await this.deps.store.readGraph(repo, issueNumber)
-        await this.deps.onGraph?.(board, issueNumber, graph)
+        await this.deps.onGraph?.(board, repo, issueNumber, graph)
       } while (this.rerun.has(key) && !this.stopped)
     }
-    const pending = run()
+    const pending: Promise<void> = run()
       .catch((err: unknown) => {
         this.deps.log.warn({ err, boardId: board.id, issueNumber }, 'kanban graph re-read failed')
+        throw err
       })
       .finally(() => this.inflight.delete(key))
     this.inflight.set(key, pending)
+    return pending
   }
 }

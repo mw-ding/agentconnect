@@ -7,9 +7,11 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
-import type { CardIssue, KanbanRepoRef } from '../../src/kanban/card-store.js'
+import type { CardGraph, CardIssue, KanbanRepoRef } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
-import { PgKanbanBoardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
+import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
 import { OrgId } from '../../src/domain/ids.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -523,4 +525,140 @@ it('periodically recovers a blocked mismatch when a ready webhook was missed', a
   await h.dispatcher.settle()
   expect(h.sent).toHaveLength(1)
   expect(h.sent[0]?.d.attempt).toBe(2)
+})
+
+const emptyGraph = (): CardGraph => ({ parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false })
+const completedBlocker = {
+  issueId: 100n,
+  number: 100,
+  repoId: REPO_ID,
+  state: 'closed' as const,
+  stateReason: 'completed'
+}
+
+async function graphHarness() {
+  const h = await harness()
+  const graphs = new Map<number, CardGraph>()
+  const store = Object.assign(h.store, {
+    readGraph: async (_repo: KanbanRepoRef, n: number) => graphs.get(n) ?? emptyGraph()
+  })
+  const log = { debug: vi.fn(), warn: vi.fn() }
+  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
+  const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
+  const poke = vi.spyOn(h.dispatcher, 'poke')
+  const bell = new KanbanGraphDoorbell({
+    boards: new PgKanbanBoardRepo(prisma),
+    installations: {
+      getByInstallationId: async () =>
+        ({ orgId: OrgId(DEFAULT_ORG_ID), installationId: 77n, revokedAt: null, suspendedAt: null }) as never
+    },
+    store,
+    onGraph: async (board, repo, n, graph) => {
+      await reconciler.apply(board, repo, n, graph)
+      await h.dispatcher.ingestCard(board.id, n)
+      h.dispatcher.poke(board.id)
+    },
+    log
+  })
+  const ring = async (n: number, deliveryKey = 'graph-1') => {
+    bell.poke({
+      deliveryKey,
+      installationId: '77',
+      repoId: REPO_ID.toString(),
+      event: 'issue_dependencies',
+      action: 'blocked_by_added',
+      ids: [],
+      numbers: [n]
+    })
+    await bell.settle()
+    await h.dispatcher.settle()
+  }
+  return { ...h, graphs, store, bell, ring, ingest, poke }
+}
+
+describe('Kanban graph reconciliation composed with dispatch (real Postgres)', () => {
+  it('promotes todo and writes ready before the dispatcher reads and claims it', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo', 'human-label'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    await h.ring(c.issueNumber)
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 1 })
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.store.writes.map((p) => p.status)).toEqual(['ready', 'running'])
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['human-label', 'ac/status:running'])
+    expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
+    await h.ring(c.issueNumber, 'graph-2')
+    expect(h.sent).toHaveLength(1)
+  })
+
+  it('dispatches a newly unblocked dependent when only its completed blocker is poked', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(100, {
+      ...emptyGraph(),
+      blocking: [{ ...completedBlocker, issueId: c.issueId, number: c.issueNumber, state: 'open', stateReason: null }]
+    })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    await h.ring(100)
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect(h.store.writes.map((p) => p.status)).toEqual(['ready', 'running'])
+  })
+
+  it.each([
+    { labels: ['ac/status:blocked'], status: 'blocked' },
+    { labels: ['ac/status:ready', 'ac/status:blocked'], status: 'triage' }
+  ])('preserves human labels ($status) and recovers only after a human ready edit', async ({ labels, status }) => {
+    const h = await graphHarness()
+    const c = await h.addCard(labels)
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    await h.ring(c.issueNumber)
+    expect((await h.card(c.id)).status).toBe(status)
+    expect(h.sent).toEqual([])
+    expect(h.store.writes).toEqual([])
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    await h.ring(c.issueNumber, 'graph-2')
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
+    expect((await h.card(c.id)).status).toBe('running')
+  })
+
+  it('does not ingest or dispatch after a failed promotion label write; redelivery repairs residue first', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    const apply = h.store.applyPlan.bind(h.store)
+    vi.spyOn(h.store, 'applyPlan')
+      .mockImplementationOnce(async () => {
+        h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
+        throw new Error('label removal failed')
+      })
+      .mockImplementation(apply)
+    await h.ring(c.issueNumber)
+    expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set())
+    expect(h.ingest).not.toHaveBeenCalled()
+    expect(h.poke).not.toHaveBeenCalled()
+    expect(h.sent).toEqual([])
+    await h.ring(c.issueNumber)
+    expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect((await h.card(c.id)).status).toBe('running')
+  })
+
+  it('rejects a stale graph CAS after mismatch ingest advances the card revision', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo'])
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const cards = new PgKanbanCardRepo(prisma)
+    const before = await cards.findByIssueNumber(h.board.id, c.issueNumber)
+    expect(before?.status).toBe('todo')
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked']
+    await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
+    expect(await cards.casStatus(c.id, before!.stateRevision, 'ready')).toBe(false)
+    expect((await h.card(c.id)).status).toBe('blocked')
+    expect(h.sent).toEqual([])
+    expect(h.store.writes).toEqual([])
+  })
 })
