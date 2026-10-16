@@ -140,6 +140,24 @@ export function planLabelReconcile(card: CardSnapshot, observed: ObservedIssue):
   return plan
 }
 
+/** The label plan for a transition the CP itself made (dispatch, run end, reap): silent, never read as a human request. */
+export function planStatusWrite(status: KanbanStatus, observed: ObservedIssue): LabelPlan {
+  const keep = statusLabel(status)
+  const removeLabels = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+  const addLabels = observed.labels.includes(keep) ? [] : [keep]
+  const desired = issueStateFor(status)
+  const issueState = issueStateDiffers(desired, observed) ? desired : undefined
+  const changed = addLabels.length > 0 || removeLabels.length > 0 || issueState !== undefined
+  return {
+    outcome: changed ? 'accepted' : 'noop',
+    status,
+    releaseLease: false,
+    addLabels,
+    removeLabels,
+    ...(issueState ? { issueState } : {})
+  }
+}
+
 function issueStateDiffers(
   desired: { state: 'open' } | { state: 'closed'; reason: IssueCloseReason },
   observed: ObservedIssue

@@ -7,6 +7,7 @@ import {
   issueStateFor,
   parseStatusLabels,
   planLabelReconcile,
+  planStatusWrite,
   refuseRequest,
   statusLabel,
   type KanbanStatus,
@@ -217,5 +218,25 @@ describe('planLabelReconcile', () => {
   it('never puts issue content in a comment', () => {
     const plan = planLabelReconcile({ status: 'ready', leased: false }, open(L('blocked'), L('triage'), 'secret-label'))
     expect(plan.comment).not.toContain('secret-label')
+  })
+})
+
+describe('planStatusWrite — CP-driven transitions', () => {
+  it('writes exactly one status label, silently, and closes for done', () => {
+    const plan = planStatusWrite('running', open(L('ready'), 'bug'))
+    expect(plan).toMatchObject({ outcome: 'accepted', status: 'running', releaseLease: false })
+    expect(plan.addLabels).toEqual([L('running')])
+    expect(plan.removeLabels).toEqual([L('ready')])
+    expect(plan.comment).toBeUndefined()
+    expect(planStatusWrite('done', open(L('running'))).issueState).toEqual({ state: 'closed', reason: 'completed' })
+  })
+
+  it('is a no-op when GitHub already matches', () => {
+    expect(planStatusWrite('ready', open(L('ready'))).outcome).toBe('noop')
+  })
+
+  it('differs from planLabelReconcile, which would read the stale label as a human request', () => {
+    expect(planLabelReconcile({ status: 'running', leased: true }, open(L('ready'))).outcome).toBe('reverted_leased')
+    expect(planStatusWrite('running', open(L('ready'))).outcome).toBe('accepted')
   })
 })
