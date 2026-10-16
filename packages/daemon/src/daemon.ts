@@ -20527,6 +20527,12 @@ export class Daemon {
       void done.catch(() => undefined)
       return { accepted: false, reason: refusal }
     }
+    // Warm the issues-write poster token. It stays in the daemon cache and is not the agent's grant.
+    if (this.cpClient) {
+      void this.gitCreds
+        .getKanbanCommentToken(d.agentId, d.repoFullName)
+        .catch((err: unknown) => this.log.warn(`kanban: comment token mint failed (${formatErr(err)})`))
+    }
     return { accepted: true, sessionKey: key, done }
   }
 

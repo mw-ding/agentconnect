@@ -701,6 +701,62 @@ export class GithubService {
     }
   }
 
+  // Daemon grant for an open Kanban run. The run mode is the permission ceiling, so a read run cannot receive write.
+  mintForKanbanRun(
+    agent: AgentRecord,
+    repoFullName: string,
+    repoId: bigint,
+    mode: 'read' | 'write',
+    bucketKeys: string[]
+  ): Promise<MintedGitCred> {
+    return this.withKanbanInstallation(agent, repoFullName, bucketKeys, (installationId) =>
+      this.tokens.mintKanbanRun(installationId, repoFullName, repoId, mode)
+    )
+  }
+
+  // Issues-write token for the daemon-owned Kanban final poster. It never enters the agent environment.
+  mintForKanbanComment(
+    agent: AgentRecord,
+    repoFullName: string,
+    repoId: bigint,
+    bucketKeys: string[],
+    forceRefresh = false
+  ): Promise<MintedGitCred> {
+    return this.withKanbanInstallation(agent, repoFullName, bucketKeys, (installationId) =>
+      this.tokens.mintKanbanCard(installationId, repoFullName, repoId, 'write', forceRefresh)
+    )
+  }
+
+  private async withKanbanInstallation(
+    agent: AgentRecord,
+    repoFullName: string,
+    bucketKeys: string[],
+    mint: (installationId: bigint) => Promise<MintedGitCred>
+  ): Promise<MintedGitCred> {
+    const [owner, repo] = repoFullName.split('/')
+    if (!owner || !repo || repoFullName.split('/').length !== 2) {
+      throw new GitCredDeniedError(`not an owner/repo reference (${repoFullName})`, 'SCOPE_DENIED', false)
+    }
+    for (const key of bucketKeys) {
+      if (!this.mintBucket.take(key)) {
+        throw new GitCredDeniedError('gitcred mint rate exceeded — backing off', 'RATE_LIMITED', true)
+      }
+    }
+    const ins = await this.deps.installations.liveByOrgAndAccount(agent.orgId, owner)
+    if (!ins || ins.orgId !== agent.orgId) {
+      throw new GitCredDeniedError(`no live github installation covers ${owner}`, 'LEASE_DENIED', false)
+    }
+    if (ins.suspendedAt) {
+      throw new GitCredDeniedError('github installation is suspended', 'LEASE_DENIED', false)
+    }
+    try {
+      return await mint(ins.installationId)
+    } catch (e) {
+      if (e instanceof GithubApiError) throw new GitCredDeniedError(e.message, e.code, e.retryable)
+      throw e
+    }
+  }
+
   /**
    * Shared repo-id-first authorization resolver for gitcred, formal reviews,
    * and CP-owned Checks. A repo name is only an endpoint/display hint: the

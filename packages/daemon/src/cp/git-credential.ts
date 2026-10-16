@@ -61,6 +61,10 @@ const keyOf = (agentId: string, plane: CachePlane, repo?: string): string =>
  *  it gets its own keyspace). One per (agent, repo). */
 const POST_KEY = (agentId: string, repo: string): string => `post\u0000${agentId}\u0000${repo.toLowerCase()}`
 
+/** Cache key for the Kanban final-poster token (issues write only, no contents). */
+const KANBAN_POST_KEY = (agentId: string, repo: string): string =>
+  `kanban-post\u0000${agentId}\u0000${repo.toLowerCase()}`
+
 export class GitCredUnavailableError extends Error {
   constructor(
     message: string,
@@ -88,7 +92,7 @@ export interface GitCredentialCacheDeps {
     reason?: 'clone' | 'fetch' | 'pull' | 'push' | 'helper'
     capabilities?: GitCredCapability[]
     repoFullName?: string
-    purpose?: 'github_hook_reply'
+    purpose?: 'github_hook_reply' | 'kanban_comment'
     hookId?: string
     forceRefresh?: boolean
   }) => Promise<GitCredGrant>
@@ -170,6 +174,32 @@ export class GitCredentialCache {
 
   /** Drop the cached GithubPoster token after GitHub rejects it. Matching the
    *  presented token avoids deleting a newer grant that won a concurrent race. */
+  /** Issues-write token for the Kanban final poster. The CP admits it only for an open run on `repo`. */
+  async getKanbanCommentToken(agentId: string, repo: string): Promise<Entry> {
+    const key = KANBAN_POST_KEY(agentId, repo)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      capabilities: ['issues'],
+      repoFullName: repo,
+      purpose: 'kanban_comment',
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop the cached Kanban poster token after GitHub rejects it. */
+  invalidateKanbanComment(agentId: string, repo: string, presentedToken?: string): void {
+    const key = KANBAN_POST_KEY(agentId, repo)
+    const entry = this.entries.get(key)
+    if (!entry) return
+    if (presentedToken !== undefined && entry.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshPosts.add(key)
+  }
+
   invalidatePost(agentId: string, repo: string, presentedToken?: string): void {
     const key = POST_KEY(agentId, repo)
     const entry = this.entries.get(key)

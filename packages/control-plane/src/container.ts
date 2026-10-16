@@ -32,6 +32,7 @@ import { GithubRunCoordinator, GithubRunReporter } from './github/run-reporter.j
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
+import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
@@ -251,6 +252,8 @@ export interface ContainerOpts {
   fastify?: FastifyServerOptions
   /** GitHub REST fetch override — integration tests stub the API without network. */
   githubFetch?: FetchLike
+  /** PAT used for Kanban GitHub calls only when the GitHub App is not configured. */
+  kanbanAccessToken?: string
   /** Slack Web API fetch override for Session membership checks. */
   slackFetch?: FetchLike
   /** Feishu/Lark Open Platform fetch override for Session membership checks. */
@@ -860,9 +863,14 @@ export function buildContainer(
       })
     : undefined
 
-  const kanbanCardStore = github
+  const kanbanTokens = kanbanTokenSource({
+    app: github?.tokens,
+    injectedToken: opts.kanbanAccessToken,
+    log: { warn: (message) => http.log.warn(message) }
+  })
+  const kanbanCardStore = kanbanTokens
     ? new GithubCardStore({
-        tokens: github.tokens,
+        tokens: kanbanTokens,
         appSlug: githubAppCfg?.slug,
         // The same GitHub transport as the token mint, so an injected fetch covers card reads and label writes too.
         ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
@@ -1389,6 +1397,9 @@ export function buildContainer(
     ...(githubReviewBroker ? { githubReviewBroker } : {}),
     ...(githubRunCoordinator ? { githubRunCoordinator } : {}),
     ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
+    kanbanGrants: {
+      openScopes: (agentId, daemonId) => repos.kanbanDispatch.openGrantScopes(agentId, daemonId)
+    },
     relayRoster: () => relayRoster.entries(),
     clock,
     config: {

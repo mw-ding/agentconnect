@@ -160,6 +160,26 @@ describe('GitCredentialCache', () => {
       expect(h.payloads.every((p) => !p.capabilities?.includes('contents'))).toBe(true)
     })
 
+    it('getKanbanCommentToken requests issues only and refreshes after a rejection', async () => {
+      const h = buildRecording()
+      const first = await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
+      expect(h.calls()).toBe(1)
+      expect(first.token).toBe('ghs_1')
+      expect(h.payloads[0]).toMatchObject({
+        repoFullName: 'acme/web',
+        capabilities: ['issues'],
+        purpose: 'kanban_comment'
+      })
+      expect(h.payloads[0]!.capabilities).not.toContain('contents')
+      expect(h.payloads[0]!.capabilities).not.toContain('pull_requests')
+
+      h.cache.invalidateKanbanComment(AGENT, 'acme/web', 'ghs_1')
+      const refreshed = await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
+      expect(refreshed.token).toBe('ghs_2')
+      expect(h.payloads[1]).toMatchObject({ purpose: 'kanban_comment', forceRefresh: true })
+    })
+
     it('invalidates only the matching cached poster token after an auth rejection', async () => {
       const h = buildRecording()
       await h.cache.getPostToken(AGENT, 'acme/infra', HOOK)

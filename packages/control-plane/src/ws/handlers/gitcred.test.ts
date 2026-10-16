@@ -191,3 +191,100 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
     expect(conn.replyTo).not.toHaveBeenCalled()
   })
 })
+
+const grant = {
+  token: 'ghs_kanban',
+  ttlSec: 3540,
+  expiresAt: '2026-07-11T01:00:00.000Z',
+  repoFullName: 'acme/web',
+  access: 'read' as const
+}
+
+describe('handleGitCredRequest — Kanban run grants', () => {
+  const scope = { repoId: 77n, repoFullName: 'acme/web', mode: 'read' as const }
+
+  function kanbanDeps(scopes: Array<typeof scope>, github: Record<string, unknown>) {
+    return {
+      agent: { getUnscoped: async () => PLACED_AGENT },
+      kanbanGrants: { openScopes: async () => scopes },
+      github
+    } as unknown as DaemonWsDeps
+  }
+
+  it('mints a read-scoped run token instead of the workspace grant while a read run is open', async () => {
+    const mintForAgent = vi.fn()
+    const mintForKanbanRun = vi.fn(async () => ({ ...grant, access: 'read' as const }))
+    const conn = fakeConn()
+    const frame = gitcredFrame({ capabilities: ['contents', 'issues', 'pull_requests'], repoFullName: 'Acme/Web' })
+
+    await handleGitCredRequest(frame, conn, kanbanDeps([scope], { mintForAgent, mintForKanbanRun }))
+
+    expect(mintForKanbanRun).toHaveBeenCalledWith(
+      PLACED_AGENT,
+      'Acme/Web',
+      77n,
+      'read',
+      [`daemon:${DAEMON_ID}`, `org:org-a`]
+    )
+    expect(mintForAgent).not.toHaveBeenCalled()
+    expect(conn.replyTo).toHaveBeenCalledWith(frame, 'gitcred/grant', expect.objectContaining({ access: 'read' }))
+  })
+
+  it('mints the write run set when every open run on the repo is write', async () => {
+    const mintForKanbanRun = vi.fn(async () => ({ ...grant, access: 'write' as const }))
+    const conn = fakeConn()
+    const frame = gitcredFrame({ repoFullName: 'acme/web' })
+
+    await handleGitCredRequest(
+      frame,
+      conn,
+      kanbanDeps([{ ...scope, mode: 'write' }], { mintForKanbanRun, mintForAgent: vi.fn() })
+    )
+
+    expect(mintForKanbanRun).toHaveBeenCalledWith(PLACED_AGENT, 'acme/web', 77n, 'write', expect.any(Array))
+    expect(conn.replyTo).toHaveBeenCalledWith(frame, 'gitcred/grant', expect.objectContaining({ access: 'write' }))
+  })
+
+  it('keeps the workspace grant when the request names a different repo', async () => {
+    const mintForAgent = vi.fn(async () => grant)
+    const mintForKanbanRun = vi.fn()
+    const conn = fakeConn()
+    const frame = gitcredFrame({ repoFullName: 'acme/other' })
+
+    await handleGitCredRequest(frame, conn, kanbanDeps([scope], { mintForAgent, mintForKanbanRun }))
+
+    expect(mintForKanbanRun).not.toHaveBeenCalled()
+    expect(mintForAgent).toHaveBeenCalled()
+  })
+
+  it('mints an issues-write poster token for an open run and refuses without one', async () => {
+    const mintForKanbanComment = vi.fn(async () => grant)
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      purpose: 'kanban_comment',
+      capabilities: ['issues'],
+      repoFullName: 'acme/web',
+      forceRefresh: true
+    })
+
+    await handleGitCredRequest(frame, conn, kanbanDeps([scope], { mintForKanbanComment }))
+
+    expect(mintForKanbanComment).toHaveBeenCalledWith(
+      PLACED_AGENT,
+      'acme/web',
+      77n,
+      [`daemon:${DAEMON_ID}`, `org:org-a`],
+      true
+    )
+    expect(conn.replyTo).toHaveBeenCalledWith(frame, 'gitcred/grant', expect.objectContaining({ token: 'ghs_kanban' }))
+
+    const denied = fakeConn()
+    await handleGitCredRequest(frame, denied, kanbanDeps([], { mintForKanbanComment }))
+    expect(denied.sendError).toHaveBeenCalledWith(
+      frame.id,
+      'SCOPE_DENIED',
+      'kanban comment credentials require an open run on the requested repo',
+      false
+    )
+  })
+})

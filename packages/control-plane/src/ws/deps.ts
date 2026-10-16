@@ -24,7 +24,8 @@ import type {
   OrganizationKnowledgeRepo,
   BotRepo,
   GithubInstallationRepo,
-  DaemonLifecycleOpRepo
+  DaemonLifecycleOpRepo,
+  KanbanGrantScope
 } from '../persistence/ports.js'
 import type { SessionVisibilityPushService } from '../orchestrator/visibilityPush.js'
 import type { RelayRosterEntry } from '@agentconnect.md/protocol'
@@ -117,6 +118,10 @@ export interface DaemonWsDeps {
   githubRunCoordinator?: GithubRunCoordinator
   /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
   kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport'>
+  /** Open Kanban runs used to clamp gitcred grants to the run mode. Absent ⇒ no clamp. */
+  kanbanGrants?: {
+    openScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+  }
   /** The current relay roster, injected into `register/ok.relays` so a (re)connecting
    *  daemon converges to the relays it should dial (shared-bot-relay.md §5). */
   relayRoster: () => Promise<RelayRosterEntry[]>

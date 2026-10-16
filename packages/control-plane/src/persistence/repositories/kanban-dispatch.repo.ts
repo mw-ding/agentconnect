@@ -10,6 +10,7 @@ import type {
   KanbanClaimOpts,
   KanbanClaimedLease,
   KanbanDispatchRepo,
+  KanbanGrantScope,
   KanbanLeaseBeatInput,
   KanbanOpenLease,
   KanbanRecoveryDue,
@@ -529,5 +530,17 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       ...r,
       agentDaemonId: agentRowId === null ? undefined : agentDaemonId
     }))
+  }
+
+  async openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]> {
+    return this.db.$queryRaw<KanbanGrantScope[]>(Prisma.sql`
+      SELECT b."repoId", b."repoFullName", r."mode"
+      FROM "kanban_run" r
+      JOIN "kanban_card" c ON c."id" = r."cardId"
+      JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE r."endedAt" IS NULL
+        AND r."agentId" = ${agentId}::uuid
+        AND r."daemonId" = ${daemonId}::uuid
+    `)
   }
 }

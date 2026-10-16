@@ -47,6 +47,8 @@ export interface BuildAppDeps {
   fastify?: FastifyServerOptions
   /** GitHub REST fetch override — integration tests stub the API without network. */
   githubFetch?: FetchLike
+  /** PAT used for Kanban GitHub calls only when the GitHub App is not configured. */
+  kanbanAccessToken?: string
   /** npm dist-tags fetch override for the daemon "latest version" resolver — tests
    *  stub it (absent under NODE_ENV=test ⇒ the resolver is inert, no network). */
   daemonReleaseFetch?: FetchLike
@@ -130,6 +132,7 @@ export function buildApp(deps: BuildAppDeps): App {
   const container = buildContainer(config, deps.prisma, clock, secretsProvider, {
     ...(deps.fastify ? { fastify: deps.fastify } : {}),
     ...(deps.githubFetch ? { githubFetch: deps.githubFetch } : {}),
+    ...(deps.kanbanAccessToken ? { kanbanAccessToken: deps.kanbanAccessToken } : {}),
     ...(deps.daemonReleaseFetch ? { daemonReleaseFetch: deps.daemonReleaseFetch } : {}),
     ...(deps.connectorsFetch ? { connectorsFetch: deps.connectorsFetch } : {}),
     ...(deps.secretCipher ? { secretCipher: deps.secretCipher } : {}),
