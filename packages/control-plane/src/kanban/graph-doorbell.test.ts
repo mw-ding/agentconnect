@@ -35,6 +35,7 @@ function installation(over: Partial<GithubInstallationRecord> = {}): GithubInsta
     accountType: 'Organization',
     repositorySelection: 'selected',
     suspendedAt: null,
+    permissions: {},
     revokedAt: null,
     createdAt: new Date(0),
     ...over
