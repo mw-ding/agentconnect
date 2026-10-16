@@ -12,6 +12,21 @@ import type {
 
 const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
 
+/** How long after its POST (or its rollback) an unacknowledged ready write is still watched for a late landing. */
+export const PROMOTION_WATCH_MS = 10 * 60_000
+
+/** No promotion in flight and no human flag: what every settled status move writes. */
+export const PROMOTION_CLEARED = {
+  promotionPending: false,
+  promotionEventCursor: null,
+  promotionPostAccepted: false,
+  promotionWatchUntil: null,
+  promotionStartedAt: null,
+  promotionChecks: 0,
+  needsAttention: false,
+  attentionReason: null
+} as const
+
 export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo {
   constructor(private readonly db: PrismaLike) {}
 
@@ -111,6 +126,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         issueNumber: true,
         status: true,
         stateRevision: true,
+        promotionPending: true,
+        needsAttention: true,
         runs: { where: { endedAt: null }, select: { id: true }, take: 1 }
       }
     })
@@ -122,18 +139,66 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision },
-      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), promotionPending: false }
+      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED }
     })
     return count === 1
   }
 
-  async revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean> {
+  async beginPromotion(
+    cardId: string,
+    expectedStateRevision: bigint,
+    eventCursor: bigint,
+    startedAt: Date
+  ): Promise<boolean> {
+    // One write for the ready CAS and the intent; an open intent keeps its caps, and a flagged card is a human's.
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
+      where: {
+        id: cardId,
+        stateRevision: expectedStateRevision,
+        status: 'todo',
+        promotionPending: false,
+        needsAttention: false
+      },
+      data: {
+        status: 'ready',
+        stateRevision: { increment: 1 },
+        githubSyncedAt: new Date(),
+        ...PROMOTION_CLEARED,
+        promotionPending: true,
+        promotionEventCursor: eventCursor,
+        promotionStartedAt: startedAt,
+        promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
+        // A minute out, so a tick cannot settle the card while this write is still in flight.
+        recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
+        recoveryChecks: 0
+      }
+    })
+    return count === 1
+  }
+
+  async notePromotionPosted(cardId: string): Promise<void> {
+    await this.db.kanbanCard.updateMany({
+      where: { id: cardId, promotionPending: true },
+      data: { promotionPostAccepted: true }
+    })
+  }
+
+  async clearPromotionIntent(cardId: string): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, status: 'ready', promotionPending: true },
+      data: PROMOTION_CLEARED
+    })
+    return count === 1
+  }
+
+  async revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean> {
+    // The timed-out POST can still land after this rollback, so the watch restarts from now.
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
       data: {
         status: 'todo',
         stateRevision: { increment: 1 },
-        promotionPending: true,
+        promotionWatchUntil: new Date(revertedAt.getTime() + PROMOTION_WATCH_MS),
         recoveryCheckAt: null,
         recoveryChecks: 0
       }

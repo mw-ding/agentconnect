@@ -108,7 +108,8 @@ attempt. Recovery accepts an edit only when the issue is open, carries exactly o
 valid status label, and the issue events show a GitHub `User` (not a `[bot]`
 login and without `performed_via_github_app`) both added that label and made the
 latest `ac/status:*` change. Any App, bot, or unknown actor, a missing event, an
-event history beyond 10 pages, or a read failure leaves the card parked. Agent
+event history that needs more than 10 page reads (newest page first), or a read
+failure leaves the card parked. Agent
 label writes reach GitHub as the App bot because the `gh` shim fails closed, so an
 agent can never un-park a card. A legal-looking edit the state machine forbids,
 such as `archived` straight to `ready`, is logged rather than silently dropped;
@@ -144,37 +145,88 @@ closed issues never stay in the scan. A check that changes nothing pushes
 (`recoveryChecks` counts the steps). Each check stores a fingerprint of the issue
 state and status labels it read (`recoveryObserved`). A check that sees a different
 fingerprint restarts the backoff at 1 minute, even when no webhook arrived. A
-doorbell for the card, an ingested move, or a new claim resets the backoff entirely.
+human doorbell for the card, an ingested move, or a new claim resets the backoff.
+A graph doorbell does not reset it for a card whose promotion is still pending.
 With 100 parked cards, the first hour is capped at 25 reads per tick, and steady
 state is about one read per card per hour.
 
-If the graph promotion's ready-label write fails after the `todo`→`ready` CAS, the
-reconciler compare-and-sets the card back to `todo`, flags it `promotionPending`, and
-fails the doorbell. A claim therefore cannot mismatch the card into a stranded
-`todo`. The write may still have half-landed. For example, the ready label was added
-and GitHub applied the `todo` removal, but the DELETE timed out. The next tick
-re-reads every flagged `todo` card. A lone `ready` label, or `todo`+`ready` residue,
-is adopted as `ready` and claimed only when two further checks pass, and the
-dispatch's `running` write then clears both labels.
+If the graph promotion's ready-label write fails, recovery decides what landed. The
+reconciler first reads the issue's newest event id (the events cursor). If the
+`Link: rel="last"` page is empty, it walks back to the newest non-empty page. A read
+that finds no event within the page bound fails before anything is written, so the
+cursor never falls back to 0. The reconciler then moves the card from `todo` to
+`ready` and opens the intent in one conditional write: `promotionPending`,
+`promotionEventCursor`, `promotionStartedAt`, and `promotionWatchUntil` (10 minutes
+out). That write refuses a card that already has an open intent or carries
+`needsAttention`. The reconciler skips both kinds of card before it reads anything,
+so a redelivered graph event can neither reset an open intent's caps, cursor, and
+start time nor promote a card that is waiting for a human. A claim
+therefore never sees a `ready` card without its intent, even across a crash. A
+claim skips any card with the intent set, so the leftover of a crash after the ready
+POST is never dispatched. The next recovery check is a minute out, so a tick cannot
+settle the card while the write is running. When the ready POST returns success the
+CP sets `promotionPostAccepted`. A successful write clears the intent. A failed one
+moves the card back to `todo`, keeps the intent, restarts the watch 10 minutes from
+the rollback, makes the next check due at once, and fails the doorbell. The write may
+still have half-landed, or a timed-out POST may still commit on GitHub after the
+rollback. For example, the ready
+label was added and GitHub applied the `todo` removal, but the DELETE timed out. The
+next tick re-reads due flagged cards within the recovery batch limit. While the
+intent is open, the reconciler does not strip a leftover `todo` label, because that
+would finish the write before attribution.
 
-- **Attribution.** The issue events must show that this deployment's App bot
-  (`<slug>[bot]`) or a GitHub `User` added the `ready` label. The CP and its agents
-  share that App identity, so the check also replays the `ac/status:*` and
-  close/reopen events. The last human change must have left the issue open with
-  only `todo` and/or `ready`. A human park (any other status, or closing the issue)
-  therefore stands until a human undoes it, even if an agent later swaps in `ready`.
-  Any other bot or App touching status, a history beyond 10 pages, or a read
-  failure refuses adoption.
+- **Attribution.** GitHub's add-labels response is only the issue's label list,
+  with no event id, so the CP cannot capture a receipt for its own write. The CP and
+  agents also act as the same App bot. Recovery therefore reads only the events
+  after the cursor: managed (`ac/*`) label adds and removals, plus close and reopen.
+  It reads the `Link: rel="last"` page first and walks backward, so a long history
+  still reaches the cursor. An App `labeled ac/status:ready` is adopted only when
+  `promotionPostAccepted` is set and the App's events in that window are exactly that
+  add, optionally followed by an `unlabeled ac/status:todo`. These are the events
+  our own write produces. A timed-out or refused POST never adopts an App ready-add,
+  even when it is the only one. A second App ready-add, any other App `ac/*` write,
+  or a writer that is neither a human `User` nor this App rejects the promotion. If
+  the latest ready-add in the window came from a human `User`, the promotion is
+  adopted, because a human finished it.
+- **Shape.** The issue must be open and carry `ready` alone or `todo`+`ready`
+  residue. The dispatch's `running` write then clears both labels.
 - **Graph readiness.** Every blocker must still be closed as completed.
 
-Anything else clears the flag and leaves the card `todo`: nothing landed, the label is
-not attributable, a blocker reopened, or a human moved the card elsewhere.
-Any Kanban doorbell for the card (a human status relabel or a graph change) settles
-the flag at once with the same checks and clears it even if the read fails, so a
-human park observed by a webhook leaves nothing for a later bot write to adopt. The
-graph reconciler never adopts a lone `ready` itself; a redelivered graph doorbell
-reaches the same attributed repair. Any later status change also clears a stale
-flag, so it can never promote a card that comes back to `todo`.
+If the issue carries no `ready` label (the POST did not land, or a human moved the
+card), the outcome depends on whether the POST was acknowledged. With
+`promotionPostAccepted` set, nothing more can land, so the intent clears and the card
+stays `todo`. Without it, the card is in the rolled-back watch until
+`promotionWatchUntil`. An empty read inside the watch only counts as a check, and the
+first empty read after the watch clears the intent. A late POST that lands inside the
+watch, or after it but before that closing read, shows up as an App ready-add with
+no acknowledged POST, so the next read escalates the card as `unattributed`. It is
+never cleared silently. Once the intent clears, a redelivered graph doorbell promotes
+the card again. Every other failed check hands the card to a human. The CP moves
+the card back to `todo`, clears the intent, sets `needsAttention` with an
+`attentionReason`, logs a warning, and posts a fixed, body-free issue comment so the
+board shows it. The reasons are:
+
+- `unattributed`: the window does not prove the add is ours.
+- `unexpected_labels`: `ready` sits next to another status.
+- `blockers_reopened`: a blocker reopened.
+- `unresolved`: the result stayed inconclusive.
+
+A thrown read, a window that does not yet show any ready-add, a window deeper than
+10 pages, or a truncated graph is inconclusive. The card keeps its intent and retries
+on the recovery backoff. Each deferred check counts in `promotionChecks`. After 12
+checks, or 6 hours after the intent opened, the card escalates as `unresolved`. A
+non-human doorbell does not reset the backoff or read early. A human status doorbell
+reads at once and still counts toward the cap. A `needsAttention` card is parked like
+a mismatch, so it is human-only: tick recovery and the label doorbell un-park it only
+when a human `User` makes the latest status edit. That edit is either a fresh add of
+`ac/status:ready` (the comment asks the human to remove and re-add it, because an
+unattributed `ready` is often still on the issue) or another single status. No
+automatic path clears the flag. The graph reconciler skips flagged cards, and the
+promotion write refuses them, so closed blockers plus todo-only labels do not
+re-promote one. A stale graph CAS cannot either, because escalation bumps the state
+revision. Any
+later status change clears the intent and the flag. They therefore cannot authorize
+a future promotion once the card returns to `todo`.
 
 Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`, or an
 unsuccessful/empty daemon token response. They never use stored human gh
@@ -211,20 +263,39 @@ stays read-only. A human who wants an archived card dispatched must relabel it
 `triage` and then `ready`; there is no issue comment explaining the refused move,
 only a CP log line.
 
-- **Bots can pin a card's recovery backoff at the minimum.** Any change in the
-  recovery fingerprint restarts the backoff at 1 minute, whoever made it. Every
-  `sub_issues` or `issue_dependencies` doorbell also resets it, and those ring for
-  bot senders too. A bot that keeps relabeling a parked card, or editing its
-  dependencies, therefore keeps it on 1-minute re-reads. Reads stay bounded by the
-  25-cards-per-board-per-tick cap, and a bot still cannot un-park the card. Fixing
-  this needs an attributed (events API) read before each reset, which costs the read
-  the backoff exists to save.
+- **Bots can pin a mismatch-parked card's recovery backoff at the minimum.** Any
+  change in the recovery fingerprint restarts the backoff at 1 minute, whoever made
+  it. A graph doorbell for a card that is not waiting on a promotion also resets
+  it, and those ring for bot senders too. A bot that keeps relabeling a parked
+  card, or editing its dependencies, therefore keeps it on 1-minute re-reads.
+  Reads stay bounded by the 25-cards-per-board-per-tick cap, and a bot still cannot
+  un-park the card. A pending promotion is not in this gap: a graph doorbell leaves
+  its backoff alone. Fixing the parked-card case needs an attributed (events API)
+  read before each reset, which costs the read the backoff exists to save.
 - **The issue events API can lag the webhook.** A doorbell re-reads the card at once,
   but if the events API does not yet show the human's label event, attribution fails
   and the card is not un-parked by that doorbell. It is picked up on the next tick
   instead, about 60 seconds later because the doorbell reset the backoff, not when the
   webhook arrived. Attribution that cannot see the event fails closed; the same lag
   can likewise defer a half-landed promotion's adoption to a later tick.
+- **A half-landed promotion trusts the agents not to replay its exact write.** The CP
+  and its agents share the App identity, and the label POST returns no event id. An
+  agent that adds `ac/status:ready`, and optionally removes `ac/status:todo`, in the
+  seconds between the cursor read and an accepted POST is therefore indistinguishable
+  from the CP's own write. A POST with an existing label adds no event, so the agent's
+  add then stands alone in the window. That case is adopted. The resulting labels are
+  the ones the CP was writing anyway, for a card whose blockers are all complete, and
+  any second App ready-add or other App `ac/*` write in the window escalates the card
+  instead. Closing this would need a per-write identity GitHub does not expose, such
+  as a separate App for the control plane.
+- **The late-landing watch is finite.** A timed-out POST that commits on GitHub after
+  the watch's closing read leaves GitHub on `ready` and the card on `todo` with
+  nothing pending or flagged. The relay ignores App senders, and the reconciler does
+  not promote over existing `ready` labels. The window is 10 minutes from the rollback,
+  plus the wait for the next backoff step, against a 10-second request timeout.
+- **Escalation comments are best-effort.** If the comment POST fails, the card still
+  carries `needsAttention` and a warning is logged, but nothing shows on the issue.
+  The console does not surface the flag yet.
 - **`sender.type === 'User'` does not prove a human.** An App acting with a
   user-to-server token, or a worker using a personal access token, is also reported
   as `User`, so it can ring the card-status doorbell. That only causes reads: un-park

@@ -95,6 +95,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   const agentId = randomUUID()
   let epoch = 4
   const issues: number[] = []
+  const createdLabels: string[] = []
   const sends: KanbanDispatch[] = []
   const reports: KanbanReport[] = []
   const permissionDenials: string[] = []
@@ -110,7 +111,6 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let smee: SmeeClient | undefined
   let hookId: number | undefined
   const createdHookIds: number[] = []
-  const createdLabels: string[] = []
   const hookMarker = `kanban-e2e-${randomUUID()}`
   let smeeUp = false
   let smeeSkipReason = ''
@@ -206,13 +206,17 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     phase('setup: live repository and human token')
     expect(BigInt((await gh<{ id: number }>('GET', `/repos/${FULL}`)).id)).toBe(REPO_ID)
     expect((await gh<{ type: string }>('GET', '/user')).type).toBe('User')
+    const existingLabels = new Set<string>()
+    for (let page = 1; ; page++) {
+      const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100&page=${page}`)
+      for (const label of labels) existingLabels.add(label.name)
+      if (labels.length < 100) break
+    }
     for (const name of ['triage', 'ready', 'running', 'review', 'done'].map((s) => `ac/status:${s}`)) {
       // Read before creating so existing repository labels are never modified.
-      const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100`)
-      if (!labels.some((label) => label.name === name)) {
-        await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
-        createdLabels.push(name)
-      }
+      if (existingLabels.has(name)) continue
+      await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
+      createdLabels.push(name)
     }
     root = mkdtempSync(join(tmpdir(), 'kanban-dispatch-e2e-'))
     const agentDir = join(root, 'agents', agentId)
