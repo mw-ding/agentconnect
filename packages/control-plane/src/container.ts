@@ -882,11 +882,12 @@ export function buildContainer(
         boards: repos.kanbanBoard,
         installations: repos.githubInstallation,
         store: kanbanCardStore,
-        onGraph: (board, issueNumber, graph) => {
+        onGraph: async (board, issueNumber, graph) => {
           http.log.debug(
             { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
             'kanban: graph re-read'
           )
+          await kanbanDispatcher?.ingestCard(board.id, issueNumber)
           kanbanDispatcher?.poke(board.id)
         },
         log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }

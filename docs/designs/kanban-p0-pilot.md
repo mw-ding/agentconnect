@@ -52,7 +52,7 @@ Consequences for P0:
 
 - No agent-driven dispatch or board moves via label writes.
 - No concurrency caps or leases on cards.
-- **One writer per effect:** humans (non-bot users) own all `ac/*` labels, including status, mode, and assignment; workers use the daemon-posted final answer only.
+- **One writer per effect:** humans (non-bot users) own all `ac/*` labels, including status and assignment (mode labels are display-only); workers use the daemon-posted final answer only.
 - Worker label edits via a **user** PAT still re-dispatch if the assignee label remains — forbid that in the pilot.
 
 ## Local validation
@@ -73,17 +73,36 @@ prompt and shared skill carry this rule. The daemon rejects recognizable label
 mutations when the runtime requests tool permission; arbitrary shell execution and
 externally supplied credentials are not comprehensively mediated by that guard.
 
-Write dispatch requires a current `ac/mode:write` label whose latest label event
-was authored by a GitHub `User`, without a bot login or GitHub App attribution.
-The dispatcher reads body-free [issue-event metadata](https://docs.github.com/en/rest/issues/events#list-issue-events)
-from GitHub before each grant. Bot/worker re-adds, missing attribution, and histories
-exceeding ten pages of 100 events never grant write access. An attribution read
-failure prevents dispatch. A human can remove and re-add the label to approve a
-new grant. The run records the approved mode before sending it to the daemon.
+Run mode comes only from control-plane database configuration: `KanbanBoard.defaultMode`
+defaults to `read`, and nullable `KanbanCard.mode` overrides it. A claim records
+`card.mode ?? board.defaultMode` in the run before dispatch, including fast-report races.
+`ac/mode:write` is display-only and never grants access, regardless of whether a
+human, PAT-backed User, bot, or App added it. No issue-event history is read.
 
-A closed or relabeled issue discovered after claiming ends only the database
-lease. It leaves the card non-ready for reconciliation and makes no GitHub label,
-state, or comment writes, so a human change survives and cannot trigger a retry.
+Until a human-authenticated board administration route exists, control-plane admin
+code may use `PgKanbanBoardRepo.setDefaultMode(orgId, boardId, userId, mode)` and
+`setCardMode(orgId, boardId, cardId, userId, modeOrNull)`. Callers must derive
+`userId` from human authentication, never worker input. Both methods require an
+organization owner in that board's organization; no daemon RPC or worker tool
+exposes them. Clearing a card override restores the board default for the next
+claim. Configuration edits do not upgrade an already active lease.
+
+A closed or relabeled issue discovered after claiming ends the lease and changes
+the database card in the same transaction: closed/completed becomes `done`,
+closed/not-planned becomes `archived`, one valid status is adopted, and conflicting,
+malformed, missing, or unavailable issue state becomes `triage`. No GitHub label,
+state, or comment writes occur. A later legal human `ready` edit is ingested by
+the graph doorbell or periodic mismatch recovery, then claimed as a fresh attempt.
+The M1 graph doorbell on this branch does not carry ordinary issue-label events;
+the periodic recovery also handles those edits without requiring a new webhook.
+
+Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`,
+or an unsuccessful/empty daemon token response. They never use stored human gh
+authentication. Runtime spawn strips GitHub token/PAT environment variables after
+all environment sources are merged. This does not prevent an unsandboxed worker
+from invoking a real binary or reading host credentials directly; database-only
+mode authority remains independent of that residual host access.
+
 A fenced heartbeat implicitly acknowledges an accepted dispatch and keeps the
 lease alive even when the original ACK write failed. Lease timestamps use the
 database clock; daemon reports and ACKs are fenced against the current daemon epoch.

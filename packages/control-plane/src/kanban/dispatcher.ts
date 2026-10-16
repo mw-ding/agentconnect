@@ -16,7 +16,13 @@ import type {
   KanbanRunEndResult,
   KanbanRunOutcomeValue
 } from '../persistence/ports.js'
-import { isDispatchableIssue, planStatusWrite, type KanbanStatus, type ObservedIssue } from './card-state.js'
+import {
+  isDispatchableIssue,
+  observedCardStatus,
+  planStatusWrite,
+  type KanbanStatus,
+  type ObservedIssue
+} from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
@@ -134,11 +140,29 @@ export class KanbanDispatcher {
   }
 
   async reconcileBoard(boardId: string): Promise<void> {
+    for (const card of await this.deps.repo.listMismatchedCards(boardId)) {
+      try {
+        await this.ingestCard(boardId, card.issueNumber)
+      } catch (err) {
+        this.deps.log.warn({ err, boardId, issueNumber: card.issueNumber }, 'kanban: mismatch recovery read failed')
+      }
+    }
     const leases = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
     })
     await Promise.allSettled(leases.map((lease) => this.dispatchLease(lease)))
+  }
+
+  // The graph/webhook doorbell and periodic mismatch recovery share the same body-free ingest.
+  async ingestCard(boardId: string, issueNumber: number): Promise<void> {
+    // Resolve addressing from the board, without minting a new lease.
+    const ref = await this.deps.repo.getBoardRef(boardId)
+    if (!ref) return
+    const repo = await this.repoRef(ref)
+    if (!repo) return
+    const observed = await this.deps.store.readCard(repo, issueNumber)
+    if (observed) await this.deps.repo.ingestStatus(boardId, issueNumber, observed)
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
@@ -199,19 +223,25 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_read_failed')
       return
     }
-    // GitHub is the system of record: a closed card or one a human relabeled is not dispatched; drift repair settles it.
+    // Preserve human changes in GitHub and release the DB card into its observed status.
     if (!observed || !isDispatchableIssue(observed)) {
       await this.deps.repo.endRun({
         leaseId: lease.leaseId,
         outcome: 'transient',
         reasonCode: 'github_state_mismatch',
         now: await this.deps.repo.now(),
-        plan: (card) => ({ ...card, countsAsFailure: false })
+        plan: (card) => ({
+          ...card,
+          status: observedCardStatus(observed),
+          cooldownUntil: null,
+          blockKind: null,
+          countsAsFailure: false
+        })
       })
       return
     }
-    const mode = observed.humanWriteMode ? 'write' : 'read'
-    if (!(await this.deps.repo.setMode(lease.leaseId, mode, lease.daemonEpoch))) return
+    const mode = lease.mode
+    if (!(await this.deps.repo.isCurrentLease(lease.leaseId, mode, lease.daemonEpoch))) return
     let reply: KanbanDispatchOk
     try {
       reply = await this.deps.send(lease.daemonId, {

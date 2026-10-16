@@ -9,7 +9,7 @@
  * Record types are lightweight, domain-facing shapes (NOT raw Prisma models) so
  * nothing above this layer imports `@prisma/client`.
  */
-import type { KanbanStatus } from '../kanban/card-state.js'
+import type { ObservedIssue, KanbanStatus } from '../kanban/card-state.js'
 import type { AccountingBoard, AccountingCard, OpenLeaseFacts, RunEndPlan } from '../kanban/run-accounting.js'
 import type {
   AuthReq,
@@ -5091,6 +5091,7 @@ export interface KanbanBoardRef {
 
 /** One lease the claim minted: the card is `running` in the CP and awaits the daemon's ack. */
 export interface KanbanClaimedLease extends KanbanBoardRef {
+  mode: 'read' | 'write'
   runId: string
   leaseId: string
   cardId: string
@@ -5164,8 +5165,12 @@ export interface KanbanDispatchRepo {
   claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
-  // Persist the approved mode before the worker can report a fast terminal outcome.
-  setMode(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
+  // Re-read cards parked by a pre-dispatch mismatch so later human edits can recover them.
+  getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
+  listMismatchedCards(boardId: string): Promise<Array<{ issueNumber: number }>>
+  ingestStatus(boardId: string, issueNumber: number, observed: ObservedIssue): Promise<void>
+  // Recheck the claim after the GitHub read, without changing its DB-selected mode.
+  isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
   // Accept only the open run with the current card revision, placement, mode, and daemon epoch.
   markAcked(leaseId: string, mode: 'read' | 'write', now: Date, epoch: bigint): Promise<boolean>
   /** End one open run and move its card, atomically and behind the lease fence. */

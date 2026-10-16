@@ -99,6 +99,14 @@ export function isDispatchableIssue(issue: ObservedIssue): boolean {
   )
 }
 
+// A mismatch releases the lease into the observed status without modifying GitHub.
+export function observedCardStatus(issue: ObservedIssue | null): KanbanStatus {
+  if (!issue) return 'triage'
+  if (issue.state === 'closed') return issue.stateReason === 'not_planned' ? 'archived' : 'done'
+  const { statuses, malformed } = parseStatusLabels(issue.labels)
+  return statuses.length === 1 && malformed.length === 0 ? statuses[0]! : 'triage'
+}
+
 /** Why a requested status is refused for this card, or undefined when it may apply. */
 export function refuseRequest(card: CardSnapshot, requested: KanbanStatus): 'leased' | 'illegal' | undefined {
   if (card.leased && !LEASED_HUMAN_STATUSES.has(requested)) return 'leased'

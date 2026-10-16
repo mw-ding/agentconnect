@@ -1783,7 +1783,7 @@ enum KanbanCompletionContract {
   pr_checks_green
 }
 
-// `write` only when the card carries `ac/mode:write`; a write run needs its own session worktree.
+// Mode comes only from board/card database configuration; write runs need their own session worktree.
 enum KanbanRunMode {
   read
   write
@@ -1817,6 +1817,7 @@ model KanbanBoard {
   failureLimit          Int                      @default(2)
   protocolRetryLimit    Int                      @default(3)
   blockRecurrenceLimit  Int                      @default(2)
+  defaultMode           KanbanRunMode            @default(read)
   completionContract    KanbanCompletionContract @default(close)
   enabled               Boolean                  @default(true)
   configRevision        BigInt                   @default(1)
@@ -1849,6 +1850,7 @@ model KanbanCard {
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?
+  mode                KanbanRunMode?
   status              KanbanCardStatus @default(triage)
   assigneeAgentId     String?          @db.Uuid
   priority            Int              @default(0)

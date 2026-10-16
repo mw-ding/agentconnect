@@ -2,7 +2,12 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
-import type { KanbanStatus } from '../../kanban/card-state.js'
+import {
+  parseStatusLabels,
+  planLabelReconcile,
+  type ObservedIssue,
+  type KanbanStatus
+} from '../../kanban/card-state.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import type { KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
@@ -24,11 +29,13 @@ interface BoardRow {
   orgId: string
   repoId: bigint
   repoFullName: string
+  defaultMode: 'read' | 'write'
   maxInProgress: number
   maxInProgressPerAgent: number
 }
 
 interface CandidateRow {
+  mode: 'read' | 'write' | null
   priority: number
   createdAt: Date
   id: string
@@ -91,7 +98,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return this.inTransaction(async (tx) => {
       // A concurrent claimer already holds this board: skip it rather than queue behind it.
       const [board] = await tx.$queryRaw<BoardRow[]>(Prisma.sql`
-        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent"
+        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode"
         FROM "kanban_board"
         WHERE "id" = ${boardId}::uuid AND "enabled"
         FOR UPDATE SKIP LOCKED
@@ -114,7 +121,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       let cursor: CandidateRow | undefined
       while (claimed.length < room) {
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
-        SELECT c."id", c."issueNumber", c."priority", c."createdAt", c."assigneeAgentId" AS "agentId", a."daemonId", d."sessionEpoch"
+        SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt", c."assigneeAgentId" AS "agentId", a."daemonId", d."sessionEpoch"
         FROM "kanban_card" c
         JOIN "agent" a ON a."id" = c."assigneeAgentId" AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
         JOIN "daemon" d ON d."id" = a."daemonId"
@@ -152,6 +159,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           })
           const run = await tx.kanbanRun.create({
             data: {
+              mode: card.mode ?? board.defaultMode,
               cardId: card.id,
               attempt,
               agentId: card.agentId,
@@ -169,6 +177,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             select: { githubSessionKey: true }
           })
           claimed.push({
+            mode: card.mode ?? board.defaultMode,
             runId: run.id,
             leaseId: run.leaseId,
             cardId: card.id,
@@ -197,17 +206,60 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return row!.now
   }
 
-  // Store mode before sending so a terminal report racing the ACK keeps the correct history.
-  async setMode(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
-    const rows = await this.db.$queryRaw<{ leaseId: string }[]>(Prisma.sql`
-      UPDATE "kanban_run" r SET "mode" = ${mode}::"KanbanRunMode"
-      FROM "kanban_card" c, "daemon" d
-      WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL
-        AND c."id" = r."cardId" AND c."dispatchRevision" = r."dispatchRevision"
-        AND c."assigneeAgentId" = r."agentId"
-        AND d."id" = r."daemonId" AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
-        AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId")
-      RETURNING r."leaseId"
+  async getBoardRef(boardId: string) {
+    const board = await this.db.kanbanBoard.findFirst({
+      where: { id: boardId, enabled: true },
+      select: { id: true, orgId: true, repoId: true, repoFullName: true }
+    })
+    return board
+      ? { boardId: board.id, orgId: OrgId(board.orgId), repoId: board.repoId, repoFullName: board.repoFullName }
+      : null
+  }
+
+  async listMismatchedCards(boardId: string): Promise<Array<{ issueNumber: number }>> {
+    return this.db.$queryRaw<Array<{ issueNumber: number }>>(Prisma.sql`
+      SELECT c."issueNumber" FROM "kanban_card" c
+      JOIN LATERAL (
+        SELECT "reasonCode", "endedAt" FROM "kanban_run"
+        WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
+      ) latest ON latest."reasonCode" = 'github_state_mismatch' AND latest."endedAt" IS NOT NULL
+      WHERE c."boardId" = ${boardId}::uuid AND c."status" <> 'ready'
+    `)
+  }
+
+  async ingestStatus(boardId: string, issueNumber: number, observed: ObservedIssue): Promise<void> {
+    const { statuses, malformed } = parseStatusLabels(observed.labels)
+    if (observed.state !== 'open' || malformed.length || statuses.length !== 1 || statuses[0] === 'running') return
+    await this.inTransaction(async (tx) => {
+      const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus }>>(Prisma.sql`
+        SELECT "id", "status" FROM "kanban_card"
+        WHERE "boardId" = ${boardId}::uuid AND "issueNumber" = ${issueNumber} FOR UPDATE
+      `)
+      if (!card) return
+      const latest = await tx.kanbanRun.findFirst({
+        where: { cardId: card.id },
+        orderBy: { attempt: 'desc' },
+        select: { endedAt: true, reasonCode: true }
+      })
+      if (!latest?.endedAt || latest.reasonCode !== 'github_state_mismatch') return
+      const plan = planLabelReconcile({ status: card.status, leased: false }, observed)
+      if (plan.status === card.status) return
+      await tx.kanbanCard.update({
+        where: { id: card.id },
+        data: { status: plan.status, stateRevision: { increment: 1 }, cooldownUntil: null, blockKind: null }
+      })
+    })
+  }
+
+  async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
+    const rows = await this.db.$queryRaw<Array<{ leaseId: string }>>(Prisma.sql`
+      SELECT r."leaseId" FROM "kanban_run" r
+      JOIN "kanban_card" c ON c."id" = r."cardId"
+      JOIN "daemon" d ON d."id" = r."daemonId"
+      JOIN "agent" a ON a."id" = r."agentId" AND a."daemonId" = r."daemonId"
+      WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL AND r."mode" = ${mode}::"KanbanRunMode"
+        AND c."dispatchRevision" = r."dispatchRevision" AND c."assigneeAgentId" = r."agentId"
+        AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
     `)
     return rows.length === 1
   }

@@ -4,6 +4,8 @@ Namespace prefix: `ac/` (AgentConnect Kanban). Create these as GitHub labels on 
 
 ## Full label catalog
 
+`ac/mode:write` is display-only. M2 run mode comes only from control-plane board default (`read`) plus a nullable card override, administered by a human through the control plane. Labels and label history never grant write.
+
 Workers must never add, remove, rename, or edit any `ac/*` label through `gh`, APIs, scripts, or tools. This includes status, mode, and assignment labels. Ask a human to change labels.
 
 ### Status (exclusive — keep exactly one `ac/status:*` on a card)

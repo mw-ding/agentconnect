@@ -2,13 +2,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { KanbanDispatch, KanbanDispatchOk, KanbanReport } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
-import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
 import type { CardIssue, KanbanRepoRef } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
+import { PgKanbanBoardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { OrgId } from '../../src/domain/ids.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -19,7 +20,6 @@ const T0 = Date.parse('2026-10-15T12:00:00.000Z')
 
 class FakeStore {
   readonly writes: LabelPlan[] = []
-  readonly botWriteGrants = new Set<number>()
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   async readCard(_repo: KanbanRepoRef, n: number): Promise<CardIssue | null> {
     const i = this.issues.get(n)
@@ -29,8 +29,7 @@ class FakeStore {
           nodeId: `I_${n}`,
           number: n,
           ...i,
-          labels: [...i.labels],
-          humanWriteMode: i.labels.includes(WRITE_MODE_LABEL) && !this.botWriteGrants.has(n)
+          labels: [...i.labels]
         }
       : null
   }
@@ -90,11 +89,11 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
     log: { debug: () => {}, info: () => {}, warn: () => {} }
   })
   let issue = 1
-  const addCard = async (labels: string[] = ['ac/status:ready']) => {
+  const addCard = async (labels: string[] = ['ac/status:ready'], mode: 'read' | 'write' | null = null) => {
     const n = issue++
     store.issues.set(n, { labels, state: 'open', stateReason: null })
     return prisma.kanbanCard.create({
-      data: { boardId: board.id, issueId: BigInt(n), issueNumber: n, status: 'ready', assigneeAgentId: A1 }
+      data: { mode, boardId: board.id, issueId: BigInt(n), issueNumber: n, status: 'ready', assigneeAgentId: A1 }
     })
   }
   const reportFor = (d: KanbanDispatch, patch: Partial<KanbanReport> = {}): KanbanReport => ({
@@ -115,7 +114,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
 describe('KanbanDispatcher — dispatch (real Postgres)', () => {
   it('sends a body-free lease, records the ack, and labels the card running', async () => {
     const h = await harness()
-    const c = await h.addCard(['ac/status:ready', WRITE_MODE_LABEL, 'bug'])
+    const c = await h.addCard(['ac/status:ready', WRITE_MODE_LABEL, 'bug'], 'write')
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
 
@@ -143,7 +142,7 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect(h.store.issues.get(c.issueNumber)?.labels).toEqual([WRITE_MODE_LABEL, 'bug', 'ac/status:running'])
   })
 
-  it('defaults to a read run without the write label', async () => {
+  it('defaults to a read run without DB write configuration', async () => {
     const h = await harness()
     await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
@@ -187,7 +186,7 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
         reason: d.mode === 'write' ? 'write_needs_worktree' : 'busy'
       })
     })
-    const write = await h.addCard(['ac/status:ready', WRITE_MODE_LABEL])
+    const write = await h.addCard(['ac/status:ready', WRITE_MODE_LABEL], 'write')
     const read = await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
@@ -221,30 +220,32 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect((await prisma.kanbanRun.findFirstOrThrow()).reasonCode).toBe('dispatch_failed')
   })
 
-  it.each([['ac/status:blocked'], ['ac/status:ready', 'ac/status:blocked']])(
-    'releases only the DB claim when a human moved the card (%j)',
-    async (...labels) => {
-      const h = await harness()
-      const c = await h.addCard([...labels, 'human-label'])
-      await h.dispatcher.reconcileBoard(h.board.id)
-      await h.dispatcher.settle()
-      h.clock.advance(120_000)
-      await h.dispatcher.tick()
-      await h.dispatcher.settle()
-      expect(h.sent).toHaveLength(0)
-      expect((await h.card(c.id)).status).toBe('running')
-      expect(await prisma.kanbanRun.findFirstOrThrow()).toMatchObject({
-        reasonCode: 'github_state_mismatch',
-        endedAt: new Date(T0)
-      })
-      expect(await prisma.kanbanRun.count()).toBe(1)
-      expect(h.store.writes).toEqual([])
-      expect(h.store.issues.get(c.issueNumber)).toMatchObject({
-        labels: [...labels, 'human-label'],
-        state: 'open'
-      })
-    }
-  )
+  it.each([
+    { labels: ['ac/status:blocked'], status: 'blocked' },
+    { labels: ['ac/status:ready', 'ac/status:blocked'], status: 'triage' }
+  ])('recovers a mismatch ($status) after a human ready transition', async ({ labels, status }) => {
+    const h = await harness()
+    const c = await h.addCard([...labels, 'human-label'])
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent).toHaveLength(0)
+    expect((await h.card(c.id)).status).toBe(status)
+    expect(await prisma.kanbanRun.findFirstOrThrow()).toMatchObject({
+      reasonCode: 'github_state_mismatch',
+      endedAt: new Date(T0)
+    })
+    expect(await prisma.kanbanRun.count({ where: { endedAt: null } })).toBe(0)
+    expect(h.store.writes).toEqual([])
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual([...labels, 'human-label'])
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready', 'human-label']
+    await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
+    expect((await h.card(c.id)).status).toBe('ready')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
+    expect((await h.card(c.id)).status).toBe('running')
+  })
 })
 
 describe('KanbanDispatcher — failure accounting through reports (real Postgres)', () => {
@@ -391,18 +392,21 @@ it('records write mode when a fast worker reports before its dispatch ACK arrive
       return { leaseId: d.leaseId, accepted: true }
     }
   })
-  await h.addCard(['ac/status:ready', WRITE_MODE_LABEL])
+  await h.addCard(['ac/status:ready', WRITE_MODE_LABEL], 'write')
   await h.dispatcher.reconcileBoard(h.board.id)
   await h.dispatcher.settle()
   expect(await h.run(h.sent[0]!.d.leaseId)).toMatchObject({ mode: 'write', outcome: 'completed' })
 })
 
-it('leaves a closed issue and its labels untouched after releasing a pre-dispatch mismatch', async () => {
+it.each([
+  ['completed', 'done'],
+  ['not_planned', 'archived']
+])('preserves closed issue %s and reconciles DB to %s', async (reason, status) => {
   const h = await harness()
   const c = await h.addCard(['ac/status:ready', 'human-label'])
   const issue = h.store.issues.get(c.issueNumber)!
   issue.state = 'closed'
-  issue.stateReason = 'not_planned'
+  issue.stateReason = reason
   await h.dispatcher.tick()
   await h.dispatcher.settle()
   h.clock.advance(5 * 60_000)
@@ -410,10 +414,23 @@ it('leaves a closed issue and its labels untouched after releasing a pre-dispatc
   await h.dispatcher.settle()
   expect(h.sent).toEqual([])
   expect(h.store.writes).toEqual([])
-  expect(issue).toEqual({ labels: ['ac/status:ready', 'human-label'], state: 'closed', stateReason: 'not_planned' })
-  expect((await h.card(c.id)).status).toBe('running')
+  expect(issue).toEqual({ labels: ['ac/status:ready', 'human-label'], state: 'closed', stateReason: reason })
+  expect((await h.card(c.id)).status).toBe(status)
   expect(await prisma.kanbanRun.count({ where: { endedAt: null } })).toBe(0)
   expect(await prisma.kanbanRun.count()).toBe(1)
+  // Reopening an archived card follows the existing archived -> triage -> ready transitions.
+  issue.state = 'open'
+  issue.stateReason = null
+  issue.labels = ['ac/status:triage', 'human-label']
+  await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
+  expect((await h.card(c.id)).status).toBe('triage')
+  issue.labels = ['ac/status:ready', 'human-label']
+  await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
+  expect((await h.card(c.id)).status).toBe('ready')
+  expect(h.store.writes).toEqual([])
+  await h.dispatcher.tick()
+  await h.dispatcher.settle()
+  expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
 })
 
 it('keeps an accepted lease alive after its ACK write fails, without reaping or redispatching', async () => {
@@ -444,13 +461,12 @@ it('keeps an accepted lease alive after its ACK write fails, without reaping or 
   expect(await prisma.kanbanRun.count()).toBe(1)
 })
 
-it('ignores a worker-added write label on the next lease after a transient report', async () => {
+it('ignores a User/PAT-added write label on the next lease after a transient report', async () => {
   const h = await harness()
   const c = await h.addCard()
   await h.dispatcher.reconcileBoard(h.board.id)
   await h.dispatcher.settle()
   h.store.issues.get(c.issueNumber)!.labels.push(WRITE_MODE_LABEL)
-  h.store.botWriteGrants.add(c.issueNumber)
   await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'transient' }))
   await h.dispatcher.settle()
   h.clock.advance(61_000)
@@ -469,4 +485,42 @@ it('rejects an old connection report after reauthentication and accepts the curr
   expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
   expect((await h.dispatcher.onReport(D1, 5, h.reportFor(d))).accepted).toBe(true)
   await h.dispatcher.settle()
+})
+
+it('uses a board default and lets a nullable card override restrict or inherit it', async () => {
+  const h = await harness()
+  const admin = new PgKanbanBoardRepo(prisma)
+  expect(await admin.setDefaultMode(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID, 'write')).toBe(true)
+  const inherited = await h.addCard()
+  const restricted = await h.addCard(['ac/status:ready', WRITE_MODE_LABEL], 'read')
+  await h.dispatcher.reconcileBoard(h.board.id)
+  expect(h.sent.find(({ d }) => d.cardId === inherited.id)?.d.mode).toBe('write')
+  expect(h.sent.find(({ d }) => d.cardId === restricted.id)?.d.mode).toBe('read')
+})
+
+it('restricts mode administration to an owner in the board org and supports clearing card overrides', async () => {
+  const h = await harness()
+  const c = await h.addCard()
+  const admin = new PgKanbanBoardRepo(prisma)
+  expect(await admin.setDefaultMode(DEFAULT_ORG_ID, h.board.id, 'worker-id', 'write')).toBe(false)
+  expect(await admin.setCardMode('other-org', h.board.id, c.id, DEFAULT_OWNER_ID, 'write')).toBe(false)
+  expect(await admin.setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, 'worker-id', 'write')).toBe(false)
+  expect((await h.card(c.id)).mode).toBeNull()
+  expect(await admin.setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'write')).toBe(true)
+  expect((await h.card(c.id)).mode).toBe('write')
+  expect(await admin.setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, null)).toBe(true)
+  expect((await h.card(c.id)).mode).toBeNull()
+})
+
+it('periodically recovers a blocked mismatch when a ready webhook was missed', async () => {
+  const h = await harness()
+  const c = await h.addCard(['ac/status:blocked'])
+  await h.dispatcher.tick()
+  expect((await h.card(c.id)).status).toBe('blocked')
+  expect(h.store.writes).toEqual([])
+  h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+  await h.dispatcher.tick()
+  await h.dispatcher.settle()
+  expect(h.sent).toHaveLength(1)
+  expect(h.sent[0]?.d.attempt).toBe(2)
 })

@@ -13,7 +13,7 @@ AgentConnect Kanban P0 uses **GitHub issue labels** on a board repo. Humans move
 | ----------------- | ------------------------------------------------------------------------------------------------------- |
 | `ac/status:*`     | **One at a time** — column / lifecycle for the card                                                     |
 | `ac/agent:<slug>` | **One worker per card** — must match the worker agent’s slug and that agent’s GitHub hook `labelFilter` |
-| `ac/mode:write`   | Optional (upcoming) — reserved for write-capable runs; mention only if the org already uses it          |
+| `ac/mode:write`   | Display-only; never grants write access. Mode comes only from board/card database config                |
 
 Full catalog, transitions, and comment templates: [references/label-protocol.md](references/label-protocol.md).
 
@@ -29,6 +29,14 @@ Full catalog, transitions, and comment templates: [references/label-protocol.md]
 | `ac/status:review`   | Work done; human review requested                        |
 | `ac/status:done`     | Completed — human should close as completed              |
 | `ac/status:archived` | Won’t do / obsolete — human should close as not planned  |
+
+## M2 mode authority
+
+Run mode is `card.mode ?? board.defaultMode` from control-plane database configuration.
+The board defaults to `read`; a null card override inherits it. Only human-authenticated
+control-plane administration may change this config. Neither issue content nor any
+label or label actor (including a User with a PAT) can grant write. Ask the board owner
+to change configuration when write is required. Workers must still never edit any `ac/*` label.
 
 ## Human path (P0)
 

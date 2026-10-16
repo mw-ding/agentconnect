@@ -1,26 +1,4 @@
-/**
- * run/bin/gh — the gh wrapper shim (agent-multi-repo-authorization.md decision
- * 4, issue #457).
- *
- * `gh` has no credential-helper hook: it reads a STATIC `GH_TOKEN` fixed at
- * process spawn, which is why P2.5's injected token went stale after ≤1h and
- * could only ever name the workspace repo. The daemon prepends `run/bin` to
- * the agent runtime's PATH so every `gh …` the agent runs lands here first;
- * the wrapper resolves the TARGET repo (explicit argv → GH_REPO → cwd origin),
- * pulls that repo's fresh token through gitcred.sock (`agentconnect gh-token`,
- * same socket + cache as the git credential helper) and exec's the real gh
- * with GH_TOKEN set. Per-invocation fresh + per-repo correct.
- *
- * Precedence: a USER-supplied GH_TOKEN must win, so the wrapper defers whenever
- * one is already set. AgentConnect tokens are fetched only for this invocation;
- * they are no longer injected into the long-lived ACP runtime environment.
- * When the daemon can't serve a token (repo unauthorized, CP down) the wrapper
- * prints the daemon's actionable reason and runs the real gh without one.
- *
- * The script is SECRET-FREE (paths + agent id only) and regenerated every
- * daemon boot, like `git-credential-helper.sh`. Tokens transit a shell
- * variable and the exec'd process env — never argv, never disk.
- */
+// Agent gh invocations use only fresh daemon-issued tokens and never fall back to human credentials.
 import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -69,13 +47,16 @@ if [ -z "$REAL_GH" ]; then
   exit 127
 fi
 
-# A user-configured GH_TOKEN always wins.
-if [ -n "$GH_TOKEN" ]; then
-  exec "$REAL_GH" "$@"
+# Only the daemon may supply invocation-scoped GitHub credentials.
+if [ -n "$GH_TOKEN$GITHUB_TOKEN$GH_ENTERPRISE_TOKEN$GITHUB_ENTERPRISE_TOKEN" ]; then
+  echo "agentconnect: refusing inherited GitHub token; agent gh requires daemon credentials" >&2
+  exit 1
 fi
 if [ -z "$AC_AGENT_ID" ]; then
-  exec "$REAL_GH" "$@"
+  echo "agentconnect: AC_AGENT_ID is required for agent gh credentials" >&2
+  exit 1
 fi
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
 # Target repo: -R/--repo argv (all spellings, last wins — matches gh's pflag),
 # then a canonical positional repo on gh repo commands that target an existing
@@ -132,19 +113,16 @@ if [ -z "$_REPO" ]; then
   _REPO=$(git remote get-url origin 2>/dev/null || true)
 fi
 
-# Fresh token from the daemon (stdout = token only; stderr passes through so
-# the agent can read WHY a repo was refused). Exit 2 = "not ours" (non-github
-# host) — run the real gh untouched.
+# Daemon stdout is token-only; errors never permit stored gh authentication.
 _TOKEN=$(AGENTCONNECT_ROOT=${q(root)} ${cli} gh-token "$AC_AGENT_ID" "$_REPO")
 _RC=$?
-if [ "$_RC" -eq 2 ]; then
-  exec "$REAL_GH" "$@"
+if [ "$_RC" -ne 0 ] || [ -z "$_TOKEN" ]; then
+  echo "agentconnect: daemon could not provide GitHub credentials; refusing stored gh authentication" >&2
+  exit 1
 fi
-if [ -n "$_TOKEN" ]; then
-  GH_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
-fi
-# Daemon couldn't serve one — let gh use any of its own configured auth.
-exec "$REAL_GH" "$@"
+# Cover both gh host token selectors so host flags cannot fall back to stored enterprise credentials.
+GH_TOKEN="$_TOKEN" GH_ENTERPRISE_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
+
 `
   writeFileSync(join(dir, 'gh'), body, { mode: 0o755 })
   return dir
