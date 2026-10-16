@@ -35,6 +35,7 @@ import { handleSessionActivity } from './event-session-activity.js'
 import { handleSessionPurged } from './event-session-purged.js'
 import { handleGitCredRequest } from './gitcred.js'
 import { handleHookStart } from './hook-start.js'
+import { handleKanbanLeaseHeartbeat, handleKanbanReport } from './kanban.js'
 import { handleGithubReviewAuthorize } from './github-review-authorize.js'
 import { handleGithubReviewResult } from './github-review-result.js'
 import {
@@ -72,6 +73,8 @@ export class FrameRouter {
       'hook/start': handleHookStart,
       'github/review-authorize': handleGithubReviewAuthorize,
       'github/review-result': handleGithubReviewResult,
+      'kanban/lease-heartbeat': handleKanbanLeaseHeartbeat,
+      'kanban/report': handleKanbanReport,
       'channel/agents': handleChannelAgents,
       'session/child-status': handleChildSessionStatus,
       'event/session': handleEventSession,
@@ -114,6 +117,8 @@ export {
   handleHookStart,
   handleGithubReviewAuthorize,
   handleGithubReviewResult,
+  handleKanbanLeaseHeartbeat,
+  handleKanbanReport,
   handleChannelAgents,
   handleChildSessionStatus,
   handleEventSession,

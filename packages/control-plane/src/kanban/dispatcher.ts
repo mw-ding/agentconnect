@@ -1,0 +1,300 @@
+// Kanban dispatcher (issue #2 M2). Why push + central claim (D2): one Postgres SKIP LOCKED claim gives atomic single assignment,
+// board/agent caps, and a leaseId + dispatchRevision fence for free; the CP sends only ids (D3) and the daemon runs the turn.
+// Liveness is daemon-derived heartbeats, never the model's memory; a stale lease is reclaimed without counting a failure, and
+// every lease ends through one fenced write, so a superseded run's late report or heartbeat can never move a card.
+import type {
+  KanbanDispatch,
+  KanbanDispatchOk,
+  KanbanDispatchRefusal,
+  KanbanLeaseBeat,
+  KanbanReport,
+  KanbanReportOk
+} from '@agentconnect.md/protocol'
+import type { Clock, TimerHandle } from '../domain/clock.js'
+import type {
+  GithubInstallationRepo,
+  KanbanBoardRef,
+  KanbanClaimedLease,
+  KanbanDispatchRepo,
+  KanbanRunEndResult,
+  KanbanRunOutcomeValue
+} from '../persistence/ports.js'
+import { planStatusWrite, statusLabel, type KanbanStatus, type ObservedIssue } from './card-state.js'
+import type { CardStore, KanbanRepoRef } from './card-store.js'
+import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
+
+/** The label that opts a card into a write run; everything else is read-only. */
+export const WRITE_MODE_LABEL = 'ac/mode:write'
+
+/** Refusals that will not fix themselves on retry: route to triage as a capability block. */
+const CAPABILITY_REFUSALS: ReadonlySet<KanbanDispatchRefusal> = new Set(['no_agent', 'write_needs_worktree'])
+
+export interface KanbanDispatcherLog {
+  debug(obj: unknown, msg?: string): void
+  info(obj: unknown, msg?: string): void
+  warn(obj: unknown, msg?: string): void
+}
+
+export interface KanbanDispatcherDeps {
+  repo: KanbanDispatchRepo
+  installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
+  store: Pick<CardStore, 'readCard' | 'applyPlan'>
+  /** The daemon's live control connection; throws when it is gone. */
+  send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
+  isDaemonLive(daemonId: string): boolean
+  clock: Clock
+  log: KanbanDispatcherLog
+  /** Reconciler period when no doorbell rings (design §4: 60s). */
+  tickMs?: number
+  unackedGraceMs?: number
+  epochGraceMs?: number
+}
+
+const DEFAULT_TICK_MS = 60_000
+const DEFAULT_UNACKED_GRACE_MS = 2 * 60_000
+const DEFAULT_EPOCH_GRACE_MS = 3 * 60_000
+const REAP_BATCH = 500
+
+export class KanbanDispatcher {
+  private timer: TimerHandle | undefined
+  private stopped = false
+  private readonly running = new Map<string, Promise<void>>()
+  private readonly rerun = new Set<string>()
+  private readonly background = new Set<Promise<unknown>>()
+
+  constructor(private readonly deps: KanbanDispatcherDeps) {}
+
+  start(): void {
+    this.stopped = false
+    this.arm()
+  }
+
+  stop(): void {
+    this.stopped = true
+    if (this.timer !== undefined) this.deps.clock.clearTimeout(this.timer)
+    this.timer = undefined
+  }
+
+  /** Await in-flight reconciles and label writes (tests and shutdown). */
+  async settle(): Promise<void> {
+    while (this.running.size > 0 || this.background.size > 0) {
+      await Promise.allSettled([...this.running.values(), ...this.background])
+    }
+  }
+
+  /** Doorbell: reconcile one board now, single-flight with one trailing rerun. */
+  poke(boardId: string): void {
+    if (this.stopped) return
+    if (this.running.has(boardId)) {
+      this.rerun.add(boardId)
+      return
+    }
+    const run = async (): Promise<void> => {
+      do {
+        this.rerun.delete(boardId)
+        await this.reconcileBoard(boardId)
+      } while (this.rerun.has(boardId) && !this.stopped)
+    }
+    const pending = run()
+      .catch((err: unknown) => this.deps.log.warn({ err, boardId }, 'kanban: board reconcile failed'))
+      .finally(() => this.running.delete(boardId))
+    this.running.set(boardId, pending)
+  }
+
+  /** One reconciler pass: reap stale leases first so their slots are claimable, then claim every board. */
+  async tick(): Promise<void> {
+    await this.reap()
+    for (const boardId of await this.deps.repo.listEnabledBoardIds()) this.poke(boardId)
+    await Promise.allSettled([...this.running.values()])
+  }
+
+  /** Reclaim every stale open lease to `ready`, counting no failure; returns how many were reclaimed. */
+  async reap(): Promise<number> {
+    const now = this.now()
+    const opts = {
+      unackedGraceMs: this.deps.unackedGraceMs ?? DEFAULT_UNACKED_GRACE_MS,
+      epochGraceMs: this.deps.epochGraceMs ?? DEFAULT_EPOCH_GRACE_MS
+    }
+    let reclaimed = 0
+    for (const lease of await this.deps.repo.listOpenLeases(REAP_BATCH)) {
+      const reason = staleLeaseReason(lease, now, opts)
+      if (!reason) continue
+      const result = await this.endRun(lease.leaseId, { outcome: 'reclaimed' }, `reclaimed:${reason}`)
+      if (result.accepted) {
+        reclaimed += 1
+        this.deps.log.info({ leaseId: lease.leaseId, reason }, 'kanban: reclaimed stale lease')
+      }
+    }
+    return reclaimed
+  }
+
+  async reconcileBoard(boardId: string): Promise<void> {
+    const leases = await this.deps.repo.claim(boardId, {
+      now: this.now(),
+      isDaemonLive: (id) => this.deps.isDaemonLive(id)
+    })
+    await Promise.allSettled(leases.map((lease) => this.dispatchLease(lease)))
+  }
+
+  /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
+  onHeartbeat(daemonId: string, epoch: number, beats: KanbanLeaseBeat[]): Promise<string[]> {
+    return this.deps.repo.heartbeat(
+      daemonId,
+      BigInt(epoch),
+      beats.map((b) => ({
+        leaseId: b.leaseId,
+        cardId: b.cardId,
+        dispatchRevision: BigInt(b.dispatchRevision),
+        ...(b.sessionId ? { sessionId: b.sessionId } : {})
+      })),
+      this.now()
+    )
+  }
+
+  /** `kanban/report`: one fenced write; a superseded run is answered as data so the daemon drops its outbox row. */
+  async onReport(daemonId: string, report: KanbanReport): Promise<KanbanReportOk> {
+    const end: KanbanRunEnd =
+      report.outcome === 'blocked'
+        ? { outcome: 'blocked', blockKind: report.blockKind ?? 'transient' }
+        : { outcome: report.outcome }
+    const result = await this.endRun(report.leaseId, end, report.reasonCode ?? null, {
+      fence: {
+        daemonId,
+        cardId: report.cardId,
+        attempt: report.attempt,
+        dispatchRevision: BigInt(report.dispatchRevision)
+      },
+      ...(report.sessionId ? { sessionId: report.sessionId } : {})
+    })
+    if (!result.accepted) return { leaseId: report.leaseId, accepted: false, reason: 'superseded' }
+    this.deps.log.info(
+      { leaseId: report.leaseId, outcome: report.outcome, to: result.card.to, tripped: result.plan.tripped },
+      'kanban: run reported'
+    )
+    // The slot is free again.
+    this.poke(result.card.boardId)
+    return { leaseId: report.leaseId, accepted: true }
+  }
+
+  private async dispatchLease(lease: KanbanClaimedLease): Promise<void> {
+    const repo = await this.repoRef(lease)
+    if (!repo) {
+      await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_installation_unavailable')
+      return
+    }
+    let observed: ObservedIssue | null
+    try {
+      observed = await this.deps.store.readCard(repo, lease.issueNumber)
+    } catch (err) {
+      this.deps.log.warn({ err, leaseId: lease.leaseId }, 'kanban: card read failed before dispatch')
+      await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_read_failed')
+      return
+    }
+    // GitHub is the system of record: a closed card or one a human relabeled is not dispatched; drift repair settles it.
+    if (!observed || observed.state !== 'open' || !hasDispatchableLabel(observed)) {
+      await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_state_mismatch')
+      return
+    }
+    const mode = observed.labels.includes(WRITE_MODE_LABEL) ? 'write' : 'read'
+    let reply: KanbanDispatchOk
+    try {
+      reply = await this.deps.send(lease.daemonId, {
+        boardId: lease.boardId,
+        cardId: lease.cardId,
+        agentId: lease.agentId,
+        repoId: lease.repoId.toString(),
+        repoFullName: lease.repoFullName,
+        issueNumber: lease.issueNumber,
+        leaseId: lease.leaseId,
+        attempt: lease.attempt,
+        dispatchRevision: lease.dispatchRevision.toString(),
+        sessionKeyPrefix: lease.sessionKeyPrefix,
+        mode
+      })
+    } catch (err) {
+      // Nack or timeout → ready with a cooldown; if the daemon did start, the fence rejects that run's writes.
+      this.deps.log.warn({ err, leaseId: lease.leaseId }, 'kanban: dispatch failed')
+      await this.endRun(lease.leaseId, { outcome: 'transient' }, 'dispatch_failed')
+      return
+    }
+    if (!reply.accepted) {
+      const end: KanbanRunEnd = CAPABILITY_REFUSALS.has(reply.reason)
+        ? { outcome: 'blocked', blockKind: 'capability' }
+        : { outcome: 'transient' }
+      this.deps.log.info({ leaseId: lease.leaseId, reason: reply.reason }, 'kanban: dispatch refused')
+      await this.endRun(lease.leaseId, end, `dispatch_refused:${reply.reason}`)
+      return
+    }
+    if (!(await this.deps.repo.markAcked(lease.leaseId, mode, this.now()))) return
+    this.writeStatus(lease, repo, 'running', observed)
+  }
+
+  private async endRun(
+    leaseId: string,
+    end: KanbanRunEnd,
+    reasonCode: string | null,
+    extra: { fence?: Parameters<KanbanDispatchRepo['endRun']>[0]['fence']; sessionId?: string } = {}
+  ): Promise<KanbanRunEndResult> {
+    const now = this.now()
+    const outcome: KanbanRunOutcomeValue = end.outcome
+    const result = await this.deps.repo.endRun({
+      leaseId,
+      outcome,
+      reasonCode,
+      now,
+      ...extra,
+      plan: (card, board) => planRunEnd(card, board, end, now)
+    })
+    if (result.accepted && result.card.from !== result.card.to) {
+      const repo = await this.repoRef(result.card)
+      if (repo) this.writeStatus(result.card, repo, result.card.to)
+    }
+    return result
+  }
+
+  /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
+  private writeStatus(
+    card: { issueNumber: number; cardId: string },
+    repo: KanbanRepoRef,
+    status: KanbanStatus,
+    observed?: ObservedIssue
+  ): void {
+    const task = (async () => {
+      const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
+      if (!current) return
+      await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
+    })()
+      .catch((err: unknown) =>
+        this.deps.log.warn({ err, cardId: card.cardId, status }, 'kanban: status label write failed')
+      )
+      .finally(() => this.background.delete(task))
+    this.background.add(task)
+  }
+
+  /** The installation is resolved live from the board's org and repo owner, never trusted from a frame. */
+  private async repoRef(board: KanbanBoardRef): Promise<KanbanRepoRef | null> {
+    const owner = board.repoFullName.split('/', 1)[0]
+    if (!owner) return null
+    const installation = await this.deps.installations.liveByOrgAndAccount(board.orgId, owner)
+    if (!installation || installation.revokedAt || installation.suspendedAt) return null
+    return { installationId: installation.installationId, repoId: board.repoId, repoFullName: board.repoFullName }
+  }
+
+  private arm(): void {
+    if (this.stopped) return
+    this.timer = this.deps.clock.setTimeout(() => {
+      void this.tick()
+        .catch((err: unknown) => this.deps.log.warn({ err }, 'kanban: reconciler tick failed'))
+        .finally(() => this.arm())
+    }, this.deps.tickMs ?? DEFAULT_TICK_MS)
+  }
+
+  private now(): Date {
+    return new Date(this.deps.clock.now())
+  }
+}
+
+/** The claimed card should still read `ready` (or our own `running` from a lost ack) on GitHub. */
+function hasDispatchableLabel(observed: ObservedIssue): boolean {
+  return observed.labels.includes(statusLabel('ready')) || observed.labels.includes(statusLabel('running'))
+}

@@ -33,6 +33,7 @@ import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
+import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
 import { type Clock, systemClock } from './domain/clock.js'
@@ -102,6 +103,7 @@ import {
   PgHookRepo,
   PgHookSecretStore,
   PgKanbanBoardRepo,
+  PgKanbanDispatchRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -367,6 +369,7 @@ export function buildContainer(
     hook: new PgHookRepo(prisma),
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
     kanbanBoard: new PgKanbanBoardRepo(prisma),
+    kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Under WAITLIST_MODE, JIT signup does NOT mint a personal org — that happens
@@ -854,17 +857,38 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke; the reconcile seam is a stub in M1.
-  const kanbanGraphDoorbell = github
+  const kanbanCardStore = github ? new GithubCardStore({ tokens: github.tokens }) : undefined
+
+  // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
+  const kanbanDispatcher = kanbanCardStore
+    ? new KanbanDispatcher({
+        repo: repos.kanbanDispatch,
+        installations: repos.githubInstallation,
+        store: kanbanCardStore,
+        send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
+        isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
+        clock,
+        log: {
+          debug: (o, m) => http.log.debug(o, m),
+          info: (o, m) => http.log.info(o, m),
+          warn: (o, m) => http.log.warn(o, m)
+        }
+      })
+    : undefined
+
+  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke, then rings the board's dispatcher.
+  const kanbanGraphDoorbell = kanbanCardStore
     ? new KanbanGraphDoorbell({
         boards: repos.kanbanBoard,
         installations: repos.githubInstallation,
-        store: new GithubCardStore({ tokens: github.tokens }),
-        onGraph: (board, issueNumber, graph) =>
+        store: kanbanCardStore,
+        onGraph: (board, issueNumber, graph) => {
           http.log.debug(
             { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
             'kanban: graph re-read'
-          ),
+          )
+          kanbanDispatcher?.poke(board.id)
+        },
         log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
       })
     : undefined
@@ -1342,6 +1366,7 @@ export function buildContainer(
     ...(github ? { github } : {}),
     ...(githubReviewBroker ? { githubReviewBroker } : {}),
     ...(githubRunCoordinator ? { githubRunCoordinator } : {}),
+    ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
     relayRoster: () => relayRoster.entries(),
     clock,
     config: {
@@ -1664,6 +1689,7 @@ export function buildContainer(
       webchatMcpOperationReaper.start()
       githubRunReporter?.start()
       hookRedeliveryReconciler?.start()
+      kanbanDispatcher?.start()
       for (const reaper of pendingInstallReapers) reaper.start()
       relaySweeper.start()
       sessionAccessWarmer.start()
@@ -1681,6 +1707,7 @@ export function buildContainer(
       hookRedeliveryReconciler?.stop()
       installationDoorbell?.stop()
       kanbanGraphDoorbell?.stop()
+      kanbanDispatcher?.stop()
       for (const reaper of pendingInstallReapers) reaper.stop()
       relaySweeper.stop()
       sessionAccessWarmer.stop()
@@ -1692,7 +1719,8 @@ export function buildContainer(
         visibilityPush.settle(),
         sessionAccessWarmer.settle(),
         ...(installationDoorbell ? [installationDoorbell.settle()] : []),
-        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : [])
+        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : []),
+        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : [])
       ])
       await rootPrisma.$disconnect()
     }
