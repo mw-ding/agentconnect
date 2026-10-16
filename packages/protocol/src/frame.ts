@@ -29,6 +29,14 @@ import {
   HookStartOk
 } from './frames/hook.js'
 import {
+  KanbanDispatch,
+  KanbanDispatchOk,
+  KanbanLeaseHeartbeat,
+  KanbanLeaseHeartbeatOk,
+  KanbanReport,
+  KanbanReportOk
+} from './frames/kanban.js'
+import {
   IntegrationUpsert,
   IntegrationRemove,
   IntegrationChannels,
@@ -228,6 +236,13 @@ export const FRAME_SCHEMAS = {
   'github/review-authorized': GithubReviewAuthorized,
   'github/review-result': GithubReviewResultReport,
   'github/review-result/ok': GithubReviewResultOk,
+  // ── kanban dispatch (issue #2 M2; body-free ids + lease fence only) ──
+  'kanban/dispatch': KanbanDispatch,
+  'kanban/dispatch/ok': KanbanDispatchOk,
+  'kanban/lease-heartbeat': KanbanLeaseHeartbeat,
+  'kanban/lease-heartbeat/ok': KanbanLeaseHeartbeatOk,
+  'kanban/report': KanbanReport,
+  'kanban/report/ok': KanbanReportOk,
   // ── integrations (platform config distribution; token-bearing — never log) ──
   'integration/upsert': IntegrationUpsert,
   'integration/remove': IntegrationRemove,
@@ -476,6 +491,12 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('github/review-authorized', FRAME_SCHEMAS['github/review-authorized']),
   frame('github/review-result', FRAME_SCHEMAS['github/review-result']),
   frame('github/review-result/ok', FRAME_SCHEMAS['github/review-result/ok']),
+  frame('kanban/dispatch', FRAME_SCHEMAS['kanban/dispatch']),
+  frame('kanban/dispatch/ok', FRAME_SCHEMAS['kanban/dispatch/ok']),
+  frame('kanban/lease-heartbeat', FRAME_SCHEMAS['kanban/lease-heartbeat']),
+  frame('kanban/lease-heartbeat/ok', FRAME_SCHEMAS['kanban/lease-heartbeat/ok']),
+  frame('kanban/report', FRAME_SCHEMAS['kanban/report']),
+  frame('kanban/report/ok', FRAME_SCHEMAS['kanban/report/ok']),
   frame('integration/upsert', FRAME_SCHEMAS['integration/upsert']),
   frame('integration/remove', FRAME_SCHEMAS['integration/remove']),
   frame('integration/channels', FRAME_SCHEMAS['integration/channels']),

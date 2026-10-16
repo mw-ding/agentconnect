@@ -188,7 +188,7 @@ export const RcGithubCommentAuthzResult = z.object({ allowed: z.boolean() }).str
 export type RcGithubCommentAuthzResult = z.infer<typeof RcGithubCommentAuthzResult>
 
 // R→C REQ — signature-verified Check identity, suite identity, or waiting external-PR workflow control.
-const GithubNumericId = z.string().regex(/^[1-9]\d*$/)
+export const GithubNumericId = z.string().regex(/^[1-9]\d*$/)
 export const RcGithubRerequest = z.union([
   z
     .object({
