@@ -725,6 +725,23 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     })
   })
 
+  it('mints the CP-only Kanban card token by repo id, never sharing a daemon grant cache entry', async () => {
+    const clock = new FakeClock(1_700_000_000_000)
+    const { svc, bodies, calls } = levelsService(clock)
+
+    const write = await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'write')
+    expect(write.access).toBe('read')
+    expect(bodies[0]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+    await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'read')
+    expect(bodies[1]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'read' } })
+
+    // Same permission shape minted for a daemon grant is a distinct entry.
+    await svc.mintLevels(IID, 'acme/tools', { issues: 'write' }, 777n)
+    expect(calls()).toBe(3)
+    await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'write')
+    expect(calls()).toBe(3)
+  })
+
   it('installation invalidation prevents an older in-flight mint from repopulating the cache', async () => {
     const clock = new FakeClock(1_700_000_000_000)
     let resolveFirst!: (response: Response) => void

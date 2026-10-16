@@ -150,6 +150,16 @@ export class InstallationTokenService {
     return this.mintPermissionLevels(installationId, repoFullName, { checks: 'read', pull_requests: 'read' }, repoId)
   }
 
+  // CP-only Kanban card token (issue #2 D3): issues on one repo id, cached apart from any daemon grant of the same shape.
+  async mintKanbanCard(
+    installationId: bigint,
+    repoFullName: string,
+    repoId: bigint,
+    access: GitAccess
+  ): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(installationId, repoFullName, { issues: access }, repoId, false, 'kanban_card')
+  }
+
   /** Drop every cached/in-flight token for one installation after a permission,
    * suspension, revoke, or reinstall fact changes. In-flight requests cannot be
    * cancelled, so the generation check below prevents stale repopulation. */
@@ -166,7 +176,8 @@ export class InstallationTokenService {
     repoFullName: string,
     levels: InternalPermissionLevels,
     repoId?: bigint,
-    forceRefresh = false
+    forceRefresh = false,
+    purpose?: 'kanban_card'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =
@@ -174,7 +185,7 @@ export class InstallationTokenService {
     const caps = (Object.keys(effectiveLevels) as InternalPermission[]).sort()
     const access: GitAccess = effectiveLevels.contents ?? 'read'
     const scope = repoId !== undefined ? `#${repoId}` : repoFullName.toLowerCase()
-    const key = `${installationId}:${scope}:${caps.map((c) => `${c}=${effectiveLevels[c]}`).join('+')}`
+    const key = `${installationId}:${scope}:${caps.map((c) => `${c}=${effectiveLevels[c]}`).join('+')}${purpose ? `@${purpose}` : ''}`
     const cached = forceRefresh ? undefined : this.cache.get(key)
     if (cached && cached.expiresAtMs - this.clock.now() > FRESH_MIN_MS) {
       return this.toGrant(cached, repoFullName, access)
