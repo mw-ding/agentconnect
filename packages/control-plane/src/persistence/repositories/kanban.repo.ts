@@ -111,6 +111,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         issueNumber: true,
         status: true,
         stateRevision: true,
+        promotionPending: true,
         runs: { where: { endedAt: null }, select: { id: true }, take: 1 }
       }
     })
@@ -127,20 +128,78 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         stateRevision: { increment: 1 },
         githubSyncedAt: new Date(),
         promotionPending: false,
-        promotionReadyAddedAt: null
+        promotionReadyEventId: null,
+        promotionWriteStartedAt: null,
+        promotionReadyNotAfter: null
       }
     })
     return count === 1
   }
 
-  async revertPromotion(cardId: string, expectedStateRevision: bigint, readyAddedAt: Date | null): Promise<boolean> {
+  async beginPromotion(
+    cardId: string,
+    expectedStateRevision: bigint,
+    notBefore: Date,
+    notAfter: Date
+  ): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
+      data: {
+        promotionPending: true,
+        promotionReadyEventId: null,
+        promotionWriteStartedAt: notBefore,
+        promotionReadyNotAfter: notAfter,
+        // A minute out, so a tick cannot settle the card while this write is still in flight.
+        recoveryCheckAt: new Date(notBefore.getTime() + 60_000),
+        recoveryChecks: 0
+      }
+    })
+    return count === 1
+  }
+
+  async notePromotionEvent(
+    cardId: string,
+    eventId: bigint | null,
+    bounds?: { notBefore: Date; notAfter: Date }
+  ): Promise<void> {
+    await this.db.kanbanCard.updateMany({
+      where: { id: cardId, promotionPending: true },
+      data: {
+        ...(eventId != null ? { promotionReadyEventId: eventId } : {}),
+        ...(bounds ? { promotionWriteStartedAt: bounds.notBefore, promotionReadyNotAfter: bounds.notAfter } : {})
+      }
+    })
+  }
+
+  async clearPromotionIntent(cardId: string): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, status: 'ready', promotionPending: true },
+      data: {
+        promotionPending: false,
+        promotionReadyEventId: null,
+        promotionWriteStartedAt: null,
+        promotionReadyNotAfter: null
+      }
+    })
+    return count === 1
+  }
+
+  async revertPromotion(
+    cardId: string,
+    expectedStateRevision: bigint,
+    readyEventId: bigint | null,
+    notBefore: Date | null,
+    notAfter: Date | null
+  ): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
       data: {
         status: 'todo',
         stateRevision: { increment: 1 },
         promotionPending: true,
-        promotionReadyAddedAt: readyAddedAt,
+        promotionReadyEventId: readyEventId,
+        promotionWriteStartedAt: notBefore,
+        promotionReadyNotAfter: notAfter,
         recoveryCheckAt: null,
         recoveryChecks: 0
       }

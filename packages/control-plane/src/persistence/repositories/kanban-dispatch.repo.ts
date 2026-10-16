@@ -28,7 +28,9 @@ const RECOVERY_RESET = {
   recoveryChecks: 0,
   recoveryObserved: null,
   promotionPending: false,
-  promotionReadyAddedAt: null
+  promotionReadyEventId: null,
+  promotionWriteStartedAt: null,
+  promotionReadyNotAfter: null
 } as const
 
 interface BoardRow {
@@ -140,6 +142,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             (c."priority" = ${cursor.priority} AND (c."createdAt", c."id") > (${cursor.createdAt}, ${cursor.id}::uuid)))`
               : Prisma.empty
           }
+          AND NOT c."promotionPending"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
         ORDER BY c."priority" DESC, c."createdAt" ASC, c."id" ASC
@@ -230,7 +233,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]> {
     return this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
-      SELECT c."id" AS "cardId", c."issueNumber", (c."status" = 'todo' AND c."promotionPending") AS "promotion", c."promotionReadyAddedAt"
+      SELECT c."id" AS "cardId", c."issueNumber",
+        (c."promotionPending" AND c."status" IN ('todo', 'ready')) AS "promotion",
+        c."promotionReadyEventId", c."promotionWriteStartedAt", c."promotionReadyNotAfter", c."recoveryCheckAt"
       FROM "kanban_card" c
       LEFT JOIN LATERAL (
         SELECT "reasonCode", "endedAt" FROM "kanban_run"
@@ -239,7 +244,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       WHERE c."boardId" = ${boardId}::uuid
         AND (c."recoveryCheckAt" IS NULL OR c."recoveryCheckAt" <= ${now})
         AND (
-          (c."status" = 'todo' AND c."promotionPending")
+          (c."promotionPending" AND c."status" IN ('todo', 'ready'))
           OR (latest."reasonCode" = 'github_state_mismatch' AND latest."endedAt" IS NOT NULL
             AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
         )
@@ -314,21 +319,53 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null> {
     const card = await this.db.kanbanCard.findFirst({
-      where: { boardId, issueNumber, status: 'todo', promotionPending: true },
-      select: { id: true, promotionReadyAddedAt: true }
+      where: { boardId, issueNumber, promotionPending: true, status: { in: ['todo', 'ready'] } },
+      select: {
+        id: true,
+        promotionReadyEventId: true,
+        promotionWriteStartedAt: true,
+        promotionReadyNotAfter: true,
+        recoveryCheckAt: true
+      }
     })
     return card
-      ? { cardId: card.id, issueNumber, promotion: true, promotionReadyAddedAt: card.promotionReadyAddedAt }
+      ? {
+          cardId: card.id,
+          issueNumber,
+          promotion: true,
+          promotionReadyEventId: card.promotionReadyEventId,
+          promotionWriteStartedAt: card.promotionWriteStartedAt,
+          promotionReadyNotAfter: card.promotionReadyNotAfter,
+          recoveryCheckAt: card.recoveryCheckAt
+        }
       : null
   }
 
+  async notePromotionEvent(cardId: string, eventId: bigint): Promise<void> {
+    await this.db.kanbanCard.updateMany({
+      where: { id: cardId, promotionPending: true },
+      data: { promotionReadyEventId: eventId }
+    })
+  }
+
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
-    // Repair adopts the promotion that already landed on GitHub; otherwise only the pending flag clears.
+    // Repair adopts the promotion that already landed; a refusal clears the intent and returns a ready card to todo.
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, status: 'todo', promotionPending: true, runs: { none: { endedAt: null } } },
+      where: {
+        id: cardId,
+        promotionPending: true,
+        status: { in: ['todo', 'ready'] },
+        runs: { none: { endedAt: null } }
+      },
       data: repaired
         ? { status: 'ready', stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...RECOVERY_RESET }
-        : { promotionPending: false, promotionReadyAddedAt: null }
+        : {
+            status: 'todo',
+            promotionPending: false,
+            promotionReadyEventId: null,
+            promotionWriteStartedAt: null,
+            promotionReadyNotAfter: null
+          }
     })
     return count === 1
   }
@@ -451,7 +488,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           cooldownUntil: plan.cooldownUntil,
           blockKind: plan.blockKind,
           promotionPending: false,
-          promotionReadyAddedAt: null,
+          promotionReadyEventId: null,
+          promotionWriteStartedAt: null,
+          promotionReadyNotAfter: null,
           dispatchRevision: { increment: 1 },
           stateRevision: { increment: 1 }
         }

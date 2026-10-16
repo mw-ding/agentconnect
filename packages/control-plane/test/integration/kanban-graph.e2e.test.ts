@@ -71,7 +71,7 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
   const log = { debug: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
   const realStore = () => new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
 
-  function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan'>) {
+  function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'identifyReadyEvent'>) {
     const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
     return new KanbanGraphDoorbell({
       boards: new PgKanbanBoardRepo(prisma),
@@ -202,7 +202,8 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
       readGraph: async () => {
         throw new Error('simulated github failure')
       },
-      applyPlan: realStore().applyPlan.bind(realStore())
+      applyPlan: realStore().applyPlan.bind(realStore()),
+      identifyReadyEvent: async () => null
     })
     failing.poke(poke('e2e-4', [b.number]))
     await failing.settle()

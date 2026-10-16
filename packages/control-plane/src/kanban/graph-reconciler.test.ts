@@ -64,7 +64,8 @@ function make(
         issueNumber: Number(n),
         status: c.status,
         stateRevision: 1n,
-        leased: false
+        leased: false,
+        promotionPending: false
       }
     ])
   )
@@ -81,7 +82,10 @@ function make(
       const card = [...db.values()].find((c) => c.id === id)!
       card.status = 'todo'
       return true
-    })
+    }),
+    beginPromotion: vi.fn(async () => true),
+    notePromotionEvent: vi.fn(async () => undefined),
+    clearPromotionIntent: vi.fn(async () => true)
   }
   const store = {
     readCard: vi.fn(async (_r: unknown, n: number): Promise<CardIssue | null> =>
@@ -97,10 +101,18 @@ function make(
         : null
     ),
     readGraph: vi.fn(async (_r: unknown, n: number) => graphs[n] ?? graph()),
+    identifyReadyEvent: vi.fn(async () => null),
     applyPlan: vi.fn(
-      async (_r: unknown, n: number, _o: unknown, plan: { addLabels: string[]; removeLabels: string[] }) => {
+      async (
+        _r: unknown,
+        n: number,
+        _o: unknown,
+        plan: { addLabels: string[]; removeLabels: string[] },
+        onLabelAdded?: (label: string) => void | Promise<void>
+      ) => {
         const next = labels.get(n)!.filter((l) => !plan.removeLabels.includes(l))
         labels.set(n, [...next, ...plan.addLabels])
+        if (plan.addLabels.includes('ac/status:ready')) await onLabelAdded?.('ac/status:ready')
       }
     )
   }
@@ -118,6 +130,10 @@ describe('KanbanGraphReconciler', () => {
     expect(h.db.get(7)!.status).toBe('ready')
     expect(h.store.readCard).toHaveBeenCalledOnce()
     expect(h.store.readCard.mock.invocationCallOrder[0]).toBeLessThan(h.cards.casStatus.mock.invocationCallOrder[0]!)
+    expect(h.cards.beginPromotion.mock.invocationCallOrder[0]).toBeLessThan(
+      h.store.applyPlan.mock.invocationCallOrder[0]!
+    )
+    expect(h.cards.clearPromotionIntent).toHaveBeenCalledWith('c7')
     expect(h.store.applyPlan).toHaveBeenCalledOnce()
     expect(h.store.applyPlan.mock.calls[0]![2]).toBe(await h.store.readCard.mock.results[0]!.value)
     const plan = h.store.applyPlan.mock.calls[0]![3]
@@ -204,7 +220,7 @@ describe('KanbanGraphReconciler', () => {
     const g = graph({ blockedBy: [done] })
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
     expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([[1n, 'ready']])
-    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n, null)
+    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n, null, null, null)
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')
@@ -231,6 +247,14 @@ describe('KanbanGraphReconciler', () => {
     await h.reconciler.apply(BOARD, REPO, 7, graph())
     expect(h.store.applyPlan).not.toHaveBeenCalled()
     expect(h.labels.get(7)).toEqual(['ac/status:ready', 'ac/status:blocked', 'ac/agent:eng'])
+  })
+
+  it('does not strip todo from a ready card whose promotion intent is still open', async () => {
+    const h = make({ 7: { status: 'ready', labels: ['ac/status:todo', 'ac/status:ready'] } })
+    h.db.get(7)!.promotionPending = true
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.labels.get(7)).toEqual(['ac/status:todo', 'ac/status:ready'])
   })
 
   it('does not repair promotion residue on an issue a human closed', async () => {

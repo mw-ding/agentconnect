@@ -1,7 +1,15 @@
 // Kanban graph reconciler (issue #2 M1): promotes todo cards whose blockers all completed, then writes the status label.
+import { GithubApiError } from '../github/api.js'
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
 import { STATUS_LABEL_PREFIX, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
-import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
+import {
+  promotionEventWindow,
+  type CardGraph,
+  type CardIssue,
+  type CardStore,
+  type KanbanRepoRef,
+  type LabelWriteObserver
+} from './card-store.js'
 
 export interface GraphReconcilerLog {
   debug(obj: unknown, msg?: string): void
@@ -9,8 +17,10 @@ export interface GraphReconcilerLog {
 
 export interface KanbanGraphReconcilerDeps {
   cards: KanbanCardRepo
-  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan'>
+  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'identifyReadyEvent'>
   log: GraphReconcilerLog
+  /** Defaults to the wall clock. Tests pass the fake clock so the write-start matches scripted event times. */
+  clock?: { now(): number }
 }
 
 export type GraphPromotion = 'promote' | 'none'
@@ -54,7 +64,11 @@ export class KanbanGraphReconciler {
     }
     const observed = await this.deps.store.readCard(repo, issueNumber)
     if (!observed || observed.state !== 'open') return
-    if (residueOnly) return this.writeReadyLabels(repo, issueNumber, true, observed)
+    // A ready card with an open intent waits for attributed recovery; stripping todo here would land before that proof.
+    if (residueOnly) {
+      if (!card.promotionPending) await this.writeReadyLabels(repo, issueNumber, true, observed)
+      return
+    }
     const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
     // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
     if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
@@ -62,14 +76,40 @@ export class KanbanGraphReconciler {
       this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
       return
     }
-    let readyAddedAt: Date | null = null
+    const revision = card.stateRevision + 1n
+    const writeStartedAt = new Date(this.deps.clock?.now() ?? Date.now())
+    // Provisional window until the POST's Date header tightens it. Held off the tick so this write is not settled early.
+    let bounds = promotionEventWindow(writeStartedAt, null, writeStartedAt.getTime())
+    if (!(await this.deps.cards.beginPromotion(card.id, revision, bounds.notBefore, bounds.notAfter))) {
+      await this.deps.cards.revertPromotion(card.id, revision, null, null, null).catch(() => false)
+      this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the intent')
+      return
+    }
+    let readyEventId: number | null = null
+    let postAccepted = false
     try {
-      await this.writeReadyLabels(repo, issueNumber, false, observed, (_label, addedAt) => {
-        readyAddedAt = addedAt
+      await this.writeReadyLabels(repo, issueNumber, false, observed, async (label, respondedAt) => {
+        if (label !== statusLabel('ready')) return
+        postAccepted = true
+        bounds = promotionEventWindow(writeStartedAt, respondedAt, this.deps.clock?.now() ?? Date.now())
+        readyEventId = await this.deps.store.identifyReadyEvent(repo, issueNumber, bounds.notBefore, bounds.notAfter)
+        await this.deps.cards.notePromotionEvent(card.id, readyEventId == null ? null : BigInt(readyEventId), bounds)
       })
+      if (!(await this.deps.cards.clearPromotionIntent(card.id))) {
+        this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: promotion intent clear lost')
+      }
     } catch (err) {
-      // Undo so a claim cannot mismatch it into todo; the pending flag lets tick recovery adopt a half-landed write.
-      await this.deps.cards.revertPromotion(card.id, card.stateRevision + 1n, readyAddedAt).catch(() => false)
+      // A timeout may have landed the label; a definitive refusal did not, so it must not bound a later App add.
+      const keepBound = postAccepted || (err instanceof GithubApiError && err.retryable)
+      await this.deps.cards
+        .revertPromotion(
+          card.id,
+          revision,
+          keepBound && readyEventId != null ? BigInt(readyEventId) : null,
+          keepBound ? bounds.notBefore : null,
+          keepBound ? bounds.notAfter : null
+        )
+        .catch(() => false)
       throw err
     }
   }

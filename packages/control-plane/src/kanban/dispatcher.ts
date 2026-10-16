@@ -46,7 +46,10 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionAttributed'>
+  store: Pick<
+    CardStore,
+    'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionAttributed' | 'identifyReadyEvent'
+  >
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -189,10 +192,15 @@ export class KanbanDispatcher {
     }
   }
 
-  /** A GitHub change to this card (status label, close/reopen, or graph): restart its backoff and re-read it now. */
-  async onCardChanged(boardId: string, issueNumber: number): Promise<boolean> {
-    await this.deps.repo.resetRecovery(boardId, issueNumber)
+  /** A GitHub change to this card. A human doorbell reads now; a graph doorbell leaves a pending promotion on its backoff. */
+  async onCardChanged(boardId: string, issueNumber: number, source: 'human' | 'graph' = 'graph'): Promise<boolean> {
     const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
+    if (pending && source !== 'human') {
+      const now = await this.deps.repo.now()
+      if (pending.recoveryCheckAt && pending.recoveryCheckAt.getTime() > now.getTime()) return false
+    } else {
+      await this.deps.repo.resetRecovery(boardId, issueNumber)
+    }
     if (!pending) return this.ingestCard(boardId, issueNumber)
     const now = await this.deps.repo.now()
     let read: RecoveryRead = { moved: false }
@@ -256,14 +264,36 @@ export class KanbanDispatcher {
     return { moved: false, observed }
   }
 
-  // The ready-add must match our receipt or a human edit, with every blocker still closed completed.
+  // The ready-add must match our event id or a human edit, with every blocker still closed completed.
   private async promotionStillHolds(
     boardId: string,
     repo: KanbanRepoRef,
     card: KanbanRecoveryDue
   ): Promise<boolean | null> {
-    const { issueNumber, promotionReadyAddedAt } = card
-    const attributed = await this.deps.store.promotionAttributed(repo, issueNumber, promotionReadyAddedAt)
+    const { issueNumber } = card
+    let eventId = card.promotionReadyEventId == null ? null : Number(card.promotionReadyEventId)
+    let unidentified = false
+    if (eventId == null && card.promotionWriteStartedAt && card.promotionReadyNotAfter) {
+      const identified = await this.deps.store.identifyReadyEvent(
+        repo,
+        issueNumber,
+        card.promotionWriteStartedAt,
+        card.promotionReadyNotAfter
+      )
+      if (identified == null) unidentified = true
+      else {
+        eventId = identified
+        await this.deps.repo.notePromotionEvent(card.cardId, BigInt(identified))
+      }
+    }
+    const attributed = await this.deps.store.promotionAttributed(repo, issueNumber, eventId)
+    // No search window means the ready POST was refused, so a visible App add is not ours. Lag and a human ready-add still fall through.
+    if (eventId == null && !card.promotionWriteStartedAt && attributed === false) {
+      this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose ready label is not ours')
+      return false
+    }
+    // Lag or several App ready events is inconclusive, never a negative. A human ready-add still falls through.
+    if (unidentified && attributed !== true) return null
     if (attributed === null) return null
     if (!attributed) {
       this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose ready label is not ours')

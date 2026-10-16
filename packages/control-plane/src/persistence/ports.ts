@@ -5171,12 +5171,15 @@ export interface KanbanOpenLease extends OpenLeaseFacts {
   leaseId: string
 }
 
-/** A card whose recovery re-read is due; `promotion` marks a todo card whose promotion write may have half-landed. */
+/** A card whose recovery re-read is due; `promotion` marks a card whose promotion write may have half-landed. */
 export interface KanbanRecoveryDue {
   cardId: string
   issueNumber: number
   promotion: boolean
-  promotionReadyAddedAt: Date | null
+  promotionReadyEventId: bigint | null
+  promotionWriteStartedAt: Date | null
+  promotionReadyNotAfter: Date | null
+  recoveryCheckAt: Date | null
 }
 
 export interface KanbanDispatchRepo {
@@ -5197,9 +5200,11 @@ export interface KanbanDispatchRepo {
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
   resetRecovery(boardId: string, issueNumber: number): Promise<void>
-  // The todo card whose promotion is still pending, or null.
+  // The card whose promotion is still pending (DB todo after a failed write, or DB ready while the intent is open).
   getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null>
-  // Settle a pending promotion on a todo card: `repaired` adopts it as ready, otherwise the flag just clears.
+  // Remember the event id once a pending promotion's ready-add is identified.
+  notePromotionEvent(cardId: string, eventId: bigint): Promise<void>
+  // Settle a pending promotion: `repaired` adopts it as ready, otherwise the flag clears and a ready intent returns to todo.
   settlePromotion(cardId: string, repaired: boolean): Promise<boolean>
   // Recheck the claim after the GitHub read, without changing its DB-selected mode.
   isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
@@ -5222,12 +5227,30 @@ export interface KanbanCardRecord {
   stateRevision: bigint
   /** An open (un-ended) run holds the card. */
   leased: boolean
+  /** A promotion write is in flight or waiting to be attributed; claim must not take the card. */
+  promotionPending: boolean
 }
 
 export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
+  /** After the ready CAS, record the in-flight write so a crash cannot claim the card. */
+  beginPromotion(cardId: string, expectedStateRevision: bigint, notBefore: Date, notAfter: Date): Promise<boolean>
+  /** Store the ready-label event id, and tighten the search window, while the intent is still open. */
+  notePromotionEvent(
+    cardId: string,
+    eventId: bigint | null,
+    bounds?: { notBefore: Date; notAfter: Date }
+  ): Promise<void>
+  /** The label write finished; drop the intent so the ready card can be claimed. */
+  clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a promotion whose label write failed and flag it pending, so recovery re-reads what landed on GitHub. */
-  revertPromotion(cardId: string, expectedStateRevision: bigint, readyAddedAt: Date | null): Promise<boolean>
+  revertPromotion(
+    cardId: string,
+    expectedStateRevision: bigint,
+    readyEventId: bigint | null,
+    notBefore: Date | null,
+    notAfter: Date | null
+  ): Promise<boolean>
 }

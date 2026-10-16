@@ -1,7 +1,15 @@
 // GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, per-label add/remove writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from '../github/api.js'
-import { GithubCardStore, isAppActor, isHumanActor, promotionAttributed, type KanbanRepoRef } from './card-store.js'
+import {
+  findOurReadyEvent,
+  GithubCardStore,
+  isAppActor,
+  isHumanActor,
+  promotionAttributed,
+  promotionEventWindow,
+  type KanbanRepoRef
+} from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
 
@@ -299,13 +307,13 @@ describe('status label attribution', () => {
 })
 
 describe('label write receipts', () => {
-  it('captures GitHub server time before a later removal fails', async () => {
+  it('notifies after the ready POST and before a later removal fails', async () => {
     const h = harness({
       'POST /repositories/42/issues/7/labels': () =>
-        new Response('[]', { headers: { date: 'Fri, 16 Oct 2026 00:00:00 GMT' } }),
+        new Response('[]', { headers: { date: 'Fri, 16 Oct 2026 00:00:01 GMT' } }),
       'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Atodo': () => json({ message: 'unavailable' }, 503)
     })
-    const receipt = vi.fn()
+    const added = vi.fn()
     await expect(
       h.store.applyPlan(
         REPO,
@@ -318,10 +326,10 @@ describe('label write receipts', () => {
           addLabels: ['ac/status:ready'],
           removeLabels: ['ac/status:todo']
         },
-        receipt
+        added
       )
     ).rejects.toThrow()
-    expect(receipt).toHaveBeenCalledWith('ac/status:ready', new Date('2026-10-16T00:00:00Z'))
+    expect(added).toHaveBeenCalledWith('ac/status:ready', new Date('2026-10-16T00:00:01.000Z'))
     expect(h.calls.map((call) => call.method)).toEqual(['POST', 'DELETE'])
   })
 })
@@ -391,7 +399,11 @@ describe('half-landed promotion attribution', () => {
       true
     ]
   ])('%s', (_name, events, expected) => {
-    expect(promotionAttributed(events(), 'agentconnect', new Date('2026-10-16T00:00:00Z'))).toBe(expected)
+    const list = events()
+    const ours = list.find(
+      (event) => event.event === 'labeled' && event.actor === app && event.label?.name?.endsWith('ready')
+    )
+    expect(promotionAttributed(list, 'agentconnect', ours?.id ?? null)).toBe(expected)
   })
 
   it.each([false, true])(
@@ -402,51 +414,99 @@ describe('half-landed promotion attribution', () => {
       const removed = del('ready', human)
       const agentAdd = { ...add('ready', app), created_at: sameSecond ? ownAdd.created_at : '2026-10-16T00:00:01Z' }
       const events = [todo, ownAdd, removed, agentAdd]
-      expect(promotionAttributed(events, 'agentconnect', new Date(ownAdd.created_at))).toBe(false)
+      expect(promotionAttributed(events, 'agentconnect', ownAdd.id)).toBe(false)
     }
   )
 
-  it('rejects a later agent add matching the response second when our event was in the preceding second', () => {
+  it('adopts our event at :00 when the response Date is :01', () => {
+    const todo = add('todo', human)
+    const ownAdd = { ...add('ready', app), created_at: '2026-10-16T00:00:00.000Z' }
+    const started = new Date('2026-10-16T00:00:00.200Z')
+    const respondedAt = new Date('2026-10-16T00:00:01.000Z')
+    const window = promotionEventWindow(started, respondedAt, started.getTime() + 150)
+    expect(Date.parse(ownAdd.created_at)).not.toBe(respondedAt.getTime())
+    expect(findOurReadyEvent([todo, ownAdd], 'agentconnect', window.notBefore, window.notAfter)).toBe(ownAdd.id)
+    expect(promotionAttributed([todo, ownAdd], 'agentconnect', ownAdd.id)).toBe(true)
+    const laterAgent = { ...add('ready', app), created_at: '2026-10-16T00:00:02.000Z' }
+    expect(findOurReadyEvent([laterAgent], 'agentconnect', window.notBefore, window.notAfter)).toBeNull()
+  })
+
+  it('does not adopt an agent re-add in the same second after a human restores todo', () => {
     const todo = add('todo', human)
     const ownAdd = add('ready', app)
     const removed = del('ready', human)
-    const agentAdd = { ...add('ready', app), created_at: '2026-10-16T00:00:01Z' }
-    expect(promotionAttributed([todo, ownAdd, removed, agentAdd], 'agentconnect', new Date(agentAdd.created_at))).toBe(
-      false
-    )
+    const restored = add('todo', human)
+    const agentAdd = { ...add('ready', app), created_at: ownAdd.created_at }
+    const notAfter = new Date('2026-10-16T00:00:01.000Z')
+    expect(promotionAttributed([todo, ownAdd, removed, restored, agentAdd], 'agentconnect', ownAdd.id)).toBe(false)
+    expect(
+      findOurReadyEvent(
+        [todo, ownAdd, removed, restored, agentAdd],
+        'agentconnect',
+        new Date(ownAdd.created_at!),
+        notAfter
+      )
+    ).toBeNull()
   })
 
-  it('cannot attribute a shared-App ready add without a receipt', () => {
+  it('cannot attribute a shared-App ready add without an event id', () => {
     expect(promotionAttributed([add('todo', human), add('ready', app)], 'agentconnect', null)).toBe(false)
   })
 
-  it('defers when the recorded write is newer than the visible ready event', () => {
-    expect(
-      promotionAttributed([add('todo', human), add('ready', app)], 'agentconnect', new Date('2026-10-16T00:00:01Z'))
-    ).toBe(null)
+  it('defers when our event id is not in the visible history, even if that history ends on a human park', () => {
+    const ready = add('ready', app)
+    const todo = add('todo', human)
+    expect(promotionAttributed([todo, ready], 'agentconnect', ready.id + 1_000)).toBe(null)
+    expect(promotionAttributed([add('blocked', human)], 'agentconnect', ready.id + 1_000)).toBe(null)
+  })
+
+  it('treats zero or several App ready events inside the window as unidentified', () => {
+    const started = new Date('2026-10-16T00:00:00.000Z')
+    const notAfter = new Date('2026-10-16T00:00:02.000Z')
+    const first = add('ready', app)
+    const second = add('ready', app)
+    expect(findOurReadyEvent([add('todo', human)], 'agentconnect', started, notAfter)).toBeNull()
+    expect(findOurReadyEvent([first, second], 'agentconnect', started, notAfter)).toBeNull()
+    expect(findOurReadyEvent([first], 'agentconnect', new Date('2026-10-16T00:00:05.000Z'), notAfter)).toBeNull()
+    expect(findOurReadyEvent([first], 'agentconnect', started, null)).toBeNull()
   })
 
   it('never trusts an App write without a configured slug, and replays by event id', () => {
-    expect(
-      promotionAttributed([add('todo', human), add('ready', app)], undefined, new Date('2026-10-16T00:00:00Z'))
-    ).toBe(false)
+    const ready = add('ready', app)
+    expect(promotionAttributed([add('todo', human), ready], undefined, ready.id)).toBe(false)
     const [park, swap] = [add('blocked', human), add('ready', app)]
-    expect(promotionAttributed([swap, park], 'agentconnect', new Date('2026-10-16T00:00:00Z'))).toBe(false)
+    expect(promotionAttributed([swap, park], 'agentconnect', swap.id)).toBe(false)
     expect(isAppActor({ actor: { type: 'User', login: 'agentconnect[bot]' } }, 'agentconnect')).toBe(false)
   })
 
   it('reads the event history through the store and fails closed past the bound', async () => {
     const EVENTS = 'GET /repositories/42/issues/7/events?per_page=100&page=1'
-    const ok = harness({ [EVENTS]: () => json([add('todo', human), add('ready', app)]) }, 'agentconnect')
-    expect(await ok.store.promotionAttributed(REPO, 7, new Date('2026-10-16T00:00:00Z'))).toBe(true)
+    const ready = add('ready', app)
+    const ok = harness({ [EVENTS]: () => json([add('todo', human), ready]) }, 'agentconnect')
+    expect(await ok.store.promotionAttributed(REPO, 7, ready.id)).toBe(true)
+    expect(
+      await ok.store.identifyReadyEvent(
+        REPO,
+        7,
+        new Date('2026-10-16T00:00:00.000Z'),
+        new Date('2026-10-16T00:00:02.000Z')
+      )
+    ).toBe(ready.id)
     expect(ok.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
     const routes: Record<string, () => Response> = {}
     for (let page = 1; page <= 10; page++) {
       routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
         json(Array.from({ length: 100 }, () => add('ready', app)))
     }
+    const bounded = harness(routes, 'agentconnect')
+    expect(await bounded.store.promotionAttributed(REPO, 7, ready.id)).toBe(null)
     expect(
-      await harness(routes, 'agentconnect').store.promotionAttributed(REPO, 7, new Date('2026-10-16T00:00:00Z'))
+      await bounded.store.identifyReadyEvent(
+        REPO,
+        7,
+        new Date('2026-10-16T00:00:00.000Z'),
+        new Date('2026-10-16T00:00:02.000Z')
+      )
     ).toBe(null)
   })
 })

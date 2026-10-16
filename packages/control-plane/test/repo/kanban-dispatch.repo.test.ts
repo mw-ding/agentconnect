@@ -554,7 +554,10 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       cardId: blocked.id,
       issueNumber: blocked.issueNumber,
       promotion: false,
-      promotionReadyAddedAt: null
+      promotionReadyEventId: null,
+      promotionWriteStartedAt: null,
+      promotionReadyNotAfter: null,
+      recoveryCheckAt: null
     })
     expect(await repo().listRecoveryDue(boardId, NOW, 2)).toHaveLength(2)
     expect(await repo().getParkedStatus(boardId, blocked.issueNumber)).toBe('blocked')
@@ -624,15 +627,20 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const plain = await seedCard(boardId, { status: 'todo' })
     const pending = await seedCard(boardId, { status: 'ready' })
     const cards = new PgKanbanCardRepo(prisma)
-    expect(await cards.revertPromotion(pending.id, 0n, new Date('2026-10-16T00:00:00Z'))).toBe(false)
+    const started = new Date('2026-10-16T00:00:00.000Z')
+    const notAfter = new Date('2026-10-16T00:00:11.000Z')
+    expect(await cards.revertPromotion(pending.id, 0n, 42n, started, notAfter)).toBe(false)
     const { stateRevision } = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: pending.id } })
-    expect(await cards.revertPromotion(pending.id, stateRevision, new Date('2026-10-16T00:00:00Z'))).toBe(true)
+    expect(await cards.revertPromotion(pending.id, stateRevision, 42n, started, notAfter)).toBe(true)
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([
       {
         cardId: pending.id,
         issueNumber: pending.issueNumber,
         promotion: true,
-        promotionReadyAddedAt: new Date('2026-10-16T00:00:00Z')
+        promotionReadyEventId: 42n,
+        promotionWriteStartedAt: started,
+        promotionReadyNotAfter: notAfter,
+        recoveryCheckAt: null
       }
     ])
     // A doorbell looks the pending card up by issue number; a plain todo card has nothing pending.
@@ -640,7 +648,10 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       cardId: pending.id,
       issueNumber: pending.issueNumber,
       promotion: true,
-      promotionReadyAddedAt: new Date('2026-10-16T00:00:00Z')
+      promotionReadyEventId: 42n,
+      promotionWriteStartedAt: started,
+      promotionReadyNotAfter: notAfter,
+      recoveryCheckAt: null
     })
     expect(await repo().getPendingPromotion(boardId, plain.issueNumber)).toBeNull()
     expect(await repo().settlePromotion(plain.id, true)).toBe(false)
@@ -656,7 +667,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
 
     const cleared = await seedCard(boardId, { status: 'ready' })
     const rev = (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).stateRevision
-    await cards.revertPromotion(cleared.id, rev, null)
+    await cards.revertPromotion(cleared.id, rev, null, null, null)
     expect(await repo().settlePromotion(cleared.id, false)).toBe(true)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).toMatchObject({
       status: 'todo',
@@ -664,9 +675,39 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     })
     // Any later status move settles a pending flag, so a stale one can never promote a card that came back to todo.
     expect(await cards.casStatus(cleared.id, rev + 1n, 'ready')).toBe(true)
-    expect(await cards.revertPromotion(cleared.id, rev + 2n, null)).toBe(true)
+    expect(await cards.revertPromotion(cleared.id, rev + 2n, null, null, null)).toBe(true)
     expect(await cards.casStatus(cleared.id, rev + 3n, 'blocked')).toBe(true)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).promotionPending).toBe(false)
+  })
+
+  it('does not claim a ready card with an open promotion intent, and lists it for recovery', async () => {
+    const boardId = await seedBoard()
+    const c = await seedCard(boardId, { status: 'todo' })
+    const cards = new PgKanbanCardRepo(prisma)
+    const rev = (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).stateRevision
+    expect(await cards.casStatus(c.id, rev, 'ready')).toBe(true)
+    const notBefore = new Date('2026-10-16T00:00:00.000Z')
+    const notAfter = new Date('2026-10-16T00:00:11.000Z')
+    expect(await cards.beginPromotion(c.id, rev + 1n, notBefore, notAfter)).toBe(true)
+    expect(await repo().claim(boardId, live)).toEqual([])
+    // The in-flight intent is not due yet, so a tick cannot settle it under the write.
+    expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([])
+    const due = new Date(notBefore.getTime() + 60_000)
+    expect(await repo().listRecoveryDue(boardId, due, 10)).toEqual([
+      {
+        cardId: c.id,
+        issueNumber: c.issueNumber,
+        promotion: true,
+        promotionReadyEventId: null,
+        promotionWriteStartedAt: notBefore,
+        promotionReadyNotAfter: notAfter,
+        recoveryCheckAt: due
+      }
+    ])
+    await cards.notePromotionEvent(c.id, 99n)
+    expect(await repo().getPendingPromotion(boardId, c.issueNumber)).toMatchObject({ promotionReadyEventId: 99n })
+    expect(await cards.clearPromotionIntent(c.id)).toBe(true)
+    expect(await repo().claim(boardId, live)).toHaveLength(1)
   })
 
   it('resets the backoff when the card is claimed again', async () => {

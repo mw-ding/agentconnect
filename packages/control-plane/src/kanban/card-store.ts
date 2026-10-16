@@ -50,7 +50,14 @@ export interface CardStore {
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
   // Null means the bounded event history cannot yet establish attribution; retry without settling the promotion.
-  promotionAttributed(repo: KanbanRepoRef, issueNumber: number, readyAddedAt: Date | null): Promise<boolean | null>
+  promotionAttributed(repo: KanbanRepoRef, issueNumber: number, readyEventId: number | null): Promise<boolean | null>
+  /** The one App ready-label event inside the window, or null when it is missing or not unique. */
+  identifyReadyEvent(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    notBefore: Date,
+    notAfter: Date | null
+  ): Promise<number | null>
   /** Write a reconcile plan's labels, issue state, and comment; a no-op plan makes no GitHub call. */
   applyPlan(
     repo: KanbanRepoRef,
@@ -61,8 +68,32 @@ export interface CardStore {
   ): Promise<void>
 }
 
-// GitHub's server timestamp returned by a successful label POST, captured before any later write can fail.
-export type LabelWriteObserver = (label: string, addedAt: Date | null) => void
+/** Called after a label POST succeeds. `respondedAt` is that response's Date header, the search window's end. */
+export type LabelWriteObserver = (label: string, respondedAt: Date | null) => void | Promise<void>
+
+/** GitHub stamps `created_at` at second resolution and its clock can lead the CP by a fraction of a second. */
+const READY_EVENT_SKEW_MS = 1000
+/** A timed-out ready POST may still have landed; the open window covers that one request and nothing later. */
+const READY_POST_BUDGET_MS = 11_000
+
+/** Inclusive `created_at` bounds for our ready-add. With a response Date, the end is that header, not an equality match. */
+export function promotionEventWindow(
+  writeStartedAt: Date,
+  respondedAt: Date | null,
+  nowMs: number
+): { notBefore: Date; notAfter: Date } {
+  if (respondedAt) {
+    const elapsed = Math.max(0, nowMs - writeStartedAt.getTime())
+    return {
+      notBefore: new Date(respondedAt.getTime() - elapsed - READY_EVENT_SKEW_MS),
+      notAfter: respondedAt
+    }
+  }
+  return {
+    notBefore: new Date(writeStartedAt.getTime() - READY_EVENT_SKEW_MS),
+    notAfter: new Date(writeStartedAt.getTime() + READY_POST_BUDGET_MS)
+  }
+}
 
 export const WRITE_MODE_LABEL = 'ac/mode:write'
 const PAGE = 100
@@ -92,17 +123,33 @@ export function isAppActor(event: Pick<LabelEvent, 'actor'>, appSlug: string | u
 
 const PROMOTABLE_LABELS: ReadonlySet<string> = new Set([statusLabel('todo'), statusLabel('ready')])
 
-// Replay the complete history; an App ready-add must uniquely match the receipt of our pending write.
+/** The only App `labeled ac/status:ready` inside the window. Zero or several is null: inconclusive, not a rejection. */
+export function findOurReadyEvent(
+  events: readonly LabelEvent[],
+  appSlug: string | undefined,
+  notBefore: Date,
+  notAfter: Date | null
+): number | null {
+  if (!notAfter) return null
+  const earliest = notBefore.getTime()
+  const latest = notAfter.getTime()
+  const candidates = events.filter((event) => {
+    if (event.event !== 'labeled' || event.label?.name !== statusLabel('ready') || !isAppActor(event, appSlug))
+      return false
+    const at = event.created_at ? Date.parse(event.created_at) : Number.NaN
+    return Number.isFinite(at) && at >= earliest && at <= latest
+  })
+  return candidates.length === 1 ? candidates[0]!.id : null
+}
+
+// Replay the history. Adopt our stored event id or a human User ready-add. A missing id is not proof.
 export function promotionAttributed(
   events: readonly LabelEvent[],
   appSlug: string | undefined,
-  readyAddedAt: Date | null
+  readyEventId: number | null
 ): boolean | null {
-  const receipt = readyAddedAt?.toISOString()
-  const matchesReceipt = (e: LabelEvent) =>
-    !!receipt && !!e.created_at && Date.parse(e.created_at) === Date.parse(receipt) && isAppActor(e, appSlug)
-  const readyAdds = events.filter((e) => e.event === 'labeled' && e.label?.name === statusLabel('ready'))
-  const matchingAdds = readyAdds.filter(matchesReceipt)
+  // A lagging history that ends before our event must not turn an older park into a negative.
+  if (readyEventId != null && !events.some((event) => event.id === readyEventId)) return null
   let latestReady: LabelEvent | undefined
   const labels = new Set<string>()
   let open = true
@@ -123,17 +170,18 @@ export function promotionAttributed(
     const known = human || isAppActor(event, appSlug)
     if (event.event === 'labeled' && name === statusLabel('ready')) {
       latestReady = event
-      readyAddTrusted = human || (matchingAdds.length === 1 && matchesReceipt(event))
+      readyAddTrusted = human || (event.id === readyEventId && isAppActor(event, appSlug))
     }
     // A human park (another status, or closed) stands until a human undoes it; any unknown writer forfeits trust.
-    if (human) trusted = open && labels.size > 0 && [...labels].every((l) => PROMOTABLE_LABELS.has(l))
+    if (human) trusted = open && labels.size > 0 && [...labels].every((label) => PROMOTABLE_LABELS.has(label))
     else if (!known) trusted = false
-    // Removing ready revokes the old promotion, even if todo remains or the server clock crosses a second.
+    // Removing ready revokes the old promotion, even when todo remains.
     if (event.event === 'unlabeled' && name === statusLabel('ready')) trusted = false
   }
+  if (!latestReady) return null
+  // A history that does not yet show ready is behind the labels already read; an older park is not a negative.
+  if (!(open && labels.has(statusLabel('ready')))) return null
   if (!trusted) return false
-  if (!latestReady || (readyAddedAt && latestReady.created_at && new Date(latestReady.created_at) < readyAddedAt))
-    return null
   return readyAddTrusted
 }
 
@@ -221,10 +269,20 @@ export class GithubCardStore implements CardStore {
   async promotionAttributed(
     repo: KanbanRepoRef,
     issueNumber: number,
-    readyAddedAt: Date | null
+    readyEventId: number | null
   ): Promise<boolean | null> {
     const events = await this.issueEvents(repo, issueNumber)
-    return events ? promotionAttributed(events, this.deps.appSlug, readyAddedAt) : null
+    return events ? promotionAttributed(events, this.deps.appSlug, readyEventId) : null
+  }
+
+  async identifyReadyEvent(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    notBefore: Date,
+    notAfter: Date | null
+  ): Promise<number | null> {
+    const events = await this.issueEvents(repo, issueNumber)
+    return events ? findOurReadyEvent(events, this.deps.appSlug, notBefore, notAfter) : null
   }
 
   /** The issue's whole event history, or null past the page bound so callers fail closed. */

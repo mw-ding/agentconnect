@@ -40,10 +40,10 @@ export class KanbanLabelWriter {
         baseUrl: this.deps.baseUrl
       })
 
-    // Add before remove so GitHub never shows zero status labels mid-write.
+    // Add before remove so GitHub never shows zero status labels mid-write. The observer runs before the removal.
     for (const label of new Set(plan.addLabels)) {
       await call('/labels', 'POST', { labels: [label] })
-      onLabelAdded?.(label, serverDate)
+      await onLabelAdded?.(label, serverDate)
     }
     for (const label of new Set(plan.removeLabels)) {
       try {

@@ -8,6 +8,7 @@ import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
 import {
+  findOurReadyEvent,
   promotionAttributed,
   type CardGraph,
   type CardIssue,
@@ -47,8 +48,16 @@ class FakeStore {
   async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
     return (this.statusActors.get(n) ?? 'human') === 'human'
   }
-  async promotionAttributed(_repo: KanbanRepoRef, n: number, readyAddedAt: Date | null): Promise<boolean | null> {
-    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG, readyAddedAt)
+  async promotionAttributed(_repo: KanbanRepoRef, n: number, readyEventId: number | null): Promise<boolean | null> {
+    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG, readyEventId)
+  }
+  async identifyReadyEvent(
+    _repo: KanbanRepoRef,
+    n: number,
+    notBefore: Date,
+    notAfter: Date | null
+  ): Promise<number | null> {
+    return findOurReadyEvent(this.events.get(n) ?? [], APP_SLUG, notBefore, notAfter)
   }
   async readGraph(_repo: KanbanRepoRef, n: number): Promise<CardGraph> {
     return this.graphs.get(n) ?? emptyGraph()
@@ -102,10 +111,7 @@ class FakeStore {
     this.writes.push(plan)
     const i = this.issues.get(n)!
     this.record(n, plan.addLabels, plan.removeLabels, 'app')
-    for (const label of plan.addLabels) {
-      const event = [...this.events.get(n)!].reverse().find((e) => e.event === 'labeled' && e.label?.name === label)!
-      onLabelAdded?.(label, new Date(event.created_at!))
-    }
+    for (const label of plan.addLabels) await onLabelAdded?.(label, null)
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
       i.state = plan.issueState.state
@@ -724,7 +730,7 @@ async function graphHarness() {
   const h = await harness()
   const { graphs, store } = h
   const log = { debug: vi.fn(), warn: vi.fn() }
-  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
+  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log, clock: h.clock })
   const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
   const poke = vi.spyOn(h.dispatcher, 'poke')
   const bell = new KanbanGraphDoorbell({
@@ -736,11 +742,11 @@ async function graphHarness() {
     store,
     onGraph: async (board, repo, n, graph) => {
       await reconciler.apply(board, repo, n, graph)
-      await h.dispatcher.onCardChanged(board.id, n)
+      await h.dispatcher.onCardChanged(board.id, n, 'graph')
       h.dispatcher.poke(board.id)
     },
     onCard: async (board, _repo, n) => {
-      await h.dispatcher.onCardChanged(board.id, n)
+      await h.dispatcher.onCardChanged(board.id, n, 'human')
       h.dispatcher.poke(board.id)
     },
     log
@@ -919,10 +925,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
           ).toBe(true)
         if (landed) {
           h.store.relabel(c.issueNumber, landed, 'app')
-          const event = [...h.store.events.get(c.issueNumber)!]
-            .reverse()
-            .find((e) => e.event === 'labeled' && e.label?.name === 'ac/status:ready')!
-          onLabelAdded?.('ac/status:ready', new Date(event.created_at!))
+          await onLabelAdded?.('ac/status:ready', null)
         }
         throw new Error('label write timed out')
       })
@@ -959,7 +962,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     async ({ labels }) => {
       const h = await graphHarness()
       const c = await failPromotion(h, labels)
-      const receipt = (await h.card(c.id)).promotionReadyAddedAt
+      const receipt = (await h.card(c.id)).promotionReadyEventId
       expect(receipt).not.toBeNull()
       h.store.relabel(
         c.issueNumber,
@@ -971,16 +974,83 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       await h.dispatcher.settle()
       await h.ring(c.issueNumber, 'graph-2')
       expect(h.sent).toEqual([])
-      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, promotionReadyAddedAt: null })
+      expect(await h.card(c.id)).toMatchObject({
+        status: 'todo',
+        promotionPending: false,
+        promotionReadyEventId: null
+      })
     }
   )
+
+  it('adopts our ready event stamped at :00 when the response Date is :01', async () => {
+    const h = await graphHarness()
+    h.clock.advance(Date.parse('2026-10-16T00:00:00.400Z') - h.clock.now())
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    vi.spyOn(h.store, 'applyPlan').mockImplementationOnce(async (_repo, n, _observed, _plan, onLabelAdded) => {
+      h.store.relabel(n, ['ac/status:todo', 'ac/status:ready'], 'app')
+      const event = [...h.store.events.get(n)!].reverse().find((e) => e.label?.name === 'ac/status:ready')!
+      event.created_at = '2026-10-16T00:00:00.000Z'
+      await onLabelAdded?.('ac/status:ready', new Date('2026-10-16T00:00:01.000Z'))
+      throw new Error('label write timed out')
+    })
+    await h.ring(c.issueNumber)
+    const pending = await h.card(c.id)
+    expect(pending.promotionReadyEventId).not.toBeNull()
+    expect(Date.parse('2026-10-16T00:00:00.000Z')).not.toBe(Date.parse('2026-10-16T00:00:01.000Z'))
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+  })
+
+  it('does not adopt an agent ready re-add in the same second after a human restores todo', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    const ours = (await h.card(c.id)).promotionReadyEventId
+    expect(ours).not.toBeNull()
+    h.store.relabel(c.issueNumber, ['ac/status:todo'], 'human')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
+    const events = h.store.events.get(c.issueNumber)!
+    const ownEvent = events.find((event) => event.id === Number(ours))!
+    const agent = [...events]
+      .reverse()
+      .find((event) => event.event === 'labeled' && event.label?.name === 'ac/status:ready')!
+    expect(agent.id).not.toBe(ownEvent.id)
+    agent.created_at = ownEvent.created_at
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await h.ring(c.issueNumber, 'graph-2')
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, promotionReadyEventId: null })
+  })
+
+  it('a graph doorbell does not skip a pending promotion backoff, and a human doorbell does', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.store.events.set(c.issueNumber, [])
+    await h.dispatcher.tick()
+    const backed = await h.card(c.id)
+    expect(backed.recoveryChecks).toBe(1)
+    const reads = h.store.reads.length
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'graph')).toBe(false)
+    expect(h.store.reads.length).toBe(reads)
+    expect(await h.card(c.id)).toMatchObject({ recoveryChecks: 1, recoveryCheckAt: backed.recoveryCheckAt })
+    h.clock.advance(1000)
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(false)
+    expect(h.store.reads.length).toBeGreaterThan(reads)
+    const afterHuman = await h.card(c.id)
+    expect(afterHuman).toMatchObject({ promotionPending: true, recoveryChecks: 1 })
+    expect(afterHuman.recoveryCheckAt!.getTime()).not.toBe(backed.recoveryCheckAt!.getTime())
+  })
 
   it.each(['tick', 'doorbell'] as const)(
     'a thrown %s read preserves the receipt and a later tick repairs',
     async (trigger) => {
       const h = await graphHarness()
       const c = await failPromotion(h, ['ac/status:ready'])
-      const receipt = (await h.card(c.id)).promotionReadyAddedAt
+      const receipt = (await h.card(c.id)).promotionReadyEventId
       vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
       if (trigger === 'doorbell')
         await expect(h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).rejects.toThrow('GitHub 503')
@@ -988,7 +1058,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await h.card(c.id)).toMatchObject({
         status: 'todo',
         promotionPending: true,
-        promotionReadyAddedAt: receipt,
+        promotionReadyEventId: receipt,
         recoveryChecks: 1
       })
       const reads = h.store.reads.length
@@ -1002,7 +1072,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await h.card(c.id)).toMatchObject({
         status: 'running',
         promotionPending: false,
-        promotionReadyAddedAt: null
+        promotionReadyEventId: null
       })
     }
   )
