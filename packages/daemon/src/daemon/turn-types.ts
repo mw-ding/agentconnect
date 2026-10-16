@@ -1,7 +1,13 @@
 import type { TurnMessage } from '../assistant/place-members.js'
 import type { HostKey } from '../acp/host-key.js'
 import type { CodeHostDecisionContext } from '../codehost/decision-state.js'
-import type { DutyGrantEntry, EventSession, ExternalSessionAudience, SessionKey } from '@agentconnect.md/protocol'
+import type {
+  DutyGrantEntry,
+  EventSession,
+  ExternalSessionAudience,
+  KanbanDispatch,
+  SessionKey
+} from '@agentconnect.md/protocol'
 import type { AcpHost } from '../acp/acp-host.js'
 import type { LoadedAgent } from '../agents/load-agents.js'
 import type { TurnPlan } from './turn-plan.js'
@@ -312,6 +318,8 @@ export interface QueueEntry {
   webchat?: WebchatTurnContext
   callMeta?: CallMeta
   hookContext?: HookDispatchContext
+  /** The Kanban card lease this turn runs under (issue #2 M2). */
+  kanban?: KanbanDispatch
   // Model and repository selection share one collected snapshot for this session birth.
   codeHostDecisionContext?: Promise<CodeHostDecisionContext | undefined>
   /** Best-effort lifecycle notification after ACP session initialization but

@@ -1,3 +1,5 @@
+import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
+import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
   MEMORY_ENTRIES_V1_FEATURE,
@@ -1004,6 +1006,9 @@ import type {
   SessionPullRequestFeedbackResult,
   TaskList,
   TaskListReq,
+  KanbanDispatch,
+  KanbanDispatchOk,
+  KanbanDispatchRefusal,
   McpAppRpc,
   McpAppRpcResult,
   CodeHostProvider,
@@ -1425,6 +1430,7 @@ export class Daemon {
   /** Spawn-time config warnings per agent (config-file secrets: pointer-var
    *  conflicts, write failures) — flushed into the next dispatched session. */
   private pendingSpawnNotices = new Map<string, string[]>()
+  private kanban?: KanbanWorker
   // Effective agents combine user-authored agent.json files with the in-memory CP
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
@@ -2491,6 +2497,7 @@ export class Daemon {
   private commandHost(): CommandHost {
     return {
       log: () => this.log,
+      kanbanReadOnly: (key) => this.kanban?.forSession(key)?.mode === 'read',
       store: () => this.store,
       agents: () => this.agents,
       cancelDecisionVerdicts: async (agentId, msg, kind) => {
@@ -5302,6 +5309,7 @@ export class Daemon {
     // Start it even when the control plane is disabled or still unreachable.
     void this.runtimeFacts.probeAndEmit(false).finally(() => this.runtimeFacts.armProbeRefresh())
     this.startMicrosandboxModelProbe()
+    this.kanbanWorker().start()
     if (!this.k8s) startControlPlane(root)
     this.armIdleSweep()
     this.armStoreRetentionSweep()
@@ -11793,6 +11801,12 @@ export class Daemon {
     sessionModel?: string,
     permissionModeOverride?: string
   ): Promise<void> {
+    // A live Kanban card keeps its CP-assigned read-only mode across policy restores.
+    const kanbanKey = this.kanban ? (await this.store.getSessionByAcpIdForAgent(agent.id, sessionId))?.key : undefined
+    if (kanbanKey !== undefined && this.kanban?.forSession(kanbanKey)?.mode === 'read') {
+      permissionModeOverride = readOnlyExtractionMode(host.permissionModeOptions(sessionId)?.modes ?? [])
+      if (!permissionModeOverride) throw new Error('kanban runtime cannot enforce read-only mode')
+    }
     const catalog = this.runtimeFacts.modelCatalog(agent.runtime)
     // Catalog defaults resolve ACP's opaque `default` to a concrete selectable model.
     const model =
@@ -14517,6 +14531,7 @@ export class Daemon {
    *  physical convergence a duty change drives. */
   private permissionHost(): PermissionHost {
     return {
+      kanbanSession: (key) => this.kanban?.forSession(key) !== undefined,
       cancelTurn: (p, reason) =>
         this.interruptTurn(p.plan.agentId, p.plan.sessionKey, reason ?? 'cancel', p.acpSessionId, { only: p }),
       log: () => this.log,
@@ -15051,6 +15066,8 @@ export class Daemon {
     key: string,
     options: { required?: boolean; adoptExisting?: boolean; existingId?: string; receiptId?: string } = {}
   ): Promise<'inserted' | 'adopted' | 'existing' | 'skipped' | 'failed'> {
+    // A restart must reclaim the lease before retrying work, rather than replay a potentially revoked write.
+    if (entry.kanban) return 'skipped'
     if (entry.webchat && entry.webchat.initiator !== 'agent') return 'skipped' // Browser-owned live sinks cannot replay.
     const id = options.existingId ?? entry.callMeta?.deliveryId ?? stableMessageId(entry.msg)
     const row = {
@@ -15542,6 +15559,7 @@ export class Daemon {
     webchat?: WebchatTurnContext,
     callMeta?: CallMeta,
     opts?: {
+      kanban?: KanbanDispatch
       isQueueCmd?: boolean
       /** Steer into the live turn or refuse `busy` — never queue. For a caller that keeps its own
        *  queue (the console composer) and must learn the verdict from the admission ACK. */
@@ -15810,6 +15828,7 @@ export class Daemon {
           ...(callMeta ? { callMeta } : {}),
           ...(hookContext ? { hookContext } : {}),
           ...(opts?.onSessionReady ? { onSessionReady: opts.onSessionReady } : {}),
+          ...(opts?.kanban ? { kanban: opts.kanban } : {}),
           ...(opts?.admissionWait ? { admissionWait: opts.admissionWait } : {}),
           ...(opts?.deferObservedInbound ? { deferObservedInbound: true } : {}),
           ...(opts?.isQueueCmd ? { isQueueCmd: true } : {}),
@@ -16591,7 +16610,16 @@ export class Daemon {
       // after a restart, when `msg` is long gone — still carry the same facts.
       // Also BEFORE the cold fence below: a cancel there keeps the new row, and a row
       // without its source binding rejects every later turn as a source mismatch.
-      await this.classifyNewSession(agentId, key, sessionId, msg, callMeta, hookContext, webchat?.evaluation === true)
+      await this.classifyNewSession(
+        agentId,
+        key,
+        sessionId,
+        msg,
+        callMeta,
+        hookContext,
+        webchat?.evaluation === true,
+        entry.kanban ?? this.kanban?.forSession(key)
+      )
     }
     // A cold session can spend time booting/materializing inside sessions.handle(). If
     // pause landed in that window, no Pending existed for the transition hook to cancel.
@@ -16790,7 +16818,14 @@ export class Daemon {
     evaluation: TurnEvaluationReporter
   ): Promise<'ok' | 'rejected'> {
     const { agentId, msg, integrationId, callMeta, hookContext } = entry
-    const sourceBinding = await this.bindSessionSource(agentId, key, msg, callMeta, hookContext)
+    const sourceBinding = await this.bindSessionSource(
+      agentId,
+      key,
+      msg,
+      callMeta,
+      hookContext,
+      entry.kanban ?? this.kanban?.forSession(key)
+    )
     if (sourceBinding !== 'unchanged') {
       evaluation.finishEvaluation('turn.cancelled', { reason: HOOK_REPORT_REASON_SESSION_SOURCE_MISMATCH })
       const conn = this.replyConnFor(agentId, integrationId)
@@ -16940,6 +16975,9 @@ export class Daemon {
           ...(remoteMcpServer ? { additionalMcpServers: [remoteMcpServer] } : {}),
           ...(entry.selectedHost ? { host: entry.selectedHost.host } : {}),
           ...(webchatIsolation ? { workspaceIsolation: webchatIsolation } : {}),
+          ...(entry.kanban?.mode === 'write'
+            ? { workspaceIsolation: 'session' as const, forceWorkspaceIsolation: true }
+            : {}),
           ...reviewWorkspace,
           ...(launchWorkspaceCwd !== undefined ? { preparedWorkspaceCwd: launchWorkspaceCwd } : {})
         }
@@ -17889,6 +17927,17 @@ export class Daemon {
         sessionId,
         promptAgent ? this.selectedSessionModel(run) : undefined
       )
+    }
+    // Enforce the CP-assigned Kanban run mode after every runtime override and before any prompt, including background wakes.
+    const kanban = entry.kanban ?? this.kanban?.forSession(key)
+    if (kanban?.mode === 'read') {
+      const readMode = readOnlyExtractionMode(host.permissionModeOptions(sessionId)?.modes ?? [])
+      if (!readMode || !(await host.setSessionPermissionMode(sessionId, readMode))) {
+        throw new Error('kanban runtime cannot enforce read-only mode')
+      }
+    }
+    if (kanban?.mode === 'write' && (await this.store.getSession(key))?.workspaceIsolation !== 'session') {
+      throw new Error('kanban write requires a session worktree')
     }
     return { host, modelOverride: chatSettingsAllowed(promptAgent) ? override : undefined }
   }
@@ -21767,10 +21816,11 @@ export class Daemon {
     msg: NormalizedMessage,
     callMeta: CallMeta | undefined,
     hookContext: HookDispatchContext | undefined,
-    isEvaluation = false
+    isEvaluation = false,
+    kanban?: KanbanDispatch
   ): Promise<void> {
     try {
-      await this.classifyNewSessionOrThrow(agentId, key, acpSessionId, msg, callMeta, hookContext, isEvaluation)
+      await this.classifyNewSessionOrThrow(agentId, key, acpSessionId, msg, callMeta, hookContext, isEvaluation, kanban)
     } catch (err) {
       // Never let classification break a turn — but fail CLOSED: an unclassified
       // session keeps memory capture excluded until the CP confirms otherwise.
@@ -21817,6 +21867,16 @@ export class Daemon {
       }
     }
     return undefined
+  }
+
+  private kanbanExternalSource(dispatch: KanbanDispatch | undefined) {
+    if (!dispatch) return undefined
+    return {
+      externalProvider: 'github' as const,
+      externalRealmKey: 'github.com',
+      externalResourceKind: 'repository' as const,
+      externalResourceKey: dispatch.repoId
+    }
   }
 
   private githubExternalSource(hookContext: HookDispatchContext | undefined) {
@@ -21894,12 +21954,14 @@ export class Daemon {
     key: string,
     msg: NormalizedMessage,
     callMeta: CallMeta | undefined,
-    hookContext: HookDispatchContext | undefined
+    hookContext: HookDispatchContext | undefined,
+    kanban?: KanbanDispatch
   ): Promise<'unchanged' | 'mismatch' | 'unavailable'> {
     // A console continuation onto a hook session is not a new audience claiming a runtime — it IS that session, and nothing re-derives a hook audience without the delivery's trusted metadata, so the row keeps its binding (§9).
     if (msg.adoptedSession && originKindOf(msg.platform) === 'hook') return 'unchanged'
     const direct =
       this.githubExternalSource(hookContext) ??
+      this.kanbanExternalSource(kanban) ??
       (await this.conversationExternalSource(agentId, msg, postlessCall(callMeta)))
     // A CONVERSATION audience is only bindable when fully attributed (realm +
     // integration); a repository audience (GitHub) has its own completeness rule.
@@ -21956,7 +22018,8 @@ export class Daemon {
     msg: NormalizedMessage,
     callMeta: CallMeta | undefined,
     hookContext: HookDispatchContext | undefined,
-    isEvaluation: boolean
+    isEvaluation: boolean,
+    kanban?: KanbanDispatch
   ): Promise<void> {
     // A report that opens its place's long session (assistant-mode.md §5.13) is the place's own, not a child.
     const isA2aChild = callMeta !== undefined && callMeta.opensPlace !== true
@@ -21972,6 +22035,7 @@ export class Daemon {
     // attributed wake of it (human or agent) rejects as a cross-source mismatch.
     const directExternalSource =
       this.githubExternalSource(hookContext) ??
+      this.kanbanExternalSource(kanban) ??
       (await this.conversationExternalSource(agentId, msg, postlessCall(callMeta)))
     const inheritedExternalSource = callMeta?.externalOrigin
       ? {
@@ -25953,6 +26017,8 @@ export class Daemon {
       replayApprovalActivity: () => this.permissions.replayApprovalActivity(),
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       cronReportOutbox: () => this.cronReportOutbox,
+      kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
+      kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
       effectiveAgents: () => this.effectiveAgents(),
@@ -26373,6 +26439,87 @@ export class Daemon {
       }, 250)
       this.transcriptActivityTimers.set(key, { timer, activity })
     }
+  }
+
+  // The shared serial gate owns execution; the worker owns lease liveness and durable body-free reports.
+  private kanbanWorker(): KanbanWorker {
+    return (this.kanban ??= new KanbanWorker({
+      clock: this.clock,
+      log: this.log,
+      outbox: {
+        has: (id) => this.store.hasKanbanReport(id),
+        reserve: (id, at) => this.store.reserveKanbanLease(id, at),
+        release: (id) => this.store.releaseKanbanLease(id),
+        put: (report, at) => this.store.putKanbanReport(report, at),
+        list: (limit) => this.store.listKanbanReports(limit),
+        remove: (id) => this.store.ackKanbanReport(id)
+      },
+      cp: () => {
+        const cp = this.cpClient
+        return cp
+          ? {
+              ready: () => cp.state === 'READY' || cp.state === 'DRAINING',
+              heartbeat: (payload) => cp.kanbanHeartbeat(payload),
+              report: (payload) => cp.kanbanReport(payload)
+            }
+          : undefined
+      },
+      gate: (dispatch) => this.kanbanGate(dispatch),
+      start: (dispatch, onSessionReady) => this.startKanban(dispatch, onSessionReady),
+      cancel: (lease) => {
+        const agentId = lease.dispatch.agentId
+        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', lease.sessionId)
+        // SDK background work has no Pending turn for interruptTurn to cancel; stop its host before admitting another writer.
+        if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), lease.sessionId)) {
+          void this.stopHost(agentId).catch((err) =>
+            this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
+          )
+        }
+      },
+      probe: {
+        turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
+        liveBackgroundTasks: (agentId, sessionId, sessionKey) =>
+          this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, sessionKey), sessionId) ? 0 : 1
+      }
+    }))
+  }
+
+  private async kanbanGate(d: KanbanDispatch): Promise<KanbanDispatchRefusal | undefined> {
+    const agent = this.agents.get(d.agentId)
+    if (!agent) return 'no_agent'
+    if (this.paused(d.agentId)) return 'paused'
+    if (this.draining || this.drainingAgents.has(d.agentId)) return 'draining'
+    if (this.safetyDrainingAgents.has(d.agentId)) return 'busy'
+    if (d.mode === 'write' && agent.workspace.mode !== 'git-repo') return 'write_needs_worktree'
+    const msg = buildKanbanMessage(d, randomUUID())
+    const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
+    if (this.inflight.has(key)) return 'busy'
+    const rec = await this.store.getSession(key)
+    if (!this.sessionSdkQuiescent(this.sessionOwnerKey(d.agentId, key), rec?.acpSessionId)) return 'busy'
+    return undefined
+  }
+
+  // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.
+  private async startKanban(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult> {
+    const msg = buildKanbanMessage(d, randomUUID())
+    const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
+    let admitted!: (result: { accepted: boolean; reason?: string }) => void
+    const admission = new Promise<{ accepted: boolean; reason?: string }>((resolve) => (admitted = resolve))
+    const done = this.dispatch(d.agentId, msg, undefined, undefined, undefined, {
+      kanban: d,
+      onSessionReady,
+      onAdmission: (result) => admitted(result)
+    })
+    void done.then(
+      () => admitted({ accepted: false, reason: 'busy' }),
+      () => admitted({ accepted: false, reason: 'busy' })
+    )
+    const result = await admission
+    if (!result.accepted) {
+      void done.catch(() => undefined)
+      return { accepted: false, reason: result.reason === 'paused' ? 'paused' : 'busy' }
+    }
+    return { accepted: true, sessionKey: key, done }
   }
 
   private async startCpClient(root: string): Promise<void> {
@@ -27080,6 +27227,8 @@ export class Daemon {
     // A grant can land right up to the socket close; its release must be settled before that.
     if (this.shutdownDutyDrain) await this.dutyCoordinator.settleLateGrants(shutdownDrain)
     this.shutdownDutyDrain = undefined
+    this.kanban?.stop()
+    await this.kanban?.tick().catch((e) => errors.push(e))
     await Promise.resolve(this.cpClient?.stop()).catch((e) => errors.push(e))
     await Promise.resolve(this.sessionMetadataOutbox.inFlightDrain()).catch((e) => errors.push(e))
     await Promise.resolve(this.cronReportOutbox.inFlightDrain()).catch((e) => errors.push(e))

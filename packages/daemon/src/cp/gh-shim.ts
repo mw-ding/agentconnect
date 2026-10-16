@@ -2,7 +2,7 @@
 // gh reads a STATIC GH_TOKEN fixed at spawn and has no credential-helper hook, so the wrapper goes first on PATH.
 // Thin on purpose: locate the real gh, forward the whole argv to the token command, exec gh with what it printed.
 // Which repo that token names is decided by `cp/gh-target.ts` on the Node side — sh must not parse `gh api` paths.
-// A user-supplied GH_TOKEN always wins; a refused repository stops here, an unreachable daemon runs the real gh untouched.
+// Fail closed: agent gh uses only fresh daemon-issued github.com tokens and never falls back to human credentials.
 // Secret-free (paths + agent id only): tokens transit a shell variable and the exec'd env, never argv, never disk.
 import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -39,31 +39,54 @@ if [ -z "$REAL_GH" ]; then
   exit 127
 fi
 
-# A user-configured GH_TOKEN always wins.
-if [ -n "$GH_TOKEN" ]; then
-  exec "$REAL_GH" "$@"
+# Only the daemon may supply invocation-scoped GitHub credentials.
+if [ -n "$GH_TOKEN$GITHUB_TOKEN$GH_ENTERPRISE_TOKEN$GITHUB_ENTERPRISE_TOKEN" ]; then
+  echo "agentconnect: refusing inherited GitHub token; agent gh requires daemon credentials" >&2
+  exit 1
 fi
 if [ -z "$AC_AGENT_ID" ]; then
-  exec "$REAL_GH" "$@"
+  echo "agentconnect: AC_AGENT_ID is required for agent gh credentials" >&2
+  exit 1
 fi
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+
+# The daemon token is a github.com token; never let a host selector carry it, or stored auth, elsewhere.
+_HOST=""
+_prev=""
+for _a in "$@"; do
+  [ "$_prev" = "--hostname" ] && _HOST="$_a"
+  case "$_a" in
+    --hostname=*) _HOST="\${_a#--hostname=}" ;;
+  esac
+  _prev="$_a"
+done
+for _h in "$_HOST" "\${GH_HOST-}"; do
+  case "$_h" in
+    ''|[Gg][Ii][Tt][Hh][Uu][Bb].[Cc][Oo][Mm]) ;;
+    *)
+      echo "agentconnect: agent gh is limited to github.com; refusing host $_h" >&2
+      exit 1
+      ;;
+  esac
+done
 
 # Fresh token from the daemon; it resolves the target repo from the argv forwarded below
 # (stdout = token only; stderr passes through so the agent can read WHY a repo was refused).
-# Exit 2 = "not ours" (non-github host) — run the real gh untouched.
-# Exit 3 = refused — stop, since gh without a token would only add "not logged in" advice to the reason.
+# Exit 2 = "not ours" (non-github.com target), exit 3 = refused; every failure stops before stored gh auth.
 _TOKEN=$(${tokenCommand})
 _RC=$?
 if [ "$_RC" -eq 2 ]; then
-  exec "$REAL_GH" "$@"
+  echo "agentconnect: agent gh credentials are limited to github.com; refusing a non-github.com target" >&2
+  exit 1
 fi
 if [ "$_RC" -eq 3 ]; then
   exit 1
 fi
-if [ -n "$_TOKEN" ]; then
-  GH_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
+if [ "$_RC" -ne 0 ] || [ -z "$_TOKEN" ]; then
+  echo "agentconnect: daemon could not provide GitHub credentials; refusing stored gh authentication" >&2
+  exit 1
 fi
-# Daemon couldn't serve one — let gh use any of its own configured auth.
-exec "$REAL_GH" "$@"
+GH_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
 `
 }
 

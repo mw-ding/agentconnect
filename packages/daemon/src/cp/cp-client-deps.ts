@@ -26,6 +26,8 @@ import type {
   SharedImageResolveReq,
   TaskList,
   TaskListReq,
+  KanbanDispatch,
+  KanbanDispatchOk,
   ExecutorStrategyTable,
   TransferNetwork
 } from '@agentconnect.md/protocol'
@@ -145,6 +147,8 @@ export interface CpClientReadyHost {
   replayApprovalActivity(): void
   sessionMetadataOutbox(): SessionMetadataOutbox
   cronReportOutbox(): CronReportOutbox
+  /** Beat live Kanban leases and drain their owed reports. */
+  kanbanTick(): Promise<void>
   webchatMcpRevocations(): WebchatMcpRevocations
   drainSessionPurges(): Promise<void>
   effectiveAgents(): LoadedAgent[]
@@ -197,6 +201,8 @@ export interface CpClientSeamHost {
   dispatchPullRequestFeedback(req: SessionPullRequestFeedback): Promise<SessionPullRequestFeedbackResult>
   resolveSharedImage(req: SharedImageResolveReq, orgId?: string): Promise<SharedImageResolveOk>
   listBackgroundTasks(req: TaskListReq): Promise<TaskList>
+  /** Admit one leased Kanban card (issue #2 M2). */
+  kanbanDispatch(dispatch: KanbanDispatch): Promise<KanbanDispatchOk>
   /** An editor's approve or discard of an assistant-mode draft, run exactly as its card click would. */
   decideAssistantDraft: AssistantActivityDeps['decideDraft']
   /** The `!cancel` core shared by every stop surface: interrupt a session's turn, no mute; true when one was interrupted. */
@@ -372,6 +378,8 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
       void host.drainSessionPurges()
       // ...and every terminal cron outcome the CP has not ACKed, such as a completion that raced the drop.
       void host.cronReportOutbox().drainReports()
+      // ...and every Kanban lease beat and report the CP has not answered.
+      void host.kanbanTick().catch((err) => host.log().warn(`kanban reconnect failed: ${(err as Error).message}`))
       // ...and each CP cron's stored last-run stamp — fires while the CP was
       // unreachable would otherwise never land (latest-wins upsert, so
       // re-asserting an already-known stamp is a no-op).
@@ -416,6 +424,7 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
     // re-done here (the lineage rule lives where the session lives), not trusted from the CP.
     childSessionStatusProbe: (probe) => host.childSessionStatusProbe(probe),
     sharedImageResolve: (req, orgId) => host.resolveSharedImage(req, orgId),
+    kanbanDispatch: (dispatch) => host.kanbanDispatch(dispatch),
     pullRequestFeedback: async (req) => {
       if (host.dutyCoordinator().dutyEnforced() && !host.duties().holdsAgent(req.agentId)) {
         const claimed = await host.dutyCoordinator().claimDutyForTrigger(req.agentId)

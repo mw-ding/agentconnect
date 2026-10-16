@@ -155,6 +155,16 @@ export interface ApprovalWait {
 }
 
 /** Process-wide daemon state the permission path reads. */
+/** A tool call that looks like it adds, removes, or edits an `ac/*` label. */
+function isKanbanLabelMutation(params: RequestPermissionRequest): boolean {
+  const tool = JSON.stringify(params.toolCall ?? {})
+  return (
+    /ac(?:\/|%2f)/i.test(tool) &&
+    /label/i.test(tool) &&
+    /add|remove|delete|edit|create|rename|replace|post|put|patch|set|update/i.test(tool)
+  )
+}
+
 export interface PermissionCoreHost {
   log(): Logger
   clock(): Clock
@@ -182,6 +192,8 @@ export interface PermissionCoreHost {
   memoryExtraction(turnKey: string): MemoryExtractionTurn | undefined
   /** End a turn as its caller's cancel would; a sub-session whose approval wait ran out names that instead. */
   cancelTurn(p: Pending, reason?: 'approval wait expired'): Promise<void>
+  /** Whether a Kanban card lease owns this session; its agent may not mutate `ac/*` labels. */
+  kanbanSession?(sessionKey: string): boolean
 }
 
 /** What the permission path knows about a live extraction turn: the bridge calls it has issued so far. */
@@ -2253,6 +2265,14 @@ export class PermissionCoordinator {
     params: RequestPermissionRequest
   ): Promise<RequestPermissionResponse> {
     try {
+      if (this.host.kanbanSession && isKanbanLabelMutation(params)) {
+        const session = await this.host.store().getSessionByAcpIdForAgent(hostKeyAgentId(owner), sessionId)
+        // Best-effort tool guard; write mode is CP configuration and recovery ignores non-human label writes.
+        if (session && this.host.kanbanSession(session.key)) {
+          this.permissionEvaluationDetails.set(params, { reason: 'kanban_label_mutation' })
+          return { outcome: { outcome: 'cancelled' } }
+        }
+      }
       return await this.resolveAcpPermission(owner, sessionId, params)
     } catch (err) {
       this.permissionEvaluationDetails.set(params, { reason: 'permission_policy_error' })

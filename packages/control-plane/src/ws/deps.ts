@@ -51,6 +51,7 @@ import type { GithubRunCoordinator } from '../github/run-reporter.js'
 import type { countReviewCheckout } from '../observability/review-checkout.js'
 import type { CodeHostNoteProjectionService } from '../codehost/note-projection.service.js'
 import type { GiteaStatusCoordinator } from '../gitea/status-projection.js'
+import type { KanbanDispatcher } from '../kanban/dispatcher.js'
 import type { ReconcileService } from '../orchestrator/placement.js'
 import type { ConnectionRegistry } from './registry.js'
 import type { Clock } from '../domain/clock.js'
@@ -228,6 +229,8 @@ export interface DaemonWsDeps {
   codeHostNoteProjection?: CodeHostNoteProjectionService
   /** gitea-integration.md §10.4: the Control-Plane-written commit-status projection's lifecycle edges. */
   giteaStatusProjection?: GiteaStatusCoordinator
+  /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
+  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport'>
   /** The current relay roster, injected into `register/ok.relays` so a (re)connecting
    *  daemon converges to the relays it should dial (shared-bot-relay.md §5). */
   relayRoster: () => Promise<RelayRosterEntry[]>

@@ -361,6 +361,50 @@ describe('CpClient dispatch', () => {
     await unsupported.client.stop()
   })
 
+  it('routes Kanban dispatch and correlates daemon heartbeats and terminal reports', async () => {
+    const dispatch = {
+      boardId: CRON_ID,
+      cardId: MOVE_ID,
+      agentId: CRON_AGENT_ID,
+      leaseId: DAEMON_ID,
+      repoId: '123',
+      repoFullName: 'acme/web',
+      issueNumber: 42,
+      attempt: 1,
+      dispatchRevision: '3',
+      sessionKeyPrefix: 'github:123',
+      mode: 'read' as const
+    }
+    const admit = vi.fn(async () => ({ leaseId: DAEMON_ID, accepted: true as const }))
+    const { t, client } = await readyClient({ kanbanDispatch: admit })
+    const request = buildEnvelope('kanban/dispatch', dispatch)
+    t.pushInbound(JSON.stringify(request))
+    await tick()
+    expect(admit).toHaveBeenCalledWith(dispatch)
+    expect(t.lastSent()).toMatchObject({ type: 'kanban/dispatch/ok', corr: request.id, payload: { accepted: true } })
+    const beating = client.kanbanHeartbeat({
+      leases: [{ leaseId: DAEMON_ID, cardId: MOVE_ID, dispatchRevision: '3', liveness: 'turn' }]
+    })
+    const beat = t.lastSent()
+    t.pushInbound(frame('kanban/lease-heartbeat/ok', { superseded: [] }, { corr: beat.id }))
+    await expect(beating).resolves.toEqual({ superseded: [] })
+    const reporting = client.kanbanReport({
+      boardId: CRON_ID,
+      cardId: MOVE_ID,
+      agentId: CRON_AGENT_ID,
+      leaseId: DAEMON_ID,
+      attempt: 1,
+      dispatchRevision: '3',
+      outcome: 'protocol_violation'
+    })
+    const report = t.lastSent()
+    t.pushInbound(
+      frame('kanban/report/ok', { leaseId: DAEMON_ID, accepted: false, reason: 'superseded' }, { corr: report.id })
+    )
+    await expect(reporting).resolves.toMatchObject({ accepted: false, reason: 'superseded' })
+    await client.stop()
+  })
+
   it('tracks additive CP features negotiated through register/ok', async () => {
     const { client } = await readyClient({}, ['hook-report-ack-v1', 'gitcred-actions-v1'])
     expect(client.supportsServerFeature('gitcred-actions-v1')).toBe(true)

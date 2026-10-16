@@ -37,6 +37,12 @@ import type {
   IntegrationChannels,
   IntegrationRevoked,
   IntegrationRevokedOk,
+  KanbanDispatch,
+  KanbanDispatchOk,
+  KanbanLeaseHeartbeat,
+  KanbanLeaseHeartbeatOk,
+  KanbanReport,
+  KanbanReportOk,
   CronReport,
   HookReport,
   HookPreparing,
@@ -150,6 +156,7 @@ import type { ControlWire } from './control/context.js'
 import type { CodeHostControlDeps } from './control/codehost.js'
 import type { DreamControlDeps } from './control/dream.js'
 import type { ExecutorControlDeps } from './control/executor.js'
+import type { KanbanControlDeps } from './control/kanban.js'
 import type { MemoryControlDeps } from './control/memory.js'
 import { CONTROL_HANDLERS, type ControlDeps } from './control/registry.js'
 import type { SessionControlDeps } from './control/session.js'
@@ -221,6 +228,7 @@ export interface CpClientDeps
     DecisionControlDeps,
     DreamControlDeps,
     ExecutorControlDeps,
+    KanbanControlDeps,
     MemoryControlDeps,
     SessionControlDeps,
     SkillsControlDeps,
@@ -395,6 +403,7 @@ export class CpClient {
     }
     this.controlDeps = {
       configApply: deps.configApply,
+      kanbanDispatch: deps.kanbanDispatch,
       sessionRead: deps.sessionRead,
       childSessionStatusProbe: deps.childSessionStatusProbe && ((probe) => deps.childSessionStatusProbe!(probe)),
       pullRequestFeedback: deps.pullRequestFeedback && ((req) => deps.pullRequestFeedback!(req)),
@@ -948,13 +957,22 @@ export class CpClient {
     return rep.payload as IntegrationRevokedOk
   }
 
-  /**
-   * Report a CP-owned cron fire (D→C `cron/report` EVT, fire-and-forget) so the
-   * console's `lastRunAt` converges. The local D11 stamp stays authoritative and
-   * the CP upsert is latest-wins, so re-asserting stored stamps on each
-   * (re)connect (see onReady in daemon.ts) makes a dropped report only a delay,
-   * never a loss. No-op unless READY/DRAINING.
-   */
+  // Correlated lease updates release durable daemon reports only after a CP reply.
+  async kanbanHeartbeat(payload: KanbanLeaseHeartbeat): Promise<KanbanLeaseHeartbeatOk> {
+    this.requireReady('kanban/lease-heartbeat')
+    const rep = await this.request('kanban/lease-heartbeat', payload)
+    if (rep.type !== 'kanban/lease-heartbeat/ok') throw new WireError('INTERNAL', 'unexpected heartbeat reply', false)
+    return rep.payload as KanbanLeaseHeartbeatOk
+  }
+
+  async kanbanReport(payload: KanbanReport): Promise<KanbanReportOk> {
+    this.requireReady('kanban/report')
+    const rep = await this.request('kanban/report', payload)
+    if (rep.type !== 'kanban/report/ok') throw new WireError('INTERNAL', 'unexpected report reply', false)
+    return rep.payload as KanbanReportOk
+  }
+
+  // Re-emit the daemon's last-run stamp on reconnect so dropped cron telemetry converges.
   emitCronReport(report: CronReport): void {
     if (this.state !== 'READY' && this.state !== 'DRAINING') return
     this.transport?.send(encode(this.scopedFrame('cron/report', report)))

@@ -2506,6 +2506,12 @@ enum KanbanCompletionContract {
   pr_checks_green
 }
 
+// Mode comes only from board/card database configuration; write runs need their own session worktree.
+enum KanbanRunMode {
+  read
+  write
+}
+
 enum KanbanRunOutcome {
   completed
   review_requested
@@ -2534,6 +2540,7 @@ model KanbanBoard {
   failureLimit          Int                      @default(2)
   protocolRetryLimit    Int                      @default(3)
   blockRecurrenceLimit  Int                      @default(2)
+  defaultMode           KanbanRunMode            @default(read)
   completionContract    KanbanCompletionContract @default(close)
   enabled               Boolean                  @default(true)
   configRevision        BigInt                   @default(1)
@@ -2566,6 +2573,7 @@ model KanbanCard {
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?
+  mode                KanbanRunMode?
   status              KanbanCardStatus @default(triage)
   assigneeAgentId     String?          @db.Uuid
   priority            Int              @default(0)
@@ -2575,6 +2583,9 @@ model KanbanCard {
   protocolViolations  Int              @default(0)
   blockRecurrence     Int              @default(0)
   cooldownUntil       DateTime?        @db.Timestamptz(6)
+  // Mismatch recovery backoff: next GitHub re-read and checks since the last change.
+  recoveryCheckAt     DateTime?        @db.Timestamptz(6)
+  recoveryChecks      Int              @default(0)
   linkedPrNumber      Int?
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)
@@ -2597,16 +2608,20 @@ model KanbanCard {
 }
 
 // One dispatch attempt. Agent/daemon ids are history, not FKs: a run outlives its placement.
+// Migration-only partial indexes: one open run (endedAt IS NULL) per card, and the reaper's open-run scan.
 model KanbanRun {
   id               String            @id @default(uuid()) @db.Uuid
   cardId           String            @db.Uuid
   attempt          Int
   agentId          String            @db.Uuid
   daemonId         String            @db.Uuid
+  daemonEpoch      BigInt            @default(0) // daemon sessionEpoch at dispatch; re-stamped by each heartbeat
+  mode             KanbanRunMode     @default(read)
   sessionId        String?
   leaseId          String            @unique @db.Uuid
   dispatchRevision BigInt // the card's dispatchRevision this lease was minted under
   dispatchedAt     DateTime          @db.Timestamptz(6)
+  ackedAt          DateTime?         @db.Timestamptz(6) // daemon accepted kanban/dispatch; null while awaiting the ack
   heartbeatAt      DateTime?         @db.Timestamptz(6)
   endedAt          DateTime?         @db.Timestamptz(6)
   outcome          KanbanRunOutcome?

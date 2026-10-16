@@ -51,6 +51,8 @@ import {
   CronUpsert,
   CronRemove,
   CronRunNow,
+  KanbanDispatch,
+  KanbanDispatchOk,
   IntegrationUpsert,
   IntegrationRemove,
   IntegrationForget,
@@ -197,6 +199,7 @@ import {
 } from '@agentconnect.md/protocol'
 import type { LaunchRepo } from '../persistence/ports.js'
 import { ConnectionClosed, type ConnectionRegistry, type DaemonConnState } from '../ws/registry.js'
+import type { RequestOpts } from '../ws/correlator.js'
 import { AgentId, DaemonId, LaunchId } from '../domain/ids.js'
 import { ProtocolError } from '../domain/errors.js'
 
@@ -639,6 +642,12 @@ export class ControlSender {
   async autoMergeState(daemonId: string, orgId: string, req: AutoMergeStateReq): Promise<AutoMergeState> {
     const c = this.must(daemonId)
     return c.conn.request<AutoMergeState>('automerge/state', req, { epoch: c.sessionEpoch }, undefined, orgId)
+  }
+
+  /** Lease one Kanban card to an agent on this daemon (issue #2 M2; body-free REQ → `kanban/dispatch/ok`). */
+  async kanbanDispatch(daemonId: string, d: KanbanDispatch, opts?: RequestOpts): Promise<KanbanDispatchOk> {
+    const c = this.must(daemonId)
+    return c.conn.request<KanbanDispatchOk>('kanban/dispatch', d, { epoch: c.sessionEpoch }, opts)
   }
 
   /** Read a daemon's local session projection (REQ → `session/list/page`).

@@ -1159,3 +1159,25 @@ describe('AcpHost steering (`_session/steering` against the fake agent)', () => 
     await host.stop()
   })
 })
+
+describe('worker GitHub credential isolation', () => {
+  it.each([
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'GH_ENTERPRISE_TOKEN',
+    'GITHUB_ENTERPRISE_TOKEN',
+    'GITHUB_AUTH_TOKEN',
+    'GH_CUSTOM_TOKEN',
+    'GITHUB_PAT',
+    'GH_CONFIG_DIR'
+  ])('scrubs %s after merging host, runtime, and explicit environments', async (name) => {
+    const saved = process.env[name]
+    process.env[name] = 'host-human-token'
+    try {
+      expect(await runIsolatedFixture('codex', name, 'configured-human-token')).toContain('env:')
+    } finally {
+      if (saved === undefined) delete process.env[name]
+      else process.env[name] = saved
+    }
+  })
+})

@@ -81,6 +81,7 @@ import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
+import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
@@ -176,6 +177,7 @@ import {
   PgHookRepo,
   PgHookSecretStore,
   PgKanbanBoardRepo,
+  PgKanbanDispatchRepo,
   PgKanbanCardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
@@ -552,6 +554,7 @@ export function buildContainer(
     }),
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
     kanbanBoard: new PgKanbanBoardRepo(prisma),
+    kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     kanbanCard: new PgKanbanCardRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
@@ -1743,23 +1746,46 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke and promotes unblocked todo cards.
+  const kanbanCardStore = github ? new GithubCardStore({ tokens: github.tokens }) : undefined
+
+  // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
+  const kanbanDispatcher = kanbanCardStore
+    ? new KanbanDispatcher({
+        repo: repos.kanbanDispatch,
+        installations: repos.githubInstallation,
+        store: kanbanCardStore,
+        send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
+        isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
+        clock,
+        log: {
+          debug: (o, m) => http.log.debug(o, m),
+          info: (o, m) => http.log.info(o, m),
+          warn: (o, m) => http.log.warn(o, m)
+        }
+      })
+    : undefined
+
   const kanbanGraphLog = {
     debug: (o: unknown, m?: string) => http.log.debug(o, m),
     warn: (o: unknown, m?: string) => http.log.warn(o, m)
   }
-  const kanbanGraphDoorbell = github
-    ? (() => {
-        const store = new GithubCardStore({ tokens: github.tokens })
-        const reconciler = new KanbanGraphReconciler({ cards: repos.kanbanCard, store, log: kanbanGraphLog })
-        return new KanbanGraphDoorbell({
-          boards: repos.kanbanBoard,
-          installations: repos.githubInstallation,
-          store,
-          onGraph: (board, repo, issueNumber, graph) => reconciler.apply(board, repo, issueNumber, graph),
-          log: kanbanGraphLog
-        })
-      })()
+  const kanbanGraphReconciler = kanbanCardStore
+    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    : undefined
+
+  // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
+  const kanbanGraphDoorbell = kanbanCardStore
+    ? new KanbanGraphDoorbell({
+        boards: repos.kanbanBoard,
+        installations: repos.githubInstallation,
+        store: kanbanCardStore,
+        onGraph: async (board, repo, issueNumber, graph) => {
+          await kanbanGraphReconciler?.apply(board, repo, issueNumber, graph)
+          await kanbanDispatcher?.ingestCard(board.id, issueNumber)
+          kanbanDispatcher?.poke(board.id)
+        },
+        log: kanbanGraphLog
+      })
     : undefined
 
   const logtoMgmtCfg = resolveLogtoMgmtConfig(config)
@@ -2709,6 +2735,7 @@ export function buildContainer(
     ...(githubRunCoordinator ? { githubRunCoordinator } : {}),
     ...(codeHostNoteProjection ? { codeHostNoteProjection } : {}),
     giteaStatusProjection,
+    ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
     relayRoster: () => relayRoster.entries(),
     clock,
     config: {
@@ -3126,6 +3153,7 @@ export function buildContainer(
       gitlabRetirementSweeper?.start()
       gitlabConvergeSweeper?.start()
       giteaConvergeSweeper.start()
+      kanbanDispatcher?.start()
       for (const reaper of pendingInstallReapers) reaper.start()
       relaySweeper.start()
       dutyRecompute.start()
@@ -3156,6 +3184,7 @@ export function buildContainer(
       giteaConvergeSweeper.stop()
       installationDoorbell?.stop()
       kanbanGraphDoorbell?.stop()
+      kanbanDispatcher?.stop()
       for (const reaper of pendingInstallReapers) reaper.stop()
       relaySweeper.stop()
       dutyRecompute.stop()
@@ -3173,7 +3202,8 @@ export function buildContainer(
         dutyRecompute.settle(),
         ...(sessionPullRequestFeedback ? [sessionPullRequestFeedback.settle()] : []),
         ...(installationDoorbell ? [installationDoorbell.settle()] : []),
-        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : [])
+        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : []),
+        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : [])
       ])
       await rootPrisma.$disconnect()
     }

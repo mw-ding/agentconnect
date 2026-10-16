@@ -40,6 +40,7 @@ describe('gh wrapper shim', () => {
       execFileSync(shim, args, {
         env: {
           ...process.env,
+          GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
           PATH: `${shimDir}:${realBin}`,
           AC_AGENT_ID: 'agent-1',
           AC_GITCRED_CAPABILITY: 'cap-agent-1',
@@ -70,6 +71,69 @@ describe('gh wrapper shim', () => {
     run(['api', '-X', 'GET', 'repos/acme/infra/pulls/64', '--jq', '.title'])
 
     expect(captured().argv).toEqual(['--', 'api', '-X', 'GET', 'repos/acme/infra/pulls/64', '--jq', '.title'])
+  })
+
+  it.each([
+    { name: 'inherited GH_TOKEN', env: { GH_TOKEN: 'human' }, exit: 0, token: 'app' },
+    { name: 'inherited enterprise token', env: { GITHUB_ENTERPRISE_TOKEN: 'human' }, exit: 0, token: 'app' },
+    { name: 'missing agent id', env: { AC_AGENT_ID: '' }, exit: 0, token: 'app' },
+    { name: 'daemon refusal', env: {}, exit: 1, token: '' },
+    { name: 'non-GitHub target', env: {}, exit: 2, token: '' },
+    { name: 'empty daemon response', env: {}, exit: 0, token: '' },
+    { name: 'token with failing response', env: {}, exit: 1, token: 'app' }
+  ])('fails closed with $name without invoking stored human gh auth', ({ env, exit, token }) => {
+    root = mkdtempSync(join(tmpdir(), 'gh-shim-'))
+    const realBin = join(root, 'real-bin')
+    mkdirSync(realBin)
+    const invoked = join(root, 'invoked')
+    const realGh = join(realBin, 'gh')
+    writeFileSync(realGh, `#!/bin/sh\nprintf invoked > '${invoked}'\n`)
+    chmodSync(realGh, 0o755)
+    const cliEntry = join(root, 'fake-cli.mjs')
+    writeFileSync(cliEntry, `process.stdout.write(${JSON.stringify(token)}); process.exit(${exit})`)
+    const shimDir = writeGhShim(root, cliEntry)
+    const result = spawnSync(join(shimDir, 'gh'), ['repo', 'view', 'acme/web'], {
+      encoding: 'utf8',
+      env: { PATH: `${shimDir}:${realBin}`, AC_AGENT_ID: 'agent-1', ...env }
+    })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toMatch(/agentconnect: .*credential|agentconnect: refusing inherited GitHub token/)
+    expect(existsSync(invoked)).toBe(false)
+  })
+
+  it.each([
+    { name: '--hostname flag', args: ['api', '--hostname', 'attacker.example.com', '/user'], env: {}, ok: false },
+    { name: '--hostname= flag', args: ['api', '--hostname=attacker.example.com', '/user'], env: {}, ok: false },
+    { name: 'GH_HOST', args: ['api', '/user'], env: { GH_HOST: 'attacker.example.com' }, ok: false },
+    {
+      name: 'github.com host',
+      args: ['api', '--hostname', 'github.com', '/user'],
+      env: { GH_HOST: 'GitHub.com' },
+      ok: true
+    }
+  ])('scopes the daemon token to github.com ($name)', ({ args, env, ok }) => {
+    root = mkdtempSync(join(tmpdir(), 'gh-shim-'))
+    const realBin = join(root, 'real-bin')
+    mkdirSync(realBin)
+    const capture = join(root, 'capture')
+    const realGh = join(realBin, 'gh')
+    writeFileSync(realGh, `#!/bin/sh\nprintf '%s|%s' "$GH_TOKEN" "$GH_ENTERPRISE_TOKEN" > '${capture}'\n`)
+    chmodSync(realGh, 0o755)
+    const cliEntry = join(root, 'fake-cli.mjs')
+    writeFileSync(cliEntry, `process.stdout.write('app')`)
+    const shimDir = writeGhShim(root, cliEntry)
+    const result = spawnSync(join(shimDir, 'gh'), args, {
+      encoding: 'utf8',
+      env: { PATH: `${shimDir}:${realBin}`, AC_AGENT_ID: 'agent-1', GH_REPO: 'acme/web', ...env }
+    })
+    if (ok) {
+      expect(result.status).toBe(0)
+      expect(readFileSync(capture, 'utf8')).toBe('app|')
+    } else {
+      expect(result.status).toBe(1)
+      expect(result.stderr).toMatch(/limited to github\.com/)
+      expect(existsSync(capture)).toBe(false)
+    }
   })
 })
 
@@ -116,6 +180,7 @@ describe('gh wrapper rendered for the sandbox runtime image', () => {
     execFileSync(wrapper, ['pr', 'view', '64', '-R', 'acme/infra'], {
       env: {
         ...process.env,
+        GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
         PATH: `${pathbin}:${realBin}`,
         AC_AGENT_ID: 'agent-1',
         ARGV_CAPTURE: argvCapture,
@@ -164,7 +229,13 @@ describe('gh wrapper on a failed token fetch', () => {
     )
     const result = spawnSync(wrapper, ['pr', 'list', '-R', 'acme/infra'], {
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${pathbin}:${realBin}`, AC_AGENT_ID: 'agent-1', RAN_CAPTURE: ranCapture }
+      env: {
+        ...process.env,
+        GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
+        PATH: `${pathbin}:${realBin}`,
+        AC_AGENT_ID: 'agent-1',
+        RAN_CAPTURE: ranCapture
+      }
     })
     return { status: result.status, stderr: result.stderr, ran: existsSync(ranCapture) }
   }
@@ -176,7 +247,9 @@ describe('gh wrapper on a failed token fetch', () => {
     expect(result.ran).toBe(false)
   })
 
-  it('still runs the real gh when the daemon could not be reached', () => {
-    expect(runWith(1).ran).toBe(true)
+  it('refuses stored gh authentication when the daemon could not be reached', () => {
+    const result = runWith(1)
+    expect(result.status).toBe(1)
+    expect(result.ran).toBe(false)
   })
 })

@@ -146,6 +146,8 @@ export interface CommandHost {
   ): Promise<ChatActorVerdict>
   /** The same for a session's own conversation. */
   sessionChatActor(rec: SessionRecord, actor: InteractionActor | undefined): Promise<ChatActorVerdict>
+  /** True while a Kanban card's CP-assigned read-only run owns this session. */
+  kanbanReadOnly?(key: string): boolean
 }
 
 /** What a handled command did: a durable effect completed before returning, a reply or refusal with nothing durable to prove, or a `!queue` whose admission the caller awaits. */
@@ -309,12 +311,10 @@ export class CommandHandlers {
     return true
   }
 
-  /** Every chat-side permission-mode change funnels through the same Agent-level
-   * guard before a sticky override can be written, including stale callbacks and
-   * relay frames. */
+  // Chat-side permission changes obey both Agent authority and a Kanban run's CP-assigned read-only mode.
   async setPermissionModeByKey(key: string, permissionMode: string): Promise<boolean> {
     const rec = await this.chatRuntimeSession(key)
-    if (!rec) return false
+    if (!rec || this.host.kanbanReadOnly?.(key)) return false
     await this.host.store().setPermissionModeOverride(key, permissionMode)
     this.host.log().info(`session ${key} permission mode override → "${permissionMode}"`)
     const acpSessionId = rec.acpSessionId

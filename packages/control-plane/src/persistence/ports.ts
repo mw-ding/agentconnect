@@ -10,6 +10,8 @@
  * nothing above this layer imports `@prisma/client`.
  */
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
+import type { KanbanStatus } from '../kanban/card-state.js'
+import type { AccountingBoard, AccountingCard, OpenLeaseFacts, RunEndPlan } from '../kanban/run-accounting.js'
 import type {
   SkillSourceFailureCode,
   AgentModelProvider,
@@ -74,7 +76,6 @@ import type {
   SessionId,
   OrgId
 } from '../domain/ids.js'
-import type { KanbanStatus } from '../kanban/card-state.js'
 import type { SessionKey } from '../domain/sessionKey.js'
 import type { ApiKeyPermission } from '../domain/api-key-permission.js'
 import type { DutyMemberKey, DutyReconcilePlan, DutyEdge, AgentSeed } from '../domain/duty.js'
@@ -7832,6 +7833,120 @@ export interface KanbanBoardRepo {
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
   /** Distinct repository ids any enabled board watches (redelivery sieve). */
   listEnabledRepoIds(): Promise<bigint[]>
+}
+
+// ── Kanban dispatch (issue #2 M2) — claim, lease fence, heartbeat, and reaper reads; still body-free ──
+
+export type KanbanRunOutcomeValue =
+  'completed' | 'review_requested' | 'blocked' | 'failed' | 'protocol_violation' | 'reclaimed' | 'transient'
+
+/** The board facts a dispatch needs to address GitHub and the daemon. */
+export interface KanbanBoardRef {
+  boardId: string
+  orgId: OrgId
+  repoId: bigint
+  repoFullName: string
+}
+
+/** One lease the claim minted: the card is `running` in the CP and awaits the daemon's ack. */
+export interface KanbanClaimedLease extends KanbanBoardRef {
+  mode: 'read' | 'write'
+  runId: string
+  leaseId: string
+  cardId: string
+  issueNumber: number
+  agentId: string
+  daemonId: string
+  daemonEpoch: bigint
+  attempt: number
+  dispatchRevision: bigint
+  /** `HookDef.githubSessionKey` of the agent's GitHub hook on this repo, else `github:<repoId>` (design D4). */
+  sessionKeyPrefix: string
+}
+
+export interface KanbanClaimOpts {
+  now: Date
+  /** Upper bound on leases minted by one claim, on top of the board's caps. */
+  limit?: number
+  /** Live-connection check; a card whose agent's daemon is offline stays ready. */
+  isDaemonLive(daemonId: string): boolean
+}
+
+/** What a daemon-originated write must echo to pass the lease fence. */
+export interface KanbanRunFence {
+  daemonEpoch: bigint
+  daemonId: string
+  cardId: string
+  boardId?: string
+  agentId?: string
+  attempt: number
+  dispatchRevision: bigint
+}
+
+export interface KanbanRunEndInput {
+  // Recheck sampled stale leases under the same row locks as the end write.
+  reclaimIf?: (lease: OpenLeaseFacts) => boolean
+  leaseId: string
+  /** Absent for CP-side ends (nack, timeout, reaper); present for daemon reports. */
+  fence?: KanbanRunFence
+  outcome: KanbanRunOutcomeValue
+  reasonCode: string | null
+  sessionId?: string
+  prNumber?: number
+  now: Date
+  /** Pure accounting, evaluated under the row locks. */
+  plan(card: AccountingCard, board: AccountingBoard): RunEndPlan
+}
+
+export type KanbanRunEndResult =
+  | { accepted: false }
+  | {
+      accepted: true
+      card: KanbanBoardRef & { cardId: string; issueNumber: number; from: KanbanStatus; to: KanbanStatus }
+      plan: RunEndPlan
+    }
+
+export interface KanbanLeaseBeatInput {
+  leaseId: string
+  cardId: string
+  dispatchRevision: bigint
+  sessionId?: string
+}
+
+export interface KanbanOpenLease extends OpenLeaseFacts {
+  leaseId: string
+}
+
+export interface KanbanDispatchRepo {
+  /** Enabled boards, for the periodic reconciler tick. */
+  listEnabledBoardIds(): Promise<string[]>
+  /** Claim ready cards by priority then age under the board caps (`FOR UPDATE SKIP LOCKED`). */
+  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
+  // Database time is the authority across CP replicas.
+  now(): Promise<Date>
+  getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
+  // Non-terminal mismatch-parked cards whose recovery re-read is due, most overdue first.
+  listMismatchedCards(
+    boardId: string,
+    now: Date,
+    limit: number
+  ): Promise<Array<{ cardId: string; issueNumber: number }>>
+  // The status a pre-dispatch mismatch parked the card in, or null when its latest run is not an ended mismatch.
+  getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
+  // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
+  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
+  // Push the card's next recovery re-read out exponentially.
+  deferRecovery(cardId: string, now: Date): Promise<void>
+  // Recheck the claim after the GitHub read, without changing its DB-selected mode.
+  isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
+  // Accept only the open run with the current card revision, placement, mode, and daemon epoch.
+  markAcked(leaseId: string, mode: 'read' | 'write', now: Date, epoch: bigint): Promise<boolean>
+  /** End one open run and move its card, atomically and behind the lease fence. */
+  endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult>
+  /** Stamp liveness for the leases this daemon still holds; returns the superseded lease ids. */
+  heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]>
+  /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */
+  listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
 }
 
 export interface KanbanCardRecord {
