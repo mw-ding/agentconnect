@@ -14,7 +14,7 @@ export const KanbanReasonCode = z
   .regex(/^[a-z0-9_:-]+$/)
 export type KanbanReasonCode = z.infer<typeof KanbanReasonCode>
 
-/** `read` unless the card carries `ac/mode:write`; a write card needs its own session worktree. */
+/** The run's mode, chosen from CP configuration (never a label); a write run needs its own session worktree. */
 export const KanbanRunMode = z.enum(['read', 'write'])
 export type KanbanRunMode = z.infer<typeof KanbanRunMode>
 

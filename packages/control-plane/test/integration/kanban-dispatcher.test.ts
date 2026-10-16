@@ -23,7 +23,14 @@ const T0 = Date.parse('2026-10-15T12:00:00.000Z')
 class FakeStore {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
+  /** Who last set each issue's status label; unset means a human. */
+  readonly statusActors = new Map<number, 'human' | 'bot'>()
+  readonly reads: number[] = []
+  async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
+    return (this.statusActors.get(n) ?? 'human') === 'human'
+  }
   async readCard(_repo: KanbanRepoRef, n: number): Promise<CardIssue | null> {
+    this.reads.push(n)
     const i = this.issues.get(n)
     return i
       ? {
@@ -62,6 +69,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   })
   const clock = new FakeClock(T0)
   const store = new FakeStore()
+  const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn() }
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
@@ -88,7 +96,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
     },
     isDaemonLive: () => true,
     clock,
-    log: { debug: () => {}, info: () => {}, warn: () => {} }
+    log
   })
   let issue = 1
   const addCard = async (labels: string[] = ['ac/status:ready'], mode: 'read' | 'write' | null = null) => {
@@ -110,7 +118,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, sent, repo, dispatcher, addCard, reportFor, card, run }
+  return { board, clock, store, log, sent, repo, dispatcher, addCard, reportFor, card, run }
 }
 
 describe('KanbanDispatcher — dispatch (real Postgres)', () => {
@@ -527,6 +535,121 @@ it('periodically recovers a blocked mismatch when a ready webhook was missed', a
   expect(h.sent[0]?.d.attempt).toBe(2)
 })
 
+describe('KanbanDispatcher — mismatch recovery is human-only and bounded (real Postgres)', () => {
+  it('an agent/bot-written ready label never un-parks a card; a human-written one does', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:blocked'])
+    await h.dispatcher.tick()
+    expect((await h.card(c.id)).status).toBe('blocked')
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    h.store.statusActors.set(c.issueNumber, 'bot')
+    expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(false)
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(60 * 60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+    }
+    expect((await h.card(c.id)).status).toBe('blocked')
+    expect(h.sent).toEqual([])
+    expect(h.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ issueNumber: c.issueNumber, from: 'blocked', to: 'ready' }),
+      'kanban: recovery ignored a non-human status label'
+    )
+    h.store.statusActors.set(c.issueNumber, 'human')
+    expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(true)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
+  })
+
+  it('recovers only on ticks, backs off per card, and resets after a change', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:blocked'])
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    const readsOf = () => h.store.reads.filter((n) => n === c.issueNumber).length
+    expect(readsOf()).toBe(1)
+    // Doorbell and report pokes never run recovery reads.
+    await h.dispatcher.reconcileBoard(h.board.id)
+    h.dispatcher.poke(h.board.id)
+    await h.dispatcher.settle()
+    expect(readsOf()).toBe(1)
+    await h.dispatcher.tick()
+    expect(readsOf()).toBe(2)
+    // Backed off 1 min, then 2 min: a tick inside the window makes no GitHub read.
+    await h.dispatcher.tick()
+    expect(readsOf()).toBe(2)
+    h.clock.advance(60_000)
+    await h.dispatcher.tick()
+    expect(readsOf()).toBe(3)
+    h.clock.advance(60_000)
+    await h.dispatcher.tick()
+    expect(readsOf()).toBe(3)
+    expect((await h.card(c.id)).recoveryChecks).toBe(2)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:triage']
+    h.clock.advance(60_000)
+    await h.dispatcher.tick()
+    expect(await h.card(c.id)).toMatchObject({ status: 'triage', recoveryChecks: 0, recoveryCheckAt: null })
+  })
+
+  it('stays under the GitHub budget with 100 closed and 100 parked cards', async () => {
+    const h = await harness()
+    await prisma.kanbanBoard.update({
+      where: { id: h.board.id },
+      data: { maxInProgress: 500, maxInProgressPerAgent: 500 }
+    })
+    const closed: Array<{ issueNumber: number }> = []
+    for (let i = 0; i < 100; i++) closed.push(await h.addCard())
+    for (const c of closed) h.store.issues.get(c.issueNumber)!.state = 'closed'
+    for (let i = 0; i < 100; i++) await h.addCard(['ac/status:blocked'])
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await prisma.kanbanCard.count({ where: { status: 'done' } })).toBe(100)
+    expect(await prisma.kanbanCard.count({ where: { status: 'blocked' } })).toBe(100)
+    const hour = async () => {
+      h.store.reads.length = 0
+      for (let minute = 0; minute < 60; minute++) {
+        await h.dispatcher.tick()
+        h.clock.advance(60_000)
+      }
+      // Terminal cards are never re-read.
+      expect(h.store.reads.some((n) => closed.some((c) => c.issueNumber === n))).toBe(false)
+      return h.store.reads.length
+    }
+    // The first hour is capped by the per-tick batch; once backed off, each parked card costs about one read an hour.
+    expect(await hour()).toBeLessThanOrEqual(60 * 25)
+    expect(await hour()).toBeLessThanOrEqual(200)
+  })
+
+  it('logs a human move the state machine cannot apply instead of dropping it silently', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    const issue = h.store.issues.get(c.issueNumber)!
+    issue.state = 'closed'
+    issue.stateReason = 'not_planned'
+    await h.dispatcher.tick()
+    expect((await h.card(c.id)).status).toBe('archived')
+    issue.state = 'open'
+    issue.labels = ['ac/status:ready']
+    expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(false)
+    expect((await h.card(c.id)).status).toBe('archived')
+    expect(h.log.info).toHaveBeenCalledWith(
+      expect.objectContaining({ from: 'archived', requested: 'ready' }),
+      'kanban: recovery ignored a status move the state machine does not allow'
+    )
+  })
+
+  it('dispatches a ready card that still carries todo+ready promotion residue instead of parking it in triage', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:todo', 'ac/status:ready', 'bug'])
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['bug', 'ac/status:running'])
+  })
+})
+
 const emptyGraph = (): CardGraph => ({ parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false })
 const completedBlocker = {
   issueId: 100n,
@@ -624,7 +747,10 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe('running')
   })
 
-  it('does not ingest or dispatch after a failed promotion label write; redelivery repairs residue first', async () => {
+  it.each([
+    { name: 'add landed, removal failed', partial: true },
+    { name: 'add failed', partial: false }
+  ])('survives a tick after a failed promotion label write ($name); redelivery promotes', async ({ partial }) => {
     const h = await graphHarness()
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
@@ -632,8 +758,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
       .mockImplementationOnce(async () => {
-        h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
-        throw new Error('label removal failed')
+        if (partial) h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
+        throw new Error('label write failed')
       })
       .mockImplementation(apply)
     await h.ring(c.issueNumber)
@@ -641,6 +767,12 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.ingest).not.toHaveBeenCalled()
     expect(h.poke).not.toHaveBeenCalled()
     expect(h.sent).toEqual([])
+    // The undone promotion leaves DB todo, so a tick before redelivery neither dispatches nor mismatches the card.
+    expect((await h.card(c.id)).status).toBe('todo')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect(await prisma.kanbanRun.count()).toBe(0)
     await h.ring(c.issueNumber)
     expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
     expect(h.sent[0]?.d.cardId).toBe(c.id)

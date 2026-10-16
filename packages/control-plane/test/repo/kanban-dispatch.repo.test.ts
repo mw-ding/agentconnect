@@ -522,3 +522,80 @@ it('reads lease time from the database clock', async () => {
   expect(now.getTime()).toBeGreaterThanOrEqual(before[0]!.now.getTime())
   expect(now.getTime()).toBeLessThanOrEqual(after[0]!.now.getTime())
 })
+
+describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => {
+  // A card whose latest run ended as a pre-dispatch mismatch, parked in `status`.
+  async function park(boardId: string, status: 'blocked' | 'triage' | 'todo' | 'done' | 'archived' | 'ready') {
+    const card = await seedCard(boardId)
+    const [lease] = await repo().claim(boardId, { ...live, limit: 1 })
+    await repo().endRun({
+      leaseId: lease!.leaseId,
+      outcome: 'transient',
+      reasonCode: 'github_state_mismatch',
+      now: NOW,
+      plan: (c) => ({ ...c, status, cooldownUntil: null, blockKind: null, countsAsFailure: false })
+    })
+    return card
+  }
+
+  it('lists only due, non-terminal, mismatch-parked cards up to the limit', async () => {
+    const boardId = await seedBoard()
+    const blocked = await park(boardId, 'blocked')
+    const triage = await park(boardId, 'triage')
+    const todo = await park(boardId, 'todo')
+    await park(boardId, 'done')
+    await park(boardId, 'archived')
+    await park(boardId, 'ready')
+    await seedCard(boardId, { status: 'todo' })
+    const listed = await repo().listMismatchedCards(boardId, NOW, 10)
+    expect(listed.map((c) => c.issueNumber)).toEqual([blocked, triage, todo].map((c) => c.issueNumber))
+    expect(listed[0]).toEqual({ cardId: blocked.id, issueNumber: blocked.issueNumber })
+    expect(await repo().listMismatchedCards(boardId, NOW, 2)).toHaveLength(2)
+    expect(await repo().getParkedStatus(boardId, blocked.issueNumber)).toBe('blocked')
+  })
+
+  it('backs a card off exponentially to a one-hour ceiling and lists the most overdue first', async () => {
+    const boardId = await seedBoard()
+    const a = await park(boardId, 'blocked')
+    const b = await park(boardId, 'blocked')
+    const expected = [60, 120, 240, 480, 960, 1920, 3600, 3600]
+    for (const sec of expected) {
+      await repo().deferRecovery(a.id, NOW)
+      expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: a.id } })).recoveryCheckAt).toEqual(
+        new Date(NOW.getTime() + sec * 1000)
+      )
+    }
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: a.id } })).recoveryChecks).toBe(expected.length)
+    expect((await repo().listMismatchedCards(boardId, NOW, 10)).map((c) => c.cardId)).toEqual([b.id])
+    await repo().deferRecovery(b.id, new Date(NOW.getTime() - 3600_000))
+    const later = new Date(NOW.getTime() + 3600_000)
+    expect((await repo().listMismatchedCards(boardId, later, 10)).map((c) => c.cardId)).toEqual([b.id, a.id])
+  })
+
+  it('applies a recovery move only from the expected parked status and resets the backoff', async () => {
+    const boardId = await seedBoard()
+    const c = await park(boardId, 'blocked')
+    await repo().deferRecovery(c.id, NOW)
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'triage', 'ready')).toBe(false)
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      status: 'ready',
+      recoveryCheckAt: null,
+      recoveryChecks: 0
+    })
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(false)
+  })
+
+  it('resets the backoff when the card is claimed again', async () => {
+    const boardId = await seedBoard()
+    const c = await park(boardId, 'blocked')
+    await repo().deferRecovery(c.id, NOW)
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'ready' } })
+    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      recoveryCheckAt: null,
+      recoveryChecks: 0
+    })
+    expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBeNull()
+  })
+})

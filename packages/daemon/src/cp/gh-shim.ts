@@ -63,17 +63,30 @@ unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 # repository, GH_REPO env, and finally the cwd origin remote. Do not scan every
 # slash-bearing argument: jq/templates and read-file paths can look repo-like.
 _REPO=""
+_HOST=""
 _prev=""
 for _a in "$@"; do
   case "$_prev" in
     -R|--repo) _REPO="$_a" ;;
+    --hostname) _HOST="$_a" ;;
   esac
   case "$_a" in
+    --hostname=*) _HOST="\${_a#--hostname=}" ;;
     --repo=*) _REPO="\${_a#--repo=}" ;;
     -R=*) _REPO="\${_a#-R=}" ;;
     -R?*) _REPO="\${_a#-R}" ;;
   esac
   _prev="$_a"
+done
+# The daemon token is a github.com token; never let a host selector carry it, or stored auth, elsewhere.
+for _h in "$_HOST" "\${GH_HOST-}"; do
+  case "$_h" in
+    ''|[Gg][Ii][Tt][Hh][Uu][Bb].[Cc][Oo][Mm]) ;;
+    *)
+      echo "agentconnect: agent gh is limited to github.com; refusing host $_h" >&2
+      exit 1
+      ;;
+  esac
 done
 if [ -z "$_REPO" ]; then
   case "\${1-}:\${2-}" in
@@ -120,8 +133,7 @@ if [ "$_RC" -ne 0 ] || [ -z "$_TOKEN" ]; then
   echo "agentconnect: daemon could not provide GitHub credentials; refusing stored gh authentication" >&2
   exit 1
 fi
-# Cover both gh host token selectors so host flags cannot fall back to stored enterprise credentials.
-GH_TOKEN="$_TOKEN" GH_ENTERPRISE_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
+GH_TOKEN="$_TOKEN" exec "$REAL_GH" "$@"
 
 `
   writeFileSync(join(dir, 'gh'), body, { mode: 0o755 })

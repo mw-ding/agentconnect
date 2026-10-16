@@ -192,6 +192,21 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
   })
 
+  it('undoes the DB promotion when the ready label write fails, so the redelivered retry promotes again', async () => {
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    h.store.applyPlan.mockRejectedValueOnce(new Error('label add failed'))
+    const g = graph({ blockedBy: [done] })
+    await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
+    expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([
+      [1n, 'ready'],
+      [2n, 'todo']
+    ])
+    expect(h.db.get(7)!.status).toBe('todo')
+    await h.reconciler.apply(BOARD, REPO, 7, g)
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+  })
+
   it('preserves conflicting ready and blocked labels for dispatcher mismatch recovery', async () => {
     const h = make({ 7: { status: 'ready', labels: ['ac/status:ready', 'ac/status:blocked', 'ac/agent:eng'] } })
     await h.reconciler.apply(BOARD, REPO, 7, graph())

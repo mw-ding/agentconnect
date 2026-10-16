@@ -7587,7 +7587,7 @@ export class Daemon {
     }
   }
 
-  // Chat-side permission changes obey both Agent authority and the card's label-derived read-only grant.
+  // Chat-side permission changes obey both Agent authority and the kanban run's CP-assigned read-only mode.
   private setPermissionModeByKey(key: string, permissionPreset: string): boolean {
     const rec = this.chatRuntimeSession(key)
     if (!rec || this.kanban?.forSession(key)?.mode === 'read') return false
@@ -14008,7 +14008,7 @@ export class Daemon {
         this.store.clearRuntimeConfigOverrides(agentId)
         await this.applyConfiguredRuntimeSettings(promptAgent ?? agent, host, sessionId)
       }
-      // Enforce the label-derived mode after every runtime override and before any prompt, including background wakes.
+      // Enforce the CP-assigned run mode after every runtime override and before any prompt, including background wakes.
       if (kanban?.mode === 'read') {
         const readMode = readOnlyExtractionMode(host.permissionModeOptions(sessionId)?.modes ?? [])
         if (!readMode || !(await host.setSessionPermissionMode(sessionId, readMode))) {
@@ -16289,7 +16289,7 @@ export class Daemon {
     try {
       const session = this.store.getSessionByAcpIdForAgent(agentId, sessionId)
       const tool = JSON.stringify(params.toolCall ?? {})
-      // Best-effort tool guard; GitHub actor attribution remains the authority for write grants.
+      // Best-effort tool guard; write mode is CP configuration and recovery ignores non-human label writes.
       if (
         session &&
         this.kanban?.forSession(session.key) &&

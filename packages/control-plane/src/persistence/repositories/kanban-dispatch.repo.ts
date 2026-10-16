@@ -2,12 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
-import {
-  parseStatusLabels,
-  planLabelReconcile,
-  type ObservedIssue,
-  type KanbanStatus
-} from '../../kanban/card-state.js'
+import type { KanbanStatus } from '../../kanban/card-state.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import type { KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
@@ -23,6 +18,9 @@ import type {
 
 /** Ready cards examined per claim; caps or offline daemons can skip some, so scan past the free room. */
 const CLAIM_SCAN = 50
+/** Mismatch recovery backoff: 1 min doubling to a 1 h ceiling, so a parked card costs at most ~1 read an hour. */
+const RECOVERY_BASE_SEC = 60
+const RECOVERY_MAX_SEC = 3600
 
 interface BoardRow {
   id: string
@@ -154,7 +152,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           // Every claim is a new dispatch generation, so any earlier holder's late write fails the fence.
           const updated = await tx.kanbanCard.update({
             where: { id: card.id },
-            data: { status: 'running', dispatchRevision: { increment: 1 }, stateRevision: { increment: 1 } },
+            data: {
+              status: 'running',
+              dispatchRevision: { increment: 1 },
+              stateRevision: { increment: 1 },
+              recoveryCheckAt: null,
+              recoveryChecks: 0
+            },
             select: { dispatchRevision: true }
           })
           const run = await tx.kanbanRun.create({
@@ -216,39 +220,74 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       : null
   }
 
-  async listMismatchedCards(boardId: string): Promise<Array<{ issueNumber: number }>> {
-    return this.db.$queryRaw<Array<{ issueNumber: number }>>(Prisma.sql`
-      SELECT c."issueNumber" FROM "kanban_card" c
+  async listMismatchedCards(
+    boardId: string,
+    now: Date,
+    limit: number
+  ): Promise<Array<{ cardId: string; issueNumber: number }>> {
+    return this.db.$queryRaw<Array<{ cardId: string; issueNumber: number }>>(Prisma.sql`
+      SELECT c."id" AS "cardId", c."issueNumber" FROM "kanban_card" c
       JOIN LATERAL (
         SELECT "reasonCode", "endedAt" FROM "kanban_run"
         WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
       ) latest ON latest."reasonCode" = 'github_state_mismatch' AND latest."endedAt" IS NOT NULL
-      WHERE c."boardId" = ${boardId}::uuid AND c."status" <> 'ready'
+      WHERE c."boardId" = ${boardId}::uuid
+        AND c."status" NOT IN ('ready', 'running', 'done', 'archived')
+        AND (c."recoveryCheckAt" IS NULL OR c."recoveryCheckAt" <= ${now})
+      ORDER BY c."recoveryCheckAt" ASC NULLS FIRST, c."issueNumber" ASC
+      LIMIT ${limit}
     `)
   }
 
-  async ingestStatus(boardId: string, issueNumber: number, observed: ObservedIssue): Promise<void> {
-    const { statuses, malformed } = parseStatusLabels(observed.labels)
-    if (observed.state !== 'open' || malformed.length || statuses.length !== 1 || statuses[0] === 'running') return
-    await this.inTransaction(async (tx) => {
+  async getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null> {
+    const card = await this.db.kanbanCard.findUnique({
+      where: { boardId_issueNumber: { boardId, issueNumber } },
+      select: {
+        status: true,
+        runs: { orderBy: { attempt: 'desc' }, take: 1, select: { endedAt: true, reasonCode: true } }
+      }
+    })
+    const latest = card?.runs[0]
+    return card && latest?.endedAt && latest.reasonCode === 'github_state_mismatch' ? card.status : null
+  }
+
+  async ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean> {
+    return this.inTransaction(async (tx) => {
       const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus }>>(Prisma.sql`
         SELECT "id", "status" FROM "kanban_card"
         WHERE "boardId" = ${boardId}::uuid AND "issueNumber" = ${issueNumber} FOR UPDATE
       `)
-      if (!card) return
+      if (!card || card.status !== from) return false
       const latest = await tx.kanbanRun.findFirst({
         where: { cardId: card.id },
         orderBy: { attempt: 'desc' },
         select: { endedAt: true, reasonCode: true }
       })
-      if (!latest?.endedAt || latest.reasonCode !== 'github_state_mismatch') return
-      const plan = planLabelReconcile({ status: card.status, leased: false }, observed)
-      if (plan.status === card.status) return
+      if (!latest?.endedAt || latest.reasonCode !== 'github_state_mismatch') return false
       await tx.kanbanCard.update({
         where: { id: card.id },
-        data: { status: plan.status, stateRevision: { increment: 1 }, cooldownUntil: null, blockKind: null }
+        data: {
+          status: to,
+          stateRevision: { increment: 1 },
+          cooldownUntil: null,
+          blockKind: null,
+          recoveryCheckAt: null,
+          recoveryChecks: 0
+        }
       })
+      return true
     })
+  }
+
+  async deferRecovery(cardId: string, now: Date): Promise<void> {
+    await this.db.$executeRaw(Prisma.sql`
+      UPDATE "kanban_card"
+      SET "recoveryCheckAt" = ${now}::timestamptz + LEAST(
+            make_interval(secs => ${RECOVERY_BASE_SEC} * power(2, LEAST("recoveryChecks", 20))),
+            make_interval(secs => ${RECOVERY_MAX_SEC})),
+          "recoveryChecks" = "recoveryChecks" + 1
+      WHERE "id" = ${cardId}::uuid
+    `)
   }
 
   async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {

@@ -5,8 +5,10 @@ import {
   LEASED_HUMAN_STATUSES,
   canTransition,
   issueStateFor,
+  isPromotionResidue,
   parseStatusLabels,
   planLabelReconcile,
+  planRecovery,
   planStatusWrite,
   refuseRequest,
   statusLabel,
@@ -238,5 +240,38 @@ describe('planStatusWrite — CP-driven transitions', () => {
   it('differs from planLabelReconcile, which would read the stale label as a human request', () => {
     expect(planLabelReconcile({ status: 'running', leased: true }, open(L('ready'))).outcome).toBe('reverted_leased')
     expect(planStatusWrite('running', open(L('ready'))).outcome).toBe('accepted')
+  })
+})
+
+describe('planRecovery — mismatch-parked cards', () => {
+  it('moves on one legal open status label', () => {
+    expect(planRecovery('blocked', open(L('ready'), 'bug'))).toEqual({ kind: 'move', to: 'ready' })
+    expect(planRecovery('archived', open(L('triage')))).toEqual({ kind: 'move', to: 'triage' })
+  })
+
+  it('reports an illegal move instead of silently dropping it', () => {
+    expect(planRecovery('archived', open(L('ready')))).toEqual({ kind: 'illegal', requested: 'ready' })
+  })
+
+  it.each<[KanbanStatus, ObservedIssue | null]>([
+    ['blocked', null],
+    ['blocked', { labels: [L('ready')], state: 'closed' }],
+    ['blocked', open(L('ready'), L('blocked'))],
+    ['blocked', open(L('ready'), 'ac/status:bogus')],
+    ['blocked', open()],
+    ['blocked', open(L('blocked'))],
+    ['blocked', open(L('running'))]
+  ])('ignores %s with %j', (from, observed) => {
+    expect(planRecovery(from, observed)).toEqual({ kind: 'none' })
+  })
+})
+
+describe('isPromotionResidue', () => {
+  it('is exactly an open todo+ready pair', () => {
+    expect(isPromotionResidue(open(L('todo'), L('ready'), 'bug'))).toBe(true)
+    expect(isPromotionResidue({ labels: [L('todo'), L('ready')], state: 'closed' })).toBe(false)
+    expect(isPromotionResidue(open(L('todo'), L('ready'), L('blocked')))).toBe(false)
+    expect(isPromotionResidue(open(L('blocked'), L('ready')))).toBe(false)
+    expect(isPromotionResidue(open(L('todo'), L('ready'), 'ac/status:bogus'))).toBe(false)
   })
 })

@@ -18,7 +18,9 @@ import type {
 } from '../persistence/ports.js'
 import {
   isDispatchableIssue,
+  isPromotionResidue,
   observedCardStatus,
+  planRecovery,
   planStatusWrite,
   type KanbanStatus,
   type ObservedIssue
@@ -40,7 +42,7 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan'>
+  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'statusSetByHuman'>
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -56,12 +58,15 @@ const DEFAULT_TICK_MS = 60_000
 const DEFAULT_UNACKED_GRACE_MS = 2 * 60_000
 const DEFAULT_EPOCH_GRACE_MS = 3 * 60_000
 const REAP_BATCH = 500
+/** Mismatch-parked cards re-read per board per tick; per-card backoff keeps the steady rate far lower. */
+const RECOVERY_BATCH = 25
 
 export class KanbanDispatcher {
   private timer: TimerHandle | undefined
   private stopped = false
   private readonly running = new Map<string, Promise<void>>()
   private readonly rerun = new Set<string>()
+  private readonly recoveryDue = new Set<string>()
   private readonly background = new Set<Promise<unknown>>()
   private readonly statusWrites = new Map<string, Promise<void>>()
 
@@ -107,7 +112,10 @@ export class KanbanDispatcher {
   /** One reconciler pass: reap stale leases first so their slots are claimable, then claim every board. */
   async tick(): Promise<void> {
     await this.reap()
-    for (const boardId of await this.deps.repo.listEnabledBoardIds()) this.poke(boardId)
+    for (const boardId of await this.deps.repo.listEnabledBoardIds()) {
+      this.recoveryDue.add(boardId)
+      this.poke(boardId)
+    }
     await Promise.allSettled([...this.running.values()])
   }
 
@@ -140,13 +148,8 @@ export class KanbanDispatcher {
   }
 
   async reconcileBoard(boardId: string): Promise<void> {
-    for (const card of await this.deps.repo.listMismatchedCards(boardId)) {
-      try {
-        await this.ingestCard(boardId, card.issueNumber)
-      } catch (err) {
-        this.deps.log.warn({ err, boardId, issueNumber: card.issueNumber }, 'kanban: mismatch recovery read failed')
-      }
-    }
+    // Recovery reads GitHub, so only the periodic tick runs it, never a doorbell or report poke.
+    if (this.recoveryDue.delete(boardId)) await this.recoverMismatches(boardId)
     const leases = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
@@ -154,15 +157,45 @@ export class KanbanDispatcher {
     await Promise.allSettled(leases.map((lease) => this.dispatchLease(lease)))
   }
 
-  // The graph/webhook doorbell and periodic mismatch recovery share the same body-free ingest.
-  async ingestCard(boardId: string, issueNumber: number): Promise<void> {
-    // Resolve addressing from the board, without minting a new lease.
+  private async recoverMismatches(boardId: string): Promise<void> {
+    const now = await this.deps.repo.now()
+    for (const card of await this.deps.repo.listMismatchedCards(boardId, now, RECOVERY_BATCH)) {
+      let moved = false
+      try {
+        moved = await this.ingestCard(boardId, card.issueNumber)
+      } catch (err) {
+        this.deps.log.warn({ err, boardId, issueNumber: card.issueNumber }, 'kanban: mismatch recovery read failed')
+      }
+      if (!moved) await this.deps.repo.deferRecovery(card.cardId, now)
+    }
+  }
+
+  /** Body-free ingest shared by the graph doorbell and tick recovery; only a human's status edit un-parks a card. */
+  async ingestCard(boardId: string, issueNumber: number): Promise<boolean> {
+    const from = await this.deps.repo.getParkedStatus(boardId, issueNumber)
+    if (!from) return false
     const ref = await this.deps.repo.getBoardRef(boardId)
-    if (!ref) return
+    if (!ref) return false
     const repo = await this.repoRef(ref)
-    if (!repo) return
-    const observed = await this.deps.store.readCard(repo, issueNumber)
-    if (observed) await this.deps.repo.ingestStatus(boardId, issueNumber, observed)
+    if (!repo) return false
+    const plan = planRecovery(from, await this.deps.store.readCard(repo, issueNumber))
+    if (plan.kind === 'illegal') {
+      this.deps.log.info(
+        { boardId, issueNumber, from, requested: plan.requested },
+        'kanban: recovery ignored a status move the state machine does not allow'
+      )
+      return false
+    }
+    if (plan.kind === 'none') return false
+    // Agents write labels as the App bot, so an unattributed or non-human change never un-parks a card.
+    if (!(await this.deps.store.statusSetByHuman(repo, issueNumber, plan.to))) {
+      this.deps.log.info(
+        { boardId, issueNumber, from, to: plan.to },
+        'kanban: recovery ignored a non-human status label'
+      )
+      return false
+    }
+    return this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
@@ -223,8 +256,8 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_read_failed')
       return
     }
-    // Preserve human changes in GitHub and release the DB card into its observed status.
-    if (!observed || !isDispatchableIssue(observed)) {
+    // Preserve human changes in GitHub and release the DB card into its observed status; promotion residue is ready.
+    if (!observed || !(isDispatchableIssue(observed) || isPromotionResidue(observed))) {
       await this.deps.repo.endRun({
         leaseId: lease.leaseId,
         outcome: 'transient',

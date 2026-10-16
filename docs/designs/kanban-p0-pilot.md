@@ -91,17 +91,44 @@ A closed or relabeled issue discovered after claiming ends the lease and changes
 the database card in the same transaction: closed/completed becomes `done`,
 closed/not-planned becomes `archived`, one valid status is adopted, and conflicting,
 malformed, missing, or unavailable issue state becomes `triage`. No GitHub label,
-state, or comment writes occur. A later legal human `ready` edit is ingested by
-the graph doorbell or periodic mismatch recovery, then claimed as a fresh attempt.
-The M1 graph doorbell on this branch does not carry ordinary issue-label events;
-the periodic recovery also handles those edits without requiring a new webhook.
+state, or comment writes occur. One exception keeps the M1 promotion contract: an
+open issue whose only status labels are `todo` and `ready` is unfinished promotion
+residue, so the claim dispatches it and the `running` write clears both labels.
+
+A later legal human status edit on a mismatch-parked card is ingested by the graph
+doorbell or periodic mismatch recovery, then a `ready` card is claimed as a fresh
+attempt. Recovery accepts an edit only when the issue is open, carries exactly one
+valid status label, and the issue events show a GitHub `User` (not a `[bot]`
+login and without `performed_via_github_app`) both added that label and made the
+latest `ac/status:*` change. Any App, bot, or unknown actor, a missing event, an
+event history beyond 10 pages, or a read failure leaves the card parked. Agent
+label writes reach GitHub as the App bot because the `gh` shim fails closed, so an
+agent can never un-park a card. A legal-looking edit the state machine forbids,
+such as `archived` straight to `ready`, is logged rather than silently dropped;
+the human must move it to `triage` first.
+
+Recovery reads GitHub only from the 60-second tick, never from a doorbell or report
+poke. Each pass reads at most 25 due cards per board. It excludes `ready`,
+`running`, `done`, and `archived` cards, so closed issues never stay in the scan.
+A check that changes nothing pushes `KanbanCard.recoveryCheckAt` out by 1, 2, 4,
+and so on up to 60 minutes (`recoveryChecks` counts the steps). An ingested move
+or a new claim resets both fields. With 100 parked cards, the first hour is capped
+at 25 reads per tick, and steady state is about one read per card per hour.
+
+If the graph promotion's ready-label write fails after the `todo`→`ready` CAS, the
+reconciler compare-and-sets the card back to `todo` and fails the doorbell. A tick
+before the redelivery therefore cannot mismatch the card into a stranded `todo`, and
+the redelivered doorbell retries the promotion, including from `todo`+`ready` residue.
 
 Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`,
 or an unsuccessful/empty daemon token response. They never use stored human gh
-authentication. Runtime spawn strips GitHub token/PAT environment variables after
-all environment sources are merged. This does not prevent an unsandboxed worker
-from invoking a real binary or reading host credentials directly; database-only
-mode authority remains independent of that residual host access.
+authentication. The shim sets only `GH_TOKEN` (never `GH_ENTERPRISE_TOKEN`), and it
+refuses a `--hostname` or `GH_HOST` other than `github.com`, so the github.com
+installation token cannot be sent to another host. Runtime spawn strips GitHub
+token/PAT environment variables and `GH_CONFIG_DIR` after all environment sources
+are merged. This does not prevent an unsandboxed worker from invoking a real binary
+or reading `~/.config/gh/hosts.yml` directly. Database-only mode authority and
+human-only recovery stay independent of that residual host access.
 
 A fenced heartbeat implicitly acknowledges an accepted dispatch and keeps the
 lease alive even when the original ACK write failed. Lease timestamps use the
@@ -112,6 +139,11 @@ PostgreSQL 17 database and run `pnpm --filter @agentconnect.md/control-plane tes
 The harness applies committed migrations, seeds the template database, creates a
 private clone per worker, and drops those clones at teardown. The connecting role
 needs permission to create databases. Without this variable it uses Testcontainers.
+
+Known gaps: no route lets an owner set write mode yet, so every run is read-only
+until a human-authenticated board administration route ships. A human who wants an
+archived card dispatched must relabel it `triage` and then `ready`; there is no
+issue comment explaining the refused move, only a CP log line.
 
 Remaining M2 follow-ups: daemon-crash reclaims need a separate configurable retry
 budget; superseding a local lease needs cancellation completion, reporting, and a

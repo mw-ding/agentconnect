@@ -9,7 +9,7 @@
  * Record types are lightweight, domain-facing shapes (NOT raw Prisma models) so
  * nothing above this layer imports `@prisma/client`.
  */
-import type { ObservedIssue, KanbanStatus } from '../kanban/card-state.js'
+import type { KanbanStatus } from '../kanban/card-state.js'
 import type { AccountingBoard, AccountingCard, OpenLeaseFacts, RunEndPlan } from '../kanban/run-accounting.js'
 import type {
   AuthReq,
@@ -5165,10 +5165,19 @@ export interface KanbanDispatchRepo {
   claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
-  // Re-read cards parked by a pre-dispatch mismatch so later human edits can recover them.
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
-  listMismatchedCards(boardId: string): Promise<Array<{ issueNumber: number }>>
-  ingestStatus(boardId: string, issueNumber: number, observed: ObservedIssue): Promise<void>
+  // Non-terminal mismatch-parked cards whose recovery re-read is due, most overdue first.
+  listMismatchedCards(
+    boardId: string,
+    now: Date,
+    limit: number
+  ): Promise<Array<{ cardId: string; issueNumber: number }>>
+  // The status a pre-dispatch mismatch parked the card in, or null when its latest run is not an ended mismatch.
+  getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
+  // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
+  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
+  // Push the card's next recovery re-read out exponentially.
+  deferRecovery(cardId: string, now: Date): Promise<void>
   // Recheck the claim after the GitHub read, without changing its DB-selected mode.
   isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
   // Accept only the open run with the current card revision, placement, mode, and daemon epoch.

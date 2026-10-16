@@ -99,6 +99,31 @@ export function isDispatchableIssue(issue: ObservedIssue): boolean {
   )
 }
 
+/** A todo+ready pair is a promotion whose todo removal has not landed yet; M1 resolves it to ready. */
+export function isPromotionResidue(issue: ObservedIssue): boolean {
+  const { statuses, malformed } = parseStatusLabels(issue.labels)
+  return (
+    issue.state === 'open' &&
+    malformed.length === 0 &&
+    statuses.length === 2 &&
+    statuses.includes('ready') &&
+    statuses.includes('todo')
+  )
+}
+
+export type RecoveryPlan =
+  { kind: 'none' } | { kind: 'move'; to: KanbanStatus } | { kind: 'illegal'; requested: KanbanStatus }
+
+/** Recovery reads one open, unambiguous status label as a request to move a mismatch-parked card. */
+export function planRecovery(from: KanbanStatus, observed: ObservedIssue | null): RecoveryPlan {
+  if (!observed || observed.state !== 'open') return { kind: 'none' }
+  const { statuses, malformed } = parseStatusLabels(observed.labels)
+  if (malformed.length > 0 || statuses.length !== 1) return { kind: 'none' }
+  const requested = statuses[0]!
+  if (requested === from || requested === 'running') return { kind: 'none' }
+  return canTransition(from, requested) ? { kind: 'move', to: requested } : { kind: 'illegal', requested }
+}
+
 // A mismatch releases the lease into the observed status without modifying GitHub.
 export function observedCardStatus(issue: ObservedIssue | null): KanbanStatus {
   if (!issue) return 'triage'
