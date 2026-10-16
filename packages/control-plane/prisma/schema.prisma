@@ -1783,6 +1783,12 @@ enum KanbanCompletionContract {
   pr_checks_green
 }
 
+// `write` only when the card carries `ac/mode:write`; a write run needs its own session worktree.
+enum KanbanRunMode {
+  read
+  write
+}
+
 enum KanbanRunOutcome {
   completed
   review_requested
@@ -1874,16 +1880,20 @@ model KanbanCard {
 }
 
 // One dispatch attempt. Agent/daemon ids are history, not FKs: a run outlives its placement.
+// Migration-only partial indexes: one open run (endedAt IS NULL) per card, and the reaper's open-run scan.
 model KanbanRun {
   id               String            @id @default(uuid()) @db.Uuid
   cardId           String            @db.Uuid
   attempt          Int
   agentId          String            @db.Uuid
   daemonId         String            @db.Uuid
+  daemonEpoch      BigInt            @default(0) // daemon sessionEpoch at dispatch; re-stamped by each heartbeat
+  mode             KanbanRunMode     @default(read)
   sessionId        String?
   leaseId          String            @unique @db.Uuid
   dispatchRevision BigInt // the card's dispatchRevision this lease was minted under
   dispatchedAt     DateTime          @db.Timestamptz(6)
+  ackedAt          DateTime?         @db.Timestamptz(6) // daemon accepted kanban/dispatch; null while awaiting the ack
   heartbeatAt      DateTime?         @db.Timestamptz(6)
   endedAt          DateTime?         @db.Timestamptz(6)
   outcome          KanbanRunOutcome?
