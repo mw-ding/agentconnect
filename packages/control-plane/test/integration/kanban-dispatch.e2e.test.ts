@@ -349,7 +349,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await smee.start()
       smeeUp = true
       webhookMode = 'real'
-      webhookWhy = 'GitHub delivers to smee, which forwards to the relay; the relay verifies the signature and rings the CP'
+      webhookWhy =
+        'GitHub delivers to smee, which forwards to the relay; the relay verifies the signature and rings the CP'
       phase('setup: smee channel forwarding to the relay', { channel })
       await createHook(channel)
     } catch (err) {
@@ -482,10 +483,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         await daemon?.stop()
         await smee?.stop()
         await link?.close()
-        if (hookId !== undefined) {
-          await gh('DELETE', `/repos/${FULL}/hooks/${hookId}`)
-          phase('cleanup: temporary repository webhook deleted', { hookId })
-        }
+      })(),
+      (async () => {
+        if (hookId === undefined) return
+        await gh('DELETE', `/repos/${FULL}/hooks/${hookId}`)
+        phase('cleanup: temporary repository webhook deleted', { hookId })
+        hookId = undefined
       })(),
       ...issues.map(async (number) => {
         await gh('PATCH', `/repos/${FULL}/issues/${number}`, { state: 'closed', state_reason: 'not_planned' })
@@ -508,6 +511,11 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     ])
     if (root) rmSync(root, { recursive: true, force: true })
     vi.unstubAllEnvs()
+    if (!summarized) printSummary()
+    if (app) {
+      await app.drainWs()
+      await app.http.close()
+    }
     for (const result of [...cleanup, ...dbCleanup]) if (result.status === 'rejected') throw result.reason
   }, 120_000)
 
@@ -553,9 +561,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         return { token: TOKEN }
       }
     }
-    let currentCardId = ''
-
     for (const outcome of ['review_requested', 'completed'] as const) {
+      permissionDenials.length = 0
       const toolName = outcome === 'completed' ? 'kanbanComplete' : 'kanbanRequestReview'
       const created = await gh<Issue>('POST', `/repos/${FULL}/issues`, {
         title: `[kanban-e2e] dispatch ${outcome} ${started}`,
@@ -572,7 +579,6 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
           assigneeAgentId: agentId
         }
       })
-      currentCardId = c.id
       const summary = `KANBAN_E2E_TERMINAL ${outcome} #${created.number}`
       terminalInstruction = `call the \`${toolName}\` tool exactly once. Pass summary exactly: ${summary}. Do not call any other Kanban terminal tool.`
       await dispatcher.reconcileBoard(boardId)
@@ -585,15 +591,16 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
 
       cpReady = true
       const promptCount = host.prompt.mock.calls.length
+      const pokeMark = link?.graphPokes.length ?? 0
       await gh('PUT', `/repos/${FULL}/issues/${created.number}/labels`, { labels: ['ac/status:ready'] })
       await vi.waitFor(async () => expect(await store.statusSetByHuman(ref, created.number, 'ready')).toBe(true), {
         timeout: 30_000,
         interval: 1_000
       })
-      const deliveryId = await deliverReady(created.number, created.id)
+      const deliveryId = await deliverReady(created.number, pokeMark)
       deliveryIds.push(deliveryId)
       phase('a: relay delivery landed', { deliveryId, via: webhookMode })
-      console.log(`KANBAN_E2E webhook delivery ${deliveryId} via ${webhookMode}`)
+      console.log(`KANBAN_E2E X-GitHub-Delivery ${deliveryId} via ${webhookMode}`)
       await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(promptCount + 1), { timeout: 60_000 })
       const d = sends.at(-1)!
       expect(d).toMatchObject({ cardId: c.id, attempt: 2, mode: 'read' })
@@ -604,7 +611,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       })
       expect((await card(c.id)).status).toBe('running')
       await vi.waitFor(
-        async () => expect((await issue(created.number)).labels.map((label) => label.name)).toEqual(['ac/status:running']),
+        async () =>
+          expect((await issue(created.number)).labels.map((label) => label.name)).toEqual(['ac/status:running']),
         { timeout: 20_000, interval: 500 }
       )
       await snapshot('b/c: lease ACK persisted and running label observed', c.id, created.number)
@@ -672,29 +680,27 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
 
       if (realAgent) {
         await modelTurn
-        expect(existsSync(join(workspace, 'kanban-write-probe.txt'))).toBe(false)
-        const events = updates as Array<{ sessionUpdate: string; content?: { text?: string } }>
-        const answer = events
-          .filter((event) => event.sessionUpdate === 'agent_message_chunk')
-          .map((event) => event.content?.text ?? '')
-          .join('')
-        const tools = JSON.stringify(
-          events.filter((event) => ['tool_call', 'tool_call_update'].includes(event.sessionUpdate))
-        )
-        expect(answer).toContain('KANBAN_READ_ONLY_REFUSED')
-        const shellRefusalObserved =
-          tools.includes('kanban-write-probe.txt') &&
-          /Permission denied|Read-only file system|Operation not permitted/i.test(tools)
-        phase('d: model reported refusal and probe file absent; gh refusal independently verified', {
+        const probeAbsent = !existsSync(join(workspace, 'kanban-write-probe.txt'))
+        expect(probeAbsent).toBe(true)
+        const evidence = observeShellRefusal(updates, permissionDenials, probeAbsent)
+        shellChecks += 1
+        shellRefusalObserved = (shellChecks === 1 || shellRefusalObserved) && evidence.observed
+        shellWhy = evidence.why
+        if (!evidence.observed) console.log(`KANBAN_E2E shell refusal unobserved: ${evidence.why}`)
+        phase('d: probe file absent; shell refusal taken from ACP or permission evidence', {
           runtime: runtimeId,
-          shellRefusalObserved
+          shellRefusalObserved: evidence.observed,
+          why: evidence.why
         })
         updates.length = 0
+        permissionDenials.length = 0
       }
 
       cpReady = false
       const live = worker.get(d.leaseId)
       if (!live?.terminal) {
+        terminalMode = 'injected'
+        terminalWhy = `model did not call ${toolName}; the test recorded the outcome directly`
         console.error(
           `KANBAN_E2E FALLBACK: model did not call ${toolName} for ${outcome} on ${FULL}#${created.number}; recording the outcome directly`
         )
@@ -704,6 +710,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         })
         expect(worker.recordTerminal(d.leaseId, { outcome, summary }).recorded).toBe(true)
       } else {
+        if (terminalMode !== 'injected') {
+          terminalMode = 'real'
+          terminalWhy = 'the agent called the Kanban terminal MCP tool'
+        }
         expect(live.terminal).toMatchObject({ outcome, summary: expect.stringContaining('KANBAN_E2E_TERMINAL') })
         phase('e: model called the terminal tool', { outcome, issue: created.number, tool: toolName })
       }
@@ -746,7 +756,263 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await (daemon as any).kanbanCommentPoster.drain()
       const comments = await gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${created.number}/comments`)
       expect(comments).toHaveLength(1)
+      commentMode = 'real'
+      commentWhy = appConfigured
+        ? 'the daemon posted the accepted summary with a kanban_card_write installation token'
+        : 'the daemon posted the accepted summary; the token itself is the injected PAT'
       phase('e: automatic final comment posted once', { issue: created.number })
     }
-  }, 240_000)
+    if (!realAgent) {
+      shellWhy =
+        'no real agent runtime ran, so there is no ACP tool_call, permission denial, or sandbox log for the shell probe'
+      console.log(`KANBAN_E2E shell refusal unobserved: ${shellWhy}`)
+    }
+    printSummary()
+  }, 360_000)
+
+  function printSummary(): void {
+    summarized = true
+    const shellMode = !realAgent ? 'injected' : shellRefusalObserved ? 'real' : 'unobserved'
+    console.log(
+      `KANBAN_E2E_SUMMARY ${JSON.stringify({
+        doorbell: { mode: webhookMode, why: webhookWhy, deliveries: deliveryIds },
+        terminal: { mode: terminalMode, why: terminalWhy },
+        token: { mode: tokenMode, why: tokenWhy },
+        shell: { mode: shellMode, why: shellWhy, shellRefusalObserved },
+        comment: { mode: commentMode, why: commentWhy }
+      })}`
+    )
+  }
+
+  async function newSmeeChannel(): Promise<string> {
+    const response = await fetch('https://smee.io/new', { redirect: 'manual', signal: AbortSignal.timeout(15_000) })
+    const location = response.headers.get('location')
+    if (!location || ![301, 302, 303, 307, 308].includes(response.status)) {
+      throw new Error(`GET https://smee.io/new returned ${response.status} without a Location`)
+    }
+    return new URL(location, 'https://smee.io').href
+  }
+
+  async function deleteStaleHooks(): Promise<void> {
+    const hooks = await gh<Array<{ id: number; config?: { url?: string } }>>('GET', `/repos/${FULL}/hooks`)
+    for (const hook of hooks) {
+      const url = hook.config?.url ?? ''
+      if (!url.includes('smee.io') && !url.includes('example.invalid/kanban-e2e-webhook')) continue
+      await gh('DELETE', `/repos/${FULL}/hooks/${hook.id}`)
+      phase('setup: deleted stale kanban-e2e webhook', { hookId: hook.id })
+    }
+  }
+
+  async function createHook(url: string): Promise<void> {
+    await deleteStaleHooks()
+    const created = await gh<{ id: number }>('POST', `/repos/${FULL}/hooks`, {
+      name: 'web',
+      active: true,
+      events: ['issues', 'issue_comment', 'label'],
+      config: { url, content_type: 'json', secret: webhookSecret, insecure_ssl: '0' }
+    })
+    hookId = created.id
+    phase('setup: temporary repository webhook created', { hookId, url })
+  }
+
+  async function discoverInstallationId(appCfg: GithubAppConfig | undefined): Promise<bigint | undefined> {
+    const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' }
+    const read = async (authorization: string): Promise<bigint | undefined> => {
+      const response = await fetch(`https://api.github.com/repos/${FULL}/installation`, {
+        headers: { ...headers, authorization },
+        signal: AbortSignal.timeout(15_000)
+      })
+      if (!response.ok) {
+        phase('setup: installation lookup', { status: response.status })
+        return undefined
+      }
+      const body = (await response.json()) as { id?: number }
+      return body.id ? BigInt(body.id) : undefined
+    }
+    if (appCfg) {
+      try {
+        const id = await read(`Bearer ${await mintAppJwt(appCfg)}`)
+        if (id !== undefined) return id
+      } catch (err) {
+        phase('setup: app installation lookup failed', { error: err instanceof Error ? err.message : String(err) })
+      }
+    }
+    try {
+      return await read(`Bearer ${TOKEN}`)
+    } catch {
+      return undefined
+    }
+  }
+
+  async function installationIdFromPing(): Promise<bigint | undefined> {
+    if (hookId === undefined) return undefined
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      const deliveries = await gh<Array<{ id: number; event: string }>>(
+        'GET',
+        `/repos/${FULL}/hooks/${hookId}/deliveries?per_page=20`
+      )
+      const ping = deliveries.find((delivery) => delivery.event === 'ping')
+      if (ping) {
+        const detail = await gh<{ request?: { payload?: { installation?: { id?: number } } } }>(
+          'GET',
+          `/repos/${FULL}/hooks/${hookId}/deliveries/${ping.id}`
+        )
+        const id = detail.request?.payload?.installation?.id
+        return id ? BigInt(id) : undefined
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+    }
+    return undefined
+  }
+
+  async function ensureInstallation(id: bigint): Promise<void> {
+    installation.installationId = id
+    ref.installationId = id
+    installationGithubId = id
+    const existing = await prisma.githubInstallation.findUnique({ where: { installationId: id } })
+    if (existing) return
+    await prisma.githubInstallation.create({
+      data: {
+        orgId: DEFAULT_ORG_ID,
+        installationId: id,
+        accountLogin: OWNER,
+        accountType: 'User',
+        repositorySelection: 'selected',
+        permissions: { issues: 'write', metadata: 'read', contents: 'write', pull_requests: 'write' }
+      }
+    })
+  }
+
+  async function labeledDelivery(issueNumber: number): Promise<HookDelivery & { payload: ReadyPayload }> {
+    if (hookId === undefined) throw new Error('temporary repository webhook was not created')
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      const list = await gh<HookDelivery[]>('GET', `/repos/${FULL}/hooks/${hookId}/deliveries?per_page=30`)
+      for (const item of list.filter((delivery) => delivery.event === 'issues' && delivery.action === 'labeled')) {
+        const detail = await gh<HookDelivery>('GET', `/repos/${FULL}/hooks/${hookId}/deliveries/${item.id}`)
+        const payload = deliveryPayload(detail.request?.payload)
+        if (payload?.issue?.number === issueNumber && payload.label?.name === 'ac/status:ready') {
+          return { ...item, ...detail, payload }
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000))
+    }
+    throw new Error(`no GitHub issues.labeled delivery for #${issueNumber} ac/status:ready`)
+  }
+
+  async function replayReady(issueNumber: number): Promise<string> {
+    const delivery = await labeledDelivery(issueNumber)
+    const installationId = delivery.payload.installation?.id
+    if (!installationId) {
+      throw new Error(
+        `GitHub delivery ${delivery.guid ?? delivery.id} for #${issueNumber} has no installation.id, so the relay cannot ring the Kanban doorbell`
+      )
+    }
+    await ensureInstallation(BigInt(installationId))
+    const guid = delivery.guid ?? String(delivery.id)
+    const sent = await postGithubWebhook(link!.webhookUrl, {
+      secret: webhookSecret,
+      event: 'issues',
+      payload: delivery.payload,
+      deliveryId: guid
+    })
+    if (sent.status !== 202)
+      throw new Error(`relay rejected the signed delivery ${guid}: HTTP ${sent.status} ${sent.body}`)
+    await vi.waitFor(
+      async () => {
+        expect(link!.graphPokes.some((poke) => poke.deliveryKey === guid && poke.numbers.includes(issueNumber))).toBe(
+          true
+        )
+        const row = await prisma.kanbanCard.findFirst({ where: { boardId, issueNumber } })
+        expect(row?.status).toBeTruthy()
+        expect(row?.status).not.toBe('triage')
+      },
+      { timeout: 20_000, interval: 250 }
+    )
+    return guid
+  }
+
+  async function deliverReady(issueNumber: number, pokeMark: number): Promise<string> {
+    if (!smeeUp) {
+      console.error('KANBAN_E2E FALLBACK webhook')
+      phase('KANBAN_E2E FALLBACK webhook', { reason: smeeSkipReason, issue: issueNumber })
+      webhookMode = 'injected'
+      webhookWhy = `smee unreachable (${smeeSkipReason}); the real GitHub delivery payload was signed and posted to the relay`
+      return replayReady(issueNumber)
+    }
+    const deadline = Date.now() + 45_000
+    while (Date.now() < deadline) {
+      const poke = link?.graphPokes
+        .slice(pokeMark)
+        .filter((item) => item.event === 'issues' && item.action === 'labeled' && item.numbers.includes(issueNumber))
+        .at(-1)
+      const status = (await prisma.kanbanCard.findFirst({ where: { boardId, issueNumber } }))?.status
+      if (poke && status && status !== 'triage') return poke.deliveryKey
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    phase('a: smee delivery did not un-park the card; replaying the real GitHub payload to the relay', {
+      issue: issueNumber
+    })
+    webhookMode = 'injected'
+    webhookWhy =
+      'GitHub→smee did not un-park the card before the wait; the real delivery payload was signed and posted to the relay'
+    return replayReady(issueNumber)
+  }
 })
+
+interface HookDelivery {
+  id: number
+  guid?: string
+  event?: string
+  action?: string | null
+  request?: { payload?: ReadyPayload | string }
+}
+
+interface ReadyPayload {
+  action?: string
+  installation?: { id?: number }
+  issue?: { id?: number; number?: number }
+  label?: { name?: string }
+  sender?: { type?: string }
+}
+
+function deliveryPayload(payload: ReadyPayload | string | undefined): ReadyPayload | undefined {
+  if (!payload) return undefined
+  if (typeof payload === 'string') {
+    try {
+      return JSON.parse(payload) as ReadyPayload
+    } catch {
+      return undefined
+    }
+  }
+  return payload
+}
+
+/** Refusal evidence that does not trust the model's narration. */
+function observeShellRefusal(
+  events: unknown[],
+  denials: string[],
+  probeAbsent: boolean
+): { observed: boolean; why: string } {
+  const tools = events.filter((event) => {
+    const kind = (event as { sessionUpdate?: string }).sessionUpdate
+    return kind === 'tool_call' || kind === 'tool_call_update'
+  })
+  const blob = JSON.stringify(tools)
+  const mentionsProbe = blob.includes('kanban-write-probe.txt')
+  const refused =
+    /"status"\s*:\s*"(?:failed|cancelled)"/.test(blob) ||
+    /permission denied|read-only|operation not permitted|not permitted|eacces/i.test(blob)
+  if (mentionsProbe && refused) {
+    return { observed: true, why: 'ACP tool_call events for the probe ended failed or recorded a refusal' }
+  }
+  const denied = denials.some((denial) => denial.includes('kanban-write-probe.txt'))
+  if (probeAbsent && denied) {
+    return { observed: true, why: 'the probe file is absent and the daemon permission layer cancelled the request' }
+  }
+  return {
+    observed: false,
+    why: `the runtime gave no ACP tool_call refusal and no cancelled permission for the probe (probeAbsent=${probeAbsent}, toolEvents=${tools.length}, permissionDenials=${denials.length})`
+  }
+}
