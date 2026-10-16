@@ -861,7 +861,12 @@ export function buildContainer(
     : undefined
 
   const kanbanCardStore = github
-    ? new GithubCardStore({ tokens: github.tokens, appSlug: githubAppCfg?.slug })
+    ? new GithubCardStore({
+        tokens: github.tokens,
+        appSlug: githubAppCfg?.slug,
+        // The same GitHub transport as the token mint, so an injected fetch covers card reads and label writes too.
+        ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+      })
     : undefined
 
   // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
