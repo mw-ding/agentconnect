@@ -13,7 +13,7 @@ const BOARD: KanbanBoardRecord = {
   repoId: 42n,
   repoFullName: 'acme/web'
 }
-const EMPTY: CardGraph = { parent: null, subIssues: [], blockedBy: [], truncated: false }
+const EMPTY: CardGraph = { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
 
 const poke = (over: Partial<RcGithubGraph> = {}): RcGithubGraph => ({
   deliveryKey: 'guid-1',
@@ -47,6 +47,7 @@ function make(
     boards?: KanbanBoardRecord[]
     installation?: GithubInstallationRecord | null
     readGraph?: (repo: unknown, n: number) => Promise<CardGraph>
+    onGraph?: () => void | Promise<void>
   } = {}
 ) {
   const readGraph = vi.fn(opts.readGraph ?? (async () => EMPTY))
@@ -58,7 +59,7 @@ function make(
       getByInstallationId: vi.fn(async () => (opts.installation === undefined ? installation() : opts.installation))
     },
     store: { readGraph },
-    onGraph,
+    onGraph: opts.onGraph ?? onGraph,
     log
   })
   return { doorbell, readGraph, onGraph, log }
@@ -74,8 +75,8 @@ describe('KanbanGraphDoorbell', () => {
       [repo, 7],
       [repo, 8]
     ])
-    expect(h.onGraph).toHaveBeenCalledWith(BOARD, 7, EMPTY)
-    expect(h.onGraph).toHaveBeenCalledWith(BOARD, 8, EMPTY)
+    expect(h.onGraph).toHaveBeenCalledWith(BOARD, repo, 7, EMPTY)
+    expect(h.onGraph).toHaveBeenCalledWith(BOARD, repo, 8, EMPTY)
   })
 
   it('records the GUID as landed even when no board watches the repo', async () => {
@@ -133,7 +134,7 @@ describe('KanbanGraphDoorbell', () => {
     })
     h.doorbell.poke(poke({ numbers: [7] }))
     await h.doorbell.settle()
-    expect(h.log.warn).toHaveBeenCalledOnce()
+    expect(h.log.warn).toHaveBeenCalledTimes(2) // per-key read failure + poke failure
     h.doorbell.poke(poke({ deliveryKey: 'guid-2', numbers: [7] }))
     await h.doorbell.settle()
     expect(h.readGraph).toHaveBeenCalledTimes(2)
@@ -157,5 +158,54 @@ describe('KanbanGraphDoorbell', () => {
     await doorbell.settle()
     expect(h.readGraph).toHaveBeenCalledTimes(1)
     expect(doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('does not land a GUID whose graph read failed', async () => {
+    const h = make({
+      readGraph: async () => {
+        throw new Error('github 502')
+      }
+    })
+    h.doorbell.poke(poke({ numbers: [7] }))
+    await h.doorbell.settle()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+  })
+
+  it('does not land a GUID whose apply failed', async () => {
+    const h = make({
+      onGraph: async () => {
+        throw new Error('apply failed')
+      }
+    })
+    h.doorbell.poke(poke({ numbers: [7, 8] }))
+    await h.doorbell.settle()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+  })
+
+  it('lands a GUID only after onGraph resolved', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const h = make({ onGraph: () => gate })
+    h.doorbell.poke(poke({ numbers: [7] }))
+    await vi.waitFor(() => expect(h.readGraph).toHaveBeenCalledTimes(1))
+    await Promise.resolve()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+    release()
+    await h.doorbell.settle()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('makes a poke coalesced into an in-flight read wait for that read', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const h = make({ onGraph: () => gate })
+    h.doorbell.poke(poke({ deliveryKey: 'a', numbers: [7] }))
+    await vi.waitFor(() => expect(h.readGraph).toHaveBeenCalledTimes(1))
+    h.doorbell.poke(poke({ deliveryKey: 'b', numbers: [7] }))
+    await new Promise((r) => setTimeout(r, 5))
+    expect(h.doorbell.landedDeliveryKeys(['a', 'b'])).toEqual(new Set())
+    release()
+    await h.doorbell.settle()
+    expect(h.doorbell.landedDeliveryKeys(['a', 'b'])).toEqual(new Set(['a', 'b']))
   })
 })

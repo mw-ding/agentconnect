@@ -88,12 +88,14 @@ describe('GithubCardStore reads', () => {
       'GET /repositories/42/issues/7/sub_issues?per_page=100': () =>
         json([issue({ id: 3, number: 9, state: 'closed', state_reason: 'completed' })]),
       'GET /repositories/42/issues/7/dependencies/blocked_by?per_page=100': () =>
-        json([issue({ id: 4, number: 5, repository: { id: 77 } })])
+        json([issue({ id: 4, number: 5, repository: { id: 77 } })]),
+      'GET /repositories/42/issues/7/dependencies/blocking?per_page=100': () => json([issue({ id: 6, number: 11 })])
     })
     expect(await h.store.readGraph(REPO, 7)).toEqual({
       parent: { issueId: 1n, number: 2, repoId: 42n, state: 'open', stateReason: null },
       subIssues: [{ issueId: 3n, number: 9, repoId: 42n, state: 'closed', stateReason: 'completed' }],
       blockedBy: [{ issueId: 4n, number: 5, repoId: 77n, state: 'open', stateReason: null }],
+      blocking: [{ issueId: 6n, number: 11, repoId: 42n, state: 'open', stateReason: null }],
       truncated: false
     })
   })
@@ -102,11 +104,22 @@ describe('GithubCardStore reads', () => {
     const page = Array.from({ length: 100 }, (_, i) => issue({ id: 100 + i, number: 100 + i }))
     const h = harness({
       'GET /repositories/42/issues/7/sub_issues?per_page=100': () => json(page),
-      'GET /repositories/42/issues/7/dependencies/blocked_by?per_page=100': () => json([])
+      'GET /repositories/42/issues/7/dependencies/blocked_by?per_page=100': () => json([]),
+      'GET /repositories/42/issues/7/dependencies/blocking?per_page=100': () => json([])
     })
     const graph = await h.store.readGraph(REPO, 7)
     expect(graph.parent).toBeNull()
     expect(graph.truncated).toBe(true)
+  })
+
+  it('flags a full blocking page as truncated', async () => {
+    const page = Array.from({ length: 100 }, (_, i) => issue({ id: 100 + i, number: 100 + i }))
+    const h = harness({
+      'GET /repositories/42/issues/7/sub_issues?per_page=100': () => json([]),
+      'GET /repositories/42/issues/7/dependencies/blocked_by?per_page=100': () => json([]),
+      'GET /repositories/42/issues/7/dependencies/blocking?per_page=100': () => json(page)
+    })
+    expect((await h.store.readGraph(REPO, 7)).truncated).toBe(true)
   })
 })
 

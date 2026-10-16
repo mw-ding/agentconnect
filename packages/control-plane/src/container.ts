@@ -81,6 +81,7 @@ import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
+import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -175,6 +176,7 @@ import {
   PgHookRepo,
   PgHookSecretStore,
   PgKanbanBoardRepo,
+  PgKanbanCardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -550,6 +552,7 @@ export function buildContainer(
     }),
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
     kanbanBoard: new PgKanbanBoardRepo(prisma),
+    kanbanCard: new PgKanbanCardRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
@@ -1740,19 +1743,23 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke; the reconcile seam is a stub in M1.
+  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke and promotes unblocked todo cards.
+  const kanbanGraphLog = {
+    debug: (o: unknown, m?: string) => http.log.debug(o, m),
+    warn: (o: unknown, m?: string) => http.log.warn(o, m)
+  }
   const kanbanGraphDoorbell = github
-    ? new KanbanGraphDoorbell({
-        boards: repos.kanbanBoard,
-        installations: repos.githubInstallation,
-        store: new GithubCardStore({ tokens: github.tokens }),
-        onGraph: (board, issueNumber, graph) =>
-          http.log.debug(
-            { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
-            'kanban: graph re-read'
-          ),
-        log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
-      })
+    ? (() => {
+        const store = new GithubCardStore({ tokens: github.tokens })
+        const reconciler = new KanbanGraphReconciler({ cards: repos.kanbanCard, store, log: kanbanGraphLog })
+        return new KanbanGraphDoorbell({
+          boards: repos.kanbanBoard,
+          installations: repos.githubInstallation,
+          store,
+          onGraph: (board, repo, issueNumber, graph) => reconciler.apply(board, repo, issueNumber, graph),
+          log: kanbanGraphLog
+        })
+      })()
     : undefined
 
   const logtoMgmtCfg = resolveLogtoMgmtConfig(config)

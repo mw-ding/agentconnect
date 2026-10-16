@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
 import { execa } from 'execa'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../src/generated/prisma/client.js'
 import type { ProvidedContext } from 'vitest'
 import { integrationTestWorkerCount } from './integration-workers.js'
 
@@ -44,6 +46,24 @@ function databaseUrl(baseUrl: string, database: string): string {
   return url.toString()
 }
 
+// TEST_DATABASE_URL path: no Docker; clone through Prisma's pg adapter on the maintenance database (the template must have no other sessions).
+async function cloneWorkerDatabasesLocal(baseUrl: string, workers: number): Promise<string[]> {
+  const templateDb = decodeURIComponent(new URL(baseUrl).pathname.slice(1))
+  const admin = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl(baseUrl, 'postgres') }) })
+  const urls: string[] = []
+  try {
+    for (let poolId = 1; poolId <= workers; poolId += 1) {
+      const database = workerDatabaseName(poolId)
+      await admin.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`)
+      await admin.$executeRawUnsafe(`CREATE DATABASE "${database}" WITH TEMPLATE "${templateDb}"`)
+      urls.push(databaseUrl(baseUrl, database))
+    }
+  } finally {
+    await admin.$disconnect()
+  }
+  return urls
+}
+
 async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<string[]> {
   if (!container) throw new Error('Postgres container is not running')
 
@@ -70,8 +90,14 @@ async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<s
 }
 
 export async function setup({ provide }: GlobalSetupContext): Promise<void> {
-  container = await new PostgreSqlContainer('postgres:16-alpine').start()
-  const url = container.getConnectionUri()
+  const localUrl = process.env.TEST_DATABASE_URL
+  let url: string
+  if (localUrl) {
+    url = localUrl
+  } else {
+    container = await new PostgreSqlContainer('postgres:16-alpine').start()
+    url = container.getConnectionUri()
+  }
 
   // Apply committed migrations (the hand-edited SQL included) to real Postgres.
   await execa('pnpm', ['exec', 'prisma', 'migrate', 'deploy', '--schema', schemaPath], {
@@ -93,7 +119,10 @@ export async function setup({ provide }: GlobalSetupContext): Promise<void> {
 
   // Each Vitest pool gets a private clone of the migrated + seeded database.
   // Files can now run concurrently without one worker truncating another's data.
-  const databaseUrls = await cloneWorkerDatabases(url, integrationTestWorkerCount())
+  const workers = integrationTestWorkerCount()
+  const databaseUrls = localUrl
+    ? await cloneWorkerDatabasesLocal(url, workers)
+    : await cloneWorkerDatabases(url, workers)
   provide('databaseUrls', databaseUrls)
 }
 
