@@ -6,9 +6,11 @@ import type { KanbanCommentRow } from '../store/local-store.js'
 const BATCH = 8
 const BACKOFF_BASE_MS = 15_000
 const BACKOFF_MAX_MS = 15 * 60_000
-/** Newest comments only. Five full pages is 500; anything older than that is inconclusive. */
+/** Comments updated since the first attempt, five pages at most; a sixth page makes the lookup inconclusive. */
 const MARKER_PAGE_LIMIT = 5
 const MARKER_PAGE_SIZE = 100
+/** Widens the since window for clock skew between this daemon and GitHub. */
+const MARKER_SINCE_SKEW_MS = 2 * 60_000
 /** Bounds the whole marker lookup, including every page fetch and its body. */
 const MARKER_LOOKUP_TIMEOUT_MS = 15_000
 
@@ -93,7 +95,7 @@ function readJson(res: Response, signal: AbortSignal): Promise<unknown> {
 /** The sqlite rows the publisher drains. LocalStore implements this. */
 export interface KanbanCommentStore {
   dueKanbanComments(now: number, limit: number): KanbanCommentRow[]
-  markKanbanCommentAttempt(leaseId: string, nextAt: number): void
+  markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): void
   deferKanbanComment(leaseId: string, nextAt: number): void
   removeKanbanComment(leaseId: string): void
 }
@@ -156,7 +158,7 @@ export class KanbanCommentPublisher {
     if (row.attempted) {
       let lookup: MarkerLookup
       try {
-        lookup = await this.findMarker(entry, token)
+        lookup = await this.findMarker(row, token)
       } catch (err) {
         this.deps.log.warn(`kanban: comment lookup failed for ${leaseId} (${String(err)})`)
         this.deps.store.deferKanbanComment(leaseId, later())
@@ -174,7 +176,7 @@ export class KanbanCommentPublisher {
       }
     }
     // Mark before the POST so a crash mid-request looks before it posts a second copy.
-    this.deps.store.markKanbanCommentAttempt(leaseId, later())
+    this.deps.store.markKanbanCommentAttempt(leaseId, later(), this.deps.clock.now())
     const published = await new GithubFinalPoster(
       {
         token: async () => this.deps.token(entry),
@@ -191,14 +193,16 @@ export class KanbanCommentPublisher {
     this.deps.log.info(`kanban: posted final comment on ${entry.repoFullName}#${entry.issueNumber}`)
   }
 
-  private async findMarker(entry: KanbanTerminalEntry, token: string): Promise<MarkerLookup> {
+  private async findMarker(row: KanbanCommentRow, token: string): Promise<MarkerLookup> {
+    const entry = row.entry
     const marker = kanbanLeaseMarker(entry.report.leaseId)
     const fetchImpl = this.deps.fetchImpl ?? fetch
     const base = this.deps.baseUrl ?? 'https://api.github.com'
     const signal = AbortSignal.timeout(this.deps.markerLookupTimeoutMs ?? MARKER_LOOKUP_TIMEOUT_MS)
-    // Newest first: a comment this daemon just posted is on the first page, not behind the oldest history.
-    let url: string | undefined =
-      `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?per_page=${MARKER_PAGE_SIZE}&sort=created&direction=desc`
+    // This endpoint ignores sort/direction and lists oldest first, so since is what skips the older history.
+    const since = new Date((row.attemptedAt ?? row.recordedAt) - MARKER_SINCE_SKEW_MS).toISOString()
+    const query = new URLSearchParams({ since, per_page: String(MARKER_PAGE_SIZE) })
+    let url: string | undefined = `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?${query}`
     for (let page = 0; page < MARKER_PAGE_LIMIT && url; page++) {
       const res = await fetchImpl(url, {
         signal,
@@ -216,7 +220,7 @@ export class KanbanCommentPublisher {
       if (!Array.isArray(comments)) throw new Error('GitHub GET comments was not a list')
       if (comments.some((comment) => comment.body?.includes(marker))) return 'found'
       const next = nextLink(res.headers.get('link'))
-      if (!next || comments.length < MARKER_PAGE_SIZE) return 'absent'
+      if (!next) return 'absent'
       url = next
     }
     // The bound was hit with more pages left, so a miss is not proof the marker is absent.

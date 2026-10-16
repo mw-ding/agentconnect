@@ -39,6 +39,8 @@ export interface KanbanCommentRow {
   attempts: number
   /** A POST may already have landed, so the publisher must look for it before posting again. */
   attempted: boolean
+  /** Daemon clock just before the first POST; the marker search reads only comments updated since then. */
+  attemptedAt?: number
   recordedAt: number
 }
 
@@ -674,12 +676,14 @@ export class LocalStore {
       );
       -- One terminal tool call per lease. state 'held' until the CP answers the report, then 'comment' until the
       -- final issue comment lands; attempted marks a POST that may have landed, so a retry looks before posting.
+      -- attemptedAt is set once, before the first POST, and bounds that look with GitHub's since filter.
       CREATE TABLE IF NOT EXISTS kanban_terminals (
         leaseId TEXT PRIMARY KEY,
         entry TEXT NOT NULL,
         state TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0,
         attempted INTEGER NOT NULL DEFAULT 0,
+        attemptedAt INTEGER,
         nextAt INTEGER NOT NULL DEFAULT 0,
         recordedAt INTEGER NOT NULL
       );
@@ -2233,22 +2237,31 @@ export class LocalStore {
   dueKanbanComments(now: number, limit: number): KanbanCommentRow[] {
     const rows = this.db
       .prepare(
-        "SELECT entry, attempts, attempted, recordedAt FROM kanban_terminals WHERE state = 'comment' AND nextAt <= ? ORDER BY nextAt, recordedAt LIMIT ?"
+        "SELECT entry, attempts, attempted, attemptedAt, recordedAt FROM kanban_terminals WHERE state = 'comment' AND nextAt <= ? ORDER BY nextAt, recordedAt LIMIT ?"
       )
-      .all(now, limit) as { entry: string; attempts: number; attempted: number; recordedAt: number }[]
+      .all(now, limit) as {
+      entry: string
+      attempts: number
+      attempted: number
+      attemptedAt: number | null
+      recordedAt: number
+    }[]
     return rows.map((row) => ({
       entry: parseKanbanTerminal(row.entry),
       attempts: row.attempts,
       attempted: row.attempted === 1,
+      ...(row.attemptedAt !== null ? { attemptedAt: row.attemptedAt } : {}),
       recordedAt: row.recordedAt
     }))
   }
 
-  /** Written before the POST, so a crash mid-request leaves the row marked for a look-before-post retry. */
-  markKanbanCommentAttempt(leaseId: string, nextAt: number): void {
+  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps the first attempt's time. */
+  markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): void {
     this.db
-      .prepare('UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, nextAt = ? WHERE leaseId = ?')
-      .run(nextAt, leaseId)
+      .prepare(
+        'UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, attemptedAt = COALESCE(attemptedAt, ?), nextAt = ? WHERE leaseId = ?'
+      )
+      .run(at, nextAt, leaseId)
   }
 
   deferKanbanComment(leaseId: string, nextAt: number): void {
