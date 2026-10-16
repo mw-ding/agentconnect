@@ -6,16 +6,16 @@ Namespace prefix: `ac/` (AgentConnect Kanban). Create these as GitHub labels on 
 
 ### Status (exclusive — keep exactly one `ac/status:*` on a card)
 
-| Label                | Column / intent      | Typical next labels (human)                                                                                                     |
-| -------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `ac/status:triage`   | Inbox, needs sorting | `ac/status:todo` or `ac/status:archived`                                                                                        |
-| `ac/status:todo`     | Backlog              | `ac/status:ready` when scoped                                                                                                   |
-| `ac/status:ready`    | Runnable             | Add `ac/agent:<slug>` **last** to dispatch; may set `ac/status:running` only after removing assignee or accepting a re-dispatch |
-| `ac/status:running`  | Active work          | Remove `ac/agent:<slug>` first, then `ac/status:review`, `ac/status:blocked`, or `ac/status:done`                               |
-| `ac/status:blocked`  | Waiting              | Remove block cause, then `ac/status:ready` and re-add `ac/agent:<slug>` to re-dispatch                                          |
-| `ac/status:review`   | Human review         | `ac/status:done` + close, or back to `ac/status:ready` + re-add assignee                                                        |
-| `ac/status:done`     | Finished             | Close issue as **completed**                                                                                                    |
-| `ac/status:archived` | Dropped              | Close issue as **not planned**                                                                                                  |
+| Label                | Column / intent      | Typical next labels (human)                                                                                                                   |
+| -------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ac/status:triage`   | Inbox, needs sorting | `ac/status:todo` or `ac/status:archived`                                                                                                      |
+| `ac/status:todo`     | Backlog              | `ac/status:ready` when scoped                                                                                                                 |
+| `ac/status:ready`    | Runnable             | Add `ac/agent:<slug>` **alone** (own action) to dispatch; may set `ac/status:running` only after removing assignee or accepting a re-dispatch |
+| `ac/status:running`  | Active work          | Remove `ac/agent:<slug>` first, then `ac/status:review`, `ac/status:blocked`, or `ac/status:done`                                             |
+| `ac/status:blocked`  | Waiting              | Remove block cause, then `ac/status:ready` and re-add `ac/agent:<slug>` to re-dispatch                                                        |
+| `ac/status:review`   | Human review         | `ac/status:done` + close, or back to `ac/status:ready` + re-add assignee                                                                      |
+| `ac/status:done`     | Finished             | Close issue as **completed**                                                                                                                  |
+| `ac/status:archived` | Dropped              | Close issue as **not planned**                                                                                                                |
 
 When changing status, **remove the previous `ac/status:*`** label so only one status applies.
 
@@ -29,18 +29,20 @@ Do not stack multiple `ac/agent:*` labels on one issue in P0.
 
 **Re-dispatch rule:** while `ac/agent:<slug>` stays on the issue, **any** human label add fires the hook again. Remove the assignee label before terminal or parked status moves (`running` / `review` / `blocked` / `done` / `archived`). Re-add it only when you intentionally want another worker turn.
 
+**Add assignee alone:** GitHub emits one `issues:labeled` delivery **per** label (including labels applied at issue creation). The daemon deduplicates **per delivery**, not per issue. Adding `ac/agent:<slug>` together with another label (`gh issue edit --add-label a,b`, multi-select in the UI, or `gh issue create --label …`) can start **two or more** worker turns. Always add `ac/agent:<slug>` **alone**, in its own action, and **never** at issue create with other labels.
+
 ## Human move cheat-sheet (P0)
 
-| Goal                | Human actions                                                                                                                                                                           |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Triage new work     | `ac/status:triage` → classify → `ac/status:todo` or `ac/status:ready`                                                                                                                   |
-| Assign worker       | Ensure `ac/status:ready`, then add `ac/agent:<slug>` **last** (that add dispatches via hook)                                                                                            |
-| Start work (visual) | Prefer leaving status at `ready`/`running` only if you accept a re-dispatch, **or** remove assignee first, set `ac/status:running`, then re-add assignee only if another turn is needed |
-| Worker finished     | Read daemon-posted `Kanban:` final answer; **remove** `ac/agent:<slug>`; set `ac/status:done` or `ac/status:review`; close if done                                                      |
-| Worker needs review | **Remove** `ac/agent:<slug>`; set `ac/status:review` after `Kanban: request_review`                                                                                                     |
-| Worker blocked      | **Remove** `ac/agent:<slug>`; set `ac/status:blocked` after `Kanban: block kind=…`                                                                                                      |
-| Unblock / re-run    | Address blocker → `ac/status:ready` → add `ac/agent:<slug>` again to dispatch                                                                                                           |
-| Cancel card         | Remove assignee if present; `ac/status:archived` + close not planned                                                                                                                    |
+| Goal                | Human actions                                                                                                                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Triage new work     | `ac/status:triage` → classify → `ac/status:todo` or `ac/status:ready`                                                                                                                             |
+| Assign worker       | Ensure `ac/status:ready`, then add `ac/agent:<slug>` **alone** (own action — never with other labels, never at issue create)                                                                      |
+| Start work (visual) | Prefer leaving status at `ready`/`running` only if you accept a re-dispatch, **or** remove assignee first, set `ac/status:running`, then re-add assignee **alone** only if another turn is needed |
+| Worker finished     | Read daemon-posted `Kanban:` final answer; **remove** `ac/agent:<slug>`; set `ac/status:done` or `ac/status:review`; close if done                                                                |
+| Worker needs review | **Remove** `ac/agent:<slug>`; set `ac/status:review` after `Kanban: request_review`                                                                                                               |
+| Worker blocked      | **Remove** `ac/agent:<slug>`; set `ac/status:blocked` after `Kanban: block kind=…`                                                                                                                |
+| Unblock / re-run    | Address blocker → `ac/status:ready` → add `ac/agent:<slug>` again **alone** to dispatch                                                                                                           |
+| Cancel card         | Remove assignee if present; `ac/status:archived` + close not planned                                                                                                                              |
 
 Humans should **not** expect the worker or App to move `ac/status:*` labels in P0.
 
@@ -91,9 +93,9 @@ Summary: <what is missing and who can unblock>
 
 Human: remove `ac/agent:<slug>`; set `ac/status:blocked`.
 
-### Quiet no-op (parked / finished)
+### Quiet no-op (parked / finished / running)
 
-If the card is already `done` / `archived` / `review` / `blocked` with no new human instruction, the worker ends **without** a `Kanban:` line (daemon may still post a brief ack if the runtime requires a final answer — prefer an empty or “no action” note, never a fresh complete/block/request_review).
+If the card is already `running` / `done` / `archived` / `review` / `blocked` with no new human instruction (no fresh ask beyond the status flip itself), the worker ends with an **empty** final answer — no `Kanban:` line and no “nothing to do” text. The daemon skips posting when the final answer is empty/whitespace (`publishOnce`); any non-empty body is posted to the issue. Never emit a fresh complete/block/request_review on a no-op turn.
 
 ## Future (not P0)
 
