@@ -123,6 +123,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         status: true,
         stateRevision: true,
         promotionPending: true,
+        needsAttention: true,
         runs: { where: { endedAt: null }, select: { id: true }, take: 1 }
       }
     })
@@ -145,9 +146,15 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
     eventCursor: bigint,
     startedAt: Date
   ): Promise<boolean> {
-    // The ready CAS and the intent are one write, so no claim or crash can see ready without the intent.
+    // One write for the ready CAS and the intent; an open intent keeps its caps, and a flagged card is a human's.
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'todo' },
+      where: {
+        id: cardId,
+        stateRevision: expectedStateRevision,
+        status: 'todo',
+        promotionPending: false,
+        needsAttention: false
+      },
       data: {
         status: 'ready',
         stateRevision: { increment: 1 },

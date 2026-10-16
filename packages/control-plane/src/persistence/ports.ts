@@ -5230,13 +5230,15 @@ export interface KanbanCardRecord {
   leased: boolean
   /** A promotion write is in flight or waiting to be attributed; claim must not take the card. */
   promotionPending: boolean
+  /** Recovery handed the card to a human; nothing automatic may promote it until a human status edit clears this. */
+  needsAttention: boolean
 }
 
 export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
-  /** CAS todo to ready and open the in-flight intent in one write, so a claim or crash never sees one without the other. */
+  /** CAS todo to ready and open the intent in one write; refused while an intent is open or the card awaits a human. */
   beginPromotion(cardId: string, expectedStateRevision: bigint, eventCursor: bigint, startedAt: Date): Promise<boolean>
   /** The ready POST returned success, so a lone App ready-add after the cursor may be adopted as ours. */
   notePromotionPosted(cardId: string): Promise<void>

@@ -65,7 +65,8 @@ function make(
         status: c.status,
         stateRevision: 1n,
         leased: false,
-        promotionPending: false
+        promotionPending: false,
+        needsAttention: false
       }
     ])
   )
@@ -228,7 +229,7 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/status:todo', 'ac/agent:eng', 'ac/status:ready'])
   })
 
-  it('undoes the DB promotion when the ready label write fails, so the redelivered retry promotes again', async () => {
+  it('undoes the DB promotion when the ready label write fails, and retries only once recovery clears the intent', async () => {
     const h = make({ 7: { status: 'todo', labels: todoLabels } })
     h.store.applyPlan.mockRejectedValueOnce(new Error('label add failed'))
     const g = graph({ blockedBy: [done] })
@@ -238,8 +239,26 @@ describe('KanbanGraphReconciler', () => {
     expect(h.cards.notePromotionPosted).not.toHaveBeenCalled()
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)
+    expect(h.cards.beginPromotion).toHaveBeenCalledOnce()
+    h.db.get(7)!.promotionPending = false
+    await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')
     expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+  })
+
+  // Vera's round-5 blockers 2 and 3: neither a flagged card nor an open intent is the reconciler's to (re)start.
+  it.each([
+    { name: 'awaits a human', flag: 'needsAttention' as const },
+    { name: 'has a pending promotion', flag: 'promotionPending' as const }
+  ])('opens no intent, reads nothing, and writes nothing for a todo card that $name', async ({ flag }) => {
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    h.db.get(7)![flag] = true
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.store.readCard).not.toHaveBeenCalled()
+    expect(h.store.lastEventId).not.toHaveBeenCalled()
+    expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
   })
 
   it('leaves a lone ready label on a todo card to attributed dispatcher recovery, even when unblocked', async () => {

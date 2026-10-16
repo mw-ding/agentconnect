@@ -48,7 +48,8 @@ export class KanbanGraphReconciler {
     graph: CardGraph
   ): Promise<void> {
     const card = await this.deps.cards.findByIssueNumber(board.id, issueNumber)
-    if (!card || card.leased) return
+    // An open intent belongs to recovery (restarting it would reset its caps), and a flagged card to a human.
+    if (!card || card.leased || card.promotionPending || card.needsAttention) return
     const residueOnly = card.status === 'ready'
     if (card.status === 'todo') {
       if (planGraphPromotion(card.status, graph) !== 'promote') return
@@ -57,11 +58,7 @@ export class KanbanGraphReconciler {
     }
     const observed = await this.deps.store.readCard(repo, issueNumber)
     if (!observed || observed.state !== 'open') return
-    // A ready card with an open intent waits for attributed recovery; stripping todo here would land before that proof.
-    if (residueOnly) {
-      if (!card.promotionPending) await this.writeReadyLabels(repo, issueNumber, true, observed)
-      return
-    }
+    if (residueOnly) return this.writeReadyLabels(repo, issueNumber, true, observed)
     const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
     // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
     if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return

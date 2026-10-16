@@ -742,8 +742,10 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       promotionChecks: 0,
       recoveryCheckAt: null
     })
-    // A stale graph CAS from before the escalation cannot re-promote it.
+    // Neither a stale graph CAS from before the escalation nor a current one can re-promote it: the park is a human's.
     expect(await cards.beginPromotion(c.id, c.stateRevision + 1n, 1n, NOW)).toBe(false)
+    expect(await cards.beginPromotion(c.id, c.stateRevision + 2n, 1n, NOW)).toBe(false)
+    expect(await cards.findByIssueNumber(boardId, c.issueNumber)).toMatchObject({ needsAttention: true })
     expect(await repo().claim(boardId, live)).toEqual([])
     // It is parked like a mismatch: listed for recovery, ingestible only from its parked status, and cleared by the move.
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toMatchObject([{ cardId: c.id, promotion: false }])
@@ -759,6 +761,19 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     })
     expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBeNull()
     expect(await repo().claim(boardId, live)).toHaveLength(1)
+  })
+
+  it('refuses a second intent while one is pending, keeping its checks, start, and cursor', async () => {
+    const boardId = await seedBoard()
+    const cards = new PgKanbanCardRepo(prisma)
+    const c = await begin(boardId, 42n, NOW)
+    expect(await cards.revertPromotion(c.id, c.stateRevision)).toBe(true)
+    await repo().deferRecovery(c.id, NOW, 'a')
+    const before = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })
+    expect(before).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })
+    const later = new Date(NOW.getTime() + 60 * 60_000)
+    expect(await cards.beginPromotion(c.id, before.stateRevision, 77n, later)).toBe(false)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toEqual(before)
   })
 
   it('never lets a concurrent claim land between the ready CAS and the promotion intent', async () => {

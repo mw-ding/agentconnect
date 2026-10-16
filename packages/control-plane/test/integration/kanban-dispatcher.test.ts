@@ -1036,6 +1036,60 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(await h.card(c.id)).toMatchObject({ status: 'running', needsAttention: false, attentionReason: null })
   })
 
+  // Vera's round-5 blocker 2: todo-only labels on a flagged card (an agent relabel here) must not let the graph promote it.
+  it('never promotes a flagged card on a graph event, even with todo-only labels and closed blockers', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unattributed')
+    h.store.relabel(c.issueNumber, ['ac/status:todo'], 'app')
+    const flagged = await h.card(c.id)
+    const writes = h.store.writes.length
+    await h.ring(c.issueNumber, 'graph-2')
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.store.writes).toHaveLength(writes)
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:todo'])
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: flagged.stateRevision,
+      promotionPending: false,
+      needsAttention: true,
+      attentionReason: 'unattributed'
+    })
+    expect(h.sent).toEqual([])
+  })
+
+  // Vera's round-5 blocker 3: a redelivered graph event must not restart an open intent and with it the caps.
+  it('a repeated graph event on a pending promotion is a no-op that keeps its checks, start, and cursor', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
+    await h.dispatcher.tick()
+    const pending = await h.card(c.id)
+    expect(pending).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })
+    const cursorReads = vi.spyOn(h.store, 'lastEventId')
+    const writes = h.store.writes.length
+    h.clock.advance(1000)
+    await h.ring(c.issueNumber, 'graph-2')
+    await h.ring(c.issueNumber, 'graph-3')
+    expect(cursorReads).not.toHaveBeenCalled()
+    expect(h.store.writes).toHaveLength(writes)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: pending.stateRevision,
+      promotionPending: true,
+      promotionChecks: 1,
+      promotionStartedAt: pending.promotionStartedAt,
+      promotionEventCursor: pending.promotionEventCursor,
+      recoveryCheckAt: pending.recoveryCheckAt
+    })
+    expect(h.sent).toEqual([])
+  })
+
   it('a graph doorbell does not skip a pending promotion backoff, and a human doorbell does', async () => {
     const h = await graphHarness()
     const c = await failPromotion(h, ['ac/status:ready'])
