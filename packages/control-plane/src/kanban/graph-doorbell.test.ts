@@ -137,4 +137,24 @@ describe('KanbanGraphDoorbell', () => {
     await h.doorbell.settle()
     expect(h.readGraph).toHaveBeenCalledTimes(2)
   })
+
+  it('marks a GUID landed only after handling succeeds, so a redelivery is processed', async () => {
+    const h = make()
+    const listEnabled = vi.fn().mockRejectedValueOnce(new Error('db down')).mockResolvedValue([BOARD])
+    const doorbell = new KanbanGraphDoorbell({
+      boards: { listEnabledByRepoId: listEnabled },
+      installations: { getByInstallationId: vi.fn(async () => installation()) },
+      store: { readGraph: h.readGraph },
+      onGraph: h.onGraph,
+      log: h.log
+    })
+    doorbell.poke(poke({ numbers: [7] }))
+    await doorbell.settle()
+    expect(doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+    expect(h.readGraph).not.toHaveBeenCalled()
+    doorbell.poke(poke({ numbers: [7] }))
+    await doorbell.settle()
+    expect(h.readGraph).toHaveBeenCalledTimes(1)
+    expect(doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
 })

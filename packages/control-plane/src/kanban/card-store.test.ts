@@ -1,4 +1,4 @@
-// GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, one atomic PATCH per plan.
+// GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, per-label add/remove writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from '../github/api.js'
 import { GithubCardStore, type KanbanRepoRef } from './card-store.js'
@@ -119,9 +119,11 @@ describe('KanbanLabelWriter via applyPlan', () => {
     expect(h.mintKanbanCard).not.toHaveBeenCalled()
   })
 
-  it('repairs drift in one atomic label PATCH, keeping unrelated labels, then comments', async () => {
+  it('repairs drift with per-label add then remove, never PATCHing the label set, then comments', async () => {
     const h = harness({
-      'PATCH /repositories/42/issues/7': () => json(issue()),
+      'POST /repositories/42/issues/7/labels': () => json([]),
+      'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Ablocked': () => json([]),
+      'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Atriage': () => json([]),
       'POST /repositories/42/issues/7/comments': () => json({ id: 1 }, 201)
     })
     const observed = { labels: ['bug', statusLabel('blocked'), statusLabel('triage')], state: 'open' as const }
@@ -129,12 +131,34 @@ describe('KanbanLabelWriter via applyPlan', () => {
     await h.store.applyPlan(REPO, 7, observed, plan)
     expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'write')
     expect(h.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
-      'PATCH https://api.test/repositories/42/issues/7',
+      'POST https://api.test/repositories/42/issues/7/labels',
+      'DELETE https://api.test/repositories/42/issues/7/labels/ac%2Fstatus%3Ablocked',
+      'DELETE https://api.test/repositories/42/issues/7/labels/ac%2Fstatus%3Atriage',
       'POST https://api.test/repositories/42/issues/7/comments'
     ])
-    expect(h.calls[0]!.body).toEqual({ labels: ['bug', 'ac/status:ready'] })
+    expect(h.calls[0]!.body).toEqual({ labels: ['ac/status:ready'] })
     expect(h.calls[0]!.auth).toBe('Bearer ghs_write')
-    expect(h.calls[1]!.body).toEqual({ body: plan.comment })
+    expect(h.calls[3]!.body).toEqual({ body: plan.comment })
+  })
+
+  it('tolerates a 404 on remove because the label is already gone', async () => {
+    const h = harness({
+      'POST /repositories/42/issues/7/labels': () => json([]),
+      'POST /repositories/42/issues/7/comments': () => json({ id: 1 }, 201)
+    })
+    const observed = { labels: [statusLabel('ready'), statusLabel('triage')], state: 'open' as const }
+    const plan = planLabelReconcile({ status: 'ready', leased: false }, observed)
+    await h.store.applyPlan(REPO, 7, observed, plan)
+    expect(h.calls.map((c) => c.method)).toEqual(['DELETE', 'POST'])
+  })
+
+  it('propagates a non-404 remove failure', async () => {
+    const h = harness({
+      'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Atriage': () => json({ message: 'boom' }, 500)
+    })
+    const observed = { labels: [statusLabel('ready'), statusLabel('triage')], state: 'open' as const }
+    const plan = planLabelReconcile({ status: 'ready', leased: false }, observed)
+    await expect(h.store.applyPlan(REPO, 7, observed, plan)).rejects.toThrow()
   })
 
   it('closes as completed together with the done label', async () => {

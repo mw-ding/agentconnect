@@ -197,6 +197,14 @@ describe('planLabelReconcile', () => {
       expect(plan).toMatchObject({ outcome: 'accepted', status: 'triage', issueState: { state: 'open' } })
     })
 
+    it.each([null, undefined])('repairs a closed card whose close reason is %s', (stateReason) => {
+      const plan = planLabelReconcile(
+        { status: 'done', leased: false },
+        { labels: [L('done')], state: 'closed', stateReason }
+      )
+      expect(plan).toMatchObject({ outcome: 'noop', issueState: { state: 'closed', reason: 'completed' } })
+    })
+
     it('corrects a wrong close reason', () => {
       const plan = planLabelReconcile(
         { status: 'archived', leased: false },

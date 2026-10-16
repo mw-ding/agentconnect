@@ -33,9 +33,11 @@ export class KanbanGraphDoorbell {
   /** Fire-and-forget entry: the relay WS handler never awaits GitHub. */
   poke(m: RcGithubGraph): void {
     if (this.stopped) return
-    if (this.landed.size >= MAX_LANDED) this.landed.clear()
-    this.landed.add(m.deliveryKey)
     const pending: Promise<void> = this.handle(m)
+      .then(() => {
+        if (this.landed.size >= MAX_LANDED) this.landed.clear()
+        this.landed.add(m.deliveryKey)
+      })
       .catch((err: unknown) => {
         this.deps.log.warn({ err, deliveryKey: m.deliveryKey, repoId: m.repoId }, 'kanban graph doorbell failed')
       })

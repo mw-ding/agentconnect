@@ -145,7 +145,7 @@ function issueStateDiffers(
   observed: ObservedIssue
 ): boolean {
   if (desired.state !== observed.state) return true
-  return desired.state === 'closed' && observed.stateReason != null && observed.stateReason !== desired.reason
+  return desired.state === 'closed' && (observed.stateReason ?? null) !== desired.reason
 }
 
 /** Fixed-template comment text: it names only statuses and labels, never issue content. */
