@@ -1,5 +1,5 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
-import { buildKanbanMessage } from './messages/kanban-message.js'
+import { buildKanbanMessage, isKanbanLabelMutation } from './messages/kanban-message.js'
 import { createHash, randomUUID } from 'node:crypto'
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { hostname, tmpdir } from 'node:os'
@@ -79,6 +79,7 @@ import type {
   OrchestrationOwnerReq,
   SetSessionTitleReq,
   SubmitGithubReviewReq,
+  KanbanTerminalReq,
   ReplyGithubReviewThreadsReq,
   ReplyGithubReviewThreadsResult
 } from './mcp/ops.js'
@@ -108,6 +109,7 @@ import {
   MEMORY_TOOL_NAMES,
   ALL_TOOL_NAMES,
   GITHUB_REVIEW_TOOLS,
+  KANBAN_TOOLS,
   KNOWLEDGE_TOOLS
 } from './mcp/tools.js'
 import { isSessionTitleToolCall } from './mcp/session-title-tool.js'
@@ -3325,6 +3327,7 @@ export class Daemon {
       cancelOrchestration: (req) => Promise.resolve(this.cancelOrchestrationForOwner(req)),
       submitGithubReview: (req) => this.submitGithubReview(req),
       replyGithubReviewThreads: (req) => this.replyGithubReviewThreads(req),
+      recordKanbanTerminal: (req) => this.recordKanbanTerminal(req),
       memory: this.memory,
       // Every session may READ shared agent memory; only a non-isolated session
       // may WRITE it, so a private DM/A2A turn can use existing memory but cannot
@@ -3421,6 +3424,8 @@ export class Daemon {
         // outlive many hook deliveries. The call resolves the CURRENT daemon-
         // private turn and fails closed everywhere else.
         tools = [...tools, ...GITHUB_REVIEW_TOOLS]
+        // Kanban cards share the GitHub issue thread session (D4); the call binds to the live lease or fails closed.
+        if (platform === 'hook' && transportScope?.startsWith('github:')) tools = [...tools, ...KANBAN_TOOLS]
         // Replace the legacy managed descriptors with this provider's stable core
         // tools. An external plugin's raw MCP tools never enter the ACP session.
         tools = tools.filter((t) => !MEMORY_TOOL_NAMES.has(t.name))
@@ -16293,9 +16298,7 @@ export class Daemon {
       if (
         session &&
         this.kanban?.forSession(session.key) &&
-        /ac(?:\/|%2f)/i.test(tool) &&
-        /label/i.test(tool) &&
-        /add|remove|delete|edit|create|rename|replace|post|put|patch|set|update/i.test(tool)
+        isKanbanLabelMutation(tool)
       ) {
         this.permissionEvaluationDetails.set(params, { reason: 'kanban_label_mutation' })
         return { outcome: { outcome: 'cancelled' } }
@@ -20467,7 +20470,10 @@ export class Daemon {
         release: (id) => this.store.releaseKanbanLease(id),
         put: (report, at) => this.store.putKanbanReport(report, at),
         list: (limit) => this.store.listKanbanReports(limit),
-        remove: (id) => this.store.ackKanbanReport(id)
+        remove: (id) => this.store.ackKanbanReport(id),
+        recordTerminal: (entry, at) => this.store.recordKanbanTerminal(entry, at),
+        orphanedTerminals: () => this.store.orphanedKanbanTerminals(),
+        settleTerminal: (id, accepted) => this.store.settleKanbanTerminal(id, accepted)
       },
       cp: () => {
         const cp = this.cpClient
@@ -20496,6 +20502,36 @@ export class Daemon {
         liveBackgroundTasks: (agentId, sessionId) => (this.sessionSdkQuiescent(agentId, sessionId) ? 0 : 1)
       }
     }))
+  }
+
+  /** A worker terminal tool call: the lease comes from the session's own live run, never from the model. */
+  private recordKanbanTerminal(req: KanbanTerminalReq): unknown {
+    const key = sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope)
+    const leaseId = this.kanban?.leaseForSession(key)
+    if (!this.kanban || !leaseId) {
+      throw new Error(
+        'No Kanban card run holds this session (it was never dispatched, already ended, or was superseded), so there is no outcome to report.'
+      )
+    }
+    const result = this.kanban.recordTerminal(leaseId, req.terminal)
+    if (!result.recorded) {
+      throw new Error(
+        result.reason === 'already_reported'
+          ? 'This Kanban card run already reported its outcome; only the first terminal call counts. Finish your turn.'
+          : result.reason === 'no_lease'
+            ? 'The Kanban card run for this session has already ended, so there is no outcome to report.'
+            : 'The outcome could not be saved on this daemon; try the same call again.'
+      )
+    }
+    const d = result.dispatch
+    return {
+      recorded: true,
+      outcome: req.terminal.outcome,
+      card: `${d.repoFullName}#${d.issueNumber}`,
+      attempt: d.attempt,
+      next:
+        'Finish your turn now. AgentConnect sends this outcome when the turn ends, moves the card, and posts your summary as the final issue comment. Do not post it or change any label yourself.'
+    }
   }
 
   private kanbanGate(d: KanbanDispatch): KanbanDispatchRefusal | undefined {

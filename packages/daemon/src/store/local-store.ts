@@ -10,6 +10,7 @@ import {
   type SessionImageAttachment
 } from '@agentconnect.md/protocol'
 import { SESSION_TITLE_TOOL_TITLES } from '../mcp/session-title-tool.js'
+import type { KanbanTerminalEntry } from '../kanban/kanban-worker.js'
 
 /** Per-tool-row rawInput budget in the mining prompt — enough for a command
  *  line or path, short enough that N tool rows can't crowd out the store. */
@@ -32,6 +33,20 @@ type SqlParams = Record<string, SQLInputValue>
  * Unknown/unsafe values fall back to 0. They remain stable via the `seq` tie-breaker
  * and sort before real timestamps instead of blocking an in-place store migration.
  */
+/** A final comment awaiting publication, with the retry bookkeeping the publisher needs. */
+export interface KanbanCommentRow {
+  entry: KanbanTerminalEntry
+  attempts: number
+  /** A POST may already have landed, so the publisher must look for it before posting again. */
+  attempted: boolean
+  recordedAt: number
+}
+
+function parseKanbanTerminal(raw: string): KanbanTerminalEntry {
+  const entry = JSON.parse(raw) as KanbanTerminalEntry
+  return { ...entry, report: KanbanReport.parse(entry.report) }
+}
+
 function transcriptEventTimeUs(ts: string | null | undefined): number {
   let raw = ts?.trim() ?? ''
   if (!raw) return 0
@@ -656,6 +671,17 @@ export class LocalStore {
         leaseId TEXT PRIMARY KEY,
         report TEXT,
         queuedAt INTEGER NOT NULL
+      );
+      -- One terminal tool call per lease. state 'held' until the CP answers the report, then 'comment' until the
+      -- final issue comment lands; attempted marks a POST that may have landed, so a retry looks before posting.
+      CREATE TABLE IF NOT EXISTS kanban_terminals (
+        leaseId TEXT PRIMARY KEY,
+        entry TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        attempted INTEGER NOT NULL DEFAULT 0,
+        nextAt INTEGER NOT NULL DEFAULT 0,
+        recordedAt INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS session_metadata_outbox (
         agentId TEXT NOT NULL,
@@ -2173,6 +2199,64 @@ export class LocalStore {
 
   ackKanbanReport(leaseId: string): void {
     this.db.prepare('UPDATE kanban_reports SET report = NULL WHERE leaseId = ?').run(leaseId)
+  }
+
+  /** The primary key is the exactly-once guard: a second terminal for the same lease is refused, even across restarts. */
+  recordKanbanTerminal(entry: KanbanTerminalEntry, at: number): boolean {
+    const report = KanbanReport.parse(entry.report)
+    const result = this.db
+      .prepare(
+        "INSERT INTO kanban_terminals (leaseId, entry, state, recordedAt) VALUES (?, ?, 'held', ?) ON CONFLICT(leaseId) DO NOTHING"
+      )
+      .run(report.leaseId, JSON.stringify({ ...entry, report }), at)
+    return Number(result.changes) === 1
+  }
+
+  /** Recorded terminals whose lease never queued a report: the reservation is still the empty pre-report row. */
+  orphanedKanbanTerminals(): KanbanTerminalEntry[] {
+    const rows = this.db
+      .prepare(
+        "SELECT t.entry FROM kanban_terminals t JOIN kanban_reports r ON r.leaseId = t.leaseId WHERE t.state = 'held' AND r.report IS NULL ORDER BY t.recordedAt"
+      )
+      .all() as { entry: string }[]
+    return rows.map((row) => parseKanbanTerminal(row.entry))
+  }
+
+  settleKanbanTerminal(leaseId: string, accepted: boolean): void {
+    if (accepted) {
+      this.db.prepare("UPDATE kanban_terminals SET state = 'comment' WHERE leaseId = ? AND state = 'held'").run(leaseId)
+    } else {
+      this.db.prepare("DELETE FROM kanban_terminals WHERE leaseId = ? AND state = 'held'").run(leaseId)
+    }
+  }
+
+  dueKanbanComments(now: number, limit: number): KanbanCommentRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT entry, attempts, attempted, recordedAt FROM kanban_terminals WHERE state = 'comment' AND nextAt <= ? ORDER BY nextAt, recordedAt LIMIT ?"
+      )
+      .all(now, limit) as { entry: string; attempts: number; attempted: number; recordedAt: number }[]
+    return rows.map((row) => ({
+      entry: parseKanbanTerminal(row.entry),
+      attempts: row.attempts,
+      attempted: row.attempted === 1,
+      recordedAt: row.recordedAt
+    }))
+  }
+
+  /** Written before the POST, so a crash mid-request leaves the row marked for a look-before-post retry. */
+  markKanbanCommentAttempt(leaseId: string, nextAt: number): void {
+    this.db
+      .prepare('UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, nextAt = ? WHERE leaseId = ?')
+      .run(nextAt, leaseId)
+  }
+
+  deferKanbanComment(leaseId: string, nextAt: number): void {
+    this.db.prepare('UPDATE kanban_terminals SET nextAt = ? WHERE leaseId = ?').run(nextAt, leaseId)
+  }
+
+  removeKanbanComment(leaseId: string): void {
+    this.db.prepare("DELETE FROM kanban_terminals WHERE leaseId = ? AND state = 'comment'").run(leaseId)
   }
 
   /**
