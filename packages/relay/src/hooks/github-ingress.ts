@@ -29,6 +29,7 @@ import type { Clock } from '@agentconnect.md/connection'
 import {
   GITHUB_GRAPH_EVENTS,
   GITHUB_REQUEST_REVIEW_ACTION,
+  KANBAN_ISSUE_ACTIONS,
   HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
   type RcGithubCommentAuthz,
   type RcGithubRerequest,
@@ -873,7 +874,7 @@ export function githubGraphDoorbell(
 }
 
 /** Card-status changes the Kanban recovery re-reads at once instead of on its backed-off tick. */
-const KANBAN_ISSUE_ACTIONS: ReadonlySet<string> = new Set(['labeled', 'unlabeled', 'closed', 'reopened'])
+const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string> = new Set(KANBAN_ISSUE_ACTIONS)
 const KANBAN_STATUS_LABEL_PREFIX = 'ac/status:'
 
 /** Reduce a human `ac/status:*` relabel or close/reopen to the body-free Kanban doorbell (exported for unit tests). */
@@ -882,20 +883,28 @@ export function githubIssueDoorbell(
   payload: GithubPayload,
   deliveryKey: string
 ): RcGithubGraph | undefined {
-  if (event !== 'issues' || !payload.action || !KANBAN_ISSUE_ACTIONS.has(payload.action)) return undefined
-  if (
-    (payload.action === 'labeled' || payload.action === 'unlabeled') &&
-    !payload.label?.name?.startsWith(KANBAN_STATUS_LABEL_PREFIX)
-  )
-    return undefined
-  // Only a human edit can un-park a card, so App and bot writes (agents included) never ring.
-  if (payload.sender?.type !== 'User') return undefined
+  if (event !== 'issues' || !payload.action || !KANBAN_ISSUE_ACTION_SET.has(payload.action)) return undefined
   const installationId = githubNumericId(payload.installation?.id)
   const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId) return undefined
+  const seen: RcGithubGraph = {
+    deliveryKey,
+    installationId,
+    repoId,
+    event,
+    action: payload.action,
+    ids: [],
+    numbers: []
+  }
+  const statusLabel =
+    (payload.action !== 'labeled' && payload.action !== 'unlabeled') ||
+    !!payload.label?.name?.startsWith(KANBAN_STATUS_LABEL_PREFIX)
+  // Only a human status edit rings; anything else is a seen-only marker so the CP's redelivery sweep knows it landed.
+  if (!statusLabel || payload.sender?.type !== 'User') return seen
   const id = githubNumericId(payload.issue?.id)
   const number = payload.issue?.number
-  if (!installationId || !repoId || !id || !Number.isSafeInteger(number) || number! <= 0) return undefined
-  return { deliveryKey, installationId, repoId, event, action: payload.action, ids: [id], numbers: [number!] }
+  if (!id || !Number.isSafeInteger(number) || number! <= 0) return seen
+  return { ...seen, ids: [id], numbers: [number!] }
 }
 
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
@@ -981,9 +990,11 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       const issuePoke = githubIssueDoorbell(event, payload, deliveryKey)
       if (issuePoke) {
         deps.graphDoorbell(issuePoke)
-        deps.log.info(
-          `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`
-        )
+        if (issuePoke.numbers.length > 0) {
+          deps.log.info(
+            `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`
+          )
+        }
       }
 
       const repoId = payload.repository?.id

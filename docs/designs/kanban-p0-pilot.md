@@ -115,8 +115,19 @@ still runs. App and bot senders never ring it. On that doorbell, and on any
 resets the card's recovery backoff, re-reads that one issue, and pokes the board's
 claim. A parked card that a human re-readies is therefore claimed when the webhook
 arrives, subject to the usual claim gates (caps, cooldown, a live daemon), not after
-its backoff. If the webhook is lost or the read fails, the card waits for its next due
-tick, at most the backoff ceiling below.
+its backoff.
+
+Every other `issues` labeled, unlabeled, closed, or reopened delivery (another label,
+or an App or bot sender) is forwarded as a seen-only marker with no issue numbers. The
+CP re-reads nothing for a marker; it only records that the delivery landed. The hook
+redelivery sweep therefore treats those four `issues` actions on a board-watched repo
+like the graph events. When a delivery's doorbell never landed (the relay pool was
+unreachable, or the CP's read failed), the sweep asks GitHub to redeliver it. The
+sweep runs every 10 minutes, needs a live relay, and asks at most three times per
+delivery. A redelivered delivery also re-runs hook matching, which is idempotent on
+its GUID. Until then, a non-terminal parked card still gets its next due tick, at most
+the backoff ceiling below. A `done` or `archived` card is not in the tick scan, so it
+depends on the redelivered webhook.
 
 The backlog scan runs only on the 60-second tick; a report or claim poke never reads
 GitHub, and a doorbell reads only the card it names. Each pass reads at most 25 due

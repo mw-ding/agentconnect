@@ -69,17 +69,17 @@ export class KanbanGraphDoorbell {
   }
 
   private async handle(m: RcGithubGraph): Promise<void> {
+    if (m.numbers.length === 0) {
+      // Cross-repo ids only (the periodic board tick reconciles those), or an `issues` seen-only marker: land it.
+      this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
+      return
+    }
     const boards = await this.deps.boards.listEnabledByRepoId(BigInt(m.repoId))
     if (boards.length === 0) return
     // The verified installation must belong to the board's org (decision 6), and must still be live.
     const installation = await this.deps.installations.getByInstallationId(BigInt(m.installationId))
     if (!installation || installation.revokedAt || installation.suspendedAt) {
       this.deps.log.debug({ installationId: m.installationId }, 'kanban graph doorbell: installation not live')
-      return
-    }
-    if (m.numbers.length === 0) {
-      // Cross-repo ids only; the periodic board tick reconciles those.
-      this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
       return
     }
     const reads: Promise<void>[] = []

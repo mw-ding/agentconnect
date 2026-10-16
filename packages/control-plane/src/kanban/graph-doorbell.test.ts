@@ -54,8 +54,9 @@ function make(
   const onGraph = vi.fn()
   const onCard = vi.fn(opts.onCard ?? (() => {}))
   const log = { debug: vi.fn(), warn: vi.fn() }
+  const listEnabledByRepoId = vi.fn(async () => opts.boards ?? [BOARD])
   const doorbell = new KanbanGraphDoorbell({
-    boards: { listEnabledByRepoId: vi.fn(async () => opts.boards ?? [BOARD]) },
+    boards: { listEnabledByRepoId },
     installations: {
       getByInstallationId: vi.fn(async () => (opts.installation === undefined ? installation() : opts.installation))
     },
@@ -64,7 +65,7 @@ function make(
     onCard,
     log
   })
-  return { doorbell, readGraph, onGraph, onCard, log }
+  return { doorbell, readGraph, onGraph, onCard, log, listEnabledByRepoId }
 }
 
 describe('KanbanGraphDoorbell', () => {
@@ -132,6 +133,16 @@ describe('KanbanGraphDoorbell', () => {
     h.doorbell.poke(poke({ numbers: [] }))
     await h.doorbell.settle()
     expect(h.readGraph).not.toHaveBeenCalled()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('lands an issues seen-only marker without any database or GitHub read', async () => {
+    const h = make()
+    h.doorbell.poke(poke({ event: 'issues', action: 'labeled', ids: [], numbers: [] }))
+    await h.doorbell.settle()
+    expect(h.listEnabledByRepoId).not.toHaveBeenCalled()
+    expect(h.onCard).not.toHaveBeenCalled()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
   })
 
   it('coalesces a storm on one card into the running read plus one trailing re-read', async () => {

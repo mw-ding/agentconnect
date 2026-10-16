@@ -410,8 +410,10 @@ export type RcGithubInstallation = z.infer<typeof RcGithubInstallation>
 
 // R→C EVT (fire-and-forget) — Kanban doorbell (issue #2 spike §3): a verified graph or card-status delivery, ids only
 export const GITHUB_GRAPH_EVENTS = ['sub_issues', 'issue_dependencies'] as const
-/** `issues` rings for an `ac/status:*` label change or a close/reopen, so the CP re-reads that card at once. */
+/** `issues` rings for a human status relabel or close/reopen; other such deliveries send empty `numbers`, landing only. */
 export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues'] as const
+/** The `issues` actions the relay always forwards (rung or seen-only), so the CP's redelivery sweep can re-ask lost ones. */
+export const KANBAN_ISSUE_ACTIONS = ['labeled', 'unlabeled', 'closed', 'reopened'] as const
 export const GithubGraphEvent = z.enum(KANBAN_DOORBELL_EVENTS)
 export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
 export const RcGithubGraph = z

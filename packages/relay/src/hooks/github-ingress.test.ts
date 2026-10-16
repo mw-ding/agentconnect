@@ -503,20 +503,30 @@ describe('github ingress', () => {
       expect(h.graphDoorbells.map((p) => p.action)).toEqual(['unlabeled', 'reopened', 'closed'])
     })
 
-    it('stays silent for other labels, other actions, bot senders, and unprovable ids', () => {
+    it('sends only a seen marker for other labels, bot senders, and unprovable ids, and nothing for other actions', () => {
       const ring = (event: string, payload: Record<string, unknown>) =>
         githubIssueDoorbell(event, payload as never, 'g')
       expect(ring('issues', labeled('ac/status:ready'))?.numbers).toEqual([42])
-      expect(ring('issues', labeled('bug'))).toBeUndefined()
-      expect(ring('issues', labeled('ac/agent:worker'))).toBeUndefined()
-      expect(ring('issues', issuesPayload({ action: 'edited', issue: { id: 5042 } }))).toBeUndefined()
+      // A seen marker names no issue, so the CP re-reads nothing but its redelivery sweep knows the GUID landed.
+      const seen = { deliveryKey: 'g', installationId: String(INSTALLATION), repoId: String(REPO_ID), event: 'issues' }
+      expect(ring('issues', labeled('bug'))).toEqual({ ...seen, action: 'labeled', ids: [], numbers: [] })
+      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([])
       expect(
-        ring('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))
-      ).toBeUndefined()
-      expect(ring('issues', labeled('ac/status:ready', { sender: undefined }))).toBeUndefined()
+        ring('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))?.numbers
+      ).toEqual([])
+      expect(ring('issues', labeled('ac/status:ready', { sender: undefined }))?.numbers).toEqual([])
+      expect(ring('issues', issuesPayload({ action: 'labeled', label: { name: 'ac/status:ready' } }))?.numbers).toEqual(
+        []
+      )
       expect(ring('issues', labeled('ac/status:ready', { installation: undefined }))).toBeUndefined()
-      expect(ring('issues', issuesPayload({ action: 'labeled', label: { name: 'ac/status:ready' } }))).toBeUndefined()
+      expect(ring('issues', issuesPayload({ action: 'edited', issue: { id: 5042 } }))).toBeUndefined()
       expect(ring('pull_request', labeled('ac/status:ready'))).toBeUndefined()
+    })
+
+    it('forwards a bot status relabel as a seen marker without logging a doorbell', async () => {
+      await post('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))
+      await flush()
+      expect(h.graphDoorbells).toEqual([expect.objectContaining({ deliveryKey: 'gh-delivery-1', numbers: [] })])
     })
   })
 

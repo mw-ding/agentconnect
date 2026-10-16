@@ -21,7 +21,7 @@
  * Same Clock-driven self-rescheduling shape as {@link CronRunReaper}; armed by
  * `startBackground()` only when the GitHub App is configured.
  */
-import { GITHUB_GRAPH_EVENTS } from '@agentconnect.md/protocol'
+import { GITHUB_GRAPH_EVENTS, KANBAN_ISSUE_ACTIONS } from '@agentconnect.md/protocol'
 import type { Clock, TimerHandle } from '../domain/clock.js'
 import type { HookId } from '../domain/ids.js'
 import type { GhHookDelivery } from '../github/service.js'
@@ -31,6 +31,8 @@ import type { HookRecord, RelayRecord } from '../persistence/ports.js'
 const SUBSCRIPTION_EVENTS = new Set(['issues', 'pull_request', 'issue_comment', 'pull_request_review_comment', 'push'])
 /** The Kanban graph doorbell families (relay mirror); they never produce a HookRun, so landing is asked of the graph dep. */
 const GRAPH_EVENTS: ReadonlySet<string> = new Set(GITHUB_GRAPH_EVENTS)
+/** `issues` actions the relay always forwards to the Kanban doorbell, so they land there too, beside any hook match. */
+const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string | null> = new Set(KANBAN_ISSUE_ACTIONS)
 /** Redeliveries requested per GUID before giving up (loop breaker). */
 const MAX_ATTEMPTS = 3
 /** Durable due gates for HookRuns that landed as a definite pre-dispatch
@@ -74,7 +76,7 @@ export interface HookRedeliveryHooks {
 export interface HookRedeliveryGraph {
   /** Repository ids an enabled Kanban board watches. */
   watchedRepoIds(): Promise<bigint[]>
-  /** The GUIDs whose graph doorbell already reached this CP (in-memory; a restart only costs capped re-asks). */
+  /** The GUIDs whose Kanban doorbell already reached this CP (in-memory; a restart only costs capped re-asks). */
   landedDeliveryKeys(deliveryKeys: readonly string[]): Set<string>
 }
 
@@ -235,18 +237,19 @@ export class HookRedeliveryReconciler {
     const matchingHookIds = new Map<string, HookId[]>()
     const graphGuids = new Set<string>()
     const matching = deliveries.filter((d) => {
-      const isGraph = GRAPH_EVENTS.has(d.event)
+      const isGraph = GRAPH_EVENTS.has(d.event) || (d.event === 'issues' && KANBAN_ISSUE_ACTION_SET.has(d.action))
       if (!isGraph && !SUBSCRIPTION_EVENTS.has(d.event)) return false
       const at = Date.parse(d.delivered_at)
       if (Number.isNaN(at) || at < now - MAX_LOOKBACK_MS || at > newest) return false
-      if (isGraph) {
-        if (d.repository_id === null || !graphRepos.has(String(d.repository_id))) return false
+      let candidate = false
+      if (isGraph && d.repository_id !== null && graphRepos.has(String(d.repository_id))) {
         graphGuids.add(d.guid)
-        return true
+        candidate = true
       }
+      if (!SUBSCRIPTION_EVENTS.has(d.event)) return candidate
       const hooks = d.repository_id === null ? undefined : byRepo.get(String(d.repository_id))
       const matched = hooks?.filter((hook) => hookMatchesEvent(hook, d.event, d.action)) ?? []
-      if (matched.length === 0) return false
+      if (matched.length === 0) return candidate
       matchingHookIds.set(
         d.guid,
         matched.map((hook) => hook.id)
@@ -259,15 +262,18 @@ export class HookRedeliveryReconciler {
     }
 
     const landed = await this.hooks.existingDeliveryKeys([
-      ...new Set(matching.filter((c) => !graphGuids.has(c.guid)).map((c) => c.guid))
+      ...new Set(matching.filter((c) => matchingHookIds.has(c.guid)).map((c) => c.guid))
     ])
     const graphLanded = this.graph?.landedDeliveryKeys([...graphGuids]) ?? new Set<string>()
     let redelivered = 0
     let oldestFailedAt: number | undefined // a failed GitHub call keeps its slice of the window open for retry
     const seenThisTick = new Set<string>() // one guid may list several attempts — ask once
     for (const d of matching) {
-      if (seenThisTick.has(d.guid) || graphLanded.has(d.guid)) continue
-      const persistedFailure = landed.has(d.guid)
+      if (seenThisTick.has(d.guid)) continue
+      // An unlanded Kanban doorbell is re-asked on the capped no-row path; the hook side dedups the re-post on its GUID.
+      const doorbellLost = graphGuids.has(d.guid) && !graphLanded.has(d.guid)
+      if (!doorbellLost && !matchingHookIds.has(d.guid)) continue
+      const persistedFailure = !doorbellLost && landed.has(d.guid)
       const deliveredAt = Date.parse(d.delivered_at)
       if (!persistedFailure && deliveredAt < oldest) continue
       if (!persistedFailure && (this.attempts.get(d.guid) ?? 0) >= MAX_ATTEMPTS) continue
