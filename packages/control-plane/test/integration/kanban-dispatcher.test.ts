@@ -267,6 +267,25 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
   })
 
+  it('accepts a blocked replay after the card block kind changes so the summary can still post', async () => {
+    const h = await harness()
+    await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    const report = h.reportFor(d, { outcome: 'blocked', blockKind: 'needs_input', reasonCode: 'agent_blocked' })
+    expect(await h.dispatcher.onReport(D1, 4, report)).toMatchObject({ accepted: true })
+    await h.dispatcher.settle()
+    expect(await prisma.kanbanRun.findFirstOrThrow({ where: { leaseId: d.leaseId } })).toMatchObject({
+      blockKind: 'needs_input'
+    })
+    await prisma.kanbanCard.update({ where: { id: d.cardId }, data: { blockKind: 'dependency' } })
+    const writes = h.store.writes.length
+    expect(await h.dispatcher.onReport(D1, 4, report)).toEqual({ leaseId: d.leaseId, accepted: true })
+    expect(h.store.writes).toHaveLength(writes)
+    expect(await h.card(d.cardId)).toMatchObject({ status: 'blocked', blockKind: 'dependency' })
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+  })
+
   it('does not grant a comment token when the run ended transient', async () => {
     const h = await harness()
     await h.addCard()
