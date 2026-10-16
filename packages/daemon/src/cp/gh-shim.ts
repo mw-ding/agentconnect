@@ -51,21 +51,89 @@ fi
 unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 
 # The daemon token is a github.com token; never let a host selector carry it, or stored auth, elsewhere.
-_HOST=""
-_prev=""
-for _a in "$@"; do
-  [ "$_prev" = "--hostname" ] && _HOST="$_a"
-  case "$_a" in
-    --hostname=*) _HOST="\${_a#--hostname=}" ;;
-  esac
-  _prev="$_a"
-done
-for _h in "$_HOST" "\${GH_HOST-}"; do
-  case "$_h" in
-    ''|[Gg][Ii][Tt][Hh][Uu][Bb].[Cc][Oo][Mm]) ;;
+_check_host() {
+  case "$1" in
+    [Gg][Ii][Tt][Hh][Uu][Bb].[Cc][Oo][Mm]) ;;
     *)
-      echo "agentconnect: agent gh is limited to github.com; refusing host $_h" >&2
+      echo "agentconnect: agent gh is limited to github.com; refusing host $1" >&2
       exit 1
+      ;;
+  esac
+}
+[ -n "\${GH_HOST-}" ] && _check_host "$GH_HOST"
+
+# The command group, found like cobra's stripFlags: at the root every flag but help/version takes a value.
+_GROUP=""
+_skip=""
+for _a in "$@"; do
+  if [ -n "$_skip" ]; then _skip=""; continue; fi
+  case "$_a" in
+    --) break ;;
+    --help|--version|-h|--*=*) ;;
+    --*|-?) _skip=1 ;;
+    -*) ;;
+    *) _GROUP="$_a"; break ;;
+  esac
+done
+# Value-taking flags per group; an unlisted flag is parsed as boolean, which can only over-refuse, never miss a host.
+case "$_GROUP" in
+  api)
+    _LONG_VALUES=" cache field header hostname input jq method preview raw-field repo template "
+    _SHORT_VALUES="FHRXfpqt"
+    ;;
+  auth)
+    _LONG_VALUES=" git-protocol hostname remove-scopes repo scopes user "
+    _SHORT_VALUES="Rhprsu"
+    ;;
+  *)
+    _LONG_VALUES=" assignee base body body-file branch field header hostname input jq json label limit milestone owner project raw-field ref repo reviewer search state template title "
+    _SHORT_VALUES="LRbqt"
+    ;;
+esac
+
+# Parse argv like pflag: every real --hostname (or auth -h) must be github.com; the repo is resolved Node-side (gh-target.ts).
+_want=""
+for _a in "$@"; do
+  case "$_want" in
+    host) _check_host "$_a"; _want=""; continue ;;
+    skip) _want=""; continue ;;
+  esac
+  case "$_a" in
+    --) break ;;
+    --*=*)
+      _name="\${_a%%=*}"
+      case "\${_name#--}" in
+        hostname) _check_host "\${_a#*=}" ;;
+      esac
+      ;;
+    --?*)
+      case "\${_a#--}" in
+        hostname) _want=host ;;
+        *) case "$_LONG_VALUES" in *" \${_a#--} "*) _want=skip ;; esac ;;
+      esac
+      ;;
+    -?*)
+      # A shorthand group like -ih: boolean letters until one takes a value, which is the rest or the next argument.
+      _rest="\${_a#-}"
+      while [ -n "$_rest" ]; do
+        _c="\${_rest%"\${_rest#?}"}"
+        _rest="\${_rest#?}"
+        case "$_SHORT_VALUES" in
+          *"$_c"*)
+            case "$_rest" in =?*) _rest="\${_rest#=}" ;; esac
+            _kind=skip
+            [ "$_c" = h ] && [ "$_GROUP" = auth ] && _kind=host
+            if [ -z "$_rest" ]; then
+              _want="$_kind"
+            elif [ "$_kind" = host ]; then
+              _check_host "$_rest"
+            fi
+            break
+            ;;
+        esac
+        # A boolean shorthand followed by =value consumes the rest of the group.
+        case "$_rest" in =*) break ;; esac
+      done
       ;;
   esac
 done

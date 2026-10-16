@@ -1746,7 +1746,9 @@ export function buildContainer(
       })
     : undefined
 
-  const kanbanCardStore = github ? new GithubCardStore({ tokens: github.tokens }) : undefined
+  const kanbanCardStore = github
+    ? new GithubCardStore({ tokens: github.tokens, appSlug: githubAppCfg?.slug })
+    : undefined
 
   // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
   const kanbanDispatcher = kanbanCardStore
@@ -1781,7 +1783,12 @@ export function buildContainer(
         store: kanbanCardStore,
         onGraph: async (board, repo, issueNumber, graph) => {
           await kanbanGraphReconciler?.apply(board, repo, issueNumber, graph)
-          await kanbanDispatcher?.ingestCard(board.id, issueNumber)
+          await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'graph')
+          kanbanDispatcher?.poke(board.id)
+        },
+        // A human status relabel or close/reopen re-reads the card at once instead of waiting out its backoff.
+        onCard: async (board, _repo, issueNumber) => {
+          await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog

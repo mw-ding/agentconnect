@@ -13,19 +13,25 @@ import type {
   KanbanBoardRef,
   KanbanClaimedLease,
   KanbanDispatchRepo,
+  KanbanRecoveryDue,
   KanbanRunEndResult,
   KanbanRunOutcomeValue
 } from '../persistence/ports.js'
 import {
+  STATUS_LABEL_PREFIX,
+  statusLabel,
   isDispatchableIssue,
   isPromotionResidue,
   observedCardStatus,
+  parseStatusLabels,
   planRecovery,
   planStatusWrite,
   type KanbanStatus,
+  type LabelPlan,
   type ObservedIssue
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
@@ -42,7 +48,7 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'statusSetByHuman'>
+  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionVerdict'>
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -60,6 +66,48 @@ const DEFAULT_EPOCH_GRACE_MS = 3 * 60_000
 const REAP_BATCH = 500
 /** Mismatch-parked cards re-read per board per tick; per-card backoff keeps the steady rate far lower. */
 const RECOVERY_BATCH = 25
+/** A pending promotion still unresolved after this many reads, or this long, escalates to a human. */
+export const MAX_PROMOTION_CHECKS = 12
+export const MAX_PROMOTION_AGE_MS = 6 * 60 * 60_000
+
+/** Why recovery gave a pending promotion up to a human. */
+export type PromotionAttention = 'unattributed' | 'unexpected_labels' | 'blockers_reopened' | 'unresolved'
+
+/** How a pending promotion stands after one read: adopt it, clear it, leave it, or hand it to a human. */
+type PendingOutcome = 'adopt' | 'clear' | 'inconclusive' | PromotionAttention
+
+/** Body-free comment for an escalated card: it names only labels and the reason code. */
+export function attentionComment(reason: PromotionAttention): string {
+  return (
+    `AgentConnect Kanban: this card's automatic promotion to \`ac/status:ready\` could not be confirmed ` +
+    `(${reason}), so it was not dispatched. Remove and re-add \`ac/status:ready\` yourself (even if it is ` +
+    `already present), or set another status, to continue.`
+  )
+}
+
+/** The cap counts reads already deferred plus `pending` more; either the count or the intent's age ends retries. */
+function promotionExhausted(card: KanbanRecoveryDue, now: Date, pending: number): boolean {
+  if (card.promotionChecks + pending >= MAX_PROMOTION_CHECKS) return true
+  return !!card.promotionStartedAt && now.getTime() - card.promotionStartedAt.getTime() >= MAX_PROMOTION_AGE_MS
+}
+
+/** A rolled-back or crashed promotion whose POST never returned is still watched for a late landing. */
+function watching(card: KanbanRecoveryDue, now: Date): boolean {
+  return !card.promotionPostAccepted && !!card.promotionWatchUntil && now.getTime() < card.promotionWatchUntil.getTime()
+}
+
+/** One recovery re-read: whether the card moved, and the fingerprint of what GitHub showed when it was read. */
+interface RecoveryRead {
+  moved: boolean
+  observed?: string
+}
+
+/** What recovery compares between reads, so a GitHub change restarts the backoff: issue state and status labels only. */
+export function recoveryFingerprint(issue: ObservedIssue | null): string {
+  if (!issue) return 'missing'
+  const statuses = issue.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX)).sort()
+  return JSON.stringify([issue.state, issue.stateReason ?? null, statuses])
+}
 
 export class KanbanDispatcher {
   private timer: TimerHandle | undefined
@@ -159,43 +207,155 @@ export class KanbanDispatcher {
 
   private async recoverMismatches(boardId: string): Promise<void> {
     const now = await this.deps.repo.now()
-    for (const card of await this.deps.repo.listMismatchedCards(boardId, now, RECOVERY_BATCH)) {
-      let moved = false
+    for (const card of await this.deps.repo.listRecoveryDue(boardId, now, RECOVERY_BATCH)) {
+      let read: RecoveryRead = { moved: false }
       try {
-        moved = await this.ingestCard(boardId, card.issueNumber)
+        read = card.promotion
+          ? await this.recoverPromotion(boardId, card)
+          : await this.ingest(boardId, card.issueNumber)
       } catch (err) {
         this.deps.log.warn({ err, boardId, issueNumber: card.issueNumber }, 'kanban: mismatch recovery read failed')
       }
-      if (!moved) await this.deps.repo.deferRecovery(card.cardId, now)
+      if (!read.moved) await this.deps.repo.deferRecovery(card.cardId, now, read.observed)
     }
   }
 
-  /** Body-free ingest shared by the graph doorbell and tick recovery; only a human's status edit un-parks a card. */
+  /** A GitHub change to this card. A human doorbell reads now; a graph doorbell leaves a pending promotion on its backoff. */
+  async onCardChanged(boardId: string, issueNumber: number, source: 'human' | 'graph' = 'graph'): Promise<boolean> {
+    const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
+    if (pending && source !== 'human') {
+      const now = await this.deps.repo.now()
+      if (pending.recoveryCheckAt && pending.recoveryCheckAt.getTime() > now.getTime()) return false
+    } else {
+      await this.deps.repo.resetRecovery(boardId, issueNumber)
+    }
+    if (!pending) return this.ingestCard(boardId, issueNumber)
+    const now = await this.deps.repo.now()
+    let read: RecoveryRead = { moved: false }
+    try {
+      read = await this.recoverPromotion(boardId, pending)
+      return read.moved
+    } finally {
+      if (!read.moved) await this.deps.repo.deferRecovery(pending.cardId, now, read.observed)
+    }
+  }
+
+  /** Body-free ingest shared by the doorbells and tick recovery; only a human's status edit un-parks a card. */
   async ingestCard(boardId: string, issueNumber: number): Promise<boolean> {
+    return (await this.ingest(boardId, issueNumber)).moved
+  }
+
+  private async ingest(boardId: string, issueNumber: number): Promise<RecoveryRead> {
     const from = await this.deps.repo.getParkedStatus(boardId, issueNumber)
-    if (!from) return false
-    const ref = await this.deps.repo.getBoardRef(boardId)
-    if (!ref) return false
-    const repo = await this.repoRef(ref)
-    if (!repo) return false
-    const plan = planRecovery(from, await this.deps.store.readCard(repo, issueNumber))
+    if (!from) return { moved: false }
+    const repo = await this.boardRepoRef(boardId)
+    if (!repo) return { moved: false }
+    const issue = await this.deps.store.readCard(repo, issueNumber)
+    const observed = recoveryFingerprint(issue)
+    const plan = planRecovery(from, issue)
     if (plan.kind === 'illegal') {
       this.deps.log.info(
         { boardId, issueNumber, from, requested: plan.requested },
         'kanban: recovery ignored a status move the state machine does not allow'
       )
-      return false
+      return { moved: false, observed }
     }
-    if (plan.kind === 'none') return false
+    if (plan.kind === 'none') return { moved: false, observed }
     // Agents write labels as the App bot, so an unattributed or non-human change never un-parks a card.
     if (!(await this.deps.store.statusSetByHuman(repo, issueNumber, plan.to))) {
       this.deps.log.info(
         { boardId, issueNumber, from, to: plan.to },
         'kanban: recovery ignored a non-human status label'
       )
-      return false
+      return { moved: false, observed }
     }
-    return this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
+    return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
+  }
+
+  // A failed promotion is adopted on proof, cleared once no ready label landed by its watch's end, else retried or escalated.
+  private async recoverPromotion(boardId: string, card: KanbanRecoveryDue): Promise<RecoveryRead> {
+    const now = await this.deps.repo.now()
+    // Reads that keep throwing never reach a verdict, so the cap is checked before reading too.
+    if (promotionExhausted(card, now, 0)) return this.escalatePromotion(boardId, card, 'unresolved')
+    const repo = await this.boardRepoRef(boardId)
+    if (!repo) return { moved: false }
+    const issue = await this.deps.store.readCard(repo, card.issueNumber)
+    const observed = recoveryFingerprint(issue)
+    const outcome = await this.judgePending(repo, card, issue)
+    if (outcome === 'inconclusive') {
+      if (!promotionExhausted(card, now, 1)) return { moved: false, observed }
+      return { ...(await this.escalatePromotion(boardId, card, 'unresolved', repo, issue)), observed }
+    }
+    if (outcome === 'adopt') {
+      if (!(await this.deps.repo.settlePromotion(card.cardId, true))) return { moved: false, observed }
+      // Residue is dispatchable as is, and the running write clears both labels.
+      this.deps.log.info({ boardId, issueNumber: card.issueNumber }, 'kanban: adopted a half-landed graph promotion')
+      return { moved: true }
+    }
+    if (outcome === 'clear') {
+      // An unacknowledged POST may still land, so no ready label only clears once its watch has passed.
+      if (watching(card, now)) return { moved: false, observed }
+      await this.deps.repo.settlePromotion(card.cardId, false)
+      return { moved: false, observed }
+    }
+    return { ...(await this.escalatePromotion(boardId, card, outcome, repo, issue)), observed }
+  }
+
+  // Adopt needs our acknowledged write (or a human's add) in the cursor window, the expected shape, and closed blockers.
+  private async judgePending(
+    repo: KanbanRepoRef,
+    card: KanbanRecoveryDue,
+    issue: CardIssue | null
+  ): Promise<PendingOutcome> {
+    // No ready label on an open issue: nothing landed (yet), or a human moved it; the caller watches or clears.
+    if (!issue || issue.state !== 'open' || !issue.labels.includes(statusLabel('ready'))) return 'clear'
+    const { statuses, malformed } = parseStatusLabels(issue.labels)
+    const readyOnly = statuses.length === 1 && malformed.length === 0
+    if (!readyOnly && !isPromotionResidue(issue)) return 'unexpected_labels'
+    // A missing cursor (an intent from before cursors existed) admits only a human ready-add.
+    const cursor = card.promotionEventCursor == null ? null : Number(card.promotionEventCursor)
+    const verdict = await this.deps.store.promotionVerdict(
+      repo,
+      card.issueNumber,
+      cursor ?? 0,
+      cursor != null && card.promotionPostAccepted
+    )
+    if (verdict === 'inconclusive') return 'inconclusive'
+    if (verdict === 'reject') return 'unattributed'
+    const graph = await this.deps.store.readGraph(repo, card.issueNumber)
+    if (graph.truncated) return 'inconclusive'
+    return planGraphPromotion('todo', graph) === 'promote' ? 'adopt' : 'blockers_reopened'
+  }
+
+  // Back to todo with the attention flag, a warn log, and a best-effort issue comment so the board shows it.
+  private async escalatePromotion(
+    boardId: string,
+    card: KanbanRecoveryDue,
+    reason: PromotionAttention,
+    repo?: KanbanRepoRef,
+    issue?: CardIssue | null
+  ): Promise<RecoveryRead> {
+    const { issueNumber } = card
+    if (!(await this.deps.repo.escalatePromotion(card.cardId, reason))) return { moved: false }
+    this.deps.log.warn(
+      { boardId, issueNumber, reason, checks: card.promotionChecks },
+      'kanban: pending promotion needs human attention'
+    )
+    try {
+      const target = repo ?? (await this.boardRepoRef(boardId))
+      const plan: LabelPlan = {
+        outcome: 'noop',
+        status: 'todo',
+        releaseLease: false,
+        addLabels: [],
+        removeLabels: [],
+        comment: attentionComment(reason)
+      }
+      if (target) await this.deps.store.applyPlan(target, issueNumber, issue ?? { labels: [], state: 'open' }, plan)
+    } catch (err) {
+      this.deps.log.warn({ err, boardId, issueNumber }, 'kanban: attention comment failed')
+    }
+    return { moved: false }
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
@@ -353,6 +513,11 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  private async boardRepoRef(boardId: string): Promise<KanbanRepoRef | null> {
+    const ref = await this.deps.repo.getBoardRef(boardId)
+    return ref ? this.repoRef(ref) : null
   }
 
   /** The installation is resolved live from the board's org and repo owner, never trusted from a frame. */

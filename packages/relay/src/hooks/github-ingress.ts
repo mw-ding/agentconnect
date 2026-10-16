@@ -7,6 +7,7 @@ import {
   GITHUB_GRAPH_EVENTS,
   GITHUB_RELEASE_RESTATED_EVENTS,
   GITHUB_REQUEST_REVIEW_ACTION,
+  KANBAN_ISSUE_ACTIONS,
   HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
   isGithubPullRequestRevisionEvent,
   type RcGithubCommentAuthz,
@@ -89,6 +90,8 @@ interface GithubPayload {
   installation?: { id?: number }
   repository?: GithubRepositoryRef
   sender?: { login?: string; type?: string; avatar_url?: string }
+  /** The label an `issues:labeled`/`unlabeled` delivery added or removed. */
+  label?: { name?: string }
   requested_reviewer?: { login?: string; type?: string }
   requested_action?: { identifier?: string }
   issue?: GithubSubject
@@ -195,6 +198,7 @@ interface GithubGraphIssue {
 }
 
 interface GithubSubject {
+  id?: number
   number?: number
   title?: string
   body?: string | null
@@ -1062,6 +1066,40 @@ export function githubGraphDoorbell(
   }
 }
 
+/** Card-status changes the Kanban recovery re-reads at once instead of on its backed-off tick. */
+const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string> = new Set(KANBAN_ISSUE_ACTIONS)
+const KANBAN_STATUS_LABEL_PREFIX = 'ac/status:'
+
+/** Reduce a human `ac/status:*` relabel or close/reopen to the body-free Kanban doorbell (exported for unit tests). */
+export function githubIssueDoorbell(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcGithubGraph | undefined {
+  if (event !== 'issues' || !payload.action || !KANBAN_ISSUE_ACTION_SET.has(payload.action)) return undefined
+  const installationId = githubNumericId(payload.installation?.id)
+  const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId) return undefined
+  const seen: RcGithubGraph = {
+    deliveryKey,
+    installationId,
+    repoId,
+    event,
+    action: payload.action,
+    ids: [],
+    numbers: []
+  }
+  const statusLabel =
+    (payload.action !== 'labeled' && payload.action !== 'unlabeled') ||
+    !!payload.label?.name?.startsWith(KANBAN_STATUS_LABEL_PREFIX)
+  // Only a human status edit rings; anything else is a seen-only marker so the CP's redelivery sweep knows it landed.
+  if (!statusLabel || payload.sender?.type !== 'User') return seen
+  const id = githubNumericId(payload.issue?.id)
+  const number = payload.issue?.number
+  if (!id || !Number.isSafeInteger(number) || number! <= 0) return seen
+  return { ...seen, ids: [id], numbers: [number!] }
+}
+
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
   // Own plugin scope, so the raw-body parser the signature needs does not leak onto other JSON routes.
   void app.register(async (scope) => {
@@ -1150,6 +1188,17 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
 
       if (!SUBSCRIPTION_EVENTS.has(event) && !GITHUB_ROUTED_THREAD_EVENTS.has(event))
         return reply.code(202).send({ deliveryKey })
+
+      // A card-status change also rings the Kanban doorbell; hook matching below still runs for the same delivery.
+      const issuePoke = githubIssueDoorbell(event, payload, deliveryKey)
+      if (issuePoke) {
+        deps.graphDoorbell(issuePoke)
+        if (issuePoke.numbers.length > 0) {
+          deps.log.info(
+            `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`
+          )
+        }
+      }
 
       const repoId = payload.repository?.id
       const subject = payload.issue ?? payload.pull_request

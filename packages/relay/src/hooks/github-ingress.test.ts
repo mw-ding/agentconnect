@@ -30,6 +30,7 @@ import {
   buildGithubContext,
   buildTrustedGithubMetadata,
   githubGraphDoorbell,
+  githubIssueDoorbell,
   GITHUB_BODY_EXCERPT_MAX,
   type GithubMatchCtx
 } from './github-ingress.js'
@@ -614,6 +615,68 @@ describe('github ingress', () => {
       )
       expect(poke?.ids).toEqual(['1001', '1002'])
       expect(githubGraphDoorbell('issues', subIssuesPayload() as never, 'guid')).toBeUndefined()
+    })
+  })
+
+  describe('Kanban card-status doorbell (issue #2)', () => {
+    const labeled = (name: string, overrides: Record<string, unknown> = {}) =>
+      issuesPayload({ action: 'labeled', label: { name }, issue: { id: 5042 }, ...overrides })
+
+    it('rings a body-free doorbell for a human status relabel and still matches hooks', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const res = await post('issues', labeled('ac/status:ready'))
+      expect(res.statusCode).toBe(202)
+      await flush()
+      expect(h.graphDoorbells).toEqual([
+        {
+          deliveryKey: 'gh-delivery-1',
+          installationId: String(INSTALLATION),
+          repoId: String(REPO_ID),
+          event: 'issues',
+          action: 'labeled',
+          ids: ['5042'],
+          numbers: [42]
+        }
+      ])
+      expect(JSON.stringify(h.graphDoorbells)).not.toMatch(/db down|primary is unreachable/)
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it('rings for a status unlabel and a close or reopen, without any hook rule', async () => {
+      await post(
+        'issues',
+        issuesPayload({ action: 'unlabeled', label: { name: 'ac/status:blocked' }, issue: { id: 5042 } })
+      )
+      await post('issues', issuesPayload({ action: 'reopened', issue: { id: 5042 } }))
+      await post('issues', issuesPayload({ action: 'closed', issue: { id: 5042 } }))
+      await flush()
+      expect(h.graphDoorbells.map((p) => p.action)).toEqual(['unlabeled', 'reopened', 'closed'])
+    })
+
+    it('sends only a seen marker for other labels, bot senders, and unprovable ids, and nothing for other actions', () => {
+      const ring = (event: string, payload: Record<string, unknown>) =>
+        githubIssueDoorbell(event, payload as never, 'g')
+      expect(ring('issues', labeled('ac/status:ready'))?.numbers).toEqual([42])
+      // A seen marker names no issue, so the CP re-reads nothing but its redelivery sweep knows the GUID landed.
+      const seen = { deliveryKey: 'g', installationId: String(INSTALLATION), repoId: String(REPO_ID), event: 'issues' }
+      expect(ring('issues', labeled('bug'))).toEqual({ ...seen, action: 'labeled', ids: [], numbers: [] })
+      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([])
+      expect(
+        ring('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))?.numbers
+      ).toEqual([])
+      expect(ring('issues', labeled('ac/status:ready', { sender: undefined }))?.numbers).toEqual([])
+      expect(ring('issues', issuesPayload({ action: 'labeled', label: { name: 'ac/status:ready' } }))?.numbers).toEqual(
+        []
+      )
+      expect(ring('issues', labeled('ac/status:ready', { installation: undefined }))).toBeUndefined()
+      expect(ring('issues', issuesPayload({ action: 'edited', issue: { id: 5042 } }))).toBeUndefined()
+      expect(ring('pull_request', labeled('ac/status:ready'))).toBeUndefined()
+    })
+
+    it('forwards a bot status relabel as a seen marker without logging a doorbell', async () => {
+      await post('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))
+      await flush()
+      expect(h.graphDoorbells).toEqual([expect.objectContaining({ deliveryKey: 'gh-delivery-1', numbers: [] })])
     })
   })
 

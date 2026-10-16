@@ -2587,6 +2587,22 @@ model KanbanCard {
   // Mismatch recovery backoff: next GitHub re-read and checks since the last change.
   recoveryCheckAt     DateTime?        @db.Timestamptz(6)
   recoveryChecks      Int              @default(0)
+  // The GitHub status fingerprint recovery last read; a change restarts the backoff.
+  recoveryObserved    String?
+  // A graph promotion's label write failed after possibly landing; recovery re-reads the card on the same backoff.
+  promotionPending        Boolean   @default(false)
+  // Newest issue-event id before our ready POST; only later events can be that write.
+  promotionEventCursor    BigInt?
+  // The ready POST returned success. Without it no App ready-add is ours.
+  promotionPostAccepted   Boolean   @default(false)
+  // An unacknowledged POST may still land until this time, so recovery watches rather than clears before it.
+  promotionWatchUntil     DateTime? @db.Timestamptz(6)
+  // When the intent opened, and recovery reads since; either cap escalates the card.
+  promotionStartedAt      DateTime? @db.Timestamptz(6)
+  promotionChecks         Int       @default(0)
+  // Recovery could not settle the card on its own; only a human status edit moves it again.
+  needsAttention          Boolean   @default(false)
+  attentionReason         String?
   linkedPrNumber      Int?
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)

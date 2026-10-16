@@ -316,6 +316,74 @@ describe('HookRedeliveryReconciler', () => {
     })
   })
 
+  describe('Kanban card-status (issues) doorbell deliveries (#18)', () => {
+    const labeled = (over: Partial<GhHookDelivery> = {}) => delivery({ action: 'labeled', ...over })
+
+    it('redelivers an unlanded issues relabel or close/reopen for a board-watched repo, even with no github hook', async () => {
+      const h = make({
+        hooks: [],
+        graph: { repoIds: [REPO_ID] },
+        deliveries: [
+          labeled({ id: 'l1', guid: 'g-l1' }),
+          labeled({ id: 'l2', guid: 'g-l2', action: 'unlabeled' }),
+          labeled({ id: 'l3', guid: 'g-l3', action: 'reopened' }),
+          labeled({ id: 'l4', guid: 'g-l4', action: 'closed' })
+        ]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual(['l1', 'l2', 'l3', 'l4'])
+      expect(h.claimMock).not.toHaveBeenCalled()
+    })
+
+    it('leaves landed ones, other actions, and unwatched repos alone', async () => {
+      const h = make({
+        hooks: [],
+        graph: { repoIds: [REPO_ID], landed: ['g-landed'] },
+        deliveries: [
+          labeled({ id: 'landed', guid: 'g-landed' }),
+          labeled({ id: 'edited', guid: 'g-edited', action: 'edited' }),
+          labeled({ id: 'opened', guid: 'g-opened', action: 'opened' }),
+          labeled({ id: 'foreign', guid: 'g-foreign', repository_id: 1 })
+        ]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual([])
+    })
+
+    it('re-asks a lost doorbell even when a hook already recorded its HookRun for the same delivery', async () => {
+      const h = make({
+        hooks: [ghHook({ events: ['issues:labeled'] })],
+        landed: ['guid-1'],
+        graph: { repoIds: [REPO_ID] },
+        deliveries: [labeled()]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual(['1234567890123456789'])
+      expect(h.claimMock).not.toHaveBeenCalled()
+      expect(h.reviewFanoutClaimMock).not.toHaveBeenCalled()
+    })
+
+    it('falls back to the hook rules once the doorbell landed', async () => {
+      const landedRun = make({
+        hooks: [ghHook({ events: ['issues:labeled'] })],
+        landed: ['guid-1'],
+        graph: { repoIds: [REPO_ID], landed: ['guid-1'] },
+        deliveries: [labeled()]
+      })
+      await landedRun.reconciler.tick()
+      expect(landedRun.redelivered).toEqual([])
+      expect(landedRun.claimMock).toHaveBeenCalledOnce()
+
+      const noRun = make({
+        hooks: [ghHook({ events: ['issues:labeled'] })],
+        graph: { repoIds: [REPO_ID], landed: ['guid-1'] },
+        deliveries: [labeled()]
+      })
+      await noRun.reconciler.tick()
+      expect(noRun.redelivered).toEqual(['1234567890123456789'])
+    })
+  })
+
   it('the event:* wildcard widens the sieve', async () => {
     const h = make({
       hooks: [ghHook({ events: ['pull_request:*'] })],
