@@ -1,4 +1,4 @@
-// Kanban GitHub tokens: App installation tokens when configured, otherwise the injected PAT (issue #2 M3).
+// Kanban GitHub tokens: App installation tokens when configured, otherwise a dev/test injected PAT (issue #2 M3).
 import type { InstallationTokenService, MintedGitCred } from '../github/installation-token.service.js'
 
 export type KanbanTokenMinter = Pick<InstallationTokenService, 'mintKanbanCard' | 'mintKanbanRun'>
