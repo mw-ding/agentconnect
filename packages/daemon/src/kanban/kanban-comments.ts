@@ -234,6 +234,14 @@ export class KanbanCommentPublisher {
       })
       if (!res.ok) {
         await res.body?.cancel().catch(() => undefined)
+        // Same as the POST path: evict a rejected token so the next pass mints a fresh one.
+        if (res.status === 401 || res.status === 403) {
+          try {
+            this.deps.invalidateToken?.(entry, token)
+          } catch {
+            // A broken invalidator must not mask the lookup failure.
+          }
+        }
         throw new Error(`GitHub GET ${res.status}`)
       }
       const comments = (await readJson(res, signal)) as Array<{ body?: string }>

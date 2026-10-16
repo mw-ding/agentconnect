@@ -377,4 +377,44 @@ describe('KanbanCommentPublisher', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(5)
     expect(posts).toEqual([])
   })
+
+  it.each([401, 403])(
+    'drops the cached token when the marker lookup gets %i, then finds the marker with a fresh one',
+    async (status) => {
+      const store = memoryStore()
+      seed(store, { attempted: true, attempts: 1, attemptedAt: 1_000 })
+      let now = 1_000
+      let cached: string | undefined
+      let minted = 0
+      const invalidated: string[] = []
+      const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const auth = new Headers(init?.headers).get('authorization')
+        if (auth === 'Bearer ghs_1') return new Response('bad credentials', { status })
+        return new Response(JSON.stringify([{ body: `<!-- ${kanbanLeaseMarker(report.leaseId)} -->` }]), {
+          status: 200
+        })
+      })
+      const publisher = new KanbanCommentPublisher({
+        clock: { now: () => now },
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        store,
+        token: async () => (cached ??= `ghs_${++minted}`),
+        invalidateToken: (target, token) => {
+          expect(target.report.leaseId).toBe(report.leaseId)
+          invalidated.push(token)
+          if (cached === token) cached = undefined
+        },
+        fetchImpl: fetchImpl as typeof fetch,
+        baseUrl: 'https://api.test'
+      })
+      await publisher.drain()
+      expect(invalidated).toEqual(['ghs_1'])
+      expect(store.rows.get(report.leaseId)).toMatchObject({ lookupMisses: 1 })
+      now = store.rows.get(report.leaseId)!.nextAt
+      await publisher.drain()
+      expect(minted).toBe(2)
+      expect(store.rows.size).toBe(0)
+      expect(fetchImpl.mock.calls.every(([, init]) => (init?.method ?? 'GET') === 'GET')).toBe(true)
+    }
+  )
 })
