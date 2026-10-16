@@ -31,6 +31,8 @@ export interface CardGraph {
   parent: CardLink | null
   subIssues: CardLink[]
   blockedBy: CardLink[]
+  /** Issues this one blocks (its dependents). */
+  blocking: CardLink[]
   /** A list hit the one-page bound, so the graph may be incomplete. */
   truncated: boolean
 }
@@ -90,19 +92,21 @@ export class GithubCardStore implements CardStore {
   }
 
   async readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph> {
-    const [parent, subIssues, blockedBy] = await Promise.all([
+    const [parent, subIssues, blockedBy, blocking] = await Promise.all([
       this.get<GhIssue>(repo, `/issues/${issueNumber}/parent`).catch((err: unknown) => {
         if (err instanceof GithubApiError && err.status === 404) return null
         throw err
       }),
       this.get<GhIssue[]>(repo, `/issues/${issueNumber}/sub_issues?per_page=${PAGE}`),
-      this.get<GhIssue[]>(repo, `/issues/${issueNumber}/dependencies/blocked_by?per_page=${PAGE}`)
+      this.get<GhIssue[]>(repo, `/issues/${issueNumber}/dependencies/blocked_by?per_page=${PAGE}`),
+      this.get<GhIssue[]>(repo, `/issues/${issueNumber}/dependencies/blocking?per_page=${PAGE}`)
     ])
     return {
       parent: parent ? toLink(parent) : null,
       subIssues: subIssues.map(toLink),
       blockedBy: blockedBy.map(toLink),
-      truncated: subIssues.length >= PAGE || blockedBy.length >= PAGE
+      blocking: blocking.map(toLink),
+      truncated: subIssues.length >= PAGE || blockedBy.length >= PAGE || blocking.length >= PAGE
     }
   }
 
