@@ -31,6 +31,8 @@ import { PullRequestViewService } from './github/pull-request-view.service.js'
 import { GithubRunCoordinator, GithubRunReporter } from './github/run-reporter.js'
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
+import { GithubCardStore } from './kanban/card-store.js'
+import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
 import { type Clock, systemClock } from './domain/clock.js'
@@ -99,6 +101,7 @@ import {
   PgCronRepo,
   PgHookRepo,
   PgHookSecretStore,
+  PgKanbanBoardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -363,6 +366,7 @@ export function buildContainer(
     cron: new PgCronRepo(prisma),
     hook: new PgHookRepo(prisma),
     hookSecret: new PgHookSecretStore(prisma, secretCipher),
+    kanbanBoard: new PgKanbanBoardRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Under WAITLIST_MODE, JIT signup does NOT mint a personal org — that happens
@@ -850,6 +854,21 @@ export function buildContainer(
       })
     : undefined
 
+  // Kanban graph doorbell (issue #2 spike §3): re-reads the graph on a relay poke; the reconcile seam is a stub in M1.
+  const kanbanGraphDoorbell = github
+    ? new KanbanGraphDoorbell({
+        boards: repos.kanbanBoard,
+        installations: repos.githubInstallation,
+        store: new GithubCardStore({ tokens: github.tokens }),
+        onGraph: (board, issueNumber, graph) =>
+          http.log.debug(
+            { boardId: board.id, issueNumber, blockedBy: graph.blockedBy.length, subIssues: graph.subIssues.length },
+            'kanban: graph re-read'
+          ),
+        log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+      })
+    : undefined
+
   const logtoMgmtCfg = resolveLogtoMgmtConfig(config)
   const logtoIdentity =
     logtoMgmtCfg && config.OIDC_ISSUER
@@ -1097,7 +1116,13 @@ export function buildContainer(
           graceMs: 2 * 60 * 1000,
           relayStaleMs
         },
-        http.log
+        http.log,
+        kanbanGraphDoorbell
+          ? {
+              watchedRepoIds: () => repos.kanbanBoard.listEnabledRepoIds(),
+              landedDeliveryKeys: (keys) => kanbanGraphDoorbell.landedDeliveryKeys(keys)
+            }
+          : undefined
       )
     : undefined
 
@@ -1609,6 +1634,13 @@ export function buildContainer(
       }
       installationDoorbell.poke(m)
     },
+    onGithubGraph: async (m) => {
+      if (!kanbanGraphDoorbell) {
+        http.log.debug({ repoId: m.repoId }, 'relay: graph doorbell ignored — GITHUB_APP_* not configured')
+        return
+      }
+      kanbanGraphDoorbell.poke(m)
+    },
     config: {
       RELAY_WS_PATH: config.RELAY_WS_PATH,
       HEARTBEAT_SEC: config.HEARTBEAT_SEC
@@ -1648,6 +1680,7 @@ export function buildContainer(
       githubRunReporter?.stop()
       hookRedeliveryReconciler?.stop()
       installationDoorbell?.stop()
+      kanbanGraphDoorbell?.stop()
       for (const reaper of pendingInstallReapers) reaper.stop()
       relaySweeper.stop()
       sessionAccessWarmer.stop()
@@ -1658,7 +1691,8 @@ export function buildContainer(
         ...relayRegistrationTasks,
         visibilityPush.settle(),
         sessionAccessWarmer.settle(),
-        ...(installationDoorbell ? [installationDoorbell.settle()] : [])
+        ...(installationDoorbell ? [installationDoorbell.settle()] : []),
+        ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : [])
       ])
       await rootPrisma.$disconnect()
     }

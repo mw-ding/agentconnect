@@ -108,6 +108,7 @@ model Org {
   sessionExternalAccess     SessionExternalAccessPolicy[]
   environmentEntries        OrganizationEnvironmentEntry[]
   clusterExecution          OrgClusterExecution?
+  kanbanBoards              KanbanBoard[]
 
   @@index([createdByUserId])
   @@map("org")
@@ -148,6 +149,8 @@ model User {
   modifiedCrons                    CronDef[]                  @relation("CronModifiedBy")
   createdHooks                     HookDef[]                  @relation("HookCreatedBy")
   modifiedHooks                    HookDef[]                  @relation("HookModifiedBy")
+  createdKanbanBoards              KanbanBoard[]              @relation("KanbanBoardCreatedBy")
+  modifiedKanbanBoards             KanbanBoard[]              @relation("KanbanBoardModifiedBy")
   createdRepoAuths                 AgentRepoAuthorization[]   @relation("AgentRepoAuthCreatedBy")
   slackConfigs                     SlackUserConfig[]
   createdInviteLinks               OrgInviteLink[]            @relation("OrgInviteLinkCreatedBy")
@@ -746,6 +749,9 @@ model Agent {
   webchatParticipations WebchatConversationAgent[]
   webchatMcpDelegations WebchatMcpDelegation[]
   presetRecords         PresetAgent[]
+  kanbanCards           KanbanCard[]
+  kanbanOrchestrated    KanbanBoard[]              @relation("KanbanBoardOrchestrator")
+  kanbanVerified        KanbanBoard[]              @relation("KanbanBoardVerifier")
 
   organizationEnvironmentAssignments OrganizationEnvironmentAssignment[]
 
@@ -1749,6 +1755,147 @@ model HookReviewSubject {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Kanban (issue #2, M1) — GitHub issues are the cards; these rows are body-free metadata only.
+// ───────────────────────────────────────────────────────────────────────────
+
+// One exclusive `ac/status:<status>` label per card; done/archived also close the issue.
+enum KanbanCardStatus {
+  triage
+  todo
+  ready
+  running
+  blocked
+  review
+  done
+  archived
+}
+
+enum KanbanBlockKind {
+  dependency
+  needs_input
+  capability
+  transient
+}
+
+enum KanbanCompletionContract {
+  close
+  pr_merged
+  pr_checks_green
+}
+
+enum KanbanRunOutcome {
+  completed
+  review_requested
+  blocked
+  failed
+  protocol_violation
+  reclaimed
+  transient
+}
+
+model KanbanBoard {
+  id                    String                   @id @default(uuid()) @db.Uuid
+  orgId                 String
+  name                  String
+  repoId                BigInt // GitHub numeric repo id — the doorbell match key (rename-proof, same as HookDef)
+  repoFullName          String // "owner/repo" — display only; never matched on
+  orchestratorAgentId   String?                  @db.Uuid
+  verifierAgentId       String?                  @db.Uuid
+  // Notification anchor (same trio as HookDef.target*; null channel ⇒ headless).
+  targetPlatform        String                   @default("slack")
+  targetChannel         String?
+  targetIntegrationId   String?                  @db.Uuid
+  maxInProgress         Int                      @default(1)
+  maxInProgressPerAgent Int                      @default(1)
+  staleLeaseSec         Int                      @default(14400)
+  failureLimit          Int                      @default(2)
+  protocolRetryLimit    Int                      @default(3)
+  blockRecurrenceLimit  Int                      @default(2)
+  completionContract    KanbanCompletionContract @default(close)
+  enabled               Boolean                  @default(true)
+  configRevision        BigInt                   @default(1)
+  visibility            ResourceVisibility       @default(org)
+  sharedWith            String[]                 @default([])
+  createdByUserId       String?
+  lastModifiedByUserId  String?
+  lastModifiedAt        DateTime                 @default(now()) @db.Timestamptz(6)
+  createdAt             DateTime                 @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime                 @updatedAt @db.Timestamptz(6)
+
+  org               Org          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  orchestratorAgent Agent?       @relation("KanbanBoardOrchestrator", fields: [orchestratorAgentId], references: [id], onDelete: SetNull)
+  verifierAgent     Agent?       @relation("KanbanBoardVerifier", fields: [verifierAgentId], references: [id], onDelete: SetNull)
+  targetIntegration Integration? @relation(fields: [targetIntegrationId], references: [id], onDelete: SetNull)
+  createdBy         User?        @relation("KanbanBoardCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  lastModifiedBy    User?        @relation("KanbanBoardModifiedBy", fields: [lastModifiedByUserId], references: [id], onDelete: SetNull)
+  cards             KanbanCard[]
+
+  @@unique([orgId, repoId]) // one board per repository per org
+  @@index([repoId]) // graph doorbell lookup
+  @@map("kanban_board")
+}
+
+model KanbanCard {
+  id                  String           @id @default(uuid()) @db.Uuid
+  boardId             String           @db.Uuid
+  issueId             BigInt // GitHub numeric issue id (what graph webhooks name)
+  issueNodeId         String? // GraphQL node id, filled on first GitHub read
+  issueNumber         Int
+  // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
+  idempotencyKey      String?
+  status              KanbanCardStatus @default(triage)
+  assigneeAgentId     String?          @db.Uuid
+  priority            Int              @default(0)
+  notBefore           DateTime?        @db.Timestamptz(6)
+  blockKind           KanbanBlockKind?
+  consecutiveFailures Int              @default(0)
+  protocolViolations  Int              @default(0)
+  blockRecurrence     Int              @default(0)
+  cooldownUntil       DateTime?        @db.Timestamptz(6)
+  linkedPrNumber      Int?
+  // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
+  dispatchRevision    BigInt           @default(1)
+  stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
+  githubSyncedAt      DateTime?        @db.Timestamptz(6)
+  createdAt           DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime         @updatedAt @db.Timestamptz(6)
+
+  board         KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
+  runs          KanbanRun[]
+
+  @@unique([boardId, issueId])
+  @@unique([boardId, issueNumber])
+  @@unique([boardId, idempotencyKey])
+  @@index([issueId]) // graph doorbell lookup
+  @@index([boardId, status])
+  @@index([assigneeAgentId])
+  @@map("kanban_card")
+}
+
+// One dispatch attempt. Agent/daemon ids are history, not FKs: a run outlives its placement.
+model KanbanRun {
+  id               String            @id @default(uuid()) @db.Uuid
+  cardId           String            @db.Uuid
+  attempt          Int
+  agentId          String            @db.Uuid
+  daemonId         String            @db.Uuid
+  sessionId        String?
+  leaseId          String            @unique @db.Uuid
+  dispatchRevision BigInt // the card's dispatchRevision this lease was minted under
+  dispatchedAt     DateTime          @db.Timestamptz(6)
+  heartbeatAt      DateTime?         @db.Timestamptz(6)
+  endedAt          DateTime?         @db.Timestamptz(6)
+  outcome          KanbanRunOutcome?
+  reasonCode       String? // short, body-free
+
+  card KanbanCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([cardId, attempt])
+  @@map("kanban_run")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Relay — one registered ingress-relay instance (shared-bot-relay.md §6)
 //   The relay pool is the platform's unified inbound plane: webchat now,
 //   shared-bot + webhook with milestone B. Instances register dynamically over
@@ -1992,9 +2139,10 @@ model Integration {
   bot             Bot                  @relation(fields: [botId], references: [id], onDelete: Restrict)
   createdBy       User?                @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
   channels        IntegrationChannel[]
-  // Crons/hooks whose target anchor posts through this integration (SetNull on uninstall).
+  // Crons/hooks/Kanban boards whose target anchor posts through this integration (SetNull on uninstall).
   targetedByCrons CronDef[]
   targetedByHooks HookDef[]
+  kanbanBoards    KanbanBoard[]
 
   @@index([orgId])
   @@index([agentId])

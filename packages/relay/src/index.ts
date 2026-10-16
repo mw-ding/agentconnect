@@ -239,6 +239,7 @@ async function main(): Promise<void> {
     daemons: () => held.rdServer,
     report: (r) => client.emitRunReport(r),
     doorbell: (poke) => client.emitGithubInstallation(poke),
+    graphDoorbell: (poke) => client.emitGithubGraph(poke),
     authorizeComment: (request) => client.authorizeGithubComment(request),
     authorizeRerequest: (request) => client.authorizeGithubRerequest(request),
     authzLimiter: githubAuthzLimiter,
