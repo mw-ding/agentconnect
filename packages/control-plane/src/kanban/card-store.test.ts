@@ -1,7 +1,7 @@
 // GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, per-label add/remove writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from '../github/api.js'
-import { GithubCardStore, type KanbanRepoRef } from './card-store.js'
+import { GithubCardStore, isHumanActor, type KanbanRepoRef } from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
 
@@ -199,5 +199,96 @@ describe('cardIdempotencyKey', () => {
     expect(cardIdempotencyKey({ epic: 'a', step: 'bc', spec: '' })).not.toBe(
       cardIdempotencyKey({ epic: 'ab', step: 'c', spec: '' })
     )
+  })
+})
+
+describe('display-only mode labels', () => {
+  it('ignores a User/PAT label grant and never consults issue events', async () => {
+    const events = vi.fn(() =>
+      json([
+        {
+          id: 1,
+          event: 'labeled',
+          label: { name: 'ac/mode:write' },
+          actor: { type: 'User', login: 'maintainer' },
+          performed_via_github_app: null
+        }
+      ])
+    )
+    const h = harness({
+      'GET /repositories/42/issues/7': () => json(issue({ labels: ['ac/status:ready', 'ac/mode:write'] })),
+      'GET /repositories/42/issues/7/events?per_page=100&page=1': events
+    })
+    expect(await h.store.readCard(REPO, 7)).toMatchObject({ labels: ['ac/status:ready', 'ac/mode:write'] })
+    expect(h.calls).toHaveLength(1)
+    expect(events).not.toHaveBeenCalled()
+  })
+})
+
+describe('status label attribution', () => {
+  const ev = (id: number, actor: unknown, label = 'ac/status:ready', extra = {}) => ({
+    id,
+    event: 'labeled',
+    label: { name: label },
+    actor,
+    ...extra
+  })
+  const human = { type: 'User', login: 'maintainer' }
+  const bot = { type: 'Bot', login: 'agentconnect[bot]' }
+  const EVENTS = 'GET /repositories/42/issues/7/events?per_page=100&page=1'
+
+  it.each([
+    ['human add', [ev(1, human)], true],
+    ['bot add', [ev(1, bot)], false],
+    ['unknown actor', [ev(1, null)], false],
+    ['user-typed bot login', [ev(1, { type: 'User', login: 'worker[bot]' })], false],
+    ['app on behalf of a user', [ev(1, human, 'ac/status:ready', { performed_via_github_app: { id: 1 } })], false],
+    ['no history', [], false],
+    ['bot re-add after human', [ev(1, human), ev(2, bot)], false],
+    ['human re-add after bot', [ev(1, bot), ev(2, human)], true],
+    [
+      'bot removed the old status after a human add',
+      [ev(1, human), ev(2, bot, 'ac/status:blocked', { event: 'unlabeled' })],
+      false
+    ],
+    [
+      'human removed the old status after a bot add',
+      [ev(1, bot), ev(2, human, 'ac/status:blocked', { event: 'unlabeled' })],
+      false
+    ],
+    ['unrelated later bot label', [ev(1, human), ev(2, bot, 'bug')], true]
+  ])('%s', async (_name, events, expected) => {
+    const h = harness({ [EVENTS]: () => json(events) })
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(expected)
+    expect(h.calls.every((c) => c.method === 'GET')).toBe(true)
+    expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
+  })
+
+  it('reads past a full page to find a later bot write', async () => {
+    const h = harness({
+      [EVENTS]: () => json([ev(1, human), ...Array.from({ length: 99 }, (_, i) => ({ id: i + 2, event: 'closed' }))]),
+      'GET /repositories/42/issues/7/events?per_page=100&page=2': () => json([ev(101, bot)])
+    })
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
+    expect(h.calls).toHaveLength(2)
+  })
+
+  it('fails closed past the history bound and on a read failure', async () => {
+    const routes: Record<string, () => Response> = {}
+    for (let page = 1; page <= 10; page++) {
+      routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
+        json(Array.from({ length: 100 }, (_, i) => ev((page - 1) * 100 + i, human)))
+    }
+    const h = harness(routes)
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
+    expect(h.calls).toHaveLength(10)
+    await expect(harness({}).store.statusSetByHuman(REPO, 7, 'ready')).rejects.toThrow()
+  })
+
+  it('classifies actors', () => {
+    expect(isHumanActor({ actor: human })).toBe(true)
+    expect(isHumanActor({ actor: { type: 'User' } })).toBe(false)
+    expect(isHumanActor({ actor: bot })).toBe(false)
+    expect(isHumanActor({ actor: undefined })).toBe(false)
   })
 })

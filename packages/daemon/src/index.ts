@@ -175,10 +175,7 @@ program
     await runGitCredential(action, agentId)
   })
 
-// gh token fetch (multi-repo authorization, issue #457): invoked BY the
-// run/bin/gh wrapper once per gh invocation — lazy import, positional args
-// (same tsx-shim reasoning as git-credential). Prints ONLY the token on
-// stdout; exit 2 = non-github target (wrapper runs the real gh untouched).
+// gh token fetch for the run/bin/gh wrapper (issue #457): token-only stdout; any nonzero exit makes the wrapper fail closed.
 program
   .command('gh-token', { hidden: true })
   .description('Fetch a per-repo GH_TOKEN from the local daemon (gh wrapper backend)')

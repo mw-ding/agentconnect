@@ -620,6 +620,10 @@ export class AcpHost {
       ...Object.fromEntries(this.runtime.env.map((e) => [e.name, e.value])),
       ...(this.opts.env ?? {})
     }
+    // Never pass human GitHub credentials (tokens, or a gh config dir holding them) from any env source to a worker.
+    for (const name of Object.keys(env)) {
+      if (/^(?:GH|GITHUB)_(?:.*_)?(?:TOKEN|PAT|AUTH_TOKEN)$|^GH_CONFIG_DIR$/i.test(name)) delete env[name]
+    }
     // Account-app isolation defaults on even for direct AcpHost callers. When on,
     // apply the overrides AFTER all caller env is merged so nothing can accidentally
     // re-enable them. A daemon-level opt-out deliberately leaves env/argv untouched.

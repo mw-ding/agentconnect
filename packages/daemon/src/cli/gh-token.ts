@@ -1,20 +1,4 @@
-/**
- * `agentconnect gh-token <agentId> [repo]` — the gh wrapper's token fetch
- * (agent-multi-repo-authorization.md decision 4, issue #457).
- *
- * Prints a fresh installation token for the named repo (or the agent's
- * workspace repo when none is given) to STDOUT — nothing else ever lands
- * there. Proxies gitcred.sock with the runtime-only agent capability and
- * `plane: 'gh'` (the widened GH_TOKEN capability set);
- * caching/coalescing/clamping all live daemon/CP-side.
- *
- * Exit codes (the wrapper's contract):
- *   0 — token on stdout
- *   1 — daemon refused / unreachable (actionable reason on stderr; the wrapper
- *       lets gh try its own configured auth)
- *   2 — "not ours": the repo argument names a non-github.com host — the
- *       wrapper runs the real gh untouched
- */
+// `agentconnect gh-token <agentId> [repo]`: a fresh token on stdout (exit 0); exit 1 refused, exit 2 non-github.com — the wrapper fails closed on both.
 import { createConnection } from 'node:net'
 import { gitRepoLabel } from '@agentconnect.md/protocol'
 import { resolveRoot } from '../paths.js'
@@ -44,14 +28,7 @@ export async function runGhToken(agentId: string, repoRaw?: string): Promise<voi
   process.stdout.write(res.password)
 }
 
-/**
- * Normalize the wrapper's raw repo argument. gh accepts `OWNER/REPO`,
- * `HOST/OWNER/REPO` and full URLs for `-R`/`GH_REPO`; the cwd fallback hands
- * us whatever `git remote get-url origin` prints. Unparseable ⇒ workspace
- * token (repo undefined); a clearly non-github.com target ⇒ defer (the
- * wrapper runs the real gh untouched — `gitRepoLabel` strips ANY host, so
- * the github.com assertion lives here).
- */
+// Parse gh's OWNER/REPO, HOST/OWNER/REPO, URL, or scp repo forms; unparseable ⇒ workspace token, non-github.com ⇒ defer (refused).
 export function normalizeRepoArg(raw?: string): { repo?: string; defer?: boolean } {
   const s = raw?.trim()
   if (!s) return {}
