@@ -115,7 +115,7 @@ still runs. App and bot senders never ring it. On that doorbell, and on any
 resets the card's recovery backoff, re-reads that one issue, and pokes the board's
 claim. A parked card that a human re-readies is therefore claimed when the webhook
 arrives, subject to the usual claim gates (caps, cooldown, a live daemon), not after
-its backoff.
+its backoff. If the events API lags, it is claimed on the next tick (see Known gaps).
 
 Every other `issues` labeled, unlabeled, closed, or reopened delivery (another label,
 or an App or bot sender) is forwarded as a seen-only marker with no issue numbers. The
@@ -201,6 +201,25 @@ Known gaps: no route lets an owner set write mode yet, so every run is read-only
 until a human-authenticated board administration route ships. A human who wants an
 archived card dispatched must relabel it `triage` and then `ready`; there is no
 issue comment explaining the refused move, only a CP log line.
+
+- **Bots can pin a card's recovery backoff at the minimum.** Any change in the
+  recovery fingerprint restarts the backoff at 1 minute, whoever made it. Every
+  `sub_issues` or `issue_dependencies` doorbell also resets it, and those ring for
+  bot senders too. A bot that keeps relabeling a parked card, or editing its
+  dependencies, therefore keeps it on 1-minute re-reads. Reads stay bounded by the
+  25-cards-per-board-per-tick cap, and a bot still cannot un-park the card. Fixing
+  this needs an attributed (events API) read before each reset, which costs the read
+  the backoff exists to save.
+- **The issue events API can lag the webhook.** A doorbell re-reads the card at once,
+  but if the events API does not yet show the human's label event, attribution fails
+  and the card is not un-parked by that doorbell. It is picked up on the next tick
+  instead, about 60 seconds later because the doorbell reset the backoff, not when the
+  webhook arrived. Attribution that cannot see the event fails closed; the same lag
+  can likewise defer a half-landed promotion's adoption to a later tick.
+- **`sender.type === 'User'` does not prove a human.** An App acting with a
+  user-to-server token, or a worker using a personal access token, is also reported
+  as `User`, so it can ring the card-status doorbell. That only causes reads: un-park
+  still requires the events API to attribute the edit to a person.
 
 Remaining M2 follow-ups: daemon-crash reclaims need a separate configurable retry
 budget; superseding a local lease needs cancellation completion, reporting, and a
