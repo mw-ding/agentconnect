@@ -56,7 +56,10 @@ export const GITHUB_APP_EVENTS = [
   'check_suite',
   'workflow_run',
   'release',
-  'repository'
+  'repository',
+  // Kanban graph doorbell; both ride the existing Issues permission.
+  'sub_issues',
+  'issue_dependencies'
 ] as const
 
 const GITHUB_ORG = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/
