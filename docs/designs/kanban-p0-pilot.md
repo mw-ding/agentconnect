@@ -266,3 +266,10 @@ Status moves arrive as `issues` actions `labeled`, `unlabeled`, `closed`, and
 `reopened`. A verified delivery becomes a body-free Kanban doorbell on the
 relay-to-control-plane WebSocket; a bad signature is 401 and puts nothing on the
 wire.
+
+Known gap: the control plane's installation-token cache for a Kanban run is
+keyed by installation, repository, and permission levels, not by lease. A grant
+minted for one run can be reused for a later run of the same mode on that
+repository until it is within 15 minutes of expiry. The daemon cache is keyed
+by the open lease and mode, so a read run does not reuse a write grant; this
+control-plane cache is not.
