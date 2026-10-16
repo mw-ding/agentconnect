@@ -21,6 +21,7 @@ export function kanbanLeaseMarker(leaseId: string): string {
 
 /** The comment body: the agent's summary, its reason when it gave one, and the lease marker. */
 export function kanbanFinalCommentBody(entry: KanbanTerminalEntry): string {
+  // @-mentions stay literal, matching GithubFinalPoster final-answer text.
   const parts = [entry.summary.trim()]
   if (entry.reason?.trim()) parts.push(entry.reason.trim())
   parts.push(`<!-- ${kanbanLeaseMarker(entry.report.leaseId)} -->`)
