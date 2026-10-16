@@ -127,6 +127,39 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toContain('ac/status:ready')
   })
 
+  it('repairs the duplicate left when a write fails between add and remove', async () => {
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    h.store.applyPlan.mockImplementationOnce(async (_r, n) => {
+      h.labels.set(n, [...h.labels.get(n)!, 'ac/status:ready'])
+      throw new Error('boom')
+    })
+    const g = graph({ blockedBy: [done] })
+    await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('boom')
+    expect(h.labels.get(7)).toEqual(['ac/status:todo', 'ac/agent:eng', 'ac/status:ready'])
+    await h.reconciler.apply(BOARD, REPO, 7, g)
+    expect(h.store.applyPlan).toHaveBeenCalledTimes(2)
+    expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+  })
+
+  it('cleans a stray status label off a ready card', async () => {
+    const h = make({ 7: { status: 'ready', labels: ['ac/status:ready', 'ac/status:blocked', 'ac/agent:eng'] } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph())
+    expect(h.store.applyPlan).toHaveBeenCalledOnce()
+    expect(h.labels.get(7)).toEqual(['ac/status:ready', 'ac/agent:eng'])
+  })
+
+  it('does not write for a ready card whose only status label is ready', async () => {
+    const h = make({ 7: { status: 'ready', labels: ['ac/status:ready', 'ac/agent:eng'] } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph())
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+  })
+
+  it('skips a dependent whose repo is unknown', async () => {
+    const h = make({ 8: { status: 'todo', labels: todoLabels } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blocking: [{ ...link(8, 'open'), repoId: null }] }))
+    expect(h.store.readGraph).not.toHaveBeenCalled()
+  })
+
   it('promotes a dependent named by the blocking list', async () => {
     const h = make(
       { 5: { status: 'running', labels: ['ac/status:running'] }, 7: { status: 'todo', labels: todoLabels } },

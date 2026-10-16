@@ -30,7 +30,8 @@ export class KanbanGraphReconciler {
     await this.evaluate(board, repo, issueNumber, graph)
     const seen = new Set([issueNumber])
     for (const dep of graph.blocking) {
-      if (dep.repoId !== null && dep.repoId !== repo.repoId) continue
+      // A null repoId is unknown, not local, so skip it rather than act on a possibly foreign issue.
+      if (dep.repoId === null || dep.repoId !== repo.repoId) continue
       if (seen.has(dep.number)) continue
       seen.add(dep.number)
       await this.evaluate(board, repo, dep.number, await this.deps.store.readGraph(repo, dep.number))
@@ -62,13 +63,16 @@ export class KanbanGraphReconciler {
     const observed = await this.deps.store.readCard(repo, issueNumber)
     if (!observed) return
     const keep = statusLabel('ready')
-    if (residueOnly && !(observed.labels.includes(statusLabel('todo')) && !observed.labels.includes(keep))) return
+    const stale = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+    const hasKeep = observed.labels.includes(keep)
+    // Add-then-remove can crash with ready plus a stray status label, so repair unless exactly [ready].
+    if (residueOnly && hasKeep && stale.length === 0) return
     const plan: LabelPlan = {
       outcome: 'accepted',
       status: 'ready',
       releaseLease: false,
-      addLabels: observed.labels.includes(keep) ? [] : [keep],
-      removeLabels: observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+      addLabels: hasKeep ? [] : [keep],
+      removeLabels: stale
     }
     await this.deps.store.applyPlan(repo, issueNumber, observed, plan)
   }
