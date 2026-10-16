@@ -131,6 +131,7 @@ import {
 } from '../agents/chat-actions.js'
 import type { AskerApprover } from '../assistant/drafts.js'
 import type { ReadAsker } from '../assistant/place-access.js'
+import { isKanbanLabelMutation } from '../messages/kanban-message.js'
 import {
   JOIN_ANSWER_REFUSED,
   JOIN_EXPIRED_TEXT,
@@ -155,16 +156,6 @@ export interface ApprovalWait {
 }
 
 /** Process-wide daemon state the permission path reads. */
-/** A tool call that looks like it adds, removes, or edits an `ac/*` label. */
-function isKanbanLabelMutation(params: RequestPermissionRequest): boolean {
-  const tool = JSON.stringify(params.toolCall ?? {})
-  return (
-    /ac(?:\/|%2f)/i.test(tool) &&
-    /label/i.test(tool) &&
-    /add|remove|delete|edit|create|rename|replace|post|put|patch|set|update/i.test(tool)
-  )
-}
-
 export interface PermissionCoreHost {
   log(): Logger
   clock(): Clock
@@ -2265,7 +2256,7 @@ export class PermissionCoordinator {
     params: RequestPermissionRequest
   ): Promise<RequestPermissionResponse> {
     try {
-      if (this.host.kanbanSession && isKanbanLabelMutation(params)) {
+      if (this.host.kanbanSession && isKanbanLabelMutation(JSON.stringify(params.toolCall ?? {}))) {
         const session = await this.host.store().getSessionByAcpIdForAgent(hostKeyAgentId(owner), sessionId)
         // Best-effort tool guard; write mode is CP configuration and recovery ignores non-human label writes.
         if (session && this.host.kanbanSession(session.key)) {

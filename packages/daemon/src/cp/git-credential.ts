@@ -81,6 +81,10 @@ const GITLAB_EFFECT_KEY = (agentId: string, projectId: string): string => `fxgla
 const GITEA_POST_KEY = (agentId: string, repoId: string): string => `postgitea\u0000${agentId}\u0000${repoId}`
 const GITEA_EFFECT_KEY = (agentId: string, repoId: string): string => `fxgitea\u0000${agentId}\u0000${repoId}`
 
+/** Cache key for a Kanban summary token. One per lease, so a grant for one run is not reused for another. */
+const KANBAN_KEY = (agentId: string, repo: string, leaseId: string): string =>
+  `kanban\u0000${agentId}\u0000${repo.toLowerCase()}\u0000${leaseId}`
+
 export class GitCredUnavailableError extends Error {
   constructor(
     message: string,
@@ -117,6 +121,7 @@ export interface GitCredentialCacheDeps {
     repoFullName?: string
     purpose?: GitCredRequest['purpose']
     hookId?: string
+    leaseId?: string
     forceRefresh?: boolean
     provider?: CodeHostProvider
     externalRepoId?: string
@@ -167,6 +172,8 @@ export class GitCredentialCache {
   /** Poster keys whose next successful CP mint must bypass the CP token cache
    *  after GitHub rejected the previous grant with 401/403. */
   private readonly refreshPosts = new Set<string>()
+  /** Kanban comment keys that must bypass the CP token cache after a 401/403. */
+  private readonly refreshKanban = new Set<string>()
   /** Workspace keys the CP told us to stop asking for (agent-level
    *  SCOPE_DENIED — moved/mode-off). Per KEY, so a gh-plane denial never
    *  silences the git plane. */
@@ -356,6 +363,34 @@ export class GitCredentialCache {
     this.dropCached(GITEA_EFFECT_KEY(agentId, repoId), presentedToken)
   }
 
+  /** Issues-write token for one accepted Kanban run's summary comment. The CP rechecks this lease. */
+  async getKanbanCommentToken(agentId: string, repo: string, leaseId: string): Promise<Entry> {
+    const key = KANBAN_KEY(agentId, repo, leaseId)
+    const forceRefresh = this.refreshKanban.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      capabilities: ['issues'],
+      repoFullName: repo,
+      purpose: 'kanban_card_write',
+      leaseId,
+      ...this.githubProvider(),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshKanban.delete(key)
+    return entry
+  }
+
+  /** Drop the cached Kanban comment token after GitHub rejects it. Matching the presented token keeps a newer grant. */
+  invalidateKanbanComment(agentId: string, repo: string, leaseId: string, presentedToken?: string): void {
+    const key = KANBAN_KEY(agentId, repo, leaseId)
+    const entry = this.entries.get(key)
+    if (!entry) return
+    if (presentedToken !== undefined && entry.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshKanban.add(key)
+  }
+
   /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */
   private dropCached(key: string, presentedToken?: string): void {
     const entry = this.entries.get(key)
@@ -443,6 +478,7 @@ export class GitCredentialCache {
     for (const key of [...this.deniedRepos.keys()]) if (key.includes(marker)) this.deniedRepos.delete(key)
     for (const key of [...this.denied]) if (key.includes(marker)) this.denied.delete(key)
     for (const key of [...this.refreshPosts]) if (key.includes(marker)) this.refreshPosts.delete(key)
+    for (const key of [...this.refreshKanban]) if (key.includes(marker)) this.refreshKanban.delete(key)
   }
 
   private async fetch(key: string, payload: Parameters<GitCredentialCacheDeps['request']>[0]): Promise<Entry> {

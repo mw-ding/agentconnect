@@ -179,6 +179,25 @@ describe('GitCredentialCache', () => {
       expect(h.payloads.every((p) => !p.capabilities?.includes('contents'))).toBe(true)
     })
 
+    it('getKanbanCommentToken requests issues only and names the accepted lease', async () => {
+      const h = buildRecording()
+      const leaseId = '44444444-4444-4444-8444-444444444444'
+      const grant = await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
+      const other = '55555555-5555-4555-8555-555555555555'
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', other)
+      expect(h.calls()).toBe(2)
+      expect(grant.token).toBe('ghs_1')
+      expect(h.payloads[0]).toMatchObject({
+        repoFullName: 'acme/web',
+        capabilities: ['issues'],
+        purpose: 'kanban_card_write',
+        leaseId
+      })
+      expect(h.payloads[1]).toMatchObject({ leaseId: other })
+      expect(h.payloads[0]!.capabilities).not.toContain('contents')
+    })
+
     it('invalidates only the matching cached poster token after an auth rejection', async () => {
       const h = buildRecording()
       await h.cache.getPostToken(AGENT, 'acme/infra', HOOK)

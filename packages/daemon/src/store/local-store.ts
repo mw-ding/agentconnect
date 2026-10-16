@@ -72,6 +72,7 @@ import {
   type SourceCacheShape
 } from '../source-cache/keys.js'
 import type { StoreBatchResult, StoreBatchStatement, StoreDatabase, StoreTx } from './store-database.js'
+import type { KanbanTerminalEntry } from '../kanban/kanban-worker.js'
 
 /** Per-tool-row rawInput budget in the mining prompt — enough for a command
  *  line or path, short enough that N tool rows can't crowd out the store. */
@@ -222,6 +223,24 @@ function idScope(column: string, values: readonly string[] | undefined): { sql: 
  * Unknown/unsafe values fall back to 0. They remain stable via the `seq` tie-breaker
  * and sort before real timestamps instead of blocking an in-place store migration.
  */
+/** A final comment awaiting publication, with the retry bookkeeping the publisher needs. */
+export interface KanbanCommentRow {
+  entry: KanbanTerminalEntry
+  attempts: number
+  /** A POST may already have landed, so the publisher must look for it before posting again. */
+  attempted: boolean
+  /** Daemon clock just before the first POST; the marker search reads only comments updated since then. */
+  attemptedAt?: number
+  /** Marker lookups that could not decide; the publisher parks the row as failed once these hit its cap. */
+  lookupMisses: number
+  recordedAt: number
+}
+
+function parseKanbanTerminal(raw: string): KanbanTerminalEntry {
+  const entry = JSON.parse(raw) as KanbanTerminalEntry
+  return { ...entry, report: KanbanReport.parse(entry.report) }
+}
+
 export function transcriptEventTimeUs(ts: string | null | undefined): number {
   let raw = ts?.trim() ?? ''
   if (!raw) return 0
@@ -2655,6 +2674,21 @@ export class LocalStore {
         leaseId TEXT PRIMARY KEY,
         report TEXT,
         queuedAt INTEGER NOT NULL
+      );
+      -- One terminal tool call per lease. state 'held' until the CP answers the report, then 'comment' until the
+      -- final issue comment lands; attempted marks a POST that may have landed, so a retry looks before posting.
+      -- attemptedAt is set once, before the first POST, and bounds that look with GitHub's since filter.
+      -- lookupMisses counts looks that could not decide; at the cap the row is parked in state 'failed'.
+      CREATE TABLE IF NOT EXISTS kanban_terminals (
+        leaseId TEXT PRIMARY KEY,
+        entry TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        attempted INTEGER NOT NULL DEFAULT 0,
+        attemptedAt INTEGER,
+        lookupMisses INTEGER NOT NULL DEFAULT 0,
+        nextAt INTEGER NOT NULL DEFAULT 0,
+        recordedAt INTEGER NOT NULL
       );
       -- Latest-wins session metadata awaiting a correlated CP persistence ACK.
       -- This is deliberately separate from sessions: an upgrade starts with an
@@ -5184,6 +5218,91 @@ export class LocalStore {
   async ackKanbanReport(leaseId: string): Promise<void> {
     await this.db.prepare('UPDATE kanban_reports SET report = NULL WHERE leaseId = ?').run(leaseId)
   }
+
+  /** The primary key is the exactly-once guard: a second terminal for the same lease is refused, even across restarts. */
+  async recordKanbanTerminal(entry: KanbanTerminalEntry, at: number): Promise<boolean> {
+    const report = KanbanReport.parse(entry.report)
+    const result = await this.db
+      .prepare(
+        "INSERT INTO kanban_terminals (leaseId, entry, state, recordedAt) VALUES (?, ?, 'held', ?) ON CONFLICT(leaseId) DO NOTHING"
+      )
+      .run(report.leaseId, JSON.stringify({ ...entry, report }), at)
+    return Number(result.changes) === 1
+  }
+
+  /** Recorded terminals whose lease never queued a report: the reservation is still the empty pre-report row. */
+  async orphanedKanbanTerminals(): Promise<KanbanTerminalEntry[]> {
+    const rows = (await this.db
+      .prepare(
+        "SELECT t.entry FROM kanban_terminals t JOIN kanban_reports r ON r.leaseId = t.leaseId WHERE t.state = 'held' AND r.report IS NULL ORDER BY t.recordedAt"
+      )
+      .all()) as { entry: string }[]
+    return rows.map((row) => parseKanbanTerminal(row.entry))
+  }
+
+  async settleKanbanTerminal(leaseId: string, accepted: boolean): Promise<void> {
+    if (accepted) {
+      await this.db
+        .prepare("UPDATE kanban_terminals SET state = 'comment' WHERE leaseId = ? AND state = 'held'")
+        .run(leaseId)
+    } else {
+      await this.db.prepare("DELETE FROM kanban_terminals WHERE leaseId = ? AND state = 'held'").run(leaseId)
+    }
+  }
+
+  async dueKanbanComments(now: number, limit: number): Promise<KanbanCommentRow[]> {
+    const rows = (await this.db
+      .prepare(
+        "SELECT entry, attempts, attempted, attemptedAt, lookupMisses, recordedAt FROM kanban_terminals WHERE state = 'comment' AND nextAt <= ? ORDER BY nextAt, recordedAt LIMIT ?"
+      )
+      .all(now, limit)) as {
+      entry: string
+      attempts: number
+      attempted: number
+      attemptedAt: number | null
+      lookupMisses: number
+      recordedAt: number
+    }[]
+    return rows.map((row) => ({
+      entry: parseKanbanTerminal(row.entry),
+      attempts: Number(row.attempts),
+      attempted: Number(row.attempted) === 1,
+      ...(row.attemptedAt !== null && row.attemptedAt !== undefined ? { attemptedAt: Number(row.attemptedAt) } : {}),
+      lookupMisses: Number(row.lookupMisses),
+      recordedAt: Number(row.recordedAt)
+    }))
+  }
+
+  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps the first attempt's time. */
+  async markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): Promise<void> {
+    await this.db
+      .prepare(
+        'UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, attemptedAt = COALESCE(attemptedAt, ?), nextAt = ? WHERE leaseId = ?'
+      )
+      .run(at, nextAt, leaseId)
+  }
+
+  async deferKanbanComment(leaseId: string, nextAt: number): Promise<void> {
+    await this.db.prepare('UPDATE kanban_terminals SET nextAt = ? WHERE leaseId = ?').run(nextAt, leaseId)
+  }
+
+  async deferKanbanCommentLookup(leaseId: string, nextAt: number): Promise<void> {
+    await this.db
+      .prepare('UPDATE kanban_terminals SET lookupMisses = lookupMisses + 1, nextAt = ? WHERE leaseId = ?')
+      .run(nextAt, leaseId)
+  }
+
+  /** Parks the row out of the drain; it stays for an operator because the comment may or may not be on the issue. */
+  async failKanbanComment(leaseId: string): Promise<void> {
+    await this.db
+      .prepare("UPDATE kanban_terminals SET state = 'failed' WHERE leaseId = ? AND state = 'comment'")
+      .run(leaseId)
+  }
+
+  async removeKanbanComment(leaseId: string): Promise<void> {
+    await this.db.prepare("DELETE FROM kanban_terminals WHERE leaseId = ? AND state = 'comment'").run(leaseId)
+  }
+
 
   /**
    * Save the latest metadata snapshot. Lifecycle milestones create an outbox

@@ -63,6 +63,7 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
     repoFullName,
     purpose,
     hookId,
+    leaseId,
     forceRefresh,
     provider,
     externalRepoId,
@@ -225,6 +226,47 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         requestedAccess
       )
       conn.replyTo(frame, 'gitcred/grant', grant)
+      return
+    }
+    if (purpose === 'kanban_card_write') {
+      const requested = new Set(capabilities ?? [])
+      if (
+        !repoFullName ||
+        !leaseId ||
+        !deps.kanbanDispatcher?.commentGrant ||
+        !deps.github ||
+        requested.size !== 1 ||
+        !requested.has('issues')
+      ) {
+        conn.sendError(
+          frame.id,
+          'SCOPE_DENIED',
+          'kanban comment credentials require an accepted lease, one repo, and issues only',
+          false
+        )
+        return
+      }
+      const allowed = await deps.kanbanDispatcher.commentGrant(conn.daemonId, agentId, leaseId, repoFullName)
+      if (!allowed) {
+        conn.sendError(frame.id, 'SCOPE_DENIED', 'lease does not authorize a kanban comment on this repo', false)
+        return
+      }
+      // GitHub has no comment-only scope. This issues:write grant stays in the poster, never the agent environment.
+      const cred = await deps.github.mintForKanbanComment(
+        agent,
+        repoFullName,
+        allowed.repoId,
+        [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
+        forceRefresh === true
+      )
+      conn.replyTo(frame, 'gitcred/grant', {
+        username: 'x-access-token',
+        token: cred.token,
+        ttlSec: cred.ttlSec,
+        expiresAt: cred.expiresAt,
+        repoFullName: cred.repoFullName,
+        access: 'read'
+      })
       return
     }
     if (purpose === 'github_hook_reply') {

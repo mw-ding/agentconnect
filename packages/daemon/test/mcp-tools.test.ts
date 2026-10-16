@@ -525,7 +525,11 @@ describe('toolsForIntegrations', () => {
         'deleteMemory',
         'submitCodeReview',
         // The pre-promotion alias stays reserved and auto-allowed for warm sessions.
-        'submitGithubReview'
+        'submitGithubReview',
+        'kanbanComplete',
+        'kanbanRequestReview',
+        'kanbanBlock',
+        'kanbanFail'
       ])
     )
     // The merged-away and removed tool names are gone.

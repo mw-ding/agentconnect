@@ -9,6 +9,7 @@ const DAEMON_ID = 'd1d1d1d1-dddd-4ddd-8ddd-dddddddddddd'
 const AGENT_ID = 'a0a0a0a0-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 const HOOK_ID = 'b0b0b0b0-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const ORG_ID = 'org-a'
+const LEASE_ID = 'c0c0c0c0-cccc-4ccc-8ccc-cccccccccccc'
 
 /** An agent placed on DAEMON_ID — passes the handler's placement scope check. */
 const PLACED_AGENT = { id: AGENT_ID, orgId: 'org-a', daemonId: DAEMON_ID }
@@ -147,6 +148,87 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
       false
     )
     expect(mintForHookReply).not.toHaveBeenCalled()
+  })
+
+  it('mints an issues-only token for an accepted Kanban lease and never the workspace git path', async () => {
+    const mintForAgent = vi.fn()
+    const mintForKanbanComment = vi.fn(async () => ({
+      token: 'ghs_kanban',
+      ttlSec: 3540,
+      expiresAt: '2026-07-11T01:00:00.000Z',
+      repoFullName: 'acme/web',
+      access: 'read' as const
+    }))
+    const commentGrant = vi.fn(async () => ({ repoId: 42n }))
+    const deps = {
+      agent: { getUnscoped: async () => PLACED_AGENT },
+      kanbanDispatcher: { commentGrant },
+      github: { mintForAgent, mintForKanbanComment }
+    } as unknown as DaemonWsDeps
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      purpose: 'kanban_card_write',
+      leaseId: LEASE_ID,
+      capabilities: ['issues'],
+      repoFullName: 'acme/web',
+      forceRefresh: true
+    })
+
+    await handleGitCredRequest(frame, conn, deps)
+
+    expect(commentGrant).toHaveBeenCalledWith(DAEMON_ID, AGENT_ID, LEASE_ID, 'acme/web')
+    expect(mintForKanbanComment).toHaveBeenCalledWith(
+      PLACED_AGENT,
+      'acme/web',
+      42n,
+      [`daemon:${DAEMON_ID}`, `org:org-a`],
+      true
+    )
+    expect(mintForAgent).not.toHaveBeenCalled()
+    expect(conn.replyTo).toHaveBeenCalledWith(
+      frame,
+      'gitcred/grant',
+      expect.objectContaining({ token: 'ghs_kanban', access: 'read' })
+    )
+  })
+
+  it('denies a Kanban comment token when the lease was not accepted or the ask is wider than issues', async () => {
+    const mintForKanbanComment = vi.fn()
+    const commentGrant = vi.fn(async () => null)
+    const deps = {
+      agent: { getUnscoped: async () => PLACED_AGENT },
+      kanbanDispatcher: { commentGrant },
+      github: { mintForKanbanComment }
+    } as unknown as DaemonWsDeps
+    const conn = fakeConn()
+    const refused = gitcredFrame({
+      purpose: 'kanban_card_write',
+      leaseId: LEASE_ID,
+      capabilities: ['issues'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(refused, conn, deps)
+    expect(conn.sendError).toHaveBeenCalledWith(
+      refused.id,
+      'SCOPE_DENIED',
+      'lease does not authorize a kanban comment on this repo',
+      false
+    )
+
+    const wide = gitcredFrame({
+      purpose: 'kanban_card_write',
+      leaseId: LEASE_ID,
+      capabilities: ['issues', 'contents'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(wide, conn, deps)
+    expect(conn.sendError).toHaveBeenCalledWith(
+      wide.id,
+      'SCOPE_DENIED',
+      'kanban comment credentials require an accepted lease, one repo, and issues only',
+      false
+    )
+    expect(mintForKanbanComment).not.toHaveBeenCalled()
   })
 
   it('denies a malformed GithubPoster capability request before minting', async () => {

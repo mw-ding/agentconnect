@@ -63,9 +63,19 @@ export const GitCredRequest = z.object({
   // one connection token serves both, so the helper/broker split of the GitLab arm does not apply.
   // A new value here is frame-fatal to an older CP (§17.3): name it only after GITLAB_EFFECT_V1_FEATURE
   // (gitea values only after GITEA_V1_FEATURE).
+  // kanban_card_write is the one Kanban summary comment for an accepted lease, rechecked by the CP against leaseId.
   purpose: z
-    .enum(['github_hook_reply', 'gitlab_hook_reply', 'gitlab_effect', 'gitea_hook_reply', 'gitea_effect'])
+    .enum([
+      'github_hook_reply',
+      'gitlab_hook_reply',
+      'gitlab_effect',
+      'gitea_hook_reply',
+      'gitea_effect',
+      'kanban_card_write'
+    ])
     .optional(),
+  // The accepted Kanban run whose summary this token may post. The CP rechecks it.
+  leaseId: z.string().uuid().optional(),
   // Trusted hook identity copied from the relay-delivered rd/msg. Required by
   // the CP for purpose=github_hook_reply so authorization stays rename-safe on
   // HookDef.repoId instead of comparing mutable owner/repo display names.

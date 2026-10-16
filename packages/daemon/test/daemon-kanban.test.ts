@@ -30,7 +30,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function harness(git = false, modes = ['read-only', 'agent']) {
+async function harness(git = false, modes = ['read-only', 'agent'], secrets?: { name: string; value: string }[]) {
   const root = mkdtempSync(join(tmpdir(), 'ac-kanban-'))
   roots.push(root)
   writeFileSync(
@@ -68,7 +68,8 @@ async function harness(git = false, modes = ['read-only', 'agent']) {
       runtime: 'claude',
       workspace: { mode: 'from-scratch', path: workspace },
       integrations: [],
-      output: { mode: 'medium' }
+      output: { mode: 'medium' },
+      ...(secrets ? { runtimeOverrides: { secrets } } : {})
     })
   )
   const host = {
@@ -139,6 +140,8 @@ it('uses the exact GitHub hook coordinates and preserves untrusted-content guida
   expect(card.text).toContain('untrusted external content')
   expect(card.text).toContain('read-only')
   for (const family of ['ac/*', 'ac/status:*', 'ac/mode:*', 'ac/agent:*']) expect(card.text).toContain(family)
+  for (const tool of ['kanbanComplete', 'kanbanRequestReview', 'kanbanBlock', 'kanbanFail'])
+    expect(card.text).toContain(tool)
 })
 
 describe('Daemon Kanban dispatch', () => {
@@ -256,6 +259,117 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
   expect(await store.listKanbanReports(1)).toEqual([])
   expect(await store.hasKanbanReport(dispatch.leaseId)).toBe(true)
   await store.close()
+})
+
+it('masks a secret in the stored terminal and in the GitHub comment body', async () => {
+  const secret = 'sk-kanban-secret-value'
+  const h = await harness(false, ['read-only', 'agent'], [{ name: 'GH_TOKEN', value: secret }])
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanCommentToken').mockResolvedValue({ token: 'ghs_test' })
+  ;(h.daemon as any).cpClient = {
+    state: 'READY',
+    stop: async () => {},
+    kanbanHeartbeat: async () => ({ superseded: [] }),
+    kanbanReport: async (payload: { leaseId: string }) => ({ leaseId: payload.leaseId, accepted: true })
+  }
+  const posted: string[] = []
+  const realFetch = globalThis.fetch.bind(globalThis)
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = String(input instanceof Request ? input.url : input)
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
+    if (method === 'POST' && url.includes('/issues/42/comments')) {
+      posted.push(String(init?.body ?? ''))
+      return Promise.resolve(new Response(JSON.stringify({ id: 99 }), { status: 201 }))
+    }
+    return realFetch(input as RequestInfo, init)
+  })
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  h.host.prompt.mockImplementationOnce(async () => {
+    await held
+    return { stopReason: 'end_turn' }
+  })
+  try {
+    h.worker.dispatch(dispatch)
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
+    const card = buildKanbanMessage(dispatch, 'trace')
+    ;(h.daemon as any).recordKanbanTerminal({
+      agentId: AGENT,
+      platform: card.platform,
+      channel: card.channel,
+      thread: card.thread,
+      transportScope: card.transportScope,
+      terminal: {
+        outcome: 'blocked',
+        blockKind: 'needs_input',
+        reasonCode: 'agent_blocked',
+        summary: `shipped with ${secret}`,
+        reason: `blocked on ${secret}`
+      }
+    })
+    const row = (h.store as any).db.prepare('SELECT entry FROM kanban_terminals').get() as { entry: string }
+    expect(row.entry).toContain('[secret:GH_TOKEN]')
+    expect(row.entry).not.toContain(secret)
+    const stored = JSON.parse(row.entry) as { summary: string; reason: string }
+    expect(stored.summary).toBe('shipped with [secret:GH_TOKEN]')
+    expect(stored.reason).toBe('blocked on [secret:GH_TOKEN]')
+    release()
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0))
+    expect(posted.join('\n')).toContain('[secret:GH_TOKEN]')
+    expect(posted.join('\n')).not.toContain(secret)
+  } finally {
+    release()
+    fetchSpy.mockRestore()
+  }
+})
+
+it('records one terminal per lease and queues its comment only after the report is accepted', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ac-kanban-terminal-'))
+  roots.push(root)
+  const store = new LocalStore(join(root, 'store.db'))
+  const report: KanbanReport = {
+    boardId: dispatch.boardId,
+    cardId: dispatch.cardId,
+    agentId: AGENT,
+    leaseId: dispatch.leaseId,
+    attempt: 1,
+    dispatchRevision: '3',
+    outcome: 'blocked',
+    blockKind: 'needs_input',
+    reasonCode: 'agent_blocked'
+  }
+  const entry = {
+    report,
+    repoFullName: dispatch.repoFullName,
+    issueNumber: dispatch.issueNumber,
+    summary: 'need a schema decision',
+    reason: 'which database?'
+  }
+  expect(store.recordKanbanTerminal(entry, 1)).toBe(true)
+  expect(store.recordKanbanTerminal({ ...entry, summary: 'second' }, 2)).toBe(false)
+  store.reserveKanbanLease(dispatch.leaseId, 1)
+  expect(store.orphanedKanbanTerminals().map((row) => row.summary)).toEqual(['need a schema decision'])
+  store.putKanbanReport(report, 3)
+  expect(store.orphanedKanbanTerminals()).toEqual([])
+  store.settleKanbanTerminal(dispatch.leaseId, false)
+  expect(store.dueKanbanComments(10, 10)).toEqual([])
+  expect(store.recordKanbanTerminal(entry, 4)).toBe(true)
+  store.settleKanbanTerminal(dispatch.leaseId, true)
+  expect(store.dueKanbanComments(0, 10)).toMatchObject([{ attempted: false, entry: { summary: entry.summary } }])
+  store.markKanbanCommentAttempt(dispatch.leaseId, 100, 40)
+  store.markKanbanCommentAttempt(dispatch.leaseId, 100, 60)
+  expect(store.dueKanbanComments(50, 10)).toEqual([])
+  expect(store.dueKanbanComments(100, 10)[0]).toMatchObject({ attempted: true, attempts: 2, attemptedAt: 40 })
+  store.deferKanbanCommentLookup(dispatch.leaseId, 100)
+  expect(store.dueKanbanComments(100, 10)[0]).toMatchObject({ lookupMisses: 1 })
+  store.close()
+  const reopened = new LocalStore(join(root, 'store.db'))
+  expect(reopened.dueKanbanComments(100, 10)[0]?.entry.reason).toBe('which database?')
+  reopened.failKanbanComment(dispatch.leaseId)
+  expect(reopened.dueKanbanComments(100, 10)).toEqual([])
+  expect((reopened as any).db.prepare('SELECT state FROM kanban_terminals').get()).toEqual({ state: 'failed' })
+  reopened.close()
 })
 
 it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant'])(

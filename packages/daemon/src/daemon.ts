@@ -1,4 +1,5 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
+import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
@@ -272,7 +273,7 @@ import { WorkBoundary } from './messages/message-boundary.js'
 import { attachmentMention, sniffImageMimeType } from './session/attachment-block.js'
 import { McpControlServer } from './mcp/control-server.js'
 import { ADMIN_MCP_SERVER_NAME, RemoteWebchatGrantManager } from './mcp/remote-webchat-grant.js'
-import type { CodeHostEffectReq, MessageGateway, SessionContext } from './mcp/ops.js'
+import type { CodeHostEffectReq, KanbanTerminalReq, MessageGateway, SessionContext } from './mcp/ops.js'
 import { notJoinedChannel } from './platforms/not-joined.js'
 import { GitCredentialCache } from './cp/git-credential.js'
 import { GitlabBroker } from './gitlab/broker.js'
@@ -329,7 +330,13 @@ import {
   type AppRow,
   type LiveApp
 } from './mcp/apps/cards.js'
-import { toolsForIntegrations, CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS, KNOWLEDGE_TOOLS } from './mcp/tools.js'
+import {
+  toolsForIntegrations,
+  CODE_HOST_EFFECT_TOOLS,
+  GITHUB_REVIEW_TOOLS,
+  KANBAN_TOOLS,
+  KNOWLEDGE_TOOLS
+} from './mcp/tools.js'
 import {
   askerIdentity,
   assistantModeOn,
@@ -1430,6 +1437,7 @@ export class Daemon {
    *  conflicts, write failures) — flushed into the next dispatched session. */
   private pendingSpawnNotices = new Map<string, string[]>()
   private kanban?: KanbanWorker
+  private kanbanCommentPoster?: KanbanCommentPublisher
   // Effective agents combine user-authored agent.json files with the in-memory CP
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
@@ -4301,6 +4309,7 @@ export class Daemon {
       spawnChannelRootSession: (req) => this.collab.spawnChannelRootSession(req),
       submitCodeReview: (req) => this.codeReviews.submit(req),
       replyGithubReviewThreads: (req) => this.githubReviews.replyGithubReviewThreads(req),
+      recordKanbanTerminal: (req) => this.recordKanbanTerminal(req),
       codeHostEffect: (req) => this.runCodeHostEffect(req),
       memory: this.memory,
       memoryEntryStore: this.store,
@@ -4710,7 +4719,7 @@ export class Daemon {
           return []
         }
         const servers: McpServer[] = []
-        let tools = this.sessionBridgeTools(agent, { platform, channel, thread, integrationId, isDm })
+        let tools = this.sessionBridgeTools(agent, { platform, channel, thread, integrationId, isDm, transportScope })
         // assistant-mode.md §5.12: a follow-up's check gets the reads, recordCheck and propose, nothing that writes or posts.
         const check = isCheckCoordinate(thread)
         // A first look (§5.13) gets only its own place's reads, memory reads and recordCheck.
@@ -8812,7 +8821,14 @@ export class Daemon {
   /** The AgentConnect tools a session at these coordinates is offered, before a check's filter. */
   private sessionBridgeTools(
     agent: Agent,
-    at: { platform: string; channel: string; thread: string; integrationId?: string | undefined; isDm: boolean }
+    at: {
+      platform: string
+      channel: string
+      thread: string
+      integrationId?: string | undefined
+      isDm: boolean
+      transportScope?: string | null | undefined
+    }
   ): ToolDescriptor[] {
     const { platform, thread, integrationId } = at
     let tools = toolsForIntegrations(agent.integrations, {
@@ -8825,6 +8841,8 @@ export class Daemon {
     })
     // Static descriptor, dynamic authority: the call resolves the current daemon-private turn and fails closed elsewhere.
     tools = [...tools, ...GITHUB_REVIEW_TOOLS]
+    // Kanban cards share the GitHub issue thread session (D4); the call binds to the live lease or fails closed.
+    if (platform === 'hook' && at.transportScope?.startsWith('github:')) tools = [...tools, ...KANBAN_TOOLS]
     // Assistant mode's follow-ups (assistant-mode.md §5.12); each call re-checks the mode, since this list is fixed per session.
     tools = [...tools, ...followUpToolsFor(agent)]
     // A first look on request (§5.13), only to a place's long session where one could run, with `propose` for its report round where the place has cards.
@@ -26451,7 +26469,10 @@ export class Daemon {
         release: (id) => this.store.releaseKanbanLease(id),
         put: (report, at) => this.store.putKanbanReport(report, at),
         list: (limit) => this.store.listKanbanReports(limit),
-        remove: (id) => this.store.ackKanbanReport(id)
+        remove: (id) => this.store.ackKanbanReport(id),
+        recordTerminal: (entry, at) => this.store.recordKanbanTerminal(entry, at),
+        orphanedTerminals: () => this.store.orphanedKanbanTerminals(),
+        settleTerminal: (id, accepted) => this.store.settleKanbanTerminal(id, accepted)
       },
       cp: () => {
         const cp = this.cpClient
@@ -26479,8 +26500,55 @@ export class Daemon {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: (agentId, sessionId, sessionKey) =>
           this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, sessionKey), sessionId) ? 0 : 1
-      }
+      },
+      comments: this.kanbanComments()
     }))
+  }
+
+  /** Posts accepted summaries. The token is minted only after the CP has accepted that lease. */
+  private kanbanComments(): KanbanCommentPublisher {
+    return (this.kanbanCommentPoster ??= new KanbanCommentPublisher({
+      clock: this.clock,
+      log: this.log,
+      store: this.store,
+      token: (entry) =>
+        this.gitCreds
+          .getKanbanCommentToken(entry.report.agentId, entry.repoFullName, entry.report.leaseId)
+          .then((grant) => grant.token),
+      invalidateToken: (entry, token) =>
+        this.gitCreds.invalidateKanbanComment(entry.report.agentId, entry.repoFullName, entry.report.leaseId, token)
+    }))
+  }
+
+  /** A worker terminal tool call: the lease comes from the session's own live run, never from the model. */
+  private async recordKanbanTerminal(req: KanbanTerminalReq): Promise<unknown> {
+    const key = sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope)
+    const leaseId = this.kanban?.leaseForSession(key)
+    if (!this.kanban || !leaseId) {
+      throw new Error(
+        'No Kanban card run holds this session (it was never dispatched, already ended, or was superseded), so there is no outcome to report.'
+      )
+    }
+    // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy.
+    const terminal = maskSecretsDeep(req.terminal, maskableSecrets(this.agents.get(req.agentId)))
+    const result = await this.kanban.recordTerminal(leaseId, terminal)
+    if (!result.recorded) {
+      throw new Error(
+        result.reason === 'already_reported'
+          ? 'This Kanban card run already reported its outcome; only the first terminal call counts. Finish your turn.'
+          : result.reason === 'no_lease'
+            ? 'The Kanban card run for this session has already ended, so there is no outcome to report.'
+            : 'The outcome could not be saved on this daemon; try the same call again.'
+      )
+    }
+    const d = result.dispatch
+    return {
+      recorded: true,
+      outcome: req.terminal.outcome,
+      card: `${d.repoFullName}#${d.issueNumber}`,
+      attempt: d.attempt,
+      next: 'Finish your turn now. AgentConnect sends this outcome when the turn ends, moves the card, and posts your summary as the final issue comment. Do not post it or change any label yourself.'
+    }
   }
 
   private async kanbanGate(d: KanbanDispatch): Promise<KanbanDispatchRefusal | undefined> {

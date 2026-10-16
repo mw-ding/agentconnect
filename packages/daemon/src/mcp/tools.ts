@@ -18,6 +18,7 @@ import { LIST_TASKS_TOOL, STOP_TASK_TOOL } from './ops/assistant-subsessions.js'
 import { FIRST_LOOK_TOOL } from './ops/first-look.js'
 import { SEND_MESSAGE_ACTIONS } from './ops/send-message-actions.js'
 import { GET_TOOL_GUIDE_TOOL } from './ops/tool-guide.js'
+import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS } from '../kanban/kanban-worker.js'
 
 /** The one send tool (send-message-guide.md §3.2): a required `action`, one flat schema, and the details in `getToolGuide`; `platform` narrows to the agent's own platforms. */
 function buildSendMessageTool(platforms: string[]): ToolDescriptor {
@@ -1087,6 +1088,67 @@ export const CODE_HOST_EFFECT_TOOLS: ToolDescriptor[] = [
   }
 ]
 
+const KANBAN_SUMMARY = {
+  type: 'string',
+  minLength: 1,
+  maxLength: KANBAN_SUMMARY_MAX_CHARS,
+  description:
+    'Self-contained Markdown summary of what you did and found. AgentConnect posts it as the one final comment on the ' +
+    'card issue after the control plane accepts the outcome; do not post it yourself.'
+}
+const KANBAN_REASON = {
+  type: 'string',
+  minLength: 1,
+  maxLength: KANBAN_REASON_MAX_CHARS,
+  description: 'Why the card could not be finished, in plain language for the humans reading the issue.'
+}
+const KANBAN_PR = {
+  type: 'integer',
+  minimum: 1,
+  description: 'Optional number of the pull request in the board repository that carries this work.'
+}
+const KANBAN_TOOL_NOTE =
+  ' Only available while a dispatched Kanban card run holds this session; the card, lease, and attempt come from ' +
+  'that run, never from arguments. Call exactly one Kanban terminal tool, once, at the end of your work; a second ' +
+  'call is refused. The card status changes after your turn ends.'
+
+/** Worker terminal tools (issue #2 §6): the run's outcome binds to the daemon-held lease, so availability is not authority. */
+export const KANBAN_TOOLS: ToolDescriptor[] = [
+  {
+    name: 'kanbanComplete',
+    description: 'Report that the dispatched Kanban card is done.' + KANBAN_TOOL_NOTE,
+    inputSchema: obj({ summary: KANBAN_SUMMARY, prNumber: KANBAN_PR }, ['summary'])
+  },
+  {
+    name: 'kanbanRequestReview',
+    description: 'Report that the dispatched Kanban card is ready for human or verifier review.' + KANBAN_TOOL_NOTE,
+    inputSchema: obj({ summary: KANBAN_SUMMARY, prNumber: KANBAN_PR }, ['summary'])
+  },
+  {
+    name: 'kanbanBlock',
+    description:
+      'Report that the dispatched Kanban card cannot proceed until something outside this run changes: `dependency` ' +
+      '(another card or issue must land first), `needs_input` (a human must answer), `capability` (this agent lacks ' +
+      'the access or tools), or `transient` (an outage worth retrying later).' +
+      KANBAN_TOOL_NOTE,
+    inputSchema: obj(
+      {
+        summary: KANBAN_SUMMARY,
+        kind: { type: 'string', enum: ['dependency', 'needs_input', 'capability', 'transient'] },
+        reason: KANBAN_REASON
+      },
+      ['summary', 'kind', 'reason']
+    )
+  },
+  {
+    name: 'kanbanFail',
+    description: 'Report that you attempted the dispatched Kanban card and could not complete it.' + KANBAN_TOOL_NOTE,
+    inputSchema: obj({ summary: KANBAN_SUMMARY, reason: KANBAN_REASON }, ['summary', 'reason'])
+  }
+]
+
+export const KANBAN_TOOL_NAMES = new Set(KANBAN_TOOLS.map((t) => t.name))
+
 export const ALL_TOOL_NAMES = [
   ...new Set(
     [
@@ -1110,6 +1172,7 @@ export const ALL_TOOL_NAMES = [
       ...DECISION_TOOLS,
       ...COLLABORATION_TOOLS,
       ...GITHUB_REVIEW_TOOLS,
+      ...KANBAN_TOOLS,
       ...CODE_HOST_EFFECT_TOOLS,
       RECALL_TOOL,
       FOLLOW_UP_TOOL,

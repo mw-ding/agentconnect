@@ -14,13 +14,32 @@ import {
 } from '@agentconnect.md/protocol'
 import { WireError, type Clock, type TimerHandle } from '@agentconnect.md/connection'
 
-/** How a run ended, as the M3 terminal tools will record it; absent at turn end ⇒ `protocol_violation`. */
+/** How a run ended, as the terminal tools record it; absent at turn end ⇒ `protocol_violation`. */
 export interface KanbanTerminal {
   outcome: Exclude<KanbanReportOutcome, 'protocol_violation'>
   blockKind?: KanbanBlockKind
   reasonCode?: string
   prNumber?: number
+  /** Free text for the final issue comment; it stays on the daemon and never rides the body-free report. */
+  summary?: string
+  reason?: string
 }
+
+export const KANBAN_SUMMARY_MAX_CHARS = 20_000
+export const KANBAN_REASON_MAX_CHARS = 2_000
+
+/** A durably recorded terminal outcome: the report to send plus the comment to post once the CP accepts it. */
+export interface KanbanTerminalEntry {
+  report: KanbanReport
+  repoFullName: string
+  issueNumber: number
+  summary: string
+  reason?: string
+}
+
+export type KanbanTerminalResult =
+  | { recorded: true; dispatch: KanbanDispatch }
+  | { recorded: false; reason: 'no_lease' | 'already_reported' | 'durability' }
 
 export interface KanbanLease {
   dispatch: KanbanDispatch
@@ -51,6 +70,17 @@ export interface KanbanReportOutbox {
   put(report: KanbanReport, queuedAt: number): Promise<void>
   list(limit: number): Promise<KanbanReport[]>
   remove(leaseId: string): Promise<void>
+  /** Claim the lease's single terminal outcome; false when one is already recorded. */
+  recordTerminal(entry: KanbanTerminalEntry, at: number): Promise<boolean>
+  /** Recorded terminals whose report was never queued (the daemon stopped mid-run). */
+  orphanedTerminals(): Promise<KanbanTerminalEntry[]>
+  /** The CP answered the report: accepted queues the final comment, superseded drops it. */
+  settleTerminal(leaseId: string, accepted: boolean): Promise<void>
+}
+
+/** Posts the final comments of accepted terminal reports; single-flight and retrying on its own schedule. */
+export interface KanbanFinalComments {
+  drain(): Promise<void>
 }
 
 export interface KanbanCpLink {
@@ -70,6 +100,7 @@ export interface KanbanWorkerDeps {
   start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult>
   cancel(lease: KanbanLease): void
   probe: KanbanLivenessProbe
+  comments?: KanbanFinalComments
   heartbeatMs?: number
 }
 
@@ -90,6 +121,8 @@ export class KanbanWorker {
   start(): void {
     if (!this.stopped) return
     this.stopped = false
+    // Comments recorded before a restart are already due; don't wait a heartbeat to post them.
+    void this.requeueOrphans().then(() => this.drainComments())
     this.arm()
   }
 
@@ -163,12 +196,37 @@ export class KanbanWorker {
     return undefined
   }
 
-  /** M3 seam: the terminal tool records the run's outcome; the report is sent once the session goes idle. */
-  recordTerminal(leaseId: string, terminal: KanbanTerminal): boolean {
+  /** The live lease a session's terminal tool binds to; the agent never names it. */
+  leaseForSession(sessionKey: string): string | undefined {
+    for (const [id, lease] of this.leases) if (lease.sessionKey === sessionKey) return id
+    return undefined
+  }
+
+  /** Record the run's one outcome durably; the report is sent once the session goes idle, so the turn can finish. */
+  async recordTerminal(leaseId: string, terminal: KanbanTerminal): Promise<KanbanTerminalResult> {
     const lease = this.leases.get(leaseId)
-    if (!lease || lease.terminal) return false
+    if (!lease) return { recorded: false, reason: 'no_lease' }
+    if (lease.terminal) return { recorded: false, reason: 'already_reported' }
+    const d = lease.dispatch
+    let fresh: boolean
+    try {
+      fresh = await this.deps.outbox.recordTerminal(
+        {
+          report: this.buildReport(leaseId, { ...lease, terminal }),
+          repoFullName: d.repoFullName,
+          issueNumber: d.issueNumber,
+          summary: terminal.summary ?? '',
+          ...(terminal.reason ? { reason: terminal.reason } : {})
+        },
+        this.deps.clock.now()
+      )
+    } catch (err) {
+      this.deps.log.warn(`kanban: terminal persistence failed for ${leaseId} (${String(err)})`)
+      return { recorded: false, reason: 'durability' }
+    }
+    if (!fresh) return { recorded: false, reason: 'already_reported' }
     lease.terminal = terminal
-    return true
+    return { recorded: true, dispatch: d }
   }
 
   /** Liveness for one lease, or null when nothing is running for it. */
@@ -225,6 +283,8 @@ export class KanbanWorker {
       this.beating = false
     }
     await this.flush()
+    // Retries comments whose earlier post failed, on the publisher's own backoff.
+    this.drainComments()
   }
 
   /** Send queued reports oldest first; a CP answer (accepted or superseded) or a permanent refusal releases the row. */
@@ -232,15 +292,20 @@ export class KanbanWorker {
     const cp = this.deps.cp()
     if (!cp?.ready() || this.flushing) return
     this.flushing = true
+    let accepted = false
     try {
       for (const report of await this.deps.outbox.list(FLUSH_BATCH)) {
         try {
           const reply = await cp.report(report)
           if (!reply.accepted) this.deps.log.info(`kanban: report for lease ${report.leaseId} superseded`)
+          // Settle before the ACK: a crash between the two resends the report, and the CP answers a replay idempotently.
+          await this.deps.outbox.settleTerminal(report.leaseId, reply.accepted)
           await this.deps.outbox.remove(report.leaseId)
+          if (reply.accepted) accepted = true
         } catch (err) {
           if (err instanceof WireError && !err.retryable) {
             this.deps.log.warn(`kanban: dead-lettering report for lease ${report.leaseId} (${err.code})`)
+            await this.deps.outbox.settleTerminal(report.leaseId, false)
             await this.deps.outbox.remove(report.leaseId)
             continue
           }
@@ -250,6 +315,28 @@ export class KanbanWorker {
       }
     } finally {
       this.flushing = false
+      if (accepted) this.drainComments()
+    }
+  }
+
+  private drainComments(): void {
+    // Shutdown's final flush only hands reports over; comments wait for the next start.
+    if (this.stopped) return
+    void this.deps.comments
+      ?.drain()
+      .catch((err: unknown) => this.deps.log.warn(`kanban: final comment drain failed (${String(err)})`))
+  }
+
+  /** A terminal recorded before a restart is still the run's word: queue its report, and the lease fence decides. */
+  private async requeueOrphans(): Promise<void> {
+    try {
+      for (const entry of await this.deps.outbox.orphanedTerminals()) {
+        if (this.leases.has(entry.report.leaseId)) continue
+        await this.deps.outbox.put(entry.report, this.deps.clock.now())
+        this.deps.log.info(`kanban: requeued recorded ${entry.report.outcome} for lease ${entry.report.leaseId}`)
+      }
+    } catch (err) {
+      this.deps.log.warn(`kanban: terminal recovery failed (${String(err)})`)
     }
   }
 
@@ -276,12 +363,19 @@ export class KanbanWorker {
   }
 
   private async finalize(leaseId: string, lease: KanbanLease): Promise<void> {
+    const report = this.buildReport(leaseId, lease)
+    await this.deps.outbox.put(report, this.deps.clock.now())
+    this.leases.delete(leaseId)
+    this.deps.log.info(`kanban: lease ${leaseId} ended (${report.outcome})`)
+  }
+
+  private buildReport(leaseId: string, lease: KanbanLease): KanbanReport {
     const d = lease.dispatch
     const terminal = lease.terminal
     const outcome: KanbanReportOutcome = terminal?.outcome ?? (lease.turnError ? 'failed' : 'protocol_violation')
     const reasonCode =
       terminal?.reasonCode ?? (terminal ? undefined : lease.turnError ? 'turn_error' : 'no_terminal_call')
-    const report: KanbanReport = {
+    return {
       boardId: d.boardId,
       cardId: d.cardId,
       agentId: d.agentId,
@@ -294,9 +388,6 @@ export class KanbanWorker {
       ...(lease.sessionId ? { sessionId: lease.sessionId } : {}),
       ...(terminal?.prNumber ? { prNumber: terminal.prNumber } : {})
     }
-    await this.deps.outbox.put(report, this.deps.clock.now())
-    this.leases.delete(leaseId)
-    this.deps.log.info(`kanban: lease ${leaseId} ended (${outcome})`)
   }
 
   private arm(): void {

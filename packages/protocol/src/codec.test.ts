@@ -2403,6 +2403,24 @@ describe('gitcred frames (github-app workspace credentials)', () => {
     expect(decoded.frame.payload.forceRefresh).toBe(true)
   })
 
+  it('round-trips a kanban comment token request bound to a lease', () => {
+    const leaseId = '44444444-4444-4444-8444-444444444444'
+    const f = buildEnvelope('gitcred/request', {
+      agentId: AGENT_ID,
+      reason: 'helper',
+      capabilities: ['issues'],
+      repoFullName: 'acme/web',
+      purpose: 'kanban_card_write',
+      leaseId
+    })
+    const decoded = decodeEnvelope(encode(f))
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok || !isFrame('gitcred/request')(decoded.frame)) throw new Error('expected a gitcred/request frame')
+    expect(decoded.frame.payload.purpose).toBe('kanban_card_write')
+    expect(decoded.frame.payload.leaseId).toBe(leaseId)
+    expect(decoded.frame.payload.capabilities).toEqual(['issues'])
+  })
+
   it('round-trips a gitcred/grant and preserves a long stateless-format token verbatim', () => {
     // New-format installation tokens (ghs_APPID_JWT) run ~520 chars — no length assumptions.
     const token = `ghs_2345678_${'a'.repeat(500)}.${'b'.repeat(20)}`
