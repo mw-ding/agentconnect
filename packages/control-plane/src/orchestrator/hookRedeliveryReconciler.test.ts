@@ -77,6 +77,7 @@ function make(opts: {
   relaysAlive?: boolean | (() => boolean)
   redeliverError?: boolean
   reviewFanoutClaim?: boolean
+  graph?: { repoIds: bigint[]; landed?: string[] }
   claim?:
     | boolean
     | ((
@@ -115,7 +116,14 @@ function make(opts: {
     },
     { listAlive: vi.fn(async () => (alive() ? [{ id: 'r1' } as RelayRecord] : [])) },
     clock,
-    CFG
+    CFG,
+    undefined,
+    opts.graph
+      ? {
+          watchedRepoIds: vi.fn(async () => opts.graph!.repoIds),
+          landedDeliveryKeys: (keys: readonly string[]) => new Set(keys.filter((k) => opts.graph!.landed?.includes(k)))
+        }
+      : undefined
   )
   // Ticks stay MANUAL: tick()'s finally re-arms a timer, and clock.advance()
   // would fire those into async sweeps racing the test's own tick() calls.
@@ -195,6 +203,57 @@ describe('HookRedeliveryReconciler', () => {
     })
     await h.reconciler.tick()
     expect(h.redelivered).toEqual(['8'])
+  })
+
+  describe('Kanban graph events (spike §3)', () => {
+    const graphDelivery = (over: Partial<GhHookDelivery> = {}) =>
+      delivery({ event: 'sub_issues', action: 'sub_issue_added', ...over })
+
+    it('redelivers an unlanded graph delivery for a board-watched repo, even with no github hook', async () => {
+      const h = make({
+        hooks: [],
+        graph: { repoIds: [REPO_ID] },
+        deliveries: [
+          graphDelivery({ id: 'g1' }),
+          graphDelivery({ id: 'g2', guid: 'g-dep', event: 'issue_dependencies' })
+        ]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual(['g1', 'g2'])
+      expect(h.claimMock).not.toHaveBeenCalled()
+    })
+
+    it('leaves a graph delivery the CP doorbell already recorded alone', async () => {
+      const h = make({ hooks: [], graph: { repoIds: [REPO_ID], landed: ['guid-1'] }, deliveries: [graphDelivery()] })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual([])
+    })
+
+    it('ignores graph deliveries for unwatched repos or without a graph dependency', async () => {
+      const unwatched = make({ hooks: [], graph: { repoIds: [1n] }, deliveries: [graphDelivery()] })
+      await unwatched.reconciler.tick()
+      expect(unwatched.redelivered).toEqual([])
+
+      const noGraph = make({ deliveries: [graphDelivery()] })
+      await noGraph.reconciler.tick()
+      expect(noGraph.redelivered).toEqual([])
+    })
+
+    it('caps no-landing graph re-asks like any no-HookRun GUID', async () => {
+      // Each redelivery re-lists the GUID with a fresh timestamp; the attempt cap ends the loop.
+      const h = make({
+        hooks: [],
+        graph: { repoIds: [REPO_ID] },
+        deliveries: () => [
+          graphDelivery({ id: '9001', delivered_at: new Date(h.clock.now() - 3 * 60 * 1000).toISOString() })
+        ]
+      })
+      for (let i = 0; i < 5; i++) {
+        await h.reconciler.tick()
+        h.clock.advance(CFG.intervalMs)
+      }
+      expect(h.redelivered).toEqual(['9001', '9001', '9001'])
+    })
   })
 
   it('the event:* wildcard widens the sieve', async () => {

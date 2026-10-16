@@ -20,6 +20,7 @@ import type {
   RcGithubCommentAuthz,
   RcGithubRerequest,
   RcGithubRerequestResult,
+  RcGithubGraph,
   RcGithubInstallation,
   RcRegister,
   RcRunReport,
@@ -95,6 +96,8 @@ export interface RelayConnDeps {
   /** Apply a relay `rc/github-installation` doorbell poke (webhook-triggers
    *  decision 11). Fire-and-forget; store/GitHub errors must not close the link. */
   onGithubInstallation: (m: RcGithubInstallation) => Promise<void>
+  /** Apply a body-free Kanban `rc/github-graph` doorbell poke; fire-and-forget like the installation doorbell. */
+  onGithubGraph: (m: RcGithubGraph) => Promise<void>
   /** The in-memory relay index — this connection registers itself for `rc/daemon-revoke` push. */
   relayReg: RelayRegistry
   /** Resolve a browser webchat token → identity + the agent's CURRENT placement
@@ -192,6 +195,9 @@ export class RelayConnection implements RelayChannel {
         case 'rc/github-installation':
           await this.handleGithubInstallation(frame.payload)
           return
+        case 'rc/github-graph':
+          await this.handleGithubGraph(frame.payload)
+          return
         default:
           this.sendError(frame.id, 'PROTOCOL_STATE', `unsupported: ${frame.type}`)
       }
@@ -221,7 +227,8 @@ export class RelayConnection implements RelayChannel {
           type === 'rc/thread-assign' ||
           type === 'rc/thread-participant' ||
           type === 'rc/thread-lookup' ||
-          type === 'rc/github-installation'
+          type === 'rc/github-installation' ||
+          type === 'rc/github-graph'
         )
       default:
         return false
@@ -279,6 +286,14 @@ export class RelayConnection implements RelayChannel {
       await this.deps.onGithubInstallation(poke)
     } catch {
       // swallowed — cache-invalidation only, never worth the socket
+    }
+  }
+
+  private async handleGithubGraph(poke: RcGithubGraph): Promise<void> {
+    try {
+      await this.deps.onGithubGraph(poke)
+    } catch {
+      // swallowed — a dropped graph poke is recovered by the redelivery sweep and the board tick
     }
   }
 

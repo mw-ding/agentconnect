@@ -1,0 +1,107 @@
+// Kanban graph doorbell (issue #2 spike §3): a body-free `rc/github-graph` poke makes the CP re-read the graph from GitHub.
+import type { RcGithubGraph } from '@agentconnect.md/protocol'
+import type { GithubInstallationRepo, KanbanBoardRecord, KanbanBoardRepo } from '../persistence/ports.js'
+import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
+
+/** Landed-GUID memory bound (flush-at-cap, the redelivery reconciler precedent). */
+const MAX_LANDED = 5_000
+
+export interface GraphDoorbellLog {
+  debug(obj: unknown, msg?: string): void
+  warn(obj: unknown, msg?: string): void
+}
+
+export interface KanbanGraphDoorbellDeps {
+  boards: Pick<KanbanBoardRepo, 'listEnabledByRepoId'>
+  installations: Pick<GithubInstallationRepo, 'getByInstallationId'>
+  store: Pick<CardStore, 'readGraph'>
+  /** M1 stub seam: the re-read graph goes here; the drift reconciler that applies it lands with M1's remainder. */
+  onGraph?: (board: KanbanBoardRecord, issueNumber: number, graph: CardGraph) => void | Promise<void>
+  log: GraphDoorbellLog
+}
+
+export class KanbanGraphDoorbell {
+  private readonly landed = new Set<string>()
+  private readonly handling = new Set<Promise<void>>()
+  private readonly inflight = new Map<string, Promise<void>>()
+  /** Keys poked while their read was already running get exactly one trailing re-read. */
+  private readonly rerun = new Set<string>()
+  private stopped = false
+
+  constructor(private readonly deps: KanbanGraphDoorbellDeps) {}
+
+  /** Fire-and-forget entry: the relay WS handler never awaits GitHub. */
+  poke(m: RcGithubGraph): void {
+    if (this.stopped) return
+    if (this.landed.size >= MAX_LANDED) this.landed.clear()
+    this.landed.add(m.deliveryKey)
+    const pending: Promise<void> = this.handle(m)
+      .catch((err: unknown) => {
+        this.deps.log.warn({ err, deliveryKey: m.deliveryKey, repoId: m.repoId }, 'kanban graph doorbell failed')
+      })
+      .finally(() => this.handling.delete(pending))
+    this.handling.add(pending)
+  }
+
+  /** The GUIDs whose doorbell reached this CP, so the redelivery sweep does not re-ask for them. */
+  landedDeliveryKeys(deliveryKeys: readonly string[]): Set<string> {
+    return new Set(deliveryKeys.filter((key) => this.landed.has(key)))
+  }
+
+  stop(): void {
+    this.stopped = true
+  }
+
+  /** Await every in-flight re-read (tests and shutdown). */
+  async settle(): Promise<void> {
+    while (this.handling.size > 0 || this.inflight.size > 0) {
+      await Promise.allSettled([...this.handling, ...this.inflight.values()])
+    }
+  }
+
+  private async handle(m: RcGithubGraph): Promise<void> {
+    const boards = await this.deps.boards.listEnabledByRepoId(BigInt(m.repoId))
+    if (boards.length === 0) return
+    // The verified installation must belong to the board's org (decision 6), and must still be live.
+    const installation = await this.deps.installations.getByInstallationId(BigInt(m.installationId))
+    if (!installation || installation.revokedAt || installation.suspendedAt) {
+      this.deps.log.debug({ installationId: m.installationId }, 'kanban graph doorbell: installation not live')
+      return
+    }
+    if (m.numbers.length === 0) {
+      // Cross-repo ids only; the periodic board tick reconciles those.
+      this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
+      return
+    }
+    for (const board of boards) {
+      if (board.orgId !== installation.orgId) continue
+      const repo = {
+        installationId: installation.installationId,
+        repoId: board.repoId,
+        repoFullName: board.repoFullName
+      }
+      for (const issueNumber of m.numbers) this.schedule(board, repo, issueNumber)
+    }
+  }
+
+  private schedule(board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number): void {
+    const key = `${board.id}#${issueNumber}`
+    if (this.inflight.has(key)) {
+      this.rerun.add(key)
+      return
+    }
+    const run = async (): Promise<void> => {
+      do {
+        this.rerun.delete(key)
+        const graph = await this.deps.store.readGraph(repo, issueNumber)
+        await this.deps.onGraph?.(board, issueNumber, graph)
+      } while (this.rerun.has(key) && !this.stopped)
+    }
+    const pending = run()
+      .catch((err: unknown) => {
+        this.deps.log.warn({ err, boardId: board.id, issueNumber }, 'kanban graph re-read failed')
+      })
+      .finally(() => this.inflight.delete(key))
+    this.inflight.set(key, pending)
+  }
+}
