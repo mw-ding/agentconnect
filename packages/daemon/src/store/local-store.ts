@@ -2,6 +2,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { chmodSync, mkdirSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 import {
+  KanbanReport,
   QuotedMessageSchema,
   type DreamInfo,
   type ExternalSessionOrigin,
@@ -651,6 +652,11 @@ export class LocalStore {
       -- Latest-wins session metadata awaiting a correlated CP persistence ACK.
       -- This is deliberately separate from sessions: an upgrade starts with an
       -- empty outbox and never treats historical session rows as pending work.
+      CREATE TABLE IF NOT EXISTS kanban_reports (
+        leaseId TEXT PRIMARY KEY,
+        report TEXT,
+        queuedAt INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS session_metadata_outbox (
         agentId TEXT NOT NULL,
         sessionId TEXT NOT NULL,
@@ -2134,6 +2140,39 @@ export class LocalStore {
       throw err
     }
     return true
+  }
+
+  // Retain redacted receipts after ACK so repeated dispatches cannot rerun a completed lease.
+  hasKanbanReport(leaseId: string): boolean {
+    return this.db.prepare('SELECT 1 FROM kanban_reports WHERE leaseId = ?').get(leaseId) !== undefined
+  }
+
+  reserveKanbanLease(leaseId: string, queuedAt: number): void {
+    this.db.prepare('INSERT INTO kanban_reports (leaseId, report, queuedAt) VALUES (?, NULL, ?)').run(leaseId, queuedAt)
+  }
+
+  releaseKanbanLease(leaseId: string): void {
+    this.db.prepare('DELETE FROM kanban_reports WHERE leaseId = ? AND report IS NULL').run(leaseId)
+  }
+
+  putKanbanReport(report: KanbanReport, queuedAt: number): void {
+    const payload = KanbanReport.parse(report)
+    this.db
+      .prepare(
+        'INSERT INTO kanban_reports (leaseId, report, queuedAt) VALUES (?, ?, ?) ON CONFLICT(leaseId) DO UPDATE SET report = excluded.report, queuedAt = excluded.queuedAt'
+      )
+      .run(payload.leaseId, JSON.stringify(payload), queuedAt)
+  }
+
+  listKanbanReports(limit: number): KanbanReport[] {
+    const rows = this.db
+      .prepare('SELECT report FROM kanban_reports WHERE report IS NOT NULL ORDER BY queuedAt, leaseId LIMIT ?')
+      .all(limit) as { report: string }[]
+    return rows.map((row) => KanbanReport.parse(JSON.parse(row.report)))
+  }
+
+  ackKanbanReport(leaseId: string): void {
+    this.db.prepare('UPDATE kanban_reports SET report = NULL WHERE leaseId = ?').run(leaseId)
   }
 
   /**
