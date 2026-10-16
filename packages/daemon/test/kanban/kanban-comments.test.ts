@@ -29,13 +29,15 @@ const entry: KanbanTerminalEntry = {
 
 interface Row extends KanbanCommentRow {
   nextAt: number
+  failed?: boolean
 }
 
 function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
   const rows = new Map<string, Row>()
   return {
     rows,
-    dueKanbanComments: (now, limit) => [...rows.values()].filter((row) => row.nextAt <= now).slice(0, limit),
+    dueKanbanComments: (now, limit) =>
+      [...rows.values()].filter((row) => !row.failed && row.nextAt <= now).slice(0, limit),
     markKanbanCommentAttempt: (leaseId, nextAt, at) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, {
@@ -50,6 +52,14 @@ function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
       const row = rows.get(leaseId)!
       rows.set(leaseId, { ...row, nextAt })
     },
+    deferKanbanCommentLookup: (leaseId, nextAt) => {
+      const row = rows.get(leaseId)!
+      rows.set(leaseId, { ...row, lookupMisses: row.lookupMisses + 1, nextAt })
+    },
+    failKanbanComment: (leaseId) => {
+      const row = rows.get(leaseId)!
+      rows.set(leaseId, { ...row, failed: true })
+    },
     removeKanbanComment: (leaseId) => {
       rows.delete(leaseId)
     }
@@ -61,6 +71,7 @@ function seed(store: { rows: Map<string, Row> }, patch: Partial<Row> = {}): void
     entry,
     attempts: 0,
     attempted: false,
+    lookupMisses: 0,
     recordedAt: 1,
     nextAt: 0,
     ...patch
@@ -127,7 +138,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -161,7 +172,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => now },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -186,7 +197,7 @@ describe('KanbanCommentPublisher', () => {
     const fetchImpl = vi.fn()
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 5_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => {
         throw new Error('offline')
@@ -207,7 +218,7 @@ describe('KanbanCommentPublisher', () => {
     seed(store, { recordedAt: t0 - 60 * 60_000 })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => now },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: github.fetchImpl,
@@ -237,7 +248,7 @@ describe('KanbanCommentPublisher', () => {
     seed(store, { attempted: true, attempts: 1, attemptedAt: t0, recordedAt: t0 })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => t0 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: github.fetchImpl,
@@ -258,6 +269,7 @@ describe('KanbanCommentPublisher', () => {
       entry: other,
       attempts: 0,
       attempted: false,
+      lookupMisses: 0,
       recordedAt: 2,
       nextAt: 0
     })
@@ -282,7 +294,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -312,7 +324,7 @@ describe('KanbanCommentPublisher', () => {
     )
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -322,5 +334,47 @@ describe('KanbanCommentPublisher', () => {
     await publisher.drain()
     expect(fetchImpl).toHaveBeenCalledOnce()
     expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
+  })
+
+  it('parks the comment as failed with an error after five undecided lookups, never posting', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1, attemptedAt: 1_000 })
+    let now = 1_000
+    const posts: string[] = []
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') !== 'GET') {
+        posts.push(String(url))
+        return new Response(JSON.stringify({ id: 1 }), { status: 201 })
+      }
+      return new Response('unavailable', { status: 503 })
+    })
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => now },
+      log,
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test'
+    })
+    const waits: number[] = []
+    for (let i = 0; i < 4; i++) {
+      await publisher.drain()
+      const row = store.rows.get(report.leaseId)!
+      expect(row).toMatchObject({ lookupMisses: i + 1 })
+      waits.push(row.nextAt - now)
+      now = row.nextAt
+    }
+    expect(waits).toEqual([30_000, 60_000, 120_000, 240_000])
+    expect(log.error).not.toHaveBeenCalled()
+    await publisher.drain()
+    expect(store.rows.get(report.leaseId)).toMatchObject({ failed: true })
+    expect(log.error).toHaveBeenCalledOnce()
+    expect(log.error.mock.calls[0]?.[0]).toContain(report.leaseId)
+    expect(log.error.mock.calls[0]?.[0]).toContain('acme/web#42')
+    now += 60 * 60_000
+    await publisher.drain()
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
+    expect(posts).toEqual([])
   })
 })

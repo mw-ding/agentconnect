@@ -11,6 +11,8 @@ const MARKER_PAGE_LIMIT = 5
 const MARKER_PAGE_SIZE = 100
 /** Widens the since window for clock skew between this daemon and GitHub. */
 const MARKER_SINCE_SKEW_MS = 2 * 60_000
+/** Undecided marker lookups (bound hit, timeout, error) before the row is parked as failed. */
+const MARKER_LOOKUP_LIMIT = 5
 /** Bounds the whole marker lookup, including every page fetch and its body. */
 const MARKER_LOOKUP_TIMEOUT_MS = 15_000
 
@@ -97,12 +99,14 @@ export interface KanbanCommentStore {
   dueKanbanComments(now: number, limit: number): KanbanCommentRow[]
   markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): void
   deferKanbanComment(leaseId: string, nextAt: number): void
+  deferKanbanCommentLookup(leaseId: string, nextAt: number): void
+  failKanbanComment(leaseId: string): void
   removeKanbanComment(leaseId: string): void
 }
 
 export interface KanbanCommentPublisherDeps {
   clock: { now(): number }
-  log: { info(message: string): void; warn(message: string): void }
+  log: { info(message: string): void; warn(message: string): void; error(message: string): void }
   store: KanbanCommentStore
   /** CP-minted issues token for this accepted lease. Throws when the CP refuses or is unreachable. */
   token(entry: KanbanTerminalEntry): Promise<string>
@@ -146,7 +150,7 @@ export class KanbanCommentPublisher {
   private async publishOne(row: KanbanCommentRow): Promise<void> {
     const entry = row.entry
     const leaseId = entry.report.leaseId
-    const later = () => this.deps.clock.now() + commentBackoff(row.attempts + 1)
+    const later = () => this.deps.clock.now() + commentBackoff(row.attempts + row.lookupMisses + 1)
     let token: string
     try {
       token = await this.deps.token(entry)
@@ -160,8 +164,7 @@ export class KanbanCommentPublisher {
       try {
         lookup = await this.findMarker(row, token)
       } catch (err) {
-        this.deps.log.warn(`kanban: comment lookup failed for ${leaseId} (${String(err)})`)
-        this.deps.store.deferKanbanComment(leaseId, later())
+        this.lookupMissed(row, later(), `failed (${String(err)})`)
         return
       }
       if (lookup === 'found') {
@@ -170,8 +173,7 @@ export class KanbanCommentPublisher {
         return
       }
       if (lookup === 'inconclusive') {
-        this.deps.log.warn(`kanban: comment lookup inconclusive for ${leaseId}; retrying before posting`)
-        this.deps.store.deferKanbanComment(leaseId, later())
+        this.lookupMissed(row, later(), 'hit the page bound')
         return
       }
     }
@@ -191,6 +193,24 @@ export class KanbanCommentPublisher {
     if (!published) return
     this.deps.store.removeKanbanComment(leaseId)
     this.deps.log.info(`kanban: posted final comment on ${entry.repoFullName}#${entry.issueNumber}`)
+  }
+
+  /** An undecided lookup retries with backoff, then parks the row loudly rather than looping or risking a duplicate. */
+  private lookupMissed(row: KanbanCommentRow, nextAt: number, why: string): void {
+    const leaseId = row.entry.report.leaseId
+    const issue = `${row.entry.repoFullName}#${row.entry.issueNumber}`
+    const misses = row.lookupMisses + 1
+    if (misses >= MARKER_LOOKUP_LIMIT) {
+      this.deps.store.failKanbanComment(leaseId)
+      this.deps.log.error(
+        `kanban: final comment for lease ${leaseId} on ${issue} needs attention; marker lookup ${why}, ${misses} undecided lookups, not posting`
+      )
+      return
+    }
+    this.deps.log.warn(
+      `kanban: comment lookup ${why} for lease ${leaseId} on ${issue} (${misses}/${MARKER_LOOKUP_LIMIT})`
+    )
+    this.deps.store.deferKanbanCommentLookup(leaseId, nextAt)
   }
 
   private async findMarker(row: KanbanCommentRow, token: string): Promise<MarkerLookup> {
