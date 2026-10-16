@@ -265,6 +265,16 @@ export class KanbanDispatcher {
     return true
   }
 
+  /** Repo a daemon may post this accepted run's summary to. Null until the report has committed, and for any other daemon or repo. */
+  commentGrant(
+    daemonId: string,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null> {
+    return this.deps.repo.kanbanCommentGrant(daemonId, agentId, leaseId, repoFullName)
+  }
+
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
   async onHeartbeat(daemonId: string, epoch: number, beats: KanbanLeaseBeat[]): Promise<string[]> {
     return this.deps.repo.heartbeat(
@@ -299,7 +309,11 @@ export class KanbanDispatcher {
       ...(report.sessionId ? { sessionId: report.sessionId } : {}),
       ...(report.prNumber !== undefined ? { prNumber: report.prNumber } : {})
     })
-    if (!result.accepted) return { leaseId: report.leaseId, accepted: false, reason: 'superseded' }
+    if (!result.accepted) {
+      // The transition committed and the ack was lost, or the CP restarted. Replay does not write again.
+      if (await this.deps.repo.isIdempotentReport(daemonId, report)) return { leaseId: report.leaseId, accepted: true }
+      return { leaseId: report.leaseId, accepted: false, reason: 'superseded' }
+    }
     this.deps.log.info(
       { leaseId: report.leaseId, outcome: report.outcome, to: result.card.to, tripped: result.plan.tripped },
       'kanban: run reported'

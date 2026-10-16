@@ -877,7 +877,7 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
+  // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,

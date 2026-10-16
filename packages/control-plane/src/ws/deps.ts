@@ -117,7 +117,7 @@ export interface DaemonWsDeps {
   /** R2a metadata-only lifecycle → informational Check projection. */
   githubRunCoordinator?: GithubRunCoordinator
   /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
-  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport'>
+  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport' | 'commentGrant'>
   /** Open Kanban runs used to clamp gitcred grants to the run mode. Absent ⇒ no clamp. */
   kanbanGrants?: {
     openScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>

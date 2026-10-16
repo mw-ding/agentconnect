@@ -2182,18 +2182,21 @@ describe('gitcred frames (github-app workspace credentials)', () => {
     expect(decoded.frame.payload.forceRefresh).toBe(true)
   })
 
-  it('round-trips the Kanban final-poster purpose', () => {
+  it('round-trips a kanban comment token request bound to a lease', () => {
+    const leaseId = '44444444-4444-4444-8444-444444444444'
     const f = buildEnvelope('gitcred/request', {
       agentId: AGENT_ID,
       reason: 'helper',
       capabilities: ['issues'],
       repoFullName: 'acme/web',
-      purpose: 'kanban_comment'
+      purpose: 'kanban_card_write',
+      leaseId
     })
     const decoded = decodeEnvelope(encode(f))
     expect(decoded.ok).toBe(true)
     if (!decoded.ok || !isFrame('gitcred/request')(decoded.frame)) throw new Error('expected a gitcred/request frame')
-    expect(decoded.frame.payload.purpose).toBe('kanban_comment')
+    expect(decoded.frame.payload.purpose).toBe('kanban_card_write')
+    expect(decoded.frame.payload.leaseId).toBe(leaseId)
     expect(decoded.frame.payload.capabilities).toEqual(['issues'])
   })
 

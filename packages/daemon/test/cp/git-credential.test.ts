@@ -122,6 +122,7 @@ describe('GitCredentialCache', () => {
         repoFullName?: string
         purpose?: string
         hookId?: string
+        leaseId?: string
         forceRefresh?: boolean
       }> = []
       let mono = 0
@@ -160,24 +161,29 @@ describe('GitCredentialCache', () => {
       expect(h.payloads.every((p) => !p.capabilities?.includes('contents'))).toBe(true)
     })
 
-    it('getKanbanCommentToken requests issues only and refreshes after a rejection', async () => {
+    it('getKanbanCommentToken requests issues only, names the accepted lease, and refreshes after a rejection', async () => {
       const h = buildRecording()
-      const first = await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
-      await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
-      expect(h.calls()).toBe(1)
+      const leaseId = '44444444-4444-4444-8444-444444444444'
+      const first = await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
+      const other = '55555555-5555-4555-8555-555555555555'
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', other)
+      expect(h.calls()).toBe(2)
       expect(first.token).toBe('ghs_1')
       expect(h.payloads[0]).toMatchObject({
         repoFullName: 'acme/web',
         capabilities: ['issues'],
-        purpose: 'kanban_comment'
+        purpose: 'kanban_card_write',
+        leaseId
       })
+      expect(h.payloads[1]).toMatchObject({ leaseId: other })
       expect(h.payloads[0]!.capabilities).not.toContain('contents')
       expect(h.payloads[0]!.capabilities).not.toContain('pull_requests')
 
-      h.cache.invalidateKanbanComment(AGENT, 'acme/web', 'ghs_1')
-      const refreshed = await h.cache.getKanbanCommentToken(AGENT, 'acme/web')
-      expect(refreshed.token).toBe('ghs_2')
-      expect(h.payloads[1]).toMatchObject({ purpose: 'kanban_comment', forceRefresh: true })
+      h.cache.invalidateKanbanComment(AGENT, 'acme/web', leaseId, 'ghs_1')
+      const refreshed = await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
+      expect(refreshed.token).toBe('ghs_3')
+      expect(h.payloads[2]).toMatchObject({ purpose: 'kanban_card_write', leaseId, forceRefresh: true })
     })
 
     it('invalidates only the matching cached poster token after an auth rejection', async () => {

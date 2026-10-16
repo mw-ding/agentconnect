@@ -787,15 +787,20 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
       }
     })
 
-    // The poster/card writer is issues:write only, and does not share the run grant's cache entry.
+    // The CP card writer is issues:write only, and does not share the run grant's cache entry.
     const poster = await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'write')
     expect(poster.token).not.toBe(write.token)
     expect(bodies[2]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
 
+    // The daemon summary token is the same issues:write shape, scoped by repo id, and cached apart from the CP card token.
+    const comment = await svc.mintKanbanComment(IID, 'acme/tools', 777n, false)
+    expect(comment.token).not.toBe(poster.token)
+    expect(bodies[3]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+
     clock.advance(46 * 60 * 1000)
     const refreshed = await svc.mintKanbanRun(IID, 'acme/tools', 777n, 'read')
     expect(refreshed.token).not.toBe(read.token)
-    expect(calls).toBe(4)
+    expect(calls).toBe(5)
   })
 
   it('installation invalidation prevents an older in-flight mint from repopulating the cache', async () => {
@@ -1143,6 +1148,17 @@ describe('GithubService.mintForAgent — additional repos (issue #457)', () => {
     expect(refreshed.token).not.toBe(first.token)
     expect(mintBodies).toHaveLength(2)
     expect(listForAgent).not.toHaveBeenCalled()
+  })
+
+  it('the kanban summary token is issues write only and does not share the hook-reply cache', async () => {
+    const { svc, mintBodies } = harness({ rows: [] })
+    const first = await svc.mintForKanbanComment(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    const cached = await svc.mintForKanbanComment(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    await svc.mintForHookReply(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    expect(mintBodies[0]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+    expect(cached.token).toBe(first.token)
+    expect(mintBodies[1]!.permissions).toEqual({ metadata: 'read', issues: 'write', pull_requests: 'write' })
+    expect(mintBodies).toHaveLength(2)
   })
 
   it('a general issues/PR ask still follows an additional repo comment-tier grant', async () => {

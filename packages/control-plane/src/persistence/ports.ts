@@ -27,6 +27,7 @@ import type {
   AgentMemoryBinding,
   ApprovalsReviewer,
   GithubPublishedComment,
+  KanbanReport,
   OrganizationSuggestionInfo
 } from '@agentconnect.md/protocol'
 import type {
@@ -5213,6 +5214,15 @@ export interface KanbanDispatchRepo {
   markAcked(leaseId: string, mode: 'read' | 'write', now: Date, epoch: bigint): Promise<boolean>
   /** End one open run and move its card, atomically and behind the lease fence. */
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult>
+  /** True when this daemon already committed this exact report, so a lost ack can be replayed. */
+  isIdempotentReport(daemonId: string, report: KanbanReport): Promise<boolean>
+  /** The board repo a daemon may comment on after that run was accepted; null when the fence fails. */
+  kanbanCommentGrant(
+    daemonId: string,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null>
   /** Stamp liveness for the leases this daemon still holds; returns the superseded lease ids. */
   heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]>
   /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */

@@ -652,18 +652,7 @@ export class GithubService {
     }
   }
 
-  /**
-   * A COMMENT-only token for the daemon-owned GithubPoster. The caller must
-   * first prove that this agent has an enabled GitHub hook for the repo. This
-   * token never enters the agent environment, so its issues/PR write scopes are
-   * deliberately independent of the workspace contents `gitAccess`: a read-
-   * only workspace can still publish the hook's promised final reply without
-   * gaining code write access.
-   *
-   * `repoId` comes from the authorized hook and keeps the token scope stable
-   * across repository renames; legacy hooks without it fall back to name scope.
-   * `forceRefresh` is set only after GitHub rejects a cached grant.
-   */
+  /** Comment token for the daemon-owned hook poster: issues/PR write, no contents, independent of workspace gitAccess. */
   async mintForHookReply(
     agent: AgentRecord,
     repoFullName: string,
@@ -714,7 +703,7 @@ export class GithubService {
     )
   }
 
-  // Issues-write token for the daemon-owned Kanban final poster. It never enters the agent environment.
+  // Issues-write token for one accepted Kanban summary. The caller proved the lease; the token never enters the agent environment.
   mintForKanbanComment(
     agent: AgentRecord,
     repoFullName: string,
@@ -723,7 +712,7 @@ export class GithubService {
     forceRefresh = false
   ): Promise<MintedGitCred> {
     return this.withKanbanInstallation(agent, repoFullName, bucketKeys, (installationId) =>
-      this.tokens.mintKanbanCard(installationId, repoFullName, repoId, 'write', forceRefresh)
+      this.tokens.mintKanbanComment(installationId, repoFullName, repoId, forceRefresh)
     )
   }
 

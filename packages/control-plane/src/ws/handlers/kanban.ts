@@ -23,7 +23,7 @@ export const handleKanbanReport: Handler = async (frame, conn, deps) => {
     return
   }
   try {
-    // Replied only after the fenced write commits, so the daemon may then drop its outbox row.
+    // Replied only after the fenced write commits. The summary stays in the daemon outbox and is posted once this ack (or its replay) says accepted.
     conn.replyTo(
       frame,
       'kanban/report/ok',
