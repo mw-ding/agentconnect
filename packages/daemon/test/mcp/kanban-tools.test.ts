@@ -72,6 +72,6 @@ describe('kanban terminal tools', () => {
     })
     const { deps: d } = deps(record)
     await expect(executeTool(ctx, 'kanbanRequestReview', { summary: 'again' }, d)).rejects.toThrow(/already reported/)
-    await expect(executeTool(ctx, 'kanbanComplete', { summary: 'x' }, { } as OpsDeps)).rejects.toThrow(/unavailable/)
+    await expect(executeTool(ctx, 'kanbanComplete', { summary: 'x' }, {} as OpsDeps)).rejects.toThrow(/unavailable/)
   })
 })

@@ -1,9 +1,5 @@
 import { KANBAN_TOOL_NAMES, type ToolDescriptor } from './tools.js'
-import {
-  KANBAN_REASON_MAX_CHARS,
-  KANBAN_SUMMARY_MAX_CHARS,
-  type KanbanTerminal
-} from '../kanban/kanban-worker.js'
+import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS, type KanbanTerminal } from '../kanban/kanban-worker.js'
 import type { MemoryProvider, MemoryScope } from '../agents/memory-provider.js'
 import {
   rootPostNeedsThreadMaterialization,

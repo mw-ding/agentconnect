@@ -210,7 +210,11 @@ describe('Kanban worker leases', () => {
       state: 'held',
       entry: { repoFullName: 'acme/web', issueNumber: 42, summary: 'secret summary text', reason: 'which database?' }
     })
-    expect(held.entry.report).toMatchObject({ outcome: 'blocked', blockKind: 'needs_input', reasonCode: 'agent_blocked' })
+    expect(held.entry.report).toMatchObject({
+      outcome: 'blocked',
+      blockKind: 'needs_input',
+      reasonCode: 'agent_blocked'
+    })
     expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'again' })).toEqual({
       recorded: false,
       reason: 'already_reported'

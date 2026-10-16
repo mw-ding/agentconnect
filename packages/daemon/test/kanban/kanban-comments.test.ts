@@ -101,8 +101,7 @@ describe('KanbanCommentPublisher', () => {
     let posts = 0
     const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       if ((init?.method ?? 'GET') === 'GET') {
-        const body =
-          posts >= 2 ? [{ body: `done\n<!-- ${kanbanLeaseMarker(report.leaseId)} -->` }] : []
+        const body = posts >= 2 ? [{ body: `done\n<!-- ${kanbanLeaseMarker(report.leaseId)} -->` }] : []
         return new Response(JSON.stringify(body), { status: 200 })
       }
       posts += 1
