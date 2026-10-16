@@ -9,7 +9,7 @@ Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2) §
 
 - A **board repo** whose issues are cards; **humans** move cards by adding/removing labels.
 - One **GitHub hook per worker agent**: `events=["issues:labeled"]`, `labelFilter=["ac/agent:<slug>"]`.
-- A shared **skill** [`skills/kanban-label-protocol/SKILL.md`](../../skills/kanban-label-protocol/SKILL.md) teaches status/assignee labels and the **comment + human label** terminal protocol until `kanban*` MCP exists.
+- A shared **skill** [`skills/kanban-label-protocol/SKILL.md`](../../skills/kanban-label-protocol/SKILL.md) teaches status/assignee labels and the **final-answer + human label** terminal protocol until `kanban*` MCP exists.
 
 Execution path is the standard hook pipeline documented in [webhook-triggers-and-github-events.md](webhook-triggers-and-github-events.md) (relay ingress → daemon turn, per-issue session).
 
@@ -25,12 +25,24 @@ Documented in [`skills/kanban-label-protocol/references/hook-config.md`](../../s
 
 - `kind: github`, `repoFullName` = board repo, `mentionOnly: false` recommended.
 - Assignee label `ac/agent:<slug>` must match the hook filter and the agent slug used on cards.
+- Board repo must sit under a GitHub App installation that covers it (**org or user account** — P0 accepts either).
 
-Label catalog and human transitions: [`references/label-protocol.md`](../../skills/kanban-label-protocol/references/label-protocol.md).
+## Avoiding the re-dispatch loop
+
+`labelFilter` matches the issue’s **current** labels on **any** `issues:labeled` event. While `ac/agent:<slug>` stays on the card, adding `ac/status:running` / `review` / `blocked` / `done` starts another worker turn.
+
+P0 control (no platform change):
+
+1. Humans add `ac/agent:<slug>` **last** to dispatch, and **remove it before** terminal or parked status moves.
+2. Workers **no-op** (no new `Kanban:` directive) when the card is already `done` / `archived` / `review` / `blocked` with no new human instruction.
 
 ## Terminal outcomes (P0)
 
-Workers end with a single GitHub comment (`Kanban: complete` | `Kanban: request_review` | `Kanban: block kind=…`) and ask a human to set the matching `ac/status:*` label. Mapping to future MCP: issue #2 §6.
+On GitHub hook turns the **daemon** posts the worker’s final answer (workers must not `gh` comment). The final answer starts with `Kanban: complete` | `Kanban: request_review` | `Kanban: block kind=…`, and asks a human to remove the assignee label and set the matching `ac/status:*`. Mapping to future MCP: issue #2 §6.
+
+## Authorization note
+
+For `issues` events the relay checks the **issue author’s** live write/admin access, not the permission of the user who added the label. File smoke cards as a write-capable user.
 
 ## Known gap (document in pilot reports)
 
@@ -40,7 +52,8 @@ Consequences for P0:
 
 - No agent-driven dispatch or board moves via label writes.
 - No concurrency caps or leases on cards.
-- **One writer per effect:** humans (non-bot users) own `ac/status:*` and assignee labels; workers use comments only.
+- **One writer per effect:** humans (non-bot users) own `ac/status:*` and assignee labels; workers use the daemon-posted final answer only.
+- Worker label edits via a **user** PAT still re-dispatch if the assignee label remains — forbid that in the pilot.
 
 ## Local validation
 

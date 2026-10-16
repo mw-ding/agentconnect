@@ -6,65 +6,61 @@ Namespace prefix: `ac/` (AgentConnect Kanban). Create these as GitHub labels on 
 
 ### Status (exclusive — keep exactly one `ac/status:*` on a card)
 
-| Label | Column / intent | Typical next labels (human) |
-| --- | --- | --- |
-| `ac/status:triage` | Inbox, needs sorting | `ac/status:todo` or `ac/status:archived` |
-| `ac/status:todo` | Backlog | `ac/status:ready` when scoped |
-| `ac/status:ready` | Runnable | Add `ac/agent:<slug>` to dispatch; may set `ac/status:running` when work starts |
-| `ac/status:running` | Active work | `ac/status:review`, `ac/status:blocked`, or `ac/status:done` |
-| `ac/status:blocked` | Waiting | Remove block cause, then `ac/status:ready` or `ac/status:running` |
-| `ac/status:review` | Human review | `ac/status:done` + close, or back to `ac/status:running` |
-| `ac/status:done` | Finished | Close issue as **completed** |
-| `ac/status:archived` | Dropped | Close issue as **not planned** |
+| Label                | Column / intent      | Typical next labels (human)                                                                                                     |
+| -------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `ac/status:triage`   | Inbox, needs sorting | `ac/status:todo` or `ac/status:archived`                                                                                        |
+| `ac/status:todo`     | Backlog              | `ac/status:ready` when scoped                                                                                                   |
+| `ac/status:ready`    | Runnable             | Add `ac/agent:<slug>` **last** to dispatch; may set `ac/status:running` only after removing assignee or accepting a re-dispatch |
+| `ac/status:running`  | Active work          | Remove `ac/agent:<slug>` first, then `ac/status:review`, `ac/status:blocked`, or `ac/status:done`                               |
+| `ac/status:blocked`  | Waiting              | Remove block cause, then `ac/status:ready` and re-add `ac/agent:<slug>` to re-dispatch                                          |
+| `ac/status:review`   | Human review         | `ac/status:done` + close, or back to `ac/status:ready` + re-add assignee                                                        |
+| `ac/status:done`     | Finished             | Close issue as **completed**                                                                                                    |
+| `ac/status:archived` | Dropped              | Close issue as **not planned**                                                                                                  |
 
 When changing status, **remove the previous `ac/status:*`** label so only one status applies.
 
 ### Assignee (at most one worker per card)
 
-| Label | Meaning |
-| --- | --- |
+| Label             | Meaning                                                                         |
+| ----------------- | ------------------------------------------------------------------------------- |
 | `ac/agent:<slug>` | Card is assigned to worker `<slug>`; must match that agent’s hook `labelFilter` |
 
 Do not stack multiple `ac/agent:*` labels on one issue in P0.
 
-### Mode (optional, forward-looking)
-
-| Label | Meaning |
-| --- | --- |
-| `ac/mode:write` | Reserved — write-capable execution mode when the platform honors it; safe to document on cards but P0 does not require it |
+**Re-dispatch rule:** while `ac/agent:<slug>` stays on the issue, **any** human label add fires the hook again. Remove the assignee label before terminal or parked status moves (`running` / `review` / `blocked` / `done` / `archived`). Re-add it only when you intentionally want another worker turn.
 
 ## Human move cheat-sheet (P0)
 
-| Goal | Human actions |
-| --- | --- |
-| Triage new work | `ac/status:triage` → classify → `ac/status:todo` or `ac/status:ready` |
-| Assign worker | Add `ac/agent:<slug>` (often while `ac/status:ready`); adding the assignee label dispatches via hook |
-| Start work (visual) | Swap to `ac/status:running` (optional but helps the board) |
-| Worker finished | Read worker comment; set `ac/status:done` or `ac/status:review`; close if done |
-| Worker needs review | Set `ac/status:review` after `Kanban: request_review` |
-| Worker blocked | Set `ac/status:blocked` after `Kanban: block kind=…` |
-| Unblock | Address blocker → `ac/status:ready` or `ac/status:running` |
-| Cancel card | `ac/status:archived` + close not planned |
+| Goal                | Human actions                                                                                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Triage new work     | `ac/status:triage` → classify → `ac/status:todo` or `ac/status:ready`                                                                                                                   |
+| Assign worker       | Ensure `ac/status:ready`, then add `ac/agent:<slug>` **last** (that add dispatches via hook)                                                                                            |
+| Start work (visual) | Prefer leaving status at `ready`/`running` only if you accept a re-dispatch, **or** remove assignee first, set `ac/status:running`, then re-add assignee only if another turn is needed |
+| Worker finished     | Read daemon-posted `Kanban:` final answer; **remove** `ac/agent:<slug>`; set `ac/status:done` or `ac/status:review`; close if done                                                      |
+| Worker needs review | **Remove** `ac/agent:<slug>`; set `ac/status:review` after `Kanban: request_review`                                                                                                     |
+| Worker blocked      | **Remove** `ac/agent:<slug>`; set `ac/status:blocked` after `Kanban: block kind=…`                                                                                                      |
+| Unblock / re-run    | Address blocker → `ac/status:ready` → add `ac/agent:<slug>` again to dispatch                                                                                                           |
+| Cancel card         | Remove assignee if present; `ac/status:archived` + close not planned                                                                                                                    |
 
 Humans should **not** expect the worker or App to move `ac/status:*` labels in P0.
 
-## Worker comment templates
+## Worker final-answer templates (daemon posts)
 
-Copy, fill in, and post **one** terminal comment per session turn.
+On GitHub hook turns the **daemon** posts the worker’s final answer. Workers must **not** `gh issue comment`. Start the final answer with one directive line.
 
 ### Complete
 
-```markdown
+Final-answer body (daemon posts):
+
+```text
 Kanban: complete
 
 Summary: <1–3 sentences on outcome>
 
-```text
 <optional: PR link, commit, test command, files touched>
 ```
-```
 
-Human: set `ac/status:done` (or `ac/status:review` if you want another pass), then close when appropriate.
+Human: remove `ac/agent:<slug>`; set `ac/status:done` (or `ac/status:review` if you want another pass), then close when appropriate.
 
 ### Request review
 
@@ -74,7 +70,7 @@ Kanban: request_review
 Summary: <what to review and where>
 ```
 
-Human: set `ac/status:review`.
+Human: remove `ac/agent:<slug>`; set `ac/status:review`.
 
 ### Block
 
@@ -86,22 +82,26 @@ Summary: <what is missing and who can unblock>
 
 `kind` must be one of:
 
-| Kind | Use when |
-| --- | --- |
-| `dependency` | Waiting on another issue, team, or merge |
-| `needs_input` | Product/owner decision or clarification |
-| `capability` | Task exceeds agent tools, access, or policy |
-| `transient` | Temporary external failure (retry later) |
+| Kind          | Use when                                    |
+| ------------- | ------------------------------------------- |
+| `dependency`  | Waiting on another issue, team, or merge    |
+| `needs_input` | Product/owner decision or clarification     |
+| `capability`  | Task exceeds agent tools, access, or policy |
+| `transient`   | Temporary external failure (retry later)    |
 
-Human: set `ac/status:blocked`.
+Human: remove `ac/agent:<slug>`; set `ac/status:blocked`.
+
+### Quiet no-op (parked / finished)
+
+If the card is already `done` / `archived` / `review` / `blocked` with no new human instruction, the worker ends **without** a `Kanban:` line (daemon may still post a brief ack if the runtime requires a final answer — prefer an empty or “no action” note, never a fresh complete/block/request_review).
 
 ## Future (not P0)
 
-| Action | P0 | Later MCP |
-| --- | --- | --- |
-| complete | comment + human `ac/status:done` | `kanbanComplete` |
-| request_review | comment + human `ac/status:review` | `kanbanRequestReview` |
-| block | comment + human `ac/status:blocked` | `kanbanBlock` |
+| Action         | P0                                                          | Later MCP             |
+| -------------- | ----------------------------------------------------------- | --------------------- |
+| complete       | final answer + human removes assignee + `ac/status:done`    | `kanbanComplete`      |
+| request_review | final answer + human removes assignee + `ac/status:review`  | `kanbanRequestReview` |
+| block          | final answer + human removes assignee + `ac/status:blocked` | `kanbanBlock`         |
 
 ## Bootstrapping labels with `gh`
 
