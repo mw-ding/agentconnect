@@ -61,7 +61,8 @@ import {
   PgThreadAffinityStore,
   PgSlackUserConfigStore,
   PgPresetAgentStore,
-  PgIntegrationChannelRepo
+  PgIntegrationChannelRepo,
+  PgKanbanBoardRepo
 } from '../../src/persistence/index.js'
 import { PlaintextSecretCipher } from '../../src/secrets/cipher.js'
 import { runWithSharedTx, withSharedTxRouting } from '../../src/persistence/ambient-tx.js'
@@ -384,7 +385,8 @@ export function buildHttpApp(
       integrationChannel: integrationChannelRepo,
       audit: auditRepo,
       webchatMcpOperation: webchatMcpOperationRepo,
-      oauth: oauthRepo
+      oauth: oauthRepo,
+      kanbanMode: new PgKanbanBoardRepo(prisma)
     },
     registry: new DaemonRegistryService(daemonRepo, new PgRuntimeProfileRepo(prisma), daemonLifecycleOpRepo, clock),
     platforms,

@@ -65,6 +65,16 @@ const TABLES = [
   // FK-less pending-state table — CASCADE from org/agent never reaches it, so it
   // must be truncated explicitly or its rows leak across tests.
   'slack_install',
+  // FK-less registration state otherwise leaks into later tests on the same worker.
+  'feishu_app_registration',
+  // Other FK-less flow and thread state must not survive a test either.
+  'github_install_state',
+  'slack_platform_install',
+  'waitlist_entry',
+  'shared_thread_agent',
+  'shared_thread_participant',
+  // Key-shredding tombstones deliberately outlive their organization.
+  'pending_key_shred',
   // FK-less deployment infra (no org/daemon column) — same leak risk as slack_install.
   'relay',
   // FK-less OAuth AS protocol state (userId/orgId/clientId are plain strings, no

@@ -37,6 +37,18 @@ export function denyViewerWrite(req: FastifyRequest, reply: FastifyReply): boole
   return true
 }
 
+/** Interactive OIDC sign-in only: personal API keys, OAuth tokens, delegated agent calls, and devAuth are refused. */
+export function denyNonInteractive(req: FastifyRequest, reply: FastifyReply): boolean {
+  if (req.oidcSubject !== undefined && req.apiKeyId === undefined && req.delegatedInvocation === undefined) return false
+  void reply.code(403).send({
+    error: 'Forbidden',
+    statusCode: 403,
+    message: 'interactive sign-in required',
+    code: 'INTERACTIVE_AUTH_REQUIRED'
+  })
+  return true
+}
+
 /** Member management + org info changes: owners only. */
 export function denyNonOwner(req: FastifyRequest, reply: FastifyReply): boolean {
   if (can(ctxOf(req), { action: AuthorizationAction.OrganizationManage })) return false

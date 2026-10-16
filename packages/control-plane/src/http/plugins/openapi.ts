@@ -75,6 +75,7 @@ export const Tag = {
   Usage: 'Usage',
   Stream: 'Stream',
   GitHub: 'GitHub',
+  Kanban: 'Kanban',
   Cluster: 'Cluster execution'
 } as const
 
@@ -127,6 +128,11 @@ const TAG_DESCRIPTIONS: ReadonlyArray<{ name: string; description: string }> = [
   {
     name: Tag.GitHub,
     description: 'GitHub App installations powering github-app workspaces (repo picker + short-lived git credentials).'
+  },
+  {
+    name: Tag.Kanban,
+    description:
+      'GitHub-issue Kanban boards. Run mode (read or write) is control-plane configuration that only an interactively signed-in organization owner can change.'
   },
   {
     name: Tag.Cluster,

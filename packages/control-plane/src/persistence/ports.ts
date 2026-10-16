@@ -119,6 +119,7 @@ export type AuditKind =
   | 'hook_change'
   | 'agent_repo_change'
   | 'org_invite_change'
+  | 'kanban_mode_change'
   | 'protocol_error'
   | 'api_key_create'
   | 'api_key_rotate'
@@ -5067,6 +5068,18 @@ export interface KanbanBoardRecord {
   name: string
   repoId: bigint
   repoFullName: string
+}
+
+/** Run-mode authority; callers pass the authenticated human's id, and only an owner in the board's org may write. */
+export interface KanbanModeAdminRepo {
+  setDefaultMode(orgId: string, boardId: string, userId: string, mode: 'read' | 'write'): Promise<boolean>
+  setCardMode(
+    orgId: string,
+    boardId: string,
+    cardId: string,
+    userId: string,
+    mode: 'read' | 'write' | null
+  ): Promise<boolean>
 }
 
 export interface KanbanBoardRepo {
