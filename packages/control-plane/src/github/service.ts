@@ -652,18 +652,39 @@ export class GithubService {
     }
   }
 
-  /**
-   * A COMMENT-only token for the daemon-owned GithubPoster. The caller must
-   * first prove that this agent has an enabled GitHub hook for the repo. This
-   * token never enters the agent environment, so its issues/PR write scopes are
-   * deliberately independent of the workspace contents `gitAccess`: a read-
-   * only workspace can still publish the hook's promised final reply without
-   * gaining code write access.
-   *
-   * `repoId` comes from the authorized hook and keeps the token scope stable
-   * across repository renames; legacy hooks without it fall back to name scope.
-   * `forceRefresh` is set only after GitHub rejects a cached grant.
-   */
+  /** Issues-write token for one accepted Kanban summary. The caller already proved the lease; the token never enters the agent environment. */
+  async mintForKanbanComment(
+    agent: AgentRecord,
+    repoFullName: string,
+    repoId: bigint,
+    bucketKeys: string[],
+    forceRefresh = false
+  ): Promise<MintedGitCred> {
+    const [owner, repo] = repoFullName.split('/')
+    if (!owner || !repo) {
+      throw new GitCredDeniedError(`not an owner/repo reference (${repoFullName})`, 'SCOPE_DENIED', false)
+    }
+    for (const key of bucketKeys) {
+      if (!this.mintBucket.take(key)) {
+        throw new GitCredDeniedError('gitcred mint rate exceeded — backing off', 'RATE_LIMITED', true)
+      }
+    }
+    const ins = await this.deps.installations.liveByOrgAndAccount(agent.orgId, owner)
+    if (!ins || ins.orgId !== agent.orgId) {
+      throw new GitCredDeniedError(`no live github installation covers ${owner}`, 'LEASE_DENIED', false)
+    }
+    if (ins.suspendedAt) {
+      throw new GitCredDeniedError('github installation is suspended', 'LEASE_DENIED', false)
+    }
+    try {
+      return await this.tokens.mintKanbanComment(ins.installationId, repoFullName, repoId, forceRefresh)
+    } catch (e) {
+      if (e instanceof GithubApiError) throw new GitCredDeniedError(e.message, e.code, e.retryable)
+      throw e
+    }
+  }
+
+  /** Comment token for the daemon-owned hook poster: issues/PR write, no contents, independent of workspace gitAccess. */
   async mintForHookReply(
     agent: AgentRecord,
     repoFullName: string,

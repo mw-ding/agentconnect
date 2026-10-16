@@ -1089,6 +1089,17 @@ describe('GithubService.mintForAgent — additional repos (issue #457)', () => {
     expect(listForAgent).not.toHaveBeenCalled()
   })
 
+  it('the kanban summary token is issues write only and does not share the hook-reply cache', async () => {
+    const { svc, mintBodies } = harness({ rows: [] })
+    const first = await svc.mintForKanbanComment(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    const cached = await svc.mintForKanbanComment(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    await svc.mintForHookReply(READ_WORKSPACE_AGENT, 'acme/infra', 777n, [])
+    expect(mintBodies[0]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+    expect(cached.token).toBe(first.token)
+    expect(mintBodies[1]!.permissions).toEqual({ metadata: 'read', issues: 'write', pull_requests: 'write' })
+    expect(mintBodies).toHaveLength(2)
+  })
+
   it('a general issues/PR ask still follows an additional repo comment-tier grant', async () => {
     const { svc, mintBodies } = harness({ rows: [grantRow({ access: 'comment' })] })
 

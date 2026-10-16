@@ -1,4 +1,4 @@
-// Live GitHub + Postgres + daemon/ACP; only unavailable runtimes, control transport and the M3 terminal seam are stubbed.
+// Live GitHub + Postgres + daemon/ACP. The model calls the real terminal tool; the comment token is the test PAT after the real lease grant.
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -20,7 +20,7 @@ import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
 import type { Daemon } from '../../../daemon/src/daemon.js'
 import type { KanbanWorker } from '../../../daemon/src/kanban/kanban-worker.js'
 import type { LocalStore } from '../../../daemon/src/store/local-store.js'
-import { GithubFinalPoster } from '../../../daemon/src/github/poster.js'
+import { kanbanLeaseMarker } from '../../../daemon/src/kanban/kanban-comments.js'
 import { writeGhShim } from '../../../daemon/src/cp/gh-shim.js'
 import { AcpHost } from '../../../daemon/src/acp/acp-host.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
@@ -91,6 +91,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let realAgent = false
   let workspace = ''
   let daemonEntry = ''
+  let terminalInstruction =
+    'call exactly one Kanban terminal tool, kanbanRequestReview or kanbanComplete, with a one-line summary.'
   const updates: unknown[] = []
   const phase = (name: string, observed: unknown = {}) =>
     console.log(`${new Date().toISOString()} +${Date.now() - started}ms ${name}`, observed)
@@ -279,7 +281,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
               ...blocks,
               {
                 type: 'text',
-                text: 'Live test instruction: no GitHub credentials are provided. Do not inspect credentials or contact GitHub. To verify read-only enforcement, use your shell tool once to attempt `printf kanban-e2e > kanban-write-probe.txt` in this workspace. Do not request escalation or retry. Report the observed refusal and include KANBAN_READ_ONLY_REFUSED. Do not make any other writes.'
+                text: `Live test instruction: no GitHub credentials are provided. Do not inspect credentials or contact GitHub. To verify read-only enforcement, use your shell tool once to attempt \`printf kanban-e2e > kanban-write-probe.txt\` in this workspace. Do not request escalation or retry. Report the observed refusal and include KANBAN_READ_ONLY_REFUSED. The filesystem probe is the only workspace write. Then ${terminalInstruction} Do not post a GitHub comment and do not change labels.`
               }
             ])
             const result = await modelTurn
@@ -296,7 +298,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     await daemon.start()
     worker = (daemon as any).kanbanWorker()
     local = (daemon as any).store
-    phase('setup: real daemon started; in-process control link and injected M3 terminal seam', {
+    phase('setup: real daemon started; in-process control link; terminal outcome comes from the agent tool', {
       agent: selected?.id ?? 'stub'
     })
   }, 120_000)
@@ -378,6 +380,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     }
     // Keep the daemon's real worker/outbox and replace only the network boundary.
     ;(worker as any).deps.cp = () => cp
+    // App minting is not under test. The publisher still asks the real grant, then posts with the supplied PAT.
+    ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
+      const allowed = await dispatcher!.commentGrant(daemonId, id, leaseId, repo)
+      if (!allowed) throw new Error(`kanban comment refused for lease ${leaseId} on ${repo}`)
+      return { token: TOKEN }
+    }
     bell = new KanbanGraphDoorbell({
       boards: new PgKanbanBoardRepo(prisma),
       installations: { getByInstallationId: async () => installation },
@@ -392,6 +400,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     let currentCardId = ''
 
     for (const outcome of ['review_requested', 'completed'] as const) {
+      const toolName = outcome === 'completed' ? 'kanbanComplete' : 'kanbanRequestReview'
       const created = await gh<Issue>('POST', `/repos/${FULL}/issues`, {
         title: `[kanban-e2e] dispatch ${outcome} ${started}`,
         body: 'Scratch issue for the opt-in Kanban M2 live integration check. No repository changes are requested.',
@@ -408,6 +417,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         }
       })
       currentCardId = c.id
+      const summary = `KANBAN_E2E_TERMINAL ${outcome} #${created.number}`
+      terminalInstruction = `call the \`${toolName}\` tool exactly once. Pass summary exactly: ${summary}. Do not call any other Kanban terminal tool.`
       await dispatcher.reconcileBoard(boardId)
       await dispatcher.settle()
       const parkedRun = await prisma.kanbanRun.findFirstOrThrow({ where: { cardId: c.id } })
@@ -532,13 +543,29 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       }
 
       cpReady = false
-      expect(worker.recordTerminal(d.leaseId, { outcome })).toBe(true)
+      const live = worker.get(d.leaseId)
+      if (!live?.terminal) {
+        console.error(
+          `KANBAN_E2E FALLBACK: model did not call ${toolName} for ${outcome} on ${FULL}#${created.number}; recording the outcome directly`
+        )
+        phase('e: FALLBACK recordTerminal; the model did not call the terminal tool', {
+          outcome,
+          issue: created.number
+        })
+        expect(worker.recordTerminal(d.leaseId, { outcome, summary }).recorded).toBe(true)
+      } else {
+        expect(live.terminal).toMatchObject({ outcome, summary: expect.stringContaining('KANBAN_E2E_TERMINAL') })
+        phase('e: model called the terminal tool', { outcome, issue: created.number, tool: toolName })
+      }
+      const summaryUsed = worker.get(d.leaseId)?.terminal?.summary ?? ''
+      expect(summaryUsed).toContain('KANBAN_E2E_TERMINAL')
+      expect(await gh<unknown[]>('GET', `/repos/${FULL}/issues/${created.number}/comments`)).toEqual([])
       releaseTurn!()
       releaseTurn = undefined
       await vi.waitFor(() => expect(local.listKanbanReports(10)).toHaveLength(1), { timeout: 30_000 })
       expect(local.listKanbanReports(10)[0]).toMatchObject({ leaseId: d.leaseId, outcome })
       expect((await run(d.leaseId)).endedAt).toBeNull()
-      phase('e: injected M3 terminal outcome persisted to real SQLite outbox while CP link offline', { outcome })
+      phase('e: terminal outcome persisted to real SQLite outbox while CP link offline', { outcome })
       cpReady = true
       await worker.flush()
       await dispatcher.settle()
@@ -552,29 +579,24 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       expect(moved.labels.map((label) => label.name)).toEqual([`ac/status:${target}`])
       expect(moved.state).toBe(outcome === 'completed' ? 'closed' : 'open')
       if (outcome === 'completed') expect(moved.state_reason).toBe('completed')
-      expect(await dispatcher.onReport(daemonId, epoch, report)).toMatchObject({
-        accepted: false,
-        reason: 'superseded'
-      })
-      await snapshot('e: fenced report accepted, outbox ACK retained, duplicate refused', c.id, created.number)
+      expect(await dispatcher.onReport(daemonId, epoch, report)).toEqual({ leaseId: d.leaseId, accepted: true })
+      expect((await issue(created.number)).labels.map((label) => label.name)).toEqual([`ac/status:${target}`])
+      await snapshot('e: fenced report accepted, identical replay accepted, outbox ACK retained', c.id, created.number)
 
-      // M2 synthetic turns do not wire the hook poster; exercise it separately without claiming automatic delivery.
-      expect(await gh<unknown[]>('GET', `/repos/${FULL}/issues/${created.number}/comments`)).toEqual([])
-      const body = `[kanban-e2e] Injected M3 terminal outcome: ${outcome}. Live M2 dispatch/read-only/report check passed (agent: ${realAgent ? runtimeId : 'stub'}). Comment posted through the real daemon poster invoked explicitly by the test; M3 terminal tools and automatic Kanban final-comment wiring are not implemented.`
-      const poster = new GithubFinalPoster(
-        { token: async () => TOKEN!, log: { warn: (message) => phase(message) } },
-        FULL,
-        created.number
+      const marker = kanbanLeaseMarker(d.leaseId)
+      await vi.waitFor(
+        async () => {
+          const comments = await gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${created.number}/comments`)
+          expect(comments).toHaveLength(1)
+          expect(comments[0]?.body).toContain(summaryUsed)
+          expect(comments[0]?.body).toContain(marker)
+        },
+        { timeout: 30_000, interval: 1_000 }
       )
-      const published = await poster.publish(body)
-      expect(published).toBeDefined()
-      expect(await poster.publish(body)).toEqual(published)
+      await (daemon as any).kanbanCommentPoster.drain()
       const comments = await gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${created.number}/comments`)
       expect(comments).toHaveLength(1)
-      expect(comments[0]?.body).toContain(body)
-      phase('e: real GitHub comment verified; poster invoked separately at missing automatic wiring seam', {
-        issue: created.number
-      })
+      phase('e: automatic final comment posted once', { issue: created.number })
     }
   }, 240_000)
 })

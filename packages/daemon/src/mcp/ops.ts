@@ -1,4 +1,5 @@
-import type { ToolDescriptor } from './tools.js'
+import { KANBAN_TOOL_NAMES, type ToolDescriptor } from './tools.js'
+import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS, type KanbanTerminal } from '../kanban/kanban-worker.js'
 import type { MemoryProvider, MemoryScope } from '../agents/memory-provider.js'
 import {
   rootPostNeedsThreadMaterialization,
@@ -13,12 +14,13 @@ import {
   offersDirectMessages,
   platformLabel
 } from '../platforms/read-ports.js'
-import type {
-  ChannelAgentsReq,
-  ChannelAgentsOk,
-  KnowledgeSearchOk,
-  OrgSkillsOk,
-  Platform
+import {
+  KANBAN_BLOCK_KINDS,
+  type ChannelAgentsReq,
+  type ChannelAgentsOk,
+  type KnowledgeSearchOk,
+  type OrgSkillsOk,
+  type Platform
 } from '@agentconnect.md/protocol'
 import { randomUUID } from 'node:crypto'
 import { MemoryPathError, MemoryTooLargeError } from '../agents/memory.js'
@@ -360,6 +362,16 @@ export interface SubmitGithubReviewReq extends SubmitGithubReviewInput {
   transportScope?: string
 }
 
+/** A worker's terminal tool call; the lease is resolved from these trusted coordinates, never from tool input. */
+export interface KanbanTerminalReq {
+  agentId: string
+  platform: string
+  channel: string
+  thread: string
+  transportScope?: string
+  terminal: KanbanTerminal & { summary: string }
+}
+
 export interface ReplyGithubReviewThreadsReq {
   agentId: string
   platform: string
@@ -556,6 +568,8 @@ export interface OpsDeps {
    * turn. The implementation owns action-time CP authorization and head/base
    * fencing; ordinary sessions fail closed. */
   submitGithubReview?: (req: SubmitGithubReviewReq) => Promise<GithubReviewEffect>
+  /** Record a Kanban card run's one terminal outcome against the session's live lease; throws when refused. */
+  recordKanbanTerminal?: (req: KanbanTerminalReq) => unknown
   /** Publish the independently authored replies for one trusted inline-review batch. */
   replyGithubReviewThreads?: (req: ReplyGithubReviewThreadsReq) => Promise<ReplyGithubReviewThreadsResult>
   /** The agent memory provider — backs the `readMemory`/`writeMemory` tools.
@@ -1384,6 +1398,18 @@ export async function executeTool(
     })
   }
 
+  if (KANBAN_TOOL_NAMES.has(name)) {
+    if (!deps.recordKanbanTerminal) throw new Error('Kanban terminal reports are unavailable on this daemon')
+    return deps.recordKanbanTerminal({
+      agentId: ctx.agentId,
+      platform: ctx.platform,
+      channel: ctx.channel,
+      thread: ctx.thread,
+      ...(ctx.transportScope !== undefined ? { transportScope: ctx.transportScope } : {}),
+      terminal: parseKanbanTerminal(name, args)
+    })
+  }
+
   if (name === 'replyGithubReviewThreads') {
     if (!deps.replyGithubReviewThreads) throw new Error('batched GitHub review replies are unavailable on this daemon')
     return deps.replyGithubReviewThreads({
@@ -1500,6 +1526,51 @@ export async function executeTool(
     default:
       throw new Error(`unknown tool: ${name}`)
   }
+}
+
+function boundedText(args: Record<string, unknown>, key: string, max: number): string {
+  const value = requireString(args, key).trim()
+  if (!value) throw new Error(`missing required string argument: ${key}`)
+  if (value.length > max) throw new Error(`argument ${key} must be at most ${max} characters`)
+  return value
+}
+
+/** Tool arguments → terminal; reason codes are daemon-chosen constants, so no model text reaches the body-free report. */
+function parseKanbanTerminal(name: string, args: Record<string, unknown>): KanbanTerminal & { summary: string } {
+  const summary = boundedText(args, 'summary', KANBAN_SUMMARY_MAX_CHARS)
+  const prNumber = optionalBoundedInt(args, 'prNumber', 1, 2 ** 31 - 1)
+  switch (name) {
+    case 'kanbanComplete':
+      assertKanbanKeys(name, args, ['summary', 'prNumber'])
+      return { outcome: 'completed', summary, ...(prNumber ? { prNumber } : {}) }
+    case 'kanbanRequestReview':
+      assertKanbanKeys(name, args, ['summary', 'prNumber'])
+      return { outcome: 'review_requested', summary, ...(prNumber ? { prNumber } : {}) }
+    case 'kanbanBlock':
+      assertKanbanKeys(name, args, ['summary', 'kind', 'reason'])
+      return {
+        outcome: 'blocked',
+        blockKind: requireEnum(args, 'kind', KANBAN_BLOCK_KINDS),
+        reasonCode: 'agent_blocked',
+        summary,
+        reason: boundedText(args, 'reason', KANBAN_REASON_MAX_CHARS)
+      }
+    case 'kanbanFail':
+      assertKanbanKeys(name, args, ['summary', 'reason'])
+      return {
+        outcome: 'failed',
+        reasonCode: 'agent_failed',
+        summary,
+        reason: boundedText(args, 'reason', KANBAN_REASON_MAX_CHARS)
+      }
+    default:
+      throw new Error(`unknown tool: ${name}`)
+  }
+}
+
+function assertKanbanKeys(name: string, args: Record<string, unknown>, allowed: readonly string[]): void {
+  const unexpected = Object.keys(args).filter((key) => !allowed.includes(key))
+  if (unexpected.length > 0) throw new Error(`${name}: unexpected argument ${unexpected.join(', ')}`)
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {

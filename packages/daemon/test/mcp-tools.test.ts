@@ -381,7 +381,11 @@ describe('toolsForIntegrations', () => {
         'getMemory',
         'updateMemory',
         'deleteMemory',
-        'submitGithubReview'
+        'submitGithubReview',
+        'kanbanComplete',
+        'kanbanRequestReview',
+        'kanbanBlock',
+        'kanbanFail'
       ])
     )
     // The merged-away tool names are gone.
