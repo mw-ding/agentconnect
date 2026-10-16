@@ -40,7 +40,7 @@ Org-scoped route: `POST /hooks` under `/api/v1/orgs/:orgId` (Console uses the sa
 - Matching is **intersection** with the issue’s **current** label names after the event is applied (not only the newly added label name).
 - For `issues:labeled`, GitHub delivers when a label is **added**. The added label is included in the issue’s label set for matching.
 - Example: `labelFilter: ["ac/agent:worker-alpha"]` matches only if the issue currently has `ac/agent:worker-alpha` (among any other labels).
-- **Important (re-dispatch):** while `ac/agent:<slug>` remains on the card, **every** subsequent human label add (`ac/status:running`, `review`, `blocked`, `done`, …) also matches and starts another worker turn. Remove the assignee label before status moves, or add the assignee label **last** only when you intend to dispatch. Empty `labelFilter` means no label gate (not recommended for Kanban P0).
+- **Important (re-dispatch):** while `ac/agent:<slug>` remains on the card, **every** subsequent human label add (`ac/status:running`, `review`, `blocked`, `done`, …) also matches and starts another worker turn. Remove the assignee label before status moves. When you intend to dispatch, add `ac/agent:<slug>` **alone** (its own action) — never with another label in the same edit, and never at issue creation. GitHub sends one delivery per label; the daemon dedupes per delivery only, so bundled adds can start 2+ turns. Empty `labelFilter` means no label gate (not recommended for Kanban P0).
 
 ## Prerequisites
 
@@ -55,7 +55,7 @@ Org-scoped route: `POST /hooks` under `/api/v1/orgs/:orgId` (Console uses the sa
 
 ```text
 Human sets ac/status:ready (assignee label still off)
-Human adds ac/agent:<slug> last on issue
+Human adds ac/agent:<slug> alone (own action; not at create)
   → GitHub issues:labeled (senderType User)
   → Relay matches hook (event + labelFilter + installation + issue-author authz)
   → Daemon opens/continues perThread session on that issue

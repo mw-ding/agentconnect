@@ -29,12 +29,12 @@ Documented in [`skills/kanban-label-protocol/references/hook-config.md`](../../s
 
 ## Avoiding the re-dispatch loop
 
-`labelFilter` matches the issue’s **current** labels on **any** `issues:labeled` event. While `ac/agent:<slug>` stays on the card, adding `ac/status:running` / `review` / `blocked` / `done` starts another worker turn.
+`labelFilter` matches the issue’s **current** labels on **any** `issues:labeled` event. While `ac/agent:<slug>` stays on the card, adding `ac/status:running` / `review` / `blocked` / `done` starts another worker turn. GitHub also emits **one delivery per label** (including labels at issue creation); the daemon deduplicates **per delivery**, not per issue — so bundling `ac/agent:<slug>` with another label, or setting it at create, can start **two or more** turns.
 
 P0 control (no platform change):
 
-1. Humans add `ac/agent:<slug>` **last** to dispatch, and **remove it before** terminal or parked status moves.
-2. Workers **no-op** (no new `Kanban:` directive) when the card is already `done` / `archived` / `review` / `blocked` with no new human instruction.
+1. Humans add `ac/agent:<slug>` **alone** (own label action — never with other labels, never at issue create) to dispatch, and **remove it before** terminal or parked status moves.
+2. Workers **no-op** with an **empty** final answer (daemon posts nothing) when the card is already `running` / `done` / `archived` / `review` / `blocked` with no new human instruction. Do not use a quiet phrase — any non-empty body is posted.
 
 ## Terminal outcomes (P0)
 
