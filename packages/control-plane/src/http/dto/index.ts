@@ -3308,6 +3308,20 @@ export const ClusterEnvelopeStatusDto = z.object({
     .optional()
 })
 
+// ── kanban run mode (CP configuration only; ac/mode:* labels never grant write access) ──
+export const KanbanRunModeDto = z.enum(['read', 'write'])
+export const KanbanBoardParams = z.object({ boardId: z.string().uuid() })
+export const KanbanCardParams = z.object({ boardId: z.string().uuid(), cardId: z.string().uuid() })
+export const SetKanbanBoardModeBody = z.object({ mode: KanbanRunModeDto }).strict()
+/** `null` clears the override so the card inherits the board default on its next claim. */
+export const SetKanbanCardModeBody = z.object({ mode: KanbanRunModeDto.nullable() }).strict()
+export const KanbanBoardModeDto = z.object({ boardId: z.string(), defaultMode: KanbanRunModeDto })
+export const KanbanCardModeDto = z.object({
+  boardId: z.string(),
+  cardId: z.string(),
+  mode: KanbanRunModeDto.nullable()
+})
+
 // ── shared ────────────────────────────────────────────────────────────────
 export const IdParam = z.object({ id: z.string() })
 export const HealthDto = z.object({ status: z.literal('ok') })

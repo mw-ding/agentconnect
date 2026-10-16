@@ -2,14 +2,20 @@
 import { OrgId } from '../../domain/ids.js'
 import type { PrismaLike } from '../prisma.js'
 import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
-import type { KanbanBoardRecord, KanbanBoardRepo, KanbanCardRecord, KanbanCardRepo } from '../ports.js'
+import type {
+  KanbanBoardRecord,
+  KanbanBoardRepo,
+  KanbanCardRecord,
+  KanbanCardRepo,
+  KanbanModeAdminRepo
+} from '../ports.js'
 
 const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
 
-export class PgKanbanBoardRepo implements KanbanBoardRepo {
+export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo {
   constructor(private readonly db: PrismaLike) {}
 
-  // Control-plane admin callers must supply the authenticated human's user id; never expose this on worker RPCs.
+  // Only the human-authenticated owner route calls this, with the caller's user id; never expose it on worker RPCs.
   async setDefaultMode(orgId: string, boardId: string, userId: string, mode: 'read' | 'write'): Promise<boolean> {
     const result = await this.db.kanbanBoard.updateMany({
       where: { id: boardId, orgId, org: { members: { some: { userId, role: 'owner' } } } },

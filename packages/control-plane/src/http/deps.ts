@@ -48,6 +48,7 @@ import type {
   AgentRepoAuthorizationRepo,
   DaemonLifecycleOpRepo,
   OAuthRepo,
+  KanbanModeAdminRepo,
   WebchatMcpOperationRepo
 } from '../persistence/ports.js'
 import type { Clock } from '../domain/clock.js'
@@ -226,6 +227,8 @@ export interface HttpDeps {
     webchatMcpOperation: WebchatMcpOperationRepo
     /** Embedded OAuth AS protocol state (agent-assistant.md §7): clients, codes, grants. */
     oauth: OAuthRepo
+    /** Kanban run-mode authority (board default + per-card override), written only by an interactive owner. */
+    kanbanMode: KanbanModeAdminRepo
   }
   /** The AgentConnectOrg writer + envelope status reader. Absent ⇒ cluster
    *  execution is not configured (CLUSTER_EXECUTION_ENABLED unset) and its

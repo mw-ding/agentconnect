@@ -5069,6 +5069,18 @@ export interface KanbanBoardRecord {
   repoFullName: string
 }
 
+/** Run-mode authority; callers pass the authenticated human's id, and only an owner in the board's org may write. */
+export interface KanbanModeAdminRepo {
+  setDefaultMode(orgId: string, boardId: string, userId: string, mode: 'read' | 'write'): Promise<boolean>
+  setCardMode(
+    orgId: string,
+    boardId: string,
+    cardId: string,
+    userId: string,
+    mode: 'read' | 'write' | null
+  ): Promise<boolean>
+}
+
 export interface KanbanBoardRepo {
   /** Enabled boards watching one repository, across orgs (graph doorbell lookup). */
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
