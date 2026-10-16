@@ -67,7 +67,8 @@ describe('GithubCardStore reads', () => {
       number: 7,
       state: 'open',
       stateReason: null,
-      labels: ['ac/status:ready', 'bug']
+      labels: ['ac/status:ready', 'bug'],
+      humanWriteMode: false
     })
     expect(JSON.stringify(card, (_k, v: unknown) => (typeof v === 'bigint' ? v.toString() : v))).not.toMatch(
       /SECRET|roadmap/
@@ -187,4 +188,76 @@ describe('cardIdempotencyKey', () => {
       cardIdempotencyKey({ epic: 'ab', step: 'c', spec: '' })
     )
   })
+})
+
+describe('write mode label attribution', () => {
+  const grant = (id: number, actor: unknown, extra = {}) => ({
+    id,
+    event: 'labeled',
+    label: { name: 'ac/mode:write' },
+    actor,
+    ...extra
+  })
+  const human = { type: 'User', login: 'maintainer' }
+  const bot = { type: 'Bot', login: 'agentconnect[bot]' }
+
+  it.each([
+    ['human', [grant(1, human)], true],
+    ['bot', [grant(1, bot)], false],
+    ['unknown actor', [grant(1, null)], false],
+    ['app on behalf of user', [grant(1, human, { performed_via_github_app: { id: 1 } })], false],
+    ['bot login', [grant(1, { ...human, login: 'worker[bot]' })], false],
+    ['missing history', [], false],
+    ['bot re-add after human', [grant(1, human), grant(2, bot)], false],
+    ['human re-add after bot', [grant(1, bot), grant(2, human)], true],
+    ['removed grant', [grant(1, human), grant(2, human, { event: 'unlabeled' })], false]
+  ])('authorizes write only for a current human grant: %s', async (_name, events, allowed) => {
+    const h = harness({
+      'GET /repositories/42/issues/7': () => json(issue({ labels: ['ac/status:ready', 'ac/mode:write'] })),
+      'GET /repositories/42/issues/7/events?per_page=100&page=1': () => json(events)
+    })
+    expect((await h.store.readCard(REPO, 7))?.humanWriteMode).toBe(allowed)
+    expect(h.calls.every((c) => c.method === 'GET')).toBe(true)
+  })
+
+  it('reads past a full page to find a later worker re-add', async () => {
+    const h = harness({
+      'GET /repositories/42/issues/7': () => json(issue({ labels: ['ac/status:ready', 'ac/mode:write'] })),
+      'GET /repositories/42/issues/7/events?per_page=100&page=1': () =>
+        json([grant(1, human), ...Array.from({ length: 99 }, (_, i) => ({ id: i + 2, event: 'closed' }))]),
+      'GET /repositories/42/issues/7/events?per_page=100&page=2': () => json([grant(101, bot)])
+    })
+    expect((await h.store.readCard(REPO, 7))?.humanWriteMode).toBe(false)
+    expect(h.calls).toHaveLength(3)
+  })
+
+  it('fails closed when event history exceeds the bound', async () => {
+    const routes: Record<string, () => Response> = {
+      'GET /repositories/42/issues/7': () => json(issue({ labels: ['ac/status:ready', 'ac/mode:write'] }))
+    }
+    for (let page = 1; page <= 10; page++) {
+      routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
+        json(Array.from({ length: 100 }, (_, i) => grant((page - 1) * 100 + i, human)))
+    }
+    const h = harness(routes)
+    expect((await h.store.readCard(REPO, 7))?.humanWriteMode).toBe(false)
+    expect(h.calls).toHaveLength(11)
+  })
+
+  it('does not dispatch on an attribution read failure', async () => {
+    const h = harness({
+      'GET /repositories/42/issues/7': () => json(issue({ labels: ['ac/status:ready', 'ac/mode:write'] }))
+    })
+    await expect(h.store.readCard(REPO, 7)).rejects.toThrow()
+  })
+})
+
+it.each([
+  { state: 'closed', labels: ['ac/status:ready', 'ac/mode:write'] },
+  { state: 'open', labels: ['ac/status:blocked', 'ac/mode:write'] },
+  { state: 'open', labels: ['ac/status:ready', 'ac/status:blocked', 'ac/mode:write'] }
+])('reads a non-dispatchable issue without attempting write-grant attribution (%j)', async (observed) => {
+  const h = harness({ 'GET /repositories/42/issues/7': () => json(issue(observed)) })
+  expect(await h.store.readCard(REPO, 7)).toMatchObject({ ...observed, humanWriteMode: false })
+  expect(h.calls).toHaveLength(1)
 })

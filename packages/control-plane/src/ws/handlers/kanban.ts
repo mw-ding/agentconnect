@@ -24,7 +24,11 @@ export const handleKanbanReport: Handler = async (frame, conn, deps) => {
   }
   try {
     // Replied only after the fenced write commits, so the daemon may then drop its outbox row.
-    conn.replyTo(frame, 'kanban/report/ok', await deps.kanbanDispatcher.onReport(conn.daemonId, frame.payload))
+    conn.replyTo(
+      frame,
+      'kanban/report/ok',
+      await deps.kanbanDispatcher.onReport(conn.daemonId, conn.sessionEpoch, frame.payload)
+    )
   } catch {
     conn.sendError(frame.id, 'INTERNAL', 'kanban report failed', true)
   }

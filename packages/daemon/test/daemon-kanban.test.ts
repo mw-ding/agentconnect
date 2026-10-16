@@ -139,6 +139,7 @@ it('uses the exact GitHub hook coordinates and preserves untrusted-content guida
   ])
   expect(card.text).toContain('untrusted external content')
   expect(card.text).toContain('read-only')
+  for (const family of ['ac/*', 'ac/status:*', 'ac/mode:*', 'ac/agent:*']) expect(card.text).toContain(family)
 })
 
 describe('Daemon Kanban dispatch', () => {
@@ -255,3 +256,35 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
   expect(store.hasKanbanReport(dispatch.leaseId)).toBe(true)
   store.close()
 })
+
+it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant'])(
+  'denies runtime tool permission to edit %s during a leased run',
+  async (label) => {
+    const h = await harness()
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    h.host.prompt.mockImplementationOnce(async () => {
+      await held
+      return { stopReason: 'end_turn' }
+    })
+    h.worker.dispatch(dispatch)
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
+    const policy = vi.spyOn(h.daemon as any, 'resolveAcpPermission').mockResolvedValue({
+      outcome: { outcome: 'selected', optionId: 'allow' }
+    })
+    try {
+      const response = await (h.daemon as any).onAcpPermission(AGENT, 'acp-card', {
+        sessionId: 'acp-card',
+        toolCall: { title: 'gh issue edit', rawInput: { command: `gh issue edit 42 --add-label ${label}` } },
+        options: [{ kind: 'allow_once', optionId: 'allow', name: 'Allow' }]
+      })
+      expect(response).toEqual({ outcome: { outcome: 'cancelled' } })
+      expect(policy).not.toHaveBeenCalled()
+    } finally {
+      release()
+    }
+    await vi.waitFor(() => expect(h.store.listKanbanReports(10)).toHaveLength(1))
+  }
+)

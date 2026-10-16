@@ -16287,6 +16287,19 @@ export class Daemon {
     params: RequestPermissionRequest
   ): Promise<RequestPermissionResponse> {
     try {
+      const session = this.store.getSessionByAcpIdForAgent(agentId, sessionId)
+      const tool = JSON.stringify(params.toolCall ?? {})
+      // Best-effort tool guard; GitHub actor attribution remains the authority for write grants.
+      if (
+        session &&
+        this.kanban?.forSession(session.key) &&
+        /ac(?:\/|%2f)/i.test(tool) &&
+        /label/i.test(tool) &&
+        /add|remove|delete|edit|create|rename|replace|post|put|patch|set|update/i.test(tool)
+      ) {
+        this.permissionEvaluationDetails.set(params, { reason: 'kanban_label_mutation' })
+        return { outcome: { outcome: 'cancelled' } }
+      }
       return await this.resolveAcpPermission(agentId, sessionId, params)
     } catch (err) {
       this.permissionEvaluationDetails.set(params, { reason: 'permission_policy_error' })

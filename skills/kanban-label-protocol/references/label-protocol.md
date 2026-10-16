@@ -4,6 +4,8 @@ Namespace prefix: `ac/` (AgentConnect Kanban). Create these as GitHub labels on 
 
 ## Full label catalog
 
+Workers must never add, remove, rename, or edit any `ac/*` label through `gh`, APIs, scripts, or tools. This includes status, mode, and assignment labels. Ask a human to change labels.
+
 ### Status (exclusive — keep exactly one `ac/status:*` on a card)
 
 | Label                | Column / intent      | Typical next labels (human)                                                                                                                   |

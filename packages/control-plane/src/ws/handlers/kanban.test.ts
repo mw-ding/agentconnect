@@ -49,7 +49,7 @@ describe('kanban WS handlers', () => {
     const c = conn()
     const f = frame('kanban/report', report)
     await handleKanbanReport(f, c, { kanbanDispatcher: { onReport } } as unknown as DaemonWsDeps)
-    expect(onReport).toHaveBeenCalledWith(DAEMON_ID, report)
+    expect(onReport).toHaveBeenCalledWith(DAEMON_ID, 9, report)
     expect(c.replyTo).toHaveBeenCalledWith(f, 'kanban/report/ok', {
       leaseId: LEASE,
       accepted: false,

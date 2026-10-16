@@ -140,6 +140,13 @@ describe('staleLeaseReason — the reaper predicate', () => {
     staleLeaseSec: 14_400
   }
 
+  it('treats a heartbeat as liveness even when an earlier ACK was lost', () => {
+    expect(staleLeaseReason({ ...healthy, ackedAt: null }, NOW, opts)).toBeNull()
+    expect(staleLeaseReason({ ...healthy, ackedAt: null, heartbeatAt: ago(14_401_000) }, NOW, opts)).toBe(
+      'stale_heartbeat'
+    )
+  })
+
   it('keeps a beating lease', () => {
     expect(staleLeaseReason(healthy, NOW, opts)).toBeNull()
   })

@@ -134,8 +134,7 @@ export function staleLeaseReason(lease: OpenLeaseFacts, now: Date, opts: Stalene
   if (lease.currentDaemonEpoch === null || lease.agentDaemonId === undefined) return 'daemon_missing'
   if (lease.agentDaemonId !== lease.daemonId) return 'agent_moved'
   const sinceBeat = now.getTime() - (lease.heartbeatAt ?? lease.ackedAt ?? lease.dispatchedAt).getTime()
-  if (lease.ackedAt === null && now.getTime() - lease.dispatchedAt.getTime() > opts.unackedGraceMs)
-    return 'dispatch_unacked'
+  if (lease.ackedAt === null && lease.heartbeatAt === null && sinceBeat > opts.unackedGraceMs) return 'dispatch_unacked'
   if (lease.currentDaemonEpoch !== lease.daemonEpoch && sinceBeat > opts.epochGraceMs) return 'epoch_changed'
   if (sinceBeat > lease.staleLeaseSec * 1000) return 'stale_heartbeat'
   return null

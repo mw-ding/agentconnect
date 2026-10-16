@@ -192,14 +192,39 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     })
   }
 
-  async markAcked(leaseId: string, mode: 'read' | 'write', now: Date): Promise<boolean> {
-    // A fast terminal report can commit before the dispatch ACK; preserve the mode in its run history too.
-    await this.db.kanbanRun.updateMany({ where: { leaseId }, data: { mode } })
-    const { count } = await this.db.kanbanRun.updateMany({
-      where: { leaseId, endedAt: null, ackedAt: null },
-      data: { ackedAt: now, heartbeatAt: now, mode }
-    })
-    return count === 1
+  async now(): Promise<Date> {
+    const [row] = await this.db.$queryRaw<{ now: Date }[]>`SELECT now() AS now`
+    return row!.now
+  }
+
+  // Store mode before sending so a terminal report racing the ACK keeps the correct history.
+  async setMode(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
+    const rows = await this.db.$queryRaw<{ leaseId: string }[]>(Prisma.sql`
+      UPDATE "kanban_run" r SET "mode" = ${mode}::"KanbanRunMode"
+      FROM "kanban_card" c, "daemon" d
+      WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL
+        AND c."id" = r."cardId" AND c."dispatchRevision" = r."dispatchRevision"
+        AND c."assigneeAgentId" = r."agentId"
+        AND d."id" = r."daemonId" AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
+        AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId")
+      RETURNING r."leaseId"
+    `)
+    return rows.length === 1
+  }
+
+  async markAcked(leaseId: string, mode: 'read' | 'write', now: Date, epoch: bigint): Promise<boolean> {
+    const rows = await this.db.$queryRaw<{ leaseId: string }[]>(Prisma.sql`
+      UPDATE "kanban_run" r
+      SET "ackedAt" = COALESCE(r."ackedAt", ${now}), "heartbeatAt" = COALESCE(r."heartbeatAt", ${now})
+      FROM "kanban_card" c, "daemon" d
+      WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL AND r."mode" = ${mode}::"KanbanRunMode"
+        AND c."id" = r."cardId" AND c."dispatchRevision" = r."dispatchRevision"
+        AND c."assigneeAgentId" = r."agentId"
+        AND d."id" = r."daemonId" AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
+        AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId")
+      RETURNING r."leaseId"
+    `)
+    return rows.length === 1
   }
 
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult> {
@@ -245,6 +270,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         ) &&
         (!fence ||
           (fence.daemonId === row.daemonId &&
+            fence.daemonEpoch === row.currentDaemonEpoch &&
             fence.cardId === row.cardId &&
             fence.attempt === row.attempt &&
             (fence.boardId === undefined || fence.boardId === row.boardId) &&
@@ -319,7 +345,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         // Re-stamping daemonEpoch is how a reconnected daemon keeps a lease whose turn survived the reconnect.
         const rows = await tx.$queryRaw<{ leaseId: string }[]>(Prisma.sql`
           UPDATE "kanban_run" r
-          SET "heartbeatAt" = ${now}, "daemonEpoch" = ${epoch},
+          SET "heartbeatAt" = ${now}, "ackedAt" = COALESCE(r."ackedAt", ${now}), "daemonEpoch" = ${epoch},
               "sessionId" = COALESCE(${beat.sessionId ?? null}, r."sessionId")
           FROM "kanban_card" c
           WHERE r."leaseId" = ${beat.leaseId}::uuid

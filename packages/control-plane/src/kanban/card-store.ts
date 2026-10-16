@@ -1,7 +1,7 @@
 // Kanban CardStore (issue #2 M1): where cards live; the GitHub store reads body-free issue facts and the dependency graph.
 import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
-import type { LabelPlan, ObservedIssue } from './card-state.js'
+import { isDispatchableIssue, type LabelPlan, type ObservedIssue } from './card-state.js'
 import { KanbanLabelWriter } from './label-writer.js'
 
 /** The repository a board watches; installationId is resolved live by the caller, never trusted from a webhook. */
@@ -16,6 +16,8 @@ export interface CardIssue extends ObservedIssue {
   issueId: bigint
   nodeId: string
   number: number
+  // Only a human-attributed label grant can authorize write mode.
+  humanWriteMode: boolean
 }
 
 export interface CardLink {
@@ -43,7 +45,17 @@ export interface CardStore {
   applyPlan(repo: KanbanRepoRef, issueNumber: number, observed: ObservedIssue, plan: LabelPlan): Promise<void>
 }
 
+export const WRITE_MODE_LABEL = 'ac/mode:write'
 const PAGE = 100
+const MAX_EVENT_PAGES = 10
+
+interface LabelEvent {
+  id: number
+  event: string
+  label?: { name?: string }
+  actor?: { type?: string; login?: string } | null
+  performed_via_github_app?: unknown
+}
 
 interface GhIssue {
   id: number
@@ -79,14 +91,41 @@ export class GithubCardStore implements CardStore {
       throw err
     }
     if (issue.pull_request !== undefined) return null
+    const labels = (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean)
     return {
       issueId: BigInt(issue.id),
       nodeId: issue.node_id,
       number: issue.number,
       state: issue.state,
       stateReason: issue.state_reason ?? null,
-      labels: (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean)
+      labels,
+      humanWriteMode:
+        isDispatchableIssue({ labels, state: issue.state }) &&
+        labels.includes(WRITE_MODE_LABEL) &&
+        (await this.humanGrantedWrite(repo, issueNumber))
     }
+  }
+
+  // Issue events contain actor/label metadata; a bounded or ambiguous history never grants write access.
+  private async humanGrantedWrite(repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
+    let latest: LabelEvent | undefined
+    for (let page = 1; page <= MAX_EVENT_PAGES; page++) {
+      const events = await this.get<LabelEvent[]>(repo, `/issues/${issueNumber}/events?per_page=${PAGE}&page=${page}`)
+      for (const event of events) {
+        if (event.label?.name !== WRITE_MODE_LABEL || !['labeled', 'unlabeled'].includes(event.event)) continue
+        if (!latest || event.id > latest.id) latest = event
+      }
+      if (events.length < PAGE) {
+        return (
+          latest?.event === 'labeled' &&
+          latest.actor?.type === 'User' &&
+          !!latest.actor.login &&
+          !latest.actor.login.endsWith('[bot]') &&
+          !latest.performed_via_github_app
+        )
+      }
+    }
+    return false
   }
 
   async readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph> {

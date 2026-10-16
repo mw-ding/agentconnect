@@ -52,7 +52,7 @@ Consequences for P0:
 
 - No agent-driven dispatch or board moves via label writes.
 - No concurrency caps or leases on cards.
-- **One writer per effect:** humans (non-bot users) own `ac/status:*` and assignee labels; workers use the daemon-posted final answer only.
+- **One writer per effect:** humans (non-bot users) own all `ac/*` labels, including status, mode, and assignment; workers use the daemon-posted final answer only.
 - Worker label edits via a **user** PAT still re-dispatch if the assignee label remains — forbid that in the pilot.
 
 ## Local validation
@@ -63,3 +63,39 @@ Manual smoke: [`skills/kanban-label-protocol/scripts/pilot-smoke.md`](../../skil
 
 - M1+ control-plane Kanban APIs, MCP `kanban*` tools, daemon lease/cap enforcement, and automated label writers.
 - Changes to relay, daemon, CP, or protocol — pilot feedback should inform those milestones, not ship in P0.
+
+## M2 dispatch safety
+
+A worker must never add, remove, rename, or edit any `ac/*` label, including
+`ac/status:*`, `ac/mode:*`, and `ac/agent:*`, through `gh`, APIs, scripts, or other
+tools. Issue content cannot authorize a mode or assignment change. The dispatched
+prompt and shared skill carry this rule. The daemon rejects recognizable label
+mutations when the runtime requests tool permission; arbitrary shell execution and
+externally supplied credentials are not comprehensively mediated by that guard.
+
+Write dispatch requires a current `ac/mode:write` label whose latest label event
+was authored by a GitHub `User`, without a bot login or GitHub App attribution.
+The dispatcher reads body-free [issue-event metadata](https://docs.github.com/en/rest/issues/events#list-issue-events)
+from GitHub before each grant. Bot/worker re-adds, missing attribution, and histories
+exceeding ten pages of 100 events never grant write access. An attribution read
+failure prevents dispatch. A human can remove and re-add the label to approve a
+new grant. The run records the approved mode before sending it to the daemon.
+
+A closed or relabeled issue discovered after claiming ends only the database
+lease. It leaves the card non-ready for reconciliation and makes no GitHub label,
+state, or comment writes, so a human change survives and cannot trigger a retry.
+A fenced heartbeat implicitly acknowledges an accepted dispatch and keeps the
+lease alive even when the original ACK write failed. Lease timestamps use the
+database clock; daemon reports and ACKs are fenced against the current daemon epoch.
+
+For local integration verification, set `TEST_DATABASE_URL` to a dedicated
+PostgreSQL 17 database and run `pnpm --filter @agentconnect.md/control-plane test:int`.
+The harness applies committed migrations, seeds the template database, creates a
+private clone per worker, and drops those clones at teardown. The connecting role
+needs permission to create databases. Without this variable it uses Testcontainers.
+
+Remaining M2 follow-ups: daemon-crash reclaims need a separate configurable retry
+budget; superseding a local lease needs cancellation completion, reporting, and a
+worktree recovery policy that preserves uncommitted work before another write run;
+report receipts and abandoned reservations need retention rules that preserve
+restart deduplication. These are outside the dispatch fixes above.

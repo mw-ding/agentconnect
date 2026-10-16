@@ -16,12 +16,11 @@ import type {
   KanbanRunEndResult,
   KanbanRunOutcomeValue
 } from '../persistence/ports.js'
-import { planStatusWrite, statusLabel, type KanbanStatus, type ObservedIssue } from './card-state.js'
-import type { CardStore, KanbanRepoRef } from './card-store.js'
+import { isDispatchableIssue, planStatusWrite, type KanbanStatus, type ObservedIssue } from './card-state.js'
+import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
-/** The label that opts a card into a write run; everything else is read-only. */
-export const WRITE_MODE_LABEL = 'ac/mode:write'
+export { WRITE_MODE_LABEL } from './card-store.js'
 
 /** Refusals that will not fix themselves on retry: route to triage as a capability block. */
 const CAPABILITY_REFUSALS: ReadonlySet<KanbanDispatchRefusal> = new Set(['no_agent', 'write_needs_worktree'])
@@ -108,7 +107,7 @@ export class KanbanDispatcher {
 
   /** Reclaim every stale open lease to `ready`, counting no failure; returns how many were reclaimed. */
   async reap(): Promise<number> {
-    const now = this.now()
+    const now = await this.deps.repo.now()
     const opts = {
       unackedGraceMs: this.deps.unackedGraceMs ?? DEFAULT_UNACKED_GRACE_MS,
       epochGraceMs: this.deps.epochGraceMs ?? DEFAULT_EPOCH_GRACE_MS
@@ -136,14 +135,14 @@ export class KanbanDispatcher {
 
   async reconcileBoard(boardId: string): Promise<void> {
     const leases = await this.deps.repo.claim(boardId, {
-      now: this.now(),
+      now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
     })
     await Promise.allSettled(leases.map((lease) => this.dispatchLease(lease)))
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
-  onHeartbeat(daemonId: string, epoch: number, beats: KanbanLeaseBeat[]): Promise<string[]> {
+  async onHeartbeat(daemonId: string, epoch: number, beats: KanbanLeaseBeat[]): Promise<string[]> {
     return this.deps.repo.heartbeat(
       daemonId,
       BigInt(epoch),
@@ -153,12 +152,12 @@ export class KanbanDispatcher {
         dispatchRevision: BigInt(b.dispatchRevision),
         ...(b.sessionId ? { sessionId: b.sessionId } : {})
       })),
-      this.now()
+      await this.deps.repo.now()
     )
   }
 
   /** `kanban/report`: one fenced write; a superseded run is answered as data so the daemon drops its outbox row. */
-  async onReport(daemonId: string, report: KanbanReport): Promise<KanbanReportOk> {
+  async onReport(daemonId: string, epoch: number, report: KanbanReport): Promise<KanbanReportOk> {
     const end: KanbanRunEnd =
       report.outcome === 'blocked'
         ? { outcome: 'blocked', blockKind: report.blockKind ?? 'transient' }
@@ -166,6 +165,7 @@ export class KanbanDispatcher {
     const result = await this.endRun(report.leaseId, end, report.reasonCode ?? null, {
       fence: {
         daemonId,
+        daemonEpoch: BigInt(epoch),
         cardId: report.cardId,
         boardId: report.boardId,
         agentId: report.agentId,
@@ -191,7 +191,7 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_installation_unavailable')
       return
     }
-    let observed: ObservedIssue | null
+    let observed: CardIssue | null
     try {
       observed = await this.deps.store.readCard(repo, lease.issueNumber)
     } catch (err) {
@@ -200,11 +200,18 @@ export class KanbanDispatcher {
       return
     }
     // GitHub is the system of record: a closed card or one a human relabeled is not dispatched; drift repair settles it.
-    if (!observed || observed.state !== 'open' || !hasDispatchableLabel(observed)) {
-      await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_state_mismatch')
+    if (!observed || !isDispatchableIssue(observed)) {
+      await this.deps.repo.endRun({
+        leaseId: lease.leaseId,
+        outcome: 'transient',
+        reasonCode: 'github_state_mismatch',
+        now: await this.deps.repo.now(),
+        plan: (card) => ({ ...card, countsAsFailure: false })
+      })
       return
     }
-    const mode = observed.labels.includes(WRITE_MODE_LABEL) ? 'write' : 'read'
+    const mode = observed.humanWriteMode ? 'write' : 'read'
+    if (!(await this.deps.repo.setMode(lease.leaseId, mode, lease.daemonEpoch))) return
     let reply: KanbanDispatchOk
     try {
       reply = await this.deps.send(lease.daemonId, {
@@ -234,7 +241,7 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, end, `dispatch_refused:${reply.reason}`)
       return
     }
-    if (!(await this.deps.repo.markAcked(lease.leaseId, mode, this.now()))) return
+    if (!(await this.deps.repo.markAcked(lease.leaseId, mode, await this.deps.repo.now(), lease.daemonEpoch))) return
     this.writeStatus(lease, repo, 'running', observed)
   }
 
@@ -244,7 +251,7 @@ export class KanbanDispatcher {
     reasonCode: string | null,
     extra: Pick<Parameters<KanbanDispatchRepo['endRun']>[0], 'fence' | 'sessionId' | 'prNumber' | 'reclaimIf'> = {}
   ): Promise<KanbanRunEndResult> {
-    const now = this.now()
+    const now = await this.deps.repo.now()
     const outcome: KanbanRunOutcomeValue = end.outcome
     const result = await this.deps.repo.endRun({
       leaseId,
@@ -302,13 +309,4 @@ export class KanbanDispatcher {
         .finally(() => this.arm())
     }, this.deps.tickMs ?? DEFAULT_TICK_MS)
   }
-
-  private now(): Date {
-    return new Date(this.deps.clock.now())
-  }
-}
-
-/** The claimed card should still read `ready` (or our own `running` from a lost ack) on GitHub. */
-function hasDispatchableLabel(observed: ObservedIssue): boolean {
-  return observed.labels.includes(statusLabel('ready')) || observed.labels.includes(statusLabel('running'))
 }

@@ -278,11 +278,12 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
     const boardId = await seedBoard()
     await seedCard(boardId)
     const [lease] = await repo().claim(boardId, live)
-    await repo().markAcked(lease!.leaseId, 'read', NOW)
+    await repo().markAcked(lease!.leaseId, 'read', NOW, 7n)
     return lease!
   }
   const fenceOf = (l: Awaited<ReturnType<typeof leased>>) => ({
     daemonId: l.daemonId,
+    daemonEpoch: l.daemonEpoch,
     cardId: l.cardId,
     attempt: l.attempt,
     dispatchRevision: l.dispatchRevision
@@ -306,6 +307,7 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
     const fence = fenceOf(lease)
     for (const bad of [
       { ...fence, daemonId: D2 },
+      { ...fence, daemonEpoch: 6n },
       { ...fence, attempt: 2 },
       { ...fence, cardId: crypto.randomUUID() },
       { ...fence, boardId: crypto.randomUUID() },
@@ -343,8 +345,9 @@ describe('PgKanbanDispatchRepo.heartbeat and open leases (real Postgres)', () =>
     await seedCard(boardId)
     await seedCard(boardId)
     const [a, b] = await repo().claim(boardId, live)
-    await repo().markAcked(a!.leaseId, 'write', NOW)
-    await repo().markAcked(b!.leaseId, 'read', NOW)
+    await repo().setMode(a!.leaseId, 'write', 7n)
+    await repo().markAcked(a!.leaseId, 'write', NOW, 7n)
+    await repo().markAcked(b!.leaseId, 'read', NOW, 7n)
     await repo().endRun(end(b!.leaseId, 'reclaimed'))
 
     const later = new Date(NOW.getTime() + 30_000)
@@ -413,7 +416,7 @@ it('does not reclaim a lease refreshed after the stale scan', async () => {
   const boardId = await seedBoard()
   await seedCard(boardId)
   const [lease] = await repo().claim(boardId, live)
-  await repo().markAcked(lease!.leaseId, 'read', NOW)
+  await repo().markAcked(lease!.leaseId, 'read', NOW, 7n)
   const later = new Date(NOW.getTime() + 5 * 60 * 60_000)
   const opts = { unackedGraceMs: 120_000, epochGraceMs: 180_000 }
   const [sample] = await repo().listOpenLeases(10)
@@ -447,9 +450,75 @@ it('rejects old-epoch heartbeats and moved-agent writes before the reaper runs',
     (
       await repo().endRun(
         end(lease!.leaseId, 'completed', {
-          fence: { daemonId: D1, cardId: lease!.cardId, attempt: 1, dispatchRevision: lease!.dispatchRevision }
+          fence: {
+            daemonId: D1,
+            daemonEpoch: 8n,
+            cardId: lease!.cardId,
+            attempt: 1,
+            dispatchRevision: lease!.dispatchRevision
+          }
         })
       )
     ).accepted
   ).toBe(false)
+})
+
+it('rechecks an unacked stale scan after a fenced heartbeat implicitly acknowledges the lease', async () => {
+  const boardId = await seedBoard()
+  await seedCard(boardId)
+  const r = repo()
+  const [lease] = await r.claim(boardId, live)
+  const later = new Date(NOW.getTime() + 180_000)
+  const opts = { unackedGraceMs: 120_000, epochGraceMs: 180_000 }
+  const [sample] = await r.listOpenLeases(10)
+  expect(staleLeaseReason(sample!, later, opts)).toBe('dispatch_unacked')
+  await r.heartbeat(
+    D1,
+    7n,
+    [{ leaseId: lease!.leaseId, cardId: lease!.cardId, dispatchRevision: lease!.dispatchRevision }],
+    later
+  )
+  expect(
+    await r.endRun(
+      end(lease!.leaseId, 'reclaimed', {
+        now: later,
+        reclaimIf: (facts) => staleLeaseReason(facts, later, opts) !== null
+      })
+    )
+  ).toEqual({ accepted: false })
+  expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId: lease!.leaseId } })).toMatchObject({
+    ackedAt: later,
+    heartbeatAt: later,
+    endedAt: null
+  })
+  expect(await r.claim(boardId, { ...live, now: later })).toEqual([])
+})
+
+it('fences mode and ACK writes against ended leases, stale epochs, and superseded revisions', async () => {
+  const boardId = await seedBoard()
+  await seedCard(boardId)
+  const r = repo()
+  const [lease] = await r.claim(boardId, live)
+  expect(await r.setMode(lease!.leaseId, 'write', 6n)).toBe(false)
+  expect(await r.markAcked(lease!.leaseId, 'read', NOW, 6n)).toBe(false)
+  expect(await r.setMode(lease!.leaseId, 'write', 7n)).toBe(true)
+  expect(await r.markAcked(lease!.leaseId, 'write', NOW, 7n)).toBe(true)
+  await prisma.kanbanCard.update({ where: { id: lease!.cardId }, data: { dispatchRevision: { increment: 1 } } })
+  expect(await r.setMode(lease!.leaseId, 'read', 7n)).toBe(false)
+  expect(await r.markAcked(lease!.leaseId, 'write', NOW, 7n)).toBe(false)
+  await prisma.kanbanCard.update({ where: { id: lease!.cardId }, data: { dispatchRevision: { decrement: 1 } } })
+  await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 8n } })
+  expect(await r.markAcked(lease!.leaseId, 'write', NOW, 7n)).toBe(false)
+  await r.endRun(end(lease!.leaseId, 'completed'))
+  expect(await r.setMode(lease!.leaseId, 'read', 8n)).toBe(false)
+  expect(await r.markAcked(lease!.leaseId, 'read', NOW, 8n)).toBe(false)
+  expect((await prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId: lease!.leaseId } })).mode).toBe('write')
+})
+
+it('reads lease time from the database clock', async () => {
+  const before = await prisma.$queryRaw<{ now: Date }[]>`SELECT now() AS now`
+  const now = await repo().now()
+  const after = await prisma.$queryRaw<{ now: Date }[]>`SELECT now() AS now`
+  expect(now.getTime()).toBeGreaterThanOrEqual(before[0]!.now.getTime())
+  expect(now.getTime()).toBeLessThanOrEqual(after[0]!.now.getTime())
 })

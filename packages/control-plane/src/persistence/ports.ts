@@ -5114,6 +5114,7 @@ export interface KanbanClaimOpts {
 
 /** What a daemon-originated write must echo to pass the lease fence. */
 export interface KanbanRunFence {
+  daemonEpoch: bigint
   daemonId: string
   cardId: string
   boardId?: string
@@ -5161,8 +5162,12 @@ export interface KanbanDispatchRepo {
   listEnabledBoardIds(): Promise<string[]>
   /** Claim ready cards by priority then age under the board caps (`FOR UPDATE SKIP LOCKED`). */
   claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
-  /** The daemon accepted the dispatch; false when the lease already ended. */
-  markAcked(leaseId: string, mode: 'read' | 'write', now: Date): Promise<boolean>
+  // Database time is the authority across CP replicas.
+  now(): Promise<Date>
+  // Persist the approved mode before the worker can report a fast terminal outcome.
+  setMode(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
+  // Accept only the open run with the current card revision, placement, mode, and daemon epoch.
+  markAcked(leaseId: string, mode: 'read' | 'write', now: Date, epoch: bigint): Promise<boolean>
   /** End one open run and move its card, atomically and behind the lease fence. */
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult>
   /** Stamp liveness for the leases this daemon still holds; returns the superseded lease ids. */

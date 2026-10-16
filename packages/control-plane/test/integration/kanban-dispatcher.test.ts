@@ -1,5 +1,5 @@
 // KanbanDispatcher (issue #2 M2) on real Postgres with a fake GitHub store and daemon link: dispatch, fencing, reaper, accounting.
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { KanbanDispatch, KanbanDispatchOk, KanbanReport } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
@@ -18,12 +18,24 @@ const REPO_ID = 987654321n
 const T0 = Date.parse('2026-10-15T12:00:00.000Z')
 
 class FakeStore {
+  readonly writes: LabelPlan[] = []
+  readonly botWriteGrants = new Set<number>()
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   async readCard(_repo: KanbanRepoRef, n: number): Promise<CardIssue | null> {
     const i = this.issues.get(n)
-    return i ? { issueId: BigInt(n), nodeId: `I_${n}`, number: n, ...i, labels: [...i.labels] } : null
+    return i
+      ? {
+          issueId: BigInt(n),
+          nodeId: `I_${n}`,
+          number: n,
+          ...i,
+          labels: [...i.labels],
+          humanWriteMode: i.labels.includes(WRITE_MODE_LABEL) && !this.botWriteGrants.has(n)
+        }
+      : null
   }
   async applyPlan(_repo: KanbanRepoRef, n: number, _observed: ObservedIssue, plan: LabelPlan): Promise<void> {
+    this.writes.push(plan)
     const i = this.issues.get(n)!
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
@@ -51,6 +63,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   const store = new FakeStore()
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
   const repo = new PgKanbanDispatchRepo(prisma)
+  vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
   const dispatcher = new KanbanDispatcher({
     repo,
     installations: {
@@ -96,7 +109,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, sent, dispatcher, addCard, reportFor, card, run }
+  return { board, clock, store, sent, repo, dispatcher, addCard, reportFor, card, run }
 }
 
 describe('KanbanDispatcher — dispatch (real Postgres)', () => {
@@ -142,7 +155,7 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     const c = await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
     const d = h.sent[0]!.d
-    expect(await h.dispatcher.onReport(D1, h.reportFor(d))).toEqual({ leaseId: d.leaseId, accepted: true })
+    expect(await h.dispatcher.onReport(D1, 4, h.reportFor(d))).toEqual({ leaseId: d.leaseId, accepted: true })
     await h.dispatcher.settle()
     expect((await h.card(c.id)).status).toBe('done')
     expect(h.store.issues.get(c.issueNumber)).toMatchObject({
@@ -150,7 +163,7 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
       state: 'closed',
       stateReason: 'completed'
     })
-    expect(await h.dispatcher.onReport(D1, h.reportFor(d, { outcome: 'failed' }))).toEqual({
+    expect(await h.dispatcher.onReport(D1, 4, h.reportFor(d, { outcome: 'failed' }))).toEqual({
       leaseId: d.leaseId,
       accepted: false,
       reason: 'superseded'
@@ -163,7 +176,7 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
     const d = h.sent[0]!.d
-    expect((await h.dispatcher.onReport(D2, h.reportFor(d))).accepted).toBe(false)
+    expect((await h.dispatcher.onReport(D2, 1, h.reportFor(d))).accepted).toBe(false)
   })
 
   it('a capability refusal routes the card to triage; a transient one cools down without counting', async () => {
@@ -208,14 +221,30 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect((await prisma.kanbanRun.findFirstOrThrow()).reasonCode).toBe('dispatch_failed')
   })
 
-  it('does not dispatch a card GitHub says a human moved; it cools down for drift repair', async () => {
-    const h = await harness()
-    const c = await h.addCard(['ac/status:blocked'])
-    await h.dispatcher.reconcileBoard(h.board.id)
-    expect(h.sent).toHaveLength(0)
-    expect((await h.card(c.id)).status).toBe('ready')
-    expect((await prisma.kanbanRun.findFirstOrThrow()).reasonCode).toBe('github_state_mismatch')
-  })
+  it.each([['ac/status:blocked'], ['ac/status:ready', 'ac/status:blocked']])(
+    'releases only the DB claim when a human moved the card (%j)',
+    async (...labels) => {
+      const h = await harness()
+      const c = await h.addCard([...labels, 'human-label'])
+      await h.dispatcher.reconcileBoard(h.board.id)
+      await h.dispatcher.settle()
+      h.clock.advance(120_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent).toHaveLength(0)
+      expect((await h.card(c.id)).status).toBe('running')
+      expect(await prisma.kanbanRun.findFirstOrThrow()).toMatchObject({
+        reasonCode: 'github_state_mismatch',
+        endedAt: new Date(T0)
+      })
+      expect(await prisma.kanbanRun.count()).toBe(1)
+      expect(h.store.writes).toEqual([])
+      expect(h.store.issues.get(c.issueNumber)).toMatchObject({
+        labels: [...labels, 'human-label'],
+        state: 'open'
+      })
+    }
+  )
 })
 
 describe('KanbanDispatcher — failure accounting through reports (real Postgres)', () => {
@@ -223,14 +252,14 @@ describe('KanbanDispatcher — failure accounting through reports (real Postgres
     const h = await harness()
     const c = await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
-    await h.dispatcher.onReport(D1, h.reportFor(h.sent[0]!.d, { outcome: 'failed', reasonCode: 'turn_error' }))
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'failed', reasonCode: 'turn_error' }))
     await h.dispatcher.settle()
     const first = await h.card(c.id)
     expect(first).toMatchObject({ status: 'ready', consecutiveFailures: 1 })
 
     h.clock.advance(61_000)
     await h.dispatcher.reconcileBoard(h.board.id)
-    await h.dispatcher.onReport(D1, h.reportFor(h.sent[1]!.d, { outcome: 'failed' }))
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[1]!.d, { outcome: 'failed' }))
     await h.dispatcher.settle()
     expect(await h.card(c.id)).toMatchObject({ status: 'triage', consecutiveFailures: 2 })
     expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:triage'])
@@ -240,7 +269,7 @@ describe('KanbanDispatcher — failure accounting through reports (real Postgres
     const h = await harness()
     const c = await h.addCard()
     await h.dispatcher.reconcileBoard(h.board.id)
-    await h.dispatcher.onReport(D1, h.reportFor(h.sent[0]!.d, { outcome: 'blocked', blockKind: 'needs_input' }))
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'blocked', blockKind: 'needs_input' }))
     expect(await h.card(c.id)).toMatchObject({ status: 'blocked', blockKind: 'needs_input', blockRecurrence: 1 })
   })
 })
@@ -273,7 +302,7 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
 
     // The superseded run is fenced out: its heartbeat is refused and its late report cannot land.
     expect(await h.dispatcher.onHeartbeat(D1, 4, beat(d))).toEqual([d.leaseId])
-    expect((await h.dispatcher.onReport(D1, h.reportFor(d))).accepted).toBe(false)
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
     expect((await h.card(c.id)).status).toBe('ready')
   })
 
@@ -346,7 +375,7 @@ it('orders slow running-label writes before terminal labels and persists the lin
   await h.dispatcher.reconcileBoard(h.board.id)
   await started
   try {
-    expect((await h.dispatcher.onReport(D1, h.reportFor(h.sent[0]!.d, { prNumber: 12 }))).accepted).toBe(true)
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { prNumber: 12 }))).accepted).toBe(true)
   } finally {
     release()
   }
@@ -358,7 +387,7 @@ it('orders slow running-label writes before terminal labels and persists the lin
 it('records write mode when a fast worker reports before its dispatch ACK arrives', async () => {
   const h = await harness({
     reply: async (d) => {
-      await h.dispatcher.onReport(D1, h.reportFor(d))
+      await h.dispatcher.onReport(D1, 4, h.reportFor(d))
       return { leaseId: d.leaseId, accepted: true }
     }
   })
@@ -366,4 +395,78 @@ it('records write mode when a fast worker reports before its dispatch ACK arrive
   await h.dispatcher.reconcileBoard(h.board.id)
   await h.dispatcher.settle()
   expect(await h.run(h.sent[0]!.d.leaseId)).toMatchObject({ mode: 'write', outcome: 'completed' })
+})
+
+it('leaves a closed issue and its labels untouched after releasing a pre-dispatch mismatch', async () => {
+  const h = await harness()
+  const c = await h.addCard(['ac/status:ready', 'human-label'])
+  const issue = h.store.issues.get(c.issueNumber)!
+  issue.state = 'closed'
+  issue.stateReason = 'not_planned'
+  await h.dispatcher.tick()
+  await h.dispatcher.settle()
+  h.clock.advance(5 * 60_000)
+  await h.dispatcher.tick()
+  await h.dispatcher.settle()
+  expect(h.sent).toEqual([])
+  expect(h.store.writes).toEqual([])
+  expect(issue).toEqual({ labels: ['ac/status:ready', 'human-label'], state: 'closed', stateReason: 'not_planned' })
+  expect((await h.card(c.id)).status).toBe('running')
+  expect(await prisma.kanbanRun.count({ where: { endedAt: null } })).toBe(0)
+  expect(await prisma.kanbanRun.count()).toBe(1)
+})
+
+it('keeps an accepted lease alive after its ACK write fails, without reaping or redispatching', async () => {
+  const h = await harness()
+  const c = await h.addCard()
+  vi.spyOn(h.repo, 'markAcked').mockRejectedValueOnce(new Error('ACK transaction failed'))
+  await h.dispatcher.reconcileBoard(h.board.id)
+  const d = h.sent[0]!.d
+  expect((await h.run(d.leaseId)).ackedAt).toBeNull()
+  for (let i = 0; i < 6; i++) {
+    h.clock.advance(60_000)
+    expect(
+      await h.dispatcher.onHeartbeat(D1, 4, [
+        {
+          leaseId: d.leaseId,
+          cardId: d.cardId,
+          dispatchRevision: d.dispatchRevision,
+          liveness: 'turn'
+        }
+      ])
+    ).toEqual([])
+    expect(await h.dispatcher.reap()).toBe(0)
+    await h.dispatcher.tick()
+  }
+  expect(await h.run(d.leaseId)).toMatchObject({ ackedAt: new Date(T0 + 60_000), endedAt: null })
+  expect((await h.card(c.id)).status).toBe('running')
+  expect(h.sent).toHaveLength(1)
+  expect(await prisma.kanbanRun.count()).toBe(1)
+})
+
+it('ignores a worker-added write label on the next lease after a transient report', async () => {
+  const h = await harness()
+  const c = await h.addCard()
+  await h.dispatcher.reconcileBoard(h.board.id)
+  await h.dispatcher.settle()
+  h.store.issues.get(c.issueNumber)!.labels.push(WRITE_MODE_LABEL)
+  h.store.botWriteGrants.add(c.issueNumber)
+  await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'transient' }))
+  await h.dispatcher.settle()
+  h.clock.advance(61_000)
+  await h.dispatcher.tick()
+  await h.dispatcher.settle()
+  expect(h.sent.map(({ d }) => d.mode)).toEqual(['read', 'read'])
+  expect((await h.run(h.sent[1]!.d.leaseId)).mode).toBe('read')
+})
+
+it('rejects an old connection report after reauthentication and accepts the current epoch', async () => {
+  const h = await harness()
+  await h.addCard()
+  await h.dispatcher.reconcileBoard(h.board.id)
+  const d = h.sent[0]!.d
+  await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 5n } })
+  expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
+  expect((await h.dispatcher.onReport(D1, 5, h.reportFor(d))).accepted).toBe(true)
+  await h.dispatcher.settle()
 })

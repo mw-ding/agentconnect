@@ -88,6 +88,17 @@ export function parseStatusLabels(labels: readonly string[]): { statuses: Kanban
   return { statuses, malformed }
 }
 
+// Conflicting human status labels must be reconciled before another worker is admitted.
+export function isDispatchableIssue(issue: ObservedIssue): boolean {
+  const { statuses, malformed } = parseStatusLabels(issue.labels)
+  return (
+    issue.state === 'open' &&
+    malformed.length === 0 &&
+    statuses.length > 0 &&
+    statuses.every((s) => s === 'ready' || s === 'running')
+  )
+}
+
 /** Why a requested status is refused for this card, or undefined when it may apply. */
 export function refuseRequest(card: CardSnapshot, requested: KanbanStatus): 'leased' | 'illegal' | undefined {
   if (card.leased && !LEASED_HUMAN_STATUSES.has(requested)) return 'leased'

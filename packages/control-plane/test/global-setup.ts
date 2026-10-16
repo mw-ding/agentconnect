@@ -1,16 +1,4 @@
-/**
- * Vitest global setup for the `integration` project (design §5.2).
- *
- * Boots ONE `postgres:16-alpine` via Testcontainers, applies the committed
- * migrations with `prisma migrate deploy` (so the real partial-unique index, the
- * `threadKey` generated column, and `BigInt` columns are exercised against real
- * Postgres — not pglite, not a mock), seeds the default Org/User, then hands the
- * connection URI to the test process via `provide("databaseUrl", …)` and
- * `process.env.DATABASE_URL`.
- *
- * `teardown` stops the container. One container per Vitest process; per-test
- * isolation is `TRUNCATE … RESTART IDENTITY CASCADE` in `setup.db.ts`.
- */
+// Migrate and seed TEST_DATABASE_URL (local Postgres) or one Testcontainer, then clone a database per worker.
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
@@ -25,17 +13,16 @@ const seedEntry = resolve(packageRoot, 'prisma/seed.ts')
 
 let container: StartedPostgreSqlContainer | undefined
 
-/**
- * Minimal structural type for the global-setup context. Vitest 4 passes a
- * `TestProject` (which exposes `provide`) but no longer exports a named
- * `GlobalSetupContext`, so we type only what we use.
- */
+// Vitest 4 supplies a TestProject; only its provide method is needed here.
 interface GlobalSetupContext {
   provide<K extends keyof ProvidedContext & string>(key: K, value: ProvidedContext[K]): void
 }
 
+const localWorkerDatabases: string[] = []
+let localBaseUrl: string | undefined
+
 function workerDatabaseName(poolId: number): string {
-  return `test_worker_${poolId}`
+  return localBaseUrl ? `kanban_test_${process.pid}_${poolId}` : `test_worker_${poolId}`
 }
 
 function databaseUrl(baseUrl: string, database: string): string {
@@ -45,24 +32,29 @@ function databaseUrl(baseUrl: string, database: string): string {
 }
 
 async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<string[]> {
-  if (!container) throw new Error('Postgres container is not running')
+  if (!container && !localBaseUrl) throw new Error('Postgres is not running')
 
   const urls: string[] = []
   for (let poolId = 1; poolId <= workers; poolId += 1) {
     const database = workerDatabaseName(poolId)
-    const result = await container.exec([
-      'psql',
-      '-v',
-      'ON_ERROR_STOP=1',
-      '-U',
-      container.getUsername(),
-      '-d',
-      'postgres',
-      '-c',
-      `CREATE DATABASE "${database}" WITH TEMPLATE "${container.getDatabase()}" OWNER "${container.getUsername()}"`
-    ])
-    if (result.exitCode !== 0) {
-      throw new Error(`failed to create ${database}: ${result.output}`)
+    const template = new URL(baseUrl).pathname.slice(1)
+    const sql = `CREATE DATABASE "${database}" WITH TEMPLATE "${template.replaceAll('"', '""')}"`
+    if (container) {
+      const result = await container.exec([
+        'psql',
+        '-v',
+        'ON_ERROR_STOP=1',
+        '-U',
+        container.getUsername(),
+        '-d',
+        'postgres',
+        '-c',
+        sql
+      ])
+      if (result.exitCode !== 0) throw new Error(`failed to create ${database}: ${result.output}`)
+    } else {
+      await execa('psql', [databaseUrl(baseUrl, 'postgres'), '-v', 'ON_ERROR_STOP=1', '-c', sql])
+      localWorkerDatabases.push(database)
     }
     urls.push(databaseUrl(baseUrl, database))
   }
@@ -70,8 +62,9 @@ async function cloneWorkerDatabases(baseUrl: string, workers: number): Promise<s
 }
 
 export async function setup({ provide }: GlobalSetupContext): Promise<void> {
-  container = await new PostgreSqlContainer('postgres:16-alpine').start()
-  const url = container.getConnectionUri()
+  localBaseUrl = process.env.TEST_DATABASE_URL
+  if (!localBaseUrl) container = await new PostgreSqlContainer('postgres:16-alpine').start()
+  const url = localBaseUrl ?? container!.getConnectionUri()
 
   // Apply committed migrations (the hand-edited SQL included) to real Postgres.
   await execa('pnpm', ['exec', 'prisma', 'migrate', 'deploy', '--schema', schemaPath], {
@@ -80,24 +73,31 @@ export async function setup({ provide }: GlobalSetupContext): Promise<void> {
     stdio: 'inherit'
   })
 
-  // Seed default Org + owner User so FK-bearing fixtures have a tenancy anchor.
-  // `--conditions development` matches how Vitest resolves workspace deps
-  // (`@agentconnect.md/*` → their `src/`): this is a SPAWNED node process, so
-  // without it any import that reaches a workspace package needs that package's
-  // `dist/` built, and the suite would depend on build order.
+  // Seed FK anchors with source exports, matching Vitest's development conditions.
   await execa('pnpm', ['exec', 'tsx', '--conditions', 'development', seedEntry], {
     cwd: packageRoot,
     env: { ...process.env, DATABASE_URL: url },
     stdio: 'inherit'
   })
 
-  // Each Vitest pool gets a private clone of the migrated + seeded database.
-  // Files can now run concurrently without one worker truncating another's data.
+  // Each worker gets a private clone so concurrent truncation cannot corrupt another test.
   const databaseUrls = await cloneWorkerDatabases(url, integrationTestWorkerCount())
   provide('databaseUrls', databaseUrls)
 }
 
 export async function teardown(): Promise<void> {
+  if (localBaseUrl) {
+    for (const database of localWorkerDatabases) {
+      await execa('psql', [
+        databaseUrl(localBaseUrl, 'postgres'),
+        '-v',
+        'ON_ERROR_STOP=1',
+        '-c',
+        `DROP DATABASE "${database}" WITH (FORCE)`
+      ])
+    }
+    localWorkerDatabases.length = 0
+  }
   await container?.stop()
 }
 
