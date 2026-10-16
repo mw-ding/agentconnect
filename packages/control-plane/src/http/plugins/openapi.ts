@@ -80,7 +80,8 @@ export const Tag = {
   Stream: 'Stream',
   GitHub: 'GitHub',
   GitLab: 'GitLab',
-  Gitea: 'Gitea'
+  Gitea: 'Gitea',
+  Kanban: 'Kanban'
 } as const
 
 /** Group order + blurbs for the docs sidebar (OpenAPI top-level `tags`). */
@@ -144,6 +145,11 @@ const TAG_DESCRIPTIONS: ReadonlyArray<{ name: string; description: string }> = [
   {
     name: Tag.GitLab,
     description: 'GitLab.com OAuth connections — the administration identity for project discovery and provisioning.'
+  },
+  {
+    name: Tag.Kanban,
+    description:
+      'GitHub-issue Kanban boards. Run mode (read or write) is control-plane configuration that only an interactively signed-in organization owner can change.'
   }
 ]
 

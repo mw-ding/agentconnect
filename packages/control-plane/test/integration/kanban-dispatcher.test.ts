@@ -700,6 +700,25 @@ async function graphHarness() {
 }
 
 describe('Kanban graph reconciliation composed with dispatch (real Postgres)', () => {
+  it('promotes despite a mode change between reading the card and the status CAS', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    const readCard = h.store.readCard.bind(h.store)
+    vi.spyOn(h.store, 'readCard').mockImplementationOnce(async (repo, number) => {
+      expect(
+        await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
+      ).toBe(true)
+      expect(await h.card(c.id)).toMatchObject({ stateRevision: c.stateRevision, modeRevision: 1 })
+      return readCard(repo, number)
+    })
+    await h.ring(c.issueNumber)
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.store.writes.map((p) => p.status)).toEqual(['ready', 'running'])
+  })
+
   it('promotes todo and writes ready before the dispatcher reads and claims it', async () => {
     const h = await graphHarness()
     const c = await h.addCard(['ac/status:todo', 'human-label'])
@@ -750,7 +769,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
   it.each([
     { name: 'add landed, removal failed', partial: true },
     { name: 'add failed', partial: false }
-  ])('survives a tick after a failed promotion label write ($name); redelivery promotes', async ({ partial }) => {
+  ])('rolls back a failed promotion after a mode change ($name); redelivery promotes', async ({ partial }) => {
     const h = await graphHarness()
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
@@ -758,6 +777,9 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
       .mockImplementationOnce(async () => {
+        expect(
+          await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
+        ).toBe(true)
         if (partial) h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
         throw new Error('label write failed')
       })
@@ -768,7 +790,12 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.poke).not.toHaveBeenCalled()
     expect(h.sent).toEqual([])
     // The undone promotion leaves DB todo, so a tick before redelivery neither dispatches nor mismatches the card.
-    expect((await h.card(c.id)).status).toBe('todo')
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: c.stateRevision + 2n,
+      mode: 'read',
+      modeRevision: 1
+    })
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])

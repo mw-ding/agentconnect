@@ -83,7 +83,8 @@ import {
   PgLinearInstallStateStore,
   PgPresetAgentStore,
   PgIntegrationChannelRepo,
-  PgDutyGroupRepo
+  PgDutyGroupRepo,
+  PgKanbanBoardRepo
 } from '../../src/persistence/index.js'
 import { CodeHostTrustedActorService } from '../../src/codehost/trusted-actor.service.js'
 import { PgMemberSetRepo } from '../../src/persistence/repositories/member-set.repo.js'
@@ -593,7 +594,8 @@ export function buildHttpApp(
       integrationChannel: integrationChannelRepo,
       audit: auditRepo,
       webchatMcpOperation: webchatMcpOperationRepo,
-      oauth: oauthRepo
+      oauth: oauthRepo,
+      kanbanMode: new PgKanbanBoardRepo(prisma)
     },
     registry: registryService,
     platforms,
