@@ -817,6 +817,25 @@ describe('Kanban card-status doorbell un-parks a re-readied card at once (real P
 })
 
 describe('Kanban graph reconciliation composed with dispatch (real Postgres)', () => {
+  it('promotes despite a mode change between reading the card and the status CAS', async () => {
+    const h = await graphHarness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
+    const readCard = h.store.readCard.bind(h.store)
+    vi.spyOn(h.store, 'readCard').mockImplementationOnce(async (repo, number) => {
+      expect(
+        await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
+      ).toBe(true)
+      expect(await h.card(c.id)).toMatchObject({ stateRevision: c.stateRevision, modeRevision: 1 })
+      return readCard(repo, number)
+    })
+    await h.ring(c.issueNumber)
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.store.writes.map((p) => p.status)).toEqual(['ready', 'running'])
+  })
+
   it('promotes todo and writes ready before the dispatcher reads and claims it', async () => {
     const h = await graphHarness()
     const c = await h.addCard(['ac/status:todo', 'human-label'])
@@ -865,13 +884,22 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
   })
 
   // A failed promotion write: nothing landed, the add landed (todo+ready), or both landed but the DELETE timed out.
-  const failPromotion = async (h: Awaited<ReturnType<typeof graphHarness>>, landed: string[] | null) => {
+  const failPromotion = async (
+    h: Awaited<ReturnType<typeof graphHarness>>,
+    landed: string[] | null,
+    changeMode = false
+  ) => {
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
     h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
       .mockImplementationOnce(async () => {
+        // #19: an owner flips the card's write mode while the promotion is in flight.
+        if (changeMode)
+          expect(
+            await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
+          ).toBe(true)
         if (landed) h.store.relabel(c.issueNumber, landed, 'app')
         throw new Error('label write timed out')
       })
@@ -901,6 +929,18 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       { boardId: h.board.id, issueNumber: c.issueNumber },
       'kanban: adopted a half-landed graph promotion'
     )
+  })
+
+  it('a failed promotion rollback keeps a concurrent mode change (#19) and still flags the card', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'], true)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      stateRevision: c.stateRevision + 2n,
+      mode: 'read',
+      modeRevision: 1,
+      promotionPending: true
+    })
   })
 
   it('a redelivered doorbell adopts a ready label that landed before its removal timed out', async () => {

@@ -40,6 +40,7 @@ import { clusterExecutionRoutes } from './routes/cluster-execution.js'
 import { connectorRoutes } from './routes/connectors.js'
 import { memoryConnectionRoutes } from './routes/memory-connections.js'
 import { githubRoutes, githubCallbackRoutes } from './routes/github.js'
+import { kanbanRoutes } from './routes/kanban.js'
 import { agentIconRoutes } from './routes/agent-icon.js'
 import { orgIconRoutes } from './routes/org-icon.js'
 import { iconUploadRoutes } from './routes/icon-upload.js'
@@ -314,6 +315,7 @@ export function buildHttpServer(deps: HttpDeps, opts: FastifyServerOptions = {})
           await scope.register(usageRoutes(deps))
           await scope.register(streamRoutes(deps))
           await scope.register(githubRoutes(deps))
+          await scope.register(kanbanRoutes(deps))
           // Uploaded-icon write surface — mounted ONLY when the object store is
           // configured; absent ⇒ the routes don't exist and the console hides Upload.
           if (deps.iconStore) await scope.register(iconUploadRoutes(deps))

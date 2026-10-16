@@ -79,13 +79,20 @@ defaults to `read`, and nullable `KanbanCard.mode` overrides it. A claim records
 `ac/mode:write` is display-only and never grants access, regardless of whether a
 human, PAT-backed User, bot, or App added it. No issue-event history is read.
 
-Until a human-authenticated board administration route exists, control-plane admin
-code may use `PgKanbanBoardRepo.setDefaultMode(orgId, boardId, userId, mode)` and
-`setCardMode(orgId, boardId, cardId, userId, modeOrNull)`. Callers must derive
-`userId` from human authentication, never worker input. Both methods require an
-organization owner in that board's organization; no daemon RPC or worker tool
-exposes them. Clearing a card override restores the board default for the next
-claim. Configuration edits do not upgrade an already active lease.
+An organization owner sets mode through two control-plane routes:
+`PUT /api/v1/orgs/:orgId/kanban/boards/:boardId/mode` with
+`{ "mode": "read" | "write" }` sets the board default, and
+`PUT /api/v1/orgs/:orgId/kanban/boards/:boardId/cards/:cardId/mode` with
+`{ "mode": "read" | "write" | null }` sets or clears one card's override. Both accept
+only an interactive OIDC session. Personal API keys, OAuth access tokens (including an
+agent's `mcp:write` token), delegated agent invocations, daemon and relay keys, and
+the no-auth devAuth stub are refused before the body is validated. Collaborators and
+viewers are refused too, and a board or card outside the path organization reads as
+`404`. The repository methods behind the routes, `PgKanbanBoardRepo.setDefaultMode`
+and `setCardMode`, check owner membership again in the same write and take the
+caller's user id only from that session. No daemon RPC or worker tool exposes them.
+Clearing a card override restores the board default for the next claim. Configuration
+edits do not upgrade an already active lease.
 
 A closed or relabeled issue discovered after claiming ends the lease and changes
 the database card in the same transaction: closed/completed becomes `done`,
@@ -197,10 +204,12 @@ The harness applies committed migrations, seeds the template database, creates a
 private clone per worker, and drops those clones at teardown. The connecting role
 needs permission to create databases. Without this variable it uses Testcontainers.
 
-Known gaps: no route lets an owner set write mode yet, so every run is read-only
-until a human-authenticated board administration route ships. A human who wants an
-archived card dispatched must relabel it `triage` and then `ready`; there is no
-issue comment explaining the refused move, only a CP log line.
+Known gaps: write mode is set only through the owner API routes above. The console
+has no control for it yet, and a no-auth (devAuth) deployment cannot set it at all,
+because no request there proves an interactive human. Every run in such a deployment
+stays read-only. A human who wants an archived card dispatched must relabel it
+`triage` and then `ready`; there is no issue comment explaining the refused move,
+only a CP log line.
 
 - **Bots can pin a card's recovery backoff at the minimum.** Any change in the
   recovery fingerprint restarts the backoff at 1 minute, whoever made it. Every
