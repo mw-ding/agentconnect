@@ -86,7 +86,7 @@ function make(
       card.promotionPending = true
       return true
     }),
-    notePromotionEvent: vi.fn(async () => undefined),
+    notePromotionPosted: vi.fn(async () => undefined),
     clearPromotionIntent: vi.fn(async (id: string) => {
       const card = [...db.values()].find((c) => c.id === id)!
       card.promotionPending = false
@@ -107,7 +107,7 @@ function make(
         : null
     ),
     readGraph: vi.fn(async (_r: unknown, n: number) => graphs[n] ?? graph()),
-    identifyReadyEvent: vi.fn(async () => null),
+    lastEventId: vi.fn(async () => 41),
     applyPlan: vi.fn(
       async (
         _r: unknown,
@@ -141,6 +141,12 @@ describe('KanbanGraphReconciler', () => {
     expect(h.cards.beginPromotion.mock.invocationCallOrder[0]).toBeLessThan(
       h.store.applyPlan.mock.invocationCallOrder[0]!
     )
+    // The cursor is read before the intent opens, and the intent before the POST, which is then noted as acknowledged.
+    expect(h.store.lastEventId.mock.invocationCallOrder[0]).toBeLessThan(
+      h.cards.beginPromotion.mock.invocationCallOrder[0]!
+    )
+    expect(h.cards.beginPromotion).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date))
+    expect(h.cards.notePromotionPosted).toHaveBeenCalledWith('c7')
     expect(h.cards.clearPromotionIntent).toHaveBeenCalledWith('c7')
     expect(h.store.applyPlan).toHaveBeenCalledOnce()
     expect(h.store.applyPlan.mock.calls[0]![2]).toBe(await h.store.readCard.mock.results[0]!.value)
@@ -228,7 +234,8 @@ describe('KanbanGraphReconciler', () => {
     const g = graph({ blockedBy: [done] })
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
     expect(h.cards.beginPromotion.mock.calls.map((c) => c.slice(0, 2))).toEqual([['c7', 1n]])
-    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n, null, null, null)
+    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n)
+    expect(h.cards.notePromotionPosted).not.toHaveBeenCalled()
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')
@@ -300,6 +307,15 @@ describe('KanbanGraphReconciler', () => {
     await h.reconciler.apply(BOARD, REPO, 7, graph({ blocking: [{ ...link(8, 'open'), repoId: 99n }] }))
     expect(h.store.readGraph).not.toHaveBeenCalled()
     expect(h.store.applyPlan).not.toHaveBeenCalled()
+  })
+
+  it('opens no intent and writes nothing when the pre-POST cursor read fails', async () => {
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    h.store.lastEventId.mockRejectedValueOnce(new Error('events 503'))
+    await expect(h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('events 503')
+    expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
   })
 
   it('writes no labels when the CAS is lost', async () => {

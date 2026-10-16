@@ -6,10 +6,14 @@ import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
-import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
 import {
-  findOurReadyEvent,
-  promotionAttributed,
+  KanbanDispatcher,
+  MAX_PROMOTION_AGE_MS,
+  MAX_PROMOTION_CHECKS,
+  WRITE_MODE_LABEL
+} from '../../src/kanban/dispatcher.js'
+import {
+  judgePromotion,
   type CardGraph,
   type CardIssue,
   type KanbanRepoRef,
@@ -48,16 +52,14 @@ class FakeStore {
   async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
     return (this.statusActors.get(n) ?? 'human') === 'human'
   }
-  async promotionAttributed(_repo: KanbanRepoRef, n: number, readyEventId: number | null): Promise<boolean | null> {
-    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG, readyEventId)
+  /** Issues whose event window cannot be read in full (for example 1,000+ events since the cursor). */
+  readonly unreadable = new Set<number>()
+  async lastEventId(_repo: KanbanRepoRef, n: number): Promise<number> {
+    return (this.events.get(n) ?? []).reduce((max, event) => Math.max(max, event.id), 0)
   }
-  async identifyReadyEvent(
-    _repo: KanbanRepoRef,
-    n: number,
-    notBefore: Date,
-    notAfter: Date | null
-  ): Promise<number | null> {
-    return findOurReadyEvent(this.events.get(n) ?? [], APP_SLUG, notBefore, notAfter)
+  async promotionVerdict(_repo: KanbanRepoRef, n: number, cursor: number, postAccepted: boolean) {
+    if (this.unreadable.has(n)) return 'inconclusive' as const
+    return judgePromotion(this.events.get(n) ?? [], APP_SLUG, cursor, postAccepted)
   }
   async readGraph(_repo: KanbanRepoRef, n: number): Promise<CardGraph> {
     return this.graphs.get(n) ?? emptyGraph()
@@ -65,6 +67,7 @@ class FakeStore {
   /** Set an issue's labels as `actor`, recording the add-then-remove events GitHub would. */
   relabel(n: number, labels: string[], actor: keyof typeof ACTORS): void {
     const i = this.issues.get(n)!
+    this.statusActors.set(n, actor === 'human' ? 'human' : 'bot')
     this.record(
       n,
       labels.filter((l) => !i.labels.includes(l)),
@@ -111,7 +114,7 @@ class FakeStore {
     this.writes.push(plan)
     const i = this.issues.get(n)!
     this.record(n, plan.addLabels, plan.removeLabels, 'app')
-    for (const label of plan.addLabels) await onLabelAdded?.(label, null)
+    for (const label of plan.addLabels) await onLabelAdded?.(label)
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
       i.state = plan.issueState.state
@@ -906,11 +909,11 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe('running')
   })
 
-  // A failed promotion write: nothing landed, the add landed (todo+ready), or both landed but the DELETE timed out.
+  // A failed promotion write: nothing landed, or labels landed and then a later step failed. `acked` is whether the ready POST returned.
   const failPromotion = async (
     h: Awaited<ReturnType<typeof graphHarness>>,
     landed: string[] | null,
-    changeMode = false
+    { changeMode = false, acked = landed !== null } = {}
   ) => {
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
@@ -923,10 +926,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
           expect(
             await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
           ).toBe(true)
-        if (landed) {
-          h.store.relabel(c.issueNumber, landed, 'app')
-          await onLabelAdded?.('ac/status:ready', null)
-        }
+        if (landed) h.store.relabel(c.issueNumber, landed, 'app')
+        if (acked) await onLabelAdded?.('ac/status:ready')
         throw new Error('label write timed out')
       })
       .mockImplementation(apply)
@@ -936,8 +937,32 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.poke).not.toHaveBeenCalled()
     expect(h.sent).toEqual([])
     // The undone promotion leaves DB todo, flagged for recovery, so no claim can mismatch it.
-    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true })
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, promotionPostAccepted: acked })
     return c
+  }
+
+  // The card was handed to a human: todo, unclaimable, flagged with `reason`, logged, and commented on GitHub.
+  const expectEscalated = async (
+    h: Awaited<ReturnType<typeof graphHarness>>,
+    c: { id: string; issueNumber: number },
+    reason: string
+  ) => {
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      promotionPending: false,
+      needsAttention: true,
+      attentionReason: reason
+    })
+    expect(h.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ boardId: h.board.id, issueNumber: c.issueNumber, reason }),
+      'kanban: pending promotion needs human attention'
+    )
+    const comments = h.store.writes.filter((plan) => plan.comment)
+    expect(comments).toHaveLength(1)
+    expect(comments[0]).toMatchObject({ addLabels: [], removeLabels: [] })
+    expect(comments[0]!.comment).toContain(`(${reason})`)
+    expect(h.sent).toEqual([])
+    expect(await prisma.kanbanRun.count()).toBe(0)
   }
 
   it.each([
@@ -949,7 +974,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
-    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false, needsAttention: false })
     expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:running'])
     expect(h.log.info).toHaveBeenCalledWith(
       { boardId: h.board.id, issueNumber: c.issueNumber },
@@ -957,13 +982,32 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     )
   })
 
+  // Vera's blocker 1: the POST timed out, then an agent (the shared App identity) adds ready inside the window.
+  it.each([
+    { name: 'the POST never landed', landed: null, agent: ['ac/status:ready'] },
+    { name: 'the POST never landed (agent left todo)', landed: null, agent: ['ac/status:todo', 'ac/status:ready'] },
+    { name: 'the POST landed unacknowledged', landed: ['ac/status:todo', 'ac/status:ready'], agent: null }
+  ])('never adopts an App ready-add after a timed-out POST ($name)', async ({ landed, agent }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, landed, { acked: false })
+    if (agent) h.store.relabel(c.issueNumber, agent, 'app')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unattributed')
+    // Neither a graph doorbell nor a later tick dispatches it; an agent label never un-parks the flag.
+    await h.ring(c.issueNumber, 'graph-2')
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect((await h.card(c.id)).needsAttention).toBe(true)
+  })
+
   it.each([{ labels: ['ac/status:ready'] }, { labels: ['ac/status:todo', 'ac/status:ready'] }])(
-    'never adopts $labels re-added by an agent using the same App after a human removal',
+    'escalates at once, not retrying forever, when an agent re-adds $labels after a human removal (two App ready-adds)',
     async ({ labels }) => {
       const h = await graphHarness()
       const c = await failPromotion(h, labels)
-      const receipt = (await h.card(c.id)).promotionReadyEventId
-      expect(receipt).not.toBeNull()
       h.store.relabel(
         c.issueNumber,
         labels.filter((label) => label !== 'ac/status:ready'),
@@ -972,58 +1016,24 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       h.store.relabel(c.issueNumber, labels, 'app')
       await h.dispatcher.tick()
       await h.dispatcher.settle()
+      await expectEscalated(h, c, 'unattributed')
       await h.ring(c.issueNumber, 'graph-2')
       expect(h.sent).toEqual([])
-      expect(await h.card(c.id)).toMatchObject({
-        status: 'todo',
-        promotionPending: false,
-        promotionReadyEventId: null
-      })
     }
   )
 
-  it('adopts our ready event stamped at :00 when the response Date is :01', async () => {
+  it('a human re-adding ready un-parks an escalated card through the label doorbell', async () => {
     const h = await graphHarness()
-    h.clock.advance(Date.parse('2026-10-16T00:00:00.400Z') - h.clock.now())
-    const c = await h.addCard(['ac/status:todo'])
-    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
-    h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
-    vi.spyOn(h.store, 'applyPlan').mockImplementationOnce(async (_repo, n, _observed, _plan, onLabelAdded) => {
-      h.store.relabel(n, ['ac/status:todo', 'ac/status:ready'], 'app')
-      const event = [...h.store.events.get(n)!].reverse().find((e) => e.label?.name === 'ac/status:ready')!
-      event.created_at = '2026-10-16T00:00:00.000Z'
-      await onLabelAdded?.('ac/status:ready', new Date('2026-10-16T00:00:01.000Z'))
-      throw new Error('label write timed out')
-    })
-    await h.ring(c.issueNumber)
-    const pending = await h.card(c.id)
-    expect(pending.promotionReadyEventId).not.toBeNull()
-    expect(Date.parse('2026-10-16T00:00:00.000Z')).not.toBe(Date.parse('2026-10-16T00:00:01.000Z'))
-    await h.dispatcher.tick()
-    await h.dispatcher.settle()
-    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
-    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
-  })
-
-  it('does not adopt an agent ready re-add in the same second after a human restores todo', async () => {
-    const h = await graphHarness()
-    const c = await failPromotion(h, ['ac/status:ready'])
-    const ours = (await h.card(c.id)).promotionReadyEventId
-    expect(ours).not.toBeNull()
-    h.store.relabel(c.issueNumber, ['ac/status:todo'], 'human')
+    const c = await failPromotion(h, null, { acked: false })
     h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
-    const events = h.store.events.get(c.issueNumber)!
-    const ownEvent = events.find((event) => event.id === Number(ours))!
-    const agent = [...events]
-      .reverse()
-      .find((event) => event.event === 'labeled' && event.label?.name === 'ac/status:ready')!
-    expect(agent.id).not.toBe(ownEvent.id)
-    agent.created_at = ownEvent.created_at
     await h.dispatcher.tick()
     await h.dispatcher.settle()
-    await h.ring(c.issueNumber, 'graph-2')
-    expect(h.sent).toEqual([])
-    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, promotionReadyEventId: null })
+    await expectEscalated(h, c, 'unattributed')
+    h.store.relabel(c.issueNumber, [], 'human')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
+    await h.ringLabel(c.issueNumber)
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', needsAttention: false, attentionReason: null })
   })
 
   it('a graph doorbell does not skip a pending promotion backoff, and a human doorbell does', async () => {
@@ -1041,16 +1051,16 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(false)
     expect(h.store.reads.length).toBeGreaterThan(reads)
     const afterHuman = await h.card(c.id)
-    expect(afterHuman).toMatchObject({ promotionPending: true, recoveryChecks: 1 })
+    expect(afterHuman).toMatchObject({ promotionPending: true, recoveryChecks: 1, promotionChecks: 2 })
     expect(afterHuman.recoveryCheckAt!.getTime()).not.toBe(backed.recoveryCheckAt!.getTime())
   })
 
   it.each(['tick', 'doorbell'] as const)(
-    'a thrown %s read preserves the receipt and a later tick repairs',
+    'a thrown %s read preserves the intent and a later tick repairs',
     async (trigger) => {
       const h = await graphHarness()
       const c = await failPromotion(h, ['ac/status:ready'])
-      const receipt = (await h.card(c.id)).promotionReadyEventId
+      const { promotionEventCursor } = await h.card(c.id)
       vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
       if (trigger === 'doorbell')
         await expect(h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).rejects.toThrow('GitHub 503')
@@ -1058,8 +1068,10 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await h.card(c.id)).toMatchObject({
         status: 'todo',
         promotionPending: true,
-        promotionReadyEventId: receipt,
-        recoveryChecks: 1
+        promotionEventCursor,
+        promotionPostAccepted: true,
+        recoveryChecks: 1,
+        promotionChecks: 1
       })
       const reads = h.store.reads.length
       await h.dispatcher.tick()
@@ -1072,7 +1084,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await h.card(c.id)).toMatchObject({
         status: 'running',
         promotionPending: false,
-        promotionReadyEventId: null
+        promotionEventCursor: null
       })
     }
   )
@@ -1103,9 +1115,47 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     }
   )
 
+  // Vera's blocker 2: inputs that never become conclusive must surface instead of stranding the card.
+  it.each([
+    { name: 'events that never show the add', hide: 'events' as const },
+    { name: 'a window past the 1,000-event read bound', hide: 'unreadable' as const }
+  ])('escalates after $name once the check cap is spent', async ({ hide }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'])
+    if (hide === 'events') h.store.events.set(c.issueNumber, [])
+    else h.store.unreadable.add(c.issueNumber)
+    // Human doorbells keep resetting the backoff, so the count cap, not the age cap, is what ends it.
+    for (let check = 1; check < MAX_PROMOTION_CHECKS; check++) {
+      h.clock.advance(1000)
+      expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(false)
+      expect(await h.card(c.id)).toMatchObject({ promotionPending: true, promotionChecks: check })
+    }
+    expect(h.log.warn).not.toHaveBeenCalledWith(expect.anything(), 'kanban: pending promotion needs human attention')
+    h.clock.advance(1000)
+    await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')
+    await expectEscalated(h, c, 'unresolved')
+    expect(h.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ checks: MAX_PROMOTION_CHECKS - 1 }),
+      'kanban: pending promotion needs human attention'
+    )
+  })
+
+  it('escalates an inconclusive promotion by age even when its reads keep throwing', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.store.events.set(c.issueNumber, [])
+    await h.dispatcher.tick()
+    expect(await h.card(c.id)).toMatchObject({ promotionPending: true, promotionChecks: 1 })
+    vi.spyOn(h.store, 'readCard').mockRejectedValue(new Error('GitHub 503'))
+    h.clock.advance(MAX_PROMOTION_AGE_MS)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    await expectEscalated(h, c, 'unresolved')
+  })
+
   it('a failed promotion rollback keeps a concurrent mode change (#19) and still flags the card', async () => {
     const h = await graphHarness()
-    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'], true)
+    const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'], { changeMode: true })
     expect(await h.card(c.id)).toMatchObject({
       status: 'todo',
       stateRevision: c.stateRevision + 2n,
@@ -1131,7 +1181,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
     expect(await prisma.kanbanRun.count()).toBe(0)
-    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
     // The recovery read happened once; the cleared flag is not re-read on later ticks.
     const reads = h.store.reads.length
     h.clock.advance(60 * 60_000)
@@ -1150,7 +1200,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
-    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
   })
 
   // Vera's #18 sequence: the promotion write fails, a human parks the card, then an agent (the App bot) or another bot readies it.
@@ -1181,12 +1231,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await prisma.kanbanRun.count()).toBe(0)
       expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
       expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:ready'])
-      if (!doorbell) {
-        expect(h.log.info).toHaveBeenCalledWith(
-          { boardId: h.board.id, issueNumber: c.issueNumber },
-          'kanban: refused a pending promotion whose ready label is not ours'
-        )
-      }
+      // Without the doorbell the pending promotion saw the swap, so it went to a human rather than silently to todo.
+      if (!doorbell) await expectEscalated(h, c, 'unattributed')
     }
   )
 
@@ -1199,7 +1245,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
   })
 
-  it('refuses a half-landed promotion once a blocker has reopened', async () => {
+  it('escalates a half-landed promotion once a blocker has reopened', async () => {
     const h = await graphHarness()
     const c = await failPromotion(h, ['ac/status:ready'])
     h.graphs.set(c.issueNumber, {
@@ -1208,12 +1254,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     })
     await h.dispatcher.tick()
     await h.dispatcher.settle()
-    expect(h.sent).toEqual([])
-    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
-    expect(h.log.info).toHaveBeenCalledWith(
-      { boardId: h.board.id, issueNumber: c.issueNumber },
-      'kanban: refused a pending promotion whose blockers reopened'
-    )
+    await expectEscalated(h, c, 'blockers_reopened')
   })
 
   it('rejects a stale graph CAS after mismatch ingest advances the card revision', async () => {

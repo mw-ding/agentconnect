@@ -12,6 +12,17 @@ import type {
 
 const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
 
+/** No promotion in flight and no human flag: what every settled status move writes. */
+export const PROMOTION_CLEARED = {
+  promotionPending: false,
+  promotionEventCursor: null,
+  promotionPostAccepted: false,
+  promotionStartedAt: null,
+  promotionChecks: 0,
+  needsAttention: false,
+  attentionReason: null
+} as const
+
 export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo {
   constructor(private readonly db: PrismaLike) {}
 
@@ -123,15 +134,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision },
-      data: {
-        status: to,
-        stateRevision: { increment: 1 },
-        githubSyncedAt: new Date(),
-        promotionPending: false,
-        promotionReadyEventId: null,
-        promotionWriteStartedAt: null,
-        promotionReadyNotAfter: null
-      }
+      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED }
     })
     return count === 1
   }
@@ -139,8 +142,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async beginPromotion(
     cardId: string,
     expectedStateRevision: bigint,
-    notBefore: Date,
-    notAfter: Date
+    eventCursor: bigint,
+    startedAt: Date
   ): Promise<boolean> {
     // The ready CAS and the intent are one write, so no claim or crash can see ready without the intent.
     const { count } = await this.db.kanbanCard.updateMany({
@@ -149,64 +152,37 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         status: 'ready',
         stateRevision: { increment: 1 },
         githubSyncedAt: new Date(),
+        ...PROMOTION_CLEARED,
         promotionPending: true,
-        promotionReadyEventId: null,
-        promotionWriteStartedAt: notBefore,
-        promotionReadyNotAfter: notAfter,
+        promotionEventCursor: eventCursor,
+        promotionStartedAt: startedAt,
         // A minute out, so a tick cannot settle the card while this write is still in flight.
-        recoveryCheckAt: new Date(notBefore.getTime() + 60_000),
+        recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
         recoveryChecks: 0
       }
     })
     return count === 1
   }
 
-  async notePromotionEvent(
-    cardId: string,
-    eventId: bigint | null,
-    bounds?: { notBefore: Date; notAfter: Date }
-  ): Promise<void> {
+  async notePromotionPosted(cardId: string): Promise<void> {
     await this.db.kanbanCard.updateMany({
       where: { id: cardId, promotionPending: true },
-      data: {
-        ...(eventId != null ? { promotionReadyEventId: eventId } : {}),
-        ...(bounds ? { promotionWriteStartedAt: bounds.notBefore, promotionReadyNotAfter: bounds.notAfter } : {})
-      }
+      data: { promotionPostAccepted: true }
     })
   }
 
   async clearPromotionIntent(cardId: string): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, status: 'ready', promotionPending: true },
-      data: {
-        promotionPending: false,
-        promotionReadyEventId: null,
-        promotionWriteStartedAt: null,
-        promotionReadyNotAfter: null
-      }
+      data: PROMOTION_CLEARED
     })
     return count === 1
   }
 
-  async revertPromotion(
-    cardId: string,
-    expectedStateRevision: bigint,
-    readyEventId: bigint | null,
-    notBefore: Date | null,
-    notAfter: Date | null
-  ): Promise<boolean> {
+  async revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
-      data: {
-        status: 'todo',
-        stateRevision: { increment: 1 },
-        promotionPending: true,
-        promotionReadyEventId: readyEventId,
-        promotionWriteStartedAt: notBefore,
-        promotionReadyNotAfter: notAfter,
-        recoveryCheckAt: null,
-        recoveryChecks: 0
-      }
+      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
+      data: { status: 'todo', stateRevision: { increment: 1 }, recoveryCheckAt: null, recoveryChecks: 0 }
     })
     return count === 1
   }

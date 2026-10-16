@@ -24,26 +24,19 @@ export class KanbanLabelWriter {
     const labelsChanged = plan.addLabels.length > 0 || plan.removeLabels.length > 0
     if (!labelsChanged && !plan.issueState && !plan.comment) return
     const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'write')
-    let serverDate: Date | null = null
-    const fetchImpl: FetchLike = async (url, init) => {
-      const response = await (this.deps.fetchImpl ?? fetch)(url, init)
-      const date = response.headers.get('date')
-      serverDate = date && Number.isFinite(Date.parse(date)) ? new Date(date) : null
-      return response
-    }
     const call = (path: string, method: 'PATCH' | 'POST' | 'DELETE', body?: unknown) =>
       githubRequest<unknown>(`/repositories/${repo.repoId}/issues/${issueNumber}${path}`, {
         method,
         auth: grant.token,
         body,
-        fetchImpl,
+        fetchImpl: this.deps.fetchImpl,
         baseUrl: this.deps.baseUrl
       })
 
     // Add before remove so GitHub never shows zero status labels mid-write. The observer runs before the removal.
     for (const label of new Set(plan.addLabels)) {
       await call('/labels', 'POST', { labels: [label] })
-      await onLabelAdded?.(label, serverDate)
+      await onLabelAdded?.(label)
     }
     for (const label of new Set(plan.removeLabels)) {
       try {

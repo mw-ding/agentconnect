@@ -5176,9 +5176,10 @@ export interface KanbanRecoveryDue {
   cardId: string
   issueNumber: number
   promotion: boolean
-  promotionReadyEventId: bigint | null
-  promotionWriteStartedAt: Date | null
-  promotionReadyNotAfter: Date | null
+  promotionEventCursor: bigint | null
+  promotionPostAccepted: boolean
+  promotionStartedAt: Date | null
+  promotionChecks: number
   recoveryCheckAt: Date | null
 }
 
@@ -5190,22 +5191,22 @@ export interface KanbanDispatchRepo {
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
-  // Non-terminal mismatch-parked cards and todo cards with a pending promotion whose re-read is due, most overdue first.
+  // Due non-terminal cards that are mismatch-parked, flagged for attention, or hold a pending promotion; most overdue first.
   listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]>
-  // The status a pre-dispatch mismatch parked the card in, or null when its latest run is not an ended mismatch.
+  // The status a mismatch or an attention flag parked the card in; null when neither holds it.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
   ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
-  // Push the card's next recovery re-read out exponentially; a changed `observed` fingerprint restarts the backoff.
+  // Push the next re-read out exponentially (a changed `observed` restarts it); counts a pending promotion's check.
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
   resetRecovery(boardId: string, issueNumber: number): Promise<void>
   // The card whose promotion is still pending (DB todo after a failed write, or DB ready while the intent is open).
   getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null>
-  // Remember the event id once a pending promotion's ready-add is identified.
-  notePromotionEvent(cardId: string, eventId: bigint): Promise<void>
   // Settle a pending promotion: `repaired` adopts it as ready, otherwise the flag clears and a ready intent returns to todo.
   settlePromotion(cardId: string, repaired: boolean): Promise<boolean>
+  // Give up on a pending promotion: back to todo, flagged for a human; false when it was already settled.
+  escalatePromotion(cardId: string, reason: string): Promise<boolean>
   // Recheck the claim after the GitHub read, without changing its DB-selected mode.
   isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
   // Accept only the open run with the current card revision, placement, mode, and daemon epoch.
@@ -5236,21 +5237,11 @@ export interface KanbanCardRepo {
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** CAS todo to ready and open the in-flight intent in one write, so a claim or crash never sees one without the other. */
-  beginPromotion(cardId: string, expectedStateRevision: bigint, notBefore: Date, notAfter: Date): Promise<boolean>
-  /** Store the ready-label event id, and tighten the search window, while the intent is still open. */
-  notePromotionEvent(
-    cardId: string,
-    eventId: bigint | null,
-    bounds?: { notBefore: Date; notAfter: Date }
-  ): Promise<void>
+  beginPromotion(cardId: string, expectedStateRevision: bigint, eventCursor: bigint, startedAt: Date): Promise<boolean>
+  /** The ready POST returned success, so a lone App ready-add after the cursor may be adopted as ours. */
+  notePromotionPosted(cardId: string): Promise<void>
   /** The label write finished; drop the intent so the ready card can be claimed. */
   clearPromotionIntent(cardId: string): Promise<boolean>
-  /** Undo a promotion whose label write failed and flag it pending, so recovery re-reads what landed on GitHub. */
-  revertPromotion(
-    cardId: string,
-    expectedStateRevision: bigint,
-    readyEventId: bigint | null,
-    notBefore: Date | null,
-    notAfter: Date | null
-  ): Promise<boolean>
+  /** Undo a promotion whose label write failed, keeping its intent so recovery judges what landed on GitHub. */
+  revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean>
 }
