@@ -1,0 +1,181 @@
+// Kanban card state machine (issue #2 D5): pure; human label edits are inputs, and our own echoes no-op by state comparison.
+
+export const KANBAN_STATUSES = ['triage', 'todo', 'ready', 'running', 'blocked', 'review', 'done', 'archived'] as const
+export type KanbanStatus = (typeof KANBAN_STATUSES)[number]
+
+export const STATUS_LABEL_PREFIX = 'ac/status:'
+
+/** Statuses a human may still move a leased card to; every other edit reverts until the lease ends. */
+export const LEASED_HUMAN_STATUSES: ReadonlySet<KanbanStatus> = new Set(['blocked', 'triage', 'archived'])
+
+/** Exhaustive transition table: from → the statuses it may move to (self-moves are no-ops, never listed). */
+export const KANBAN_TRANSITIONS: Readonly<Record<KanbanStatus, readonly KanbanStatus[]>> = {
+  triage: ['todo', 'ready', 'blocked', 'archived'],
+  todo: ['ready', 'blocked', 'triage', 'archived'],
+  ready: ['running', 'todo', 'blocked', 'triage', 'archived'],
+  running: ['review', 'done', 'blocked', 'ready', 'triage', 'archived'],
+  blocked: ['todo', 'ready', 'triage', 'archived'],
+  review: ['done', 'ready', 'blocked', 'triage', 'archived'],
+  done: ['ready', 'triage'],
+  archived: ['triage']
+}
+
+export function isKanbanStatus(value: string): value is KanbanStatus {
+  return (KANBAN_STATUSES as readonly string[]).includes(value)
+}
+
+export function statusLabel(status: KanbanStatus): string {
+  return `${STATUS_LABEL_PREFIX}${status}`
+}
+
+export function canTransition(from: KanbanStatus, to: KanbanStatus): boolean {
+  return KANBAN_TRANSITIONS[from].includes(to)
+}
+
+/** The GitHub issue state a status implies. */
+export function issueStateFor(status: KanbanStatus): { state: 'open' } | { state: 'closed'; reason: IssueCloseReason } {
+  if (status === 'done') return { state: 'closed', reason: 'completed' }
+  if (status === 'archived') return { state: 'closed', reason: 'not_planned' }
+  return { state: 'open' }
+}
+
+export type IssueCloseReason = 'completed' | 'not_planned'
+
+export interface CardSnapshot {
+  /** The CP's current status for the card. */
+  status: KanbanStatus
+  /** A live run lease (worker or verifier) holds the card. */
+  leased: boolean
+}
+
+export interface ObservedIssue {
+  /** Every label currently on the issue, as GitHub reports it. */
+  labels: readonly string[]
+  state: 'open' | 'closed'
+  stateReason?: string | null
+}
+
+export type LabelPlanOutcome =
+  'noop' | 'accepted' | 'drift_repaired' | 'reverted_leased' | 'reverted_illegal' | 'restored_missing'
+
+export interface LabelPlan {
+  outcome: LabelPlanOutcome
+  /** The status after the plan applies; equals the snapshot status unless accepted or drift-repaired. */
+  status: KanbanStatus
+  /** An accepted edit moved a leased card, so the caller must revoke the lease (never transfer it). */
+  releaseLease: boolean
+  /** The status a human edit asked for, when one was detected. */
+  requested?: KanbanStatus
+  addLabels: string[]
+  removeLabels: string[]
+  /** Desired issue-state change, only when observed state differs. */
+  issueState?: { state: 'open' } | { state: 'closed'; reason: IssueCloseReason }
+  /** Body-free CP comment explaining a repair or revert; absent on silent outcomes. */
+  comment?: string
+}
+
+/** Split an issue's labels into recognized statuses and malformed `ac/status:*` labels. */
+export function parseStatusLabels(labels: readonly string[]): { statuses: KanbanStatus[]; malformed: string[] } {
+  const statuses: KanbanStatus[] = []
+  const malformed: string[] = []
+  for (const label of labels) {
+    if (!label.startsWith(STATUS_LABEL_PREFIX)) continue
+    const value = label.slice(STATUS_LABEL_PREFIX.length)
+    if (isKanbanStatus(value)) {
+      if (!statuses.includes(value)) statuses.push(value)
+    } else malformed.push(label)
+  }
+  return { statuses, malformed }
+}
+
+/** Why a requested status is refused for this card, or undefined when it may apply. */
+export function refuseRequest(card: CardSnapshot, requested: KanbanStatus): 'leased' | 'illegal' | undefined {
+  if (card.leased && !LEASED_HUMAN_STATUSES.has(requested)) return 'leased'
+  return canTransition(card.status, requested) ? undefined : 'illegal'
+}
+
+/** Reconcile observed labels to exactly one status label: one new label is a request; several are drift. */
+export function planLabelReconcile(card: CardSnapshot, observed: ObservedIssue): LabelPlan {
+  const { statuses, malformed } = parseStatusLabels(observed.labels)
+  const requests = statuses.filter((s) => s !== card.status)
+  const drift = statuses.length > 1 || malformed.length > 0
+
+  let outcome: LabelPlanOutcome
+  let status = card.status
+  let requested: KanbanStatus | undefined
+  if (statuses.length === 0 && malformed.length === 0) {
+    outcome = 'restored_missing'
+  } else if (requests.length === 0) {
+    outcome = drift ? 'drift_repaired' : 'noop'
+  } else if (requests.length > 1) {
+    outcome = 'drift_repaired'
+  } else {
+    requested = requests[0]!
+    const refusal = refuseRequest(card, requested)
+    if (refusal === undefined) {
+      status = requested
+      outcome = drift ? 'drift_repaired' : 'accepted'
+    } else {
+      outcome = refusal === 'leased' ? 'reverted_leased' : 'reverted_illegal'
+    }
+  }
+
+  const keep = statusLabel(status)
+  const removeLabels = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+  const addLabels = observed.labels.includes(keep) ? [] : [keep]
+  const desired = issueStateFor(status)
+  const issueState = issueStateDiffers(desired, observed) ? desired : undefined
+  const releaseLease = card.leased && status !== card.status
+  const plan: LabelPlan = {
+    outcome,
+    status,
+    releaseLease,
+    addLabels,
+    removeLabels,
+    ...(issueState ? { issueState } : {})
+  }
+  if (requested) plan.requested = requested
+  const comment = renderPlanComment(card, plan, statuses, malformed)
+  if (comment) plan.comment = comment
+  return plan
+}
+
+function issueStateDiffers(
+  desired: { state: 'open' } | { state: 'closed'; reason: IssueCloseReason },
+  observed: ObservedIssue
+): boolean {
+  if (desired.state !== observed.state) return true
+  return desired.state === 'closed' && observed.stateReason != null && observed.stateReason !== desired.reason
+}
+
+/** Fixed-template comment text: it names only statuses and labels, never issue content. */
+function renderPlanComment(
+  card: CardSnapshot,
+  plan: LabelPlan,
+  statuses: readonly KanbanStatus[],
+  malformed: readonly string[]
+): string | undefined {
+  const label = (s: KanbanStatus) => `\`${statusLabel(s)}\``
+  switch (plan.outcome) {
+    case 'noop':
+    case 'accepted':
+      return undefined
+    case 'restored_missing':
+      return `AgentConnect Kanban: this card had no status label, so ${label(card.status)} was restored.`
+    case 'drift_repaired': {
+      const seen = [...statuses.map(label), ...malformed.map((l) => `\`${l}\``)].join(', ')
+      return `AgentConnect Kanban: a card carries exactly one status label. Found ${seen}; kept ${label(plan.status)}.`
+    }
+    case 'reverted_leased':
+      return (
+        `AgentConnect Kanban: this card is leased to a running agent, so only ` +
+        `${[...LEASED_HUMAN_STATUSES].map(label).join(', ')} are accepted until the lease ends. ` +
+        `Reverted ${label(plan.requested!)} to ${label(card.status)}.`
+      )
+    case 'reverted_illegal':
+      return (
+        `AgentConnect Kanban: ${label(card.status)} cannot move to ${label(plan.requested!)}. ` +
+        `Allowed next statuses: ${KANBAN_TRANSITIONS[card.status].map(label).join(', ')}.`
+      )
+  }
+}
