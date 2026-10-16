@@ -47,7 +47,7 @@ export interface BuildAppDeps {
   fastify?: FastifyServerOptions
   /** GitHub REST fetch override — integration tests stub the API without network. */
   githubFetch?: FetchLike
-  /** PAT used for Kanban GitHub calls only when the GitHub App is not configured. */
+  /** Dev/test only. PAT for Kanban GitHub calls when the App is not configured; not a production setting. */
   kanbanAccessToken?: string
   /** npm dist-tags fetch override for the daemon "latest version" resolver — tests
    *  stub it (absent under NODE_ENV=test ⇒ the resolver is inert, no network). */

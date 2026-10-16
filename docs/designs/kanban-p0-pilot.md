@@ -255,7 +255,8 @@ token itself cannot write. Write mode is those three at write; `workflows: write
 follows contents write. Card reads use `issues: read`. Label writes and the
 daemon-owned final poster use `issues: write` and never enter the agent
 environment. If the App is not configured, the card store and poster keep the
-injected PAT and log that they are doing so.
+injected PAT (`kanbanAccessToken`) and log that they are doing so. That option
+is dev/test only; a production board uses the App installation token.
 
 Webhook delivery: point the App's webhook at the relay's `POST /webhooks/github`.
 The relay checks `X-Hub-Signature-256` with `GITHUB_APP_WEBHOOK_SECRET`, replaced

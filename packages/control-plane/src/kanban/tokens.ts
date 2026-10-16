@@ -3,7 +3,7 @@ import type { InstallationTokenService, MintedGitCred } from '../github/installa
 
 export type KanbanTokenMinter = Pick<InstallationTokenService, 'mintKanbanCard' | 'mintKanbanRun'>
 
-/** App tokens when the GitHub App is configured; otherwise the injected PAT, with one warning. */
+/** App tokens when the GitHub App is configured; otherwise a dev/test injected PAT, with one warning. */
 export function kanbanTokenSource(opts: {
   app?: KanbanTokenMinter
   injectedToken?: string

@@ -252,7 +252,7 @@ export interface ContainerOpts {
   fastify?: FastifyServerOptions
   /** GitHub REST fetch override — integration tests stub the API without network. */
   githubFetch?: FetchLike
-  /** PAT used for Kanban GitHub calls only when the GitHub App is not configured. */
+  /** Dev/test only. PAT for Kanban GitHub calls when the App is not configured; not a production setting. */
   kanbanAccessToken?: string
   /** Slack Web API fetch override for Session membership checks. */
   slackFetch?: FetchLike
