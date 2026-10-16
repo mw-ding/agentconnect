@@ -31,7 +31,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function harness(git = false, modes = ['read-only', 'agent']) {
+async function harness(git = false, modes = ['read-only', 'agent'], secrets?: { name: string; value: string }[]) {
   const root = mkdtempSync(join(tmpdir(), 'ac-kanban-'))
   roots.push(root)
   writeFileSync(
@@ -69,7 +69,8 @@ async function harness(git = false, modes = ['read-only', 'agent']) {
       runtime: 'claude',
       workspace: { mode: 'from-scratch', path: workspace },
       integrations: [],
-      output: { mode: 'medium' }
+      output: { mode: 'medium' },
+      ...(secrets ? { runtimeOverrides: { secrets } } : {})
     })
   )
   const host = {
@@ -257,6 +258,69 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
   expect(store.listKanbanReports(1)).toEqual([])
   expect(store.hasKanbanReport(dispatch.leaseId)).toBe(true)
   store.close()
+})
+
+it('masks a secret in the stored terminal and in the GitHub comment body', async () => {
+  const secret = 'sk-kanban-secret-value'
+  const h = await harness(false, ['read-only', 'agent'], [{ name: 'GH_TOKEN', value: secret }])
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanCommentToken').mockResolvedValue({ token: 'ghs_test' })
+  ;(h.daemon as any).cpClient = {
+    state: 'READY',
+    stop: async () => {},
+    kanbanHeartbeat: async () => ({ superseded: [] }),
+    kanbanReport: async (payload: { leaseId: string }) => ({ leaseId: payload.leaseId, accepted: true })
+  }
+  const posted: string[] = []
+  const realFetch = globalThis.fetch.bind(globalThis)
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = String(input instanceof Request ? input.url : input)
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
+    if (method === 'POST' && url.includes('/issues/42/comments')) {
+      posted.push(String(init?.body ?? ''))
+      return Promise.resolve(new Response(JSON.stringify({ id: 99 }), { status: 201 }))
+    }
+    return realFetch(input as RequestInfo, init)
+  })
+  let release!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  h.host.prompt.mockImplementationOnce(async () => {
+    await held
+    return { stopReason: 'end_turn' }
+  })
+  try {
+    h.worker.dispatch(dispatch)
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
+    const card = buildKanbanMessage(dispatch, 'trace')
+    ;(h.daemon as any).recordKanbanTerminal({
+      agentId: AGENT,
+      platform: card.platform,
+      channel: card.channel,
+      thread: card.thread,
+      transportScope: card.transportScope,
+      terminal: {
+        outcome: 'blocked',
+        blockKind: 'needs_input',
+        reasonCode: 'agent_blocked',
+        summary: `shipped with ${secret}`,
+        reason: `blocked on ${secret}`
+      }
+    })
+    const row = (h.store as any).db.prepare('SELECT entry FROM kanban_terminals').get() as { entry: string }
+    expect(row.entry).toContain('[secret:GH_TOKEN]')
+    expect(row.entry).not.toContain(secret)
+    const stored = JSON.parse(row.entry) as { summary: string; reason: string }
+    expect(stored.summary).toBe('shipped with [secret:GH_TOKEN]')
+    expect(stored.reason).toBe('blocked on [secret:GH_TOKEN]')
+    release()
+    await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0))
+    expect(posted.join('\n')).toContain('[secret:GH_TOKEN]')
+    expect(posted.join('\n')).not.toContain(secret)
+  } finally {
+    release()
+    fetchSpy.mockRestore()
+  }
 })
 
 it('records one terminal per lease and queues its comment only after the report is accepted', () => {
