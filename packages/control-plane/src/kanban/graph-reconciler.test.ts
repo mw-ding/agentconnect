@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { OrgId } from '../domain/ids.js'
 import type { KanbanBoardRecord, KanbanCardRecord } from '../persistence/ports.js'
-import type { KanbanStatus } from './card-state.js'
+import type { KanbanStatus, LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardLink } from './card-store.js'
 import { KanbanGraphReconciler, planGraphPromotion } from './graph-reconciler.js'
 
@@ -92,12 +92,10 @@ function make(
         : null
     ),
     readGraph: vi.fn(async (_r: unknown, n: number) => graphs[n] ?? graph()),
-    applyPlan: vi.fn(
-      async (_r: unknown, n: number, _o: unknown, plan: { addLabels: string[]; removeLabels: string[] }) => {
-        const next = labels.get(n)!.filter((l) => !plan.removeLabels.includes(l))
-        labels.set(n, [...next, ...plan.addLabels])
-      }
-    )
+    applyPlan: vi.fn(async (_r: unknown, n: number, _o: unknown, plan: LabelPlan) => {
+      const next = labels.get(n)!.filter((l) => !plan.removeLabels.includes(l))
+      labels.set(n, [...next, ...plan.addLabels])
+    })
   }
   const reconciler = new KanbanGraphReconciler({ cards, store, log: { debug: vi.fn() } })
   return { reconciler, cards, store, labels, db }
