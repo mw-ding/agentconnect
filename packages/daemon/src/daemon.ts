@@ -1007,7 +1007,6 @@ import type {
   TaskList,
   TaskListReq,
   KanbanDispatch,
-  KanbanDispatchOk,
   KanbanDispatchRefusal,
   McpAppRpc,
   McpAppRpcResult,
@@ -26500,7 +26499,10 @@ export class Daemon {
   }
 
   // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.
-  private async startKanban(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult> {
+  private async startKanban(
+    d: KanbanDispatch,
+    onSessionReady: (sessionId: string) => void
+  ): Promise<KanbanStartResult> {
     const msg = buildKanbanMessage(d, randomUUID())
     const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
     let admitted!: (result: { accepted: boolean; reason?: string }) => void

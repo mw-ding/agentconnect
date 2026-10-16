@@ -32,7 +32,7 @@ function harness() {
     heartbeat: vi.fn(async () => ({ superseded: [] as string[] })),
     report: vi.fn(async (r: KanbanReport) => ({ leaseId: r.leaseId, accepted: true }))
   }
-  const start = vi.fn((_d: KanbanDispatch, ready: (id: string) => void) => {
+  const start = vi.fn(async (_d: KanbanDispatch, ready: (id: string) => void) => {
     ready('acp-1')
     return { accepted: true as const, sessionKey: 'session-42', done }
   })
@@ -43,21 +43,21 @@ function harness() {
     cp: () => cp,
     start,
     cancel,
-    gate: () => state.refusal,
+    gate: async () => state.refusal,
     probe: { turnActive: () => state.active, liveBackgroundTasks: () => state.tasks },
     outbox: {
-      has: (id) => reports.has(id),
-      reserve: (id) => {
+      has: async (id) => reports.has(id),
+      reserve: async (id) => {
         reports.set(id, null)
       },
-      release: (id) => {
+      release: async (id) => {
         reports.delete(id)
       },
-      put: (r) => {
+      put: async (r) => {
         reports.set(r.leaseId, r)
       },
-      list: (n) => [...reports.values()].filter((r): r is KanbanReport => r !== null).slice(0, n),
-      remove: (id) => {
+      list: async (n) => [...reports.values()].filter((r): r is KanbanReport => r !== null).slice(0, n),
+      remove: async (id) => {
         reports.set(id, null)
       }
     }
@@ -75,8 +75,8 @@ describe('Kanban worker leases', () => {
   it('deduplicates dispatches and heartbeats only observed live turns on the timer', async () => {
     const h = harness()
     h.worker.start()
-    expect(h.worker.dispatch(dispatch).accepted).toBe(true)
-    expect(h.worker.dispatch(dispatch).accepted).toBe(true)
+    expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
+    expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(1)
     await h.clock.advance(60_000)
     await vi.waitFor(() => expect(h.cp.heartbeat).toHaveBeenCalledTimes(1))
@@ -96,17 +96,17 @@ describe('Kanban worker leases', () => {
     expect(h.cp.heartbeat).toHaveBeenCalledTimes(1)
   })
 
-  it('does not execute an already accepted lease after a daemon restart', () => {
+  it('does not execute an already accepted lease after a daemon restart', async () => {
     const h = harness()
     h.reports.set(dispatch.leaseId, null)
-    expect(h.worker.dispatch(dispatch).accepted).toBe(true)
+    expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
     expect(h.start).not.toHaveBeenCalled()
   })
 
-  it('refuses admission without running a turn', () => {
+  it('refuses admission without running a turn', async () => {
     const h = harness()
     h.state.refusal = 'write_needs_worktree'
-    expect(h.worker.dispatch({ ...dispatch, mode: 'write' })).toEqual({
+    expect(await h.worker.dispatch({ ...dispatch, mode: 'write' })).toEqual({
       leaseId: dispatch.leaseId,
       accepted: false,
       reason: 'write_needs_worktree'
@@ -116,7 +116,7 @@ describe('Kanban worker leases', () => {
 
   it('keeps a settled turn alive while background tasks run, then reports once', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     h.state.tasks = 1
     expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed' })).toBe(true)
     expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'failed' })).toBe(false)
@@ -126,13 +126,13 @@ describe('Kanban worker leases', () => {
     h.state.tasks = 0
     await h.worker.tick()
     expect(h.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'completed', sessionId: 'acp-1' }))
-    expect(h.worker.dispatch(dispatch).accepted).toBe(true)
+    expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(1)
   })
 
   it('holds body-free reports through a CP outage and retryable failures', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     h.state.ready = false
     await h.settle()
     expect(h.reports.get(dispatch.leaseId)).toMatchObject({
@@ -149,7 +149,7 @@ describe('Kanban worker leases', () => {
 
   it('reports turn failures without sending the error text to the CP', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     h.state.active = false
     h.reject(new Error('sensitive provider message'))
     await Promise.resolve()
@@ -160,7 +160,7 @@ describe('Kanban worker leases', () => {
 
   it('cancels superseded turns and stops beating or reporting them', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     h.cp.heartbeat.mockResolvedValueOnce({ superseded: [dispatch.leaseId] })
     await h.worker.tick()
     expect(h.cancel).toHaveBeenCalledOnce()

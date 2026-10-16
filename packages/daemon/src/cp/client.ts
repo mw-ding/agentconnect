@@ -37,8 +37,6 @@ import type {
   IntegrationChannels,
   IntegrationRevoked,
   IntegrationRevokedOk,
-  KanbanDispatch,
-  KanbanDispatchOk,
   KanbanLeaseHeartbeat,
   KanbanLeaseHeartbeatOk,
   KanbanReport,

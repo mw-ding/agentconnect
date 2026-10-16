@@ -99,6 +99,7 @@ export const canonicalColumns = [
   'lastRunAt',
   'lastTurnOutcome',
   'launchCorrelationId',
+  'leaseId',
   'localExcluded',
   'loopGuardCounted',
   'mainAgentId',

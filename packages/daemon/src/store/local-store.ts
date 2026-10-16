@@ -5151,36 +5151,38 @@ export class LocalStore {
   }
 
   // Retain redacted receipts after ACK so repeated dispatches cannot rerun a completed lease.
-  hasKanbanReport(leaseId: string): boolean {
-    return this.db.prepare('SELECT 1 FROM kanban_reports WHERE leaseId = ?').get(leaseId) !== undefined
+  async hasKanbanReport(leaseId: string): Promise<boolean> {
+    return (await this.db.prepare('SELECT 1 AS one FROM kanban_reports WHERE leaseId = ?').get(leaseId)) !== undefined
   }
 
-  reserveKanbanLease(leaseId: string, queuedAt: number): void {
-    this.db.prepare('INSERT INTO kanban_reports (leaseId, report, queuedAt) VALUES (?, NULL, ?)').run(leaseId, queuedAt)
+  async reserveKanbanLease(leaseId: string, queuedAt: number): Promise<void> {
+    await this.db
+      .prepare('INSERT INTO kanban_reports (leaseId, report, queuedAt) VALUES (?, NULL, ?)')
+      .run(leaseId, queuedAt)
   }
 
-  releaseKanbanLease(leaseId: string): void {
-    this.db.prepare('DELETE FROM kanban_reports WHERE leaseId = ? AND report IS NULL').run(leaseId)
+  async releaseKanbanLease(leaseId: string): Promise<void> {
+    await this.db.prepare('DELETE FROM kanban_reports WHERE leaseId = ? AND report IS NULL').run(leaseId)
   }
 
-  putKanbanReport(report: KanbanReport, queuedAt: number): void {
+  async putKanbanReport(report: KanbanReport, queuedAt: number): Promise<void> {
     const payload = KanbanReport.parse(report)
-    this.db
+    await this.db
       .prepare(
         'INSERT INTO kanban_reports (leaseId, report, queuedAt) VALUES (?, ?, ?) ON CONFLICT(leaseId) DO UPDATE SET report = excluded.report, queuedAt = excluded.queuedAt'
       )
       .run(payload.leaseId, JSON.stringify(payload), queuedAt)
   }
 
-  listKanbanReports(limit: number): KanbanReport[] {
-    const rows = this.db
+  async listKanbanReports(limit: number): Promise<KanbanReport[]> {
+    const rows = (await this.db
       .prepare('SELECT report FROM kanban_reports WHERE report IS NOT NULL ORDER BY queuedAt, leaseId LIMIT ?')
-      .all(limit) as { report: string }[]
+      .all(limit)) as { report: string }[]
     return rows.map((row) => KanbanReport.parse(JSON.parse(row.report)))
   }
 
-  ackKanbanReport(leaseId: string): void {
-    this.db.prepare('UPDATE kanban_reports SET report = NULL WHERE leaseId = ?').run(leaseId)
+  async ackKanbanReport(leaseId: string): Promise<void> {
+    await this.db.prepare('UPDATE kanban_reports SET report = NULL WHERE leaseId = ?').run(leaseId)
   }
 
   /**

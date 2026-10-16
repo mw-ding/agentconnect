@@ -4,7 +4,6 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Daemon } from '../src/daemon.js'
-import { sessionWorktreePath } from '../src/workspace/workspace-manager.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { buildKanbanMessage } from '../src/messages/kanban-message.js'
 import { buildHookMessage } from '../src/messages/hook-message.js'
@@ -99,7 +98,7 @@ async function harness(git = false, modes = ['read-only', 'agent']) {
       gitRepo: 'https://github.com/acme/web',
       isolation: 'shared'
     }
-    const isolated = sessionWorktreePath(agent, key())
+    const isolated = (daemon as any).workspaces.sessionWorktreePath(agent, key())
     execFileSync('git', ['-C', workspace, 'worktree', 'add', '-b', 'card-42', isolated])
     vi.spyOn(daemon as any, 'prepareAgentWorkspace').mockImplementation(async (_agent, _host, request) => {
       if (!request) return workspace
@@ -145,11 +144,11 @@ it('uses the exact GitHub hook coordinates and preserves untrusted-content guida
 describe('Daemon Kanban dispatch', () => {
   it('runs and resumes the GitHub issue session, enforcing read-only after runtime settings', async () => {
     const h = await harness()
-    expect(h.worker.dispatch(dispatch).accepted).toBe(true)
+    expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(1))
-    await vi.waitFor(() => expect(h.store.listKanbanReports(10)).toHaveLength(1))
+    await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
     expect(h.host.setSessionPermissionMode).toHaveBeenLastCalledWith('acp-card', 'read-only')
-    const rec = h.store.getSession(key())!
+    const rec = (await h.store.getSession(key()))!
     expect(rec).toMatchObject({
       externalProvider: 'github',
       externalRealmKey: 'github.com',
@@ -157,17 +156,19 @@ describe('Daemon Kanban dispatch', () => {
       sourceBindingKind: 'external'
     })
     expect(
-      h.worker.dispatch({
-        ...dispatch,
-        leaseId: '55555555-5555-4555-8555-555555555555',
-        attempt: 2,
-        dispatchRevision: '5'
-      }).accepted
+      (
+        await h.worker.dispatch({
+          ...dispatch,
+          leaseId: '55555555-5555-4555-8555-555555555555',
+          attempt: 2,
+          dispatchRevision: '5'
+        })
+      ).accepted
     ).toBe(true)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(2))
     expect(h.host.newSession).toHaveBeenCalledTimes(1)
-    expect(h.store.getSession(key())?.acpSessionId).toBe(rec.acpSessionId)
-    expect(h.store.listInboxBySessionKeyFifo()).toHaveLength(0)
+    expect((await h.store.getSession(key()))?.acpSessionId).toBe(rec.acpSessionId)
+    expect(await h.store.listInboxBySessionKeyFifo()).toHaveLength(0)
   })
 
   it('keeps live read-only cards protected from chat permission changes and configuration refreshes', async () => {
@@ -180,52 +181,52 @@ describe('Daemon Kanban dispatch', () => {
       await held
       return { stopReason: 'end_turn' }
     })
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
     try {
       const agent = (h.daemon as any).agents.get(AGENT)
       agent.allowRuntimeChangesInChat = true
       agent.permissionMode = 'agent'
-      expect((h.daemon as any).setPermissionModeByKey(key(), 'agent-full-access')).toBe(false)
+      expect(await (h.daemon as any).commands.setPermissionModeByKey(key(), 'agent-full-access')).toBe(false)
       await (h.daemon as any).applyConfiguredRuntimeSettings(agent, h.host, 'acp-card')
       expect(h.host.setSessionPermissionMode).toHaveBeenLastCalledWith('acp-card', 'read-only')
     } finally {
       release()
     }
-    await vi.waitFor(() => expect(h.store.listKanbanReports(10)).toHaveLength(1))
+    await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
   })
 
   it('fails closed when the runtime has no read-only mode', async () => {
     const h = await harness(false, ['agent'])
-    h.worker.dispatch(dispatch)
-    await vi.waitFor(() => expect(h.store.listKanbanReports(10)).toHaveLength(1))
+    await h.worker.dispatch(dispatch)
+    await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
     expect(h.host.prompt).not.toHaveBeenCalled()
-    expect(h.store.listKanbanReports(10)[0]?.outcome).toBe('failed')
+    expect((await h.store.listKanbanReports(10))[0]?.outcome).toBe('failed')
   })
 
   it('refuses a write card without a git worktree and obeys pause/drain gates', async () => {
     const h = await harness()
-    expect(h.worker.dispatch({ ...dispatch, mode: 'write' })).toMatchObject({
+    expect(await h.worker.dispatch({ ...dispatch, mode: 'write' })).toMatchObject({
       accepted: false,
       reason: 'write_needs_worktree'
     })
     ;(h.daemon as any).draining = true
-    expect(h.worker.dispatch(dispatch)).toMatchObject({ accepted: false, reason: 'draining' })
+    expect(await h.worker.dispatch(dispatch)).toMatchObject({ accepted: false, reason: 'draining' })
     expect(h.host.prompt).not.toHaveBeenCalled()
   })
 
   it('forces a separate worktree for write cards even when the agent defaults to shared', async () => {
     const h = await harness(true)
-    expect(h.worker.dispatch({ ...dispatch, mode: 'write' }).accepted).toBe(true)
+    expect((await h.worker.dispatch({ ...dispatch, mode: 'write' })).accepted).toBe(true)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce(), { timeout: 10_000 })
-    expect(h.store.getSession(key())?.workspaceIsolation).toBe('session')
+    expect((await h.store.getSession(key()))?.workspaceIsolation).toBe('session')
     const options = h.host.newSession.mock.calls[0] as unknown as [string]
     expect(options[0]).toContain('worktrees')
     expect(options[0]).not.toBe(h.workspace)
   })
 })
 
-it('persists terminal reports across restarts and redacts ACKed receipts without losing deduplication', () => {
+it('persists terminal reports across restarts and redacts ACKed receipts without losing deduplication', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ac-kanban-outbox-'))
   roots.push(root)
   const path = join(root, 'store.db')
@@ -239,22 +240,22 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
     outcome: 'protocol_violation',
     reasonCode: 'no_terminal_call'
   }
-  let store = new LocalStore(path)
-  store.reserveKanbanLease(dispatch.leaseId, 50)
-  store.close()
-  store = new LocalStore(path)
-  expect(store.hasKanbanReport(dispatch.leaseId)).toBe(true)
-  expect(store.listKanbanReports(1)).toEqual([])
-  store.putKanbanReport(report, 100)
-  store.close()
-  store = new LocalStore(path)
-  expect(store.listKanbanReports(1)).toEqual([report])
-  store.ackKanbanReport(dispatch.leaseId)
-  store.close()
-  store = new LocalStore(path)
-  expect(store.listKanbanReports(1)).toEqual([])
-  expect(store.hasKanbanReport(dispatch.leaseId)).toBe(true)
-  store.close()
+  let store = await LocalStore.open(path)
+  await store.reserveKanbanLease(dispatch.leaseId, 50)
+  await store.close()
+  store = await LocalStore.open(path)
+  expect(await store.hasKanbanReport(dispatch.leaseId)).toBe(true)
+  expect(await store.listKanbanReports(1)).toEqual([])
+  await store.putKanbanReport(report, 100)
+  await store.close()
+  store = await LocalStore.open(path)
+  expect(await store.listKanbanReports(1)).toEqual([report])
+  await store.ackKanbanReport(dispatch.leaseId)
+  await store.close()
+  store = await LocalStore.open(path)
+  expect(await store.listKanbanReports(1)).toEqual([])
+  expect(await store.hasKanbanReport(dispatch.leaseId)).toBe(true)
+  await store.close()
 })
 
 it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant'])(
@@ -269,13 +270,13 @@ it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant
       await held
       return { stopReason: 'end_turn' }
     })
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
-    const policy = vi.spyOn(h.daemon as any, 'resolveAcpPermission').mockResolvedValue({
+    const policy = vi.spyOn((h.daemon as any).permissions, 'resolveAcpPermission').mockResolvedValue({
       outcome: { outcome: 'selected', optionId: 'allow' }
     })
     try {
-      const response = await (h.daemon as any).onAcpPermission(AGENT, 'acp-card', {
+      const response = await (h.daemon as any).permissions.onAcpPermission(AGENT, 'acp-card', {
         sessionId: 'acp-card',
         toolCall: { title: 'gh issue edit', rawInput: { command: `gh issue edit 42 --add-label ${label}` } },
         options: [{ kind: 'allow_once', optionId: 'allow', name: 'Allow' }]
@@ -285,6 +286,6 @@ it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant
     } finally {
       release()
     }
-    await vi.waitFor(() => expect(h.store.listKanbanReports(10)).toHaveLength(1))
+    await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
   }
 )

@@ -36,7 +36,7 @@ export interface KanbanLease {
 /** What the daemon can observe about a lease's session right now. */
 export interface KanbanLivenessProbe {
   turnActive(sessionKey: string): boolean
-  liveBackgroundTasks(agentId: string, sessionId: string): number
+  liveBackgroundTasks(agentId: string, sessionId: string, sessionKey: string): number
 }
 
 export type KanbanStartResult =
@@ -45,12 +45,12 @@ export type KanbanStartResult =
 
 /** Durable report outbox: a terminal report survives CP outages and daemon restarts until the CP answers. */
 export interface KanbanReportOutbox {
-  has(leaseId: string): boolean
-  reserve(leaseId: string, queuedAt: number): void
-  release(leaseId: string): void
-  put(report: KanbanReport, queuedAt: number): void
-  list(limit: number): KanbanReport[]
-  remove(leaseId: string): void
+  has(leaseId: string): Promise<boolean>
+  reserve(leaseId: string, queuedAt: number): Promise<void>
+  release(leaseId: string): Promise<void>
+  put(report: KanbanReport, queuedAt: number): Promise<void>
+  list(limit: number): Promise<KanbanReport[]>
+  remove(leaseId: string): Promise<void>
 }
 
 export interface KanbanCpLink {
@@ -64,10 +64,10 @@ export interface KanbanWorkerDeps {
   log: { debug(m: string): void; info(m: string): void; warn(m: string): void }
   outbox: KanbanReportOutbox
   cp(): KanbanCpLink | undefined
-  /** Synchronous admission gates (agent present, paused, draining, write worktree). */
-  gate(d: KanbanDispatch): KanbanDispatchRefusal | undefined
-  /** Admit the turn; `onSessionReady` fires once the ACP session exists. */
-  start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): KanbanStartResult
+  /** Admission gates (agent present, paused, draining, write worktree). */
+  gate(d: KanbanDispatch): Promise<KanbanDispatchRefusal | undefined>
+  /** Admit the turn; resolves once the serial gate settles admission. `onSessionReady` fires once the ACP session exists. */
+  start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult>
   cancel(lease: KanbanLease): void
   probe: KanbanLivenessProbe
   heartbeatMs?: number
@@ -78,6 +78,8 @@ const FLUSH_BATCH = 50
 
 export class KanbanWorker {
   private readonly leases = new Map<string, KanbanLease>()
+  // A CP retry of an in-flight admission joins it instead of racing the outbox reservation.
+  private readonly admitting = new Map<string, Promise<KanbanDispatchOk>>()
   private timer: TimerHandle | undefined
   private stopped = true
   private flushing = false
@@ -103,23 +105,41 @@ export class KanbanWorker {
   }
 
   /** `kanban/dispatch` REQ: admit the card's turn into its GitHub thread session, or refuse with a typed reason. */
-  dispatch(d: KanbanDispatch): KanbanDispatchOk {
-    if (this.leases.has(d.leaseId) || this.deps.outbox.has(d.leaseId)) return { leaseId: d.leaseId, accepted: true }
-    const refusal = this.deps.gate(d)
+  dispatch(d: KanbanDispatch): Promise<KanbanDispatchOk> {
+    const inFlight = this.admitting.get(d.leaseId)
+    if (inFlight) return inFlight
+    const admission = this.admit(d).finally(() => this.admitting.delete(d.leaseId))
+    this.admitting.set(d.leaseId, admission)
+    return admission
+  }
+
+  private async admit(d: KanbanDispatch): Promise<KanbanDispatchOk> {
+    if (this.leases.has(d.leaseId)) return { leaseId: d.leaseId, accepted: true }
+    try {
+      if (await this.deps.outbox.has(d.leaseId)) return { leaseId: d.leaseId, accepted: true }
+    } catch {
+      return { leaseId: d.leaseId, accepted: false, reason: 'durability' }
+    }
+    const refusal = await this.deps.gate(d)
     if (refusal) return { leaseId: d.leaseId, accepted: false, reason: refusal }
     try {
-      this.deps.outbox.reserve(d.leaseId, this.deps.clock.now())
+      await this.deps.outbox.reserve(d.leaseId, this.deps.clock.now())
     } catch {
       return { leaseId: d.leaseId, accepted: false, reason: 'durability' }
     }
     let readySessionId: string | undefined
-    const started = this.deps.start(d, (sessionId) => {
-      readySessionId = sessionId
-      const lease = this.leases.get(d.leaseId)
-      if (lease) lease.sessionId = sessionId
-    })
+    let started: KanbanStartResult
+    try {
+      started = await this.deps.start(d, (sessionId) => {
+        readySessionId = sessionId
+        const lease = this.leases.get(d.leaseId)
+        if (lease) lease.sessionId = sessionId
+      })
+    } catch {
+      started = { accepted: false, reason: 'busy' }
+    }
     if (!started.accepted) {
-      this.deps.outbox.release(d.leaseId)
+      await this.deps.outbox.release(d.leaseId).catch(() => undefined)
       return { leaseId: d.leaseId, accepted: false, reason: started.reason }
     }
     // The CP mints a new lease for a card only after ending the old one, so an older local lease is already superseded.
@@ -154,7 +174,10 @@ export class KanbanWorker {
   /** Liveness for one lease, or null when nothing is running for it. */
   liveness(lease: KanbanLease): KanbanLeaseBeat['liveness'] | null {
     if (this.deps.probe.turnActive(lease.sessionKey)) return 'turn'
-    if (lease.sessionId && this.deps.probe.liveBackgroundTasks(lease.dispatch.agentId, lease.sessionId) > 0)
+    if (
+      lease.sessionId &&
+      this.deps.probe.liveBackgroundTasks(lease.dispatch.agentId, lease.sessionId, lease.sessionKey) > 0
+    )
       return 'background'
     return null
   }
@@ -168,7 +191,7 @@ export class KanbanWorker {
       for (const [leaseId, lease] of [...this.leases]) {
         const live = this.liveness(lease)
         if (live === null) {
-          if (lease.turnSettled) this.finalize(leaseId, lease)
+          if (lease.turnSettled) await this.finalize(leaseId, lease)
           continue
         }
         beats.push({
@@ -210,15 +233,15 @@ export class KanbanWorker {
     if (!cp?.ready() || this.flushing) return
     this.flushing = true
     try {
-      for (const report of this.deps.outbox.list(FLUSH_BATCH)) {
+      for (const report of await this.deps.outbox.list(FLUSH_BATCH)) {
         try {
           const reply = await cp.report(report)
           if (!reply.accepted) this.deps.log.info(`kanban: report for lease ${report.leaseId} superseded`)
-          this.deps.outbox.remove(report.leaseId)
+          await this.deps.outbox.remove(report.leaseId)
         } catch (err) {
           if (err instanceof WireError && !err.retryable) {
             this.deps.log.warn(`kanban: dead-lettering report for lease ${report.leaseId} (${err.code})`)
-            this.deps.outbox.remove(report.leaseId)
+            await this.deps.outbox.remove(report.leaseId)
             continue
           }
           // Transient: keep the row; the next beat or reconnect retries.
@@ -243,17 +266,16 @@ export class KanbanWorker {
     this.deps.clock.setTimeout(() => {
       const current = this.leases.get(leaseId)
       if (current && this.liveness(current) === null) {
-        try {
-          this.finalize(leaseId, current)
-          void this.flush().catch((err: unknown) => this.deps.log.warn(`kanban: outbox flush failed (${String(err)})`))
-        } catch (err) {
-          this.deps.log.warn(`kanban: report persistence failed for ${leaseId} (${String(err)})`)
-        }
+        void this.finalize(leaseId, current).then(
+          () =>
+            this.flush().catch((err: unknown) => this.deps.log.warn(`kanban: outbox flush failed (${String(err)})`)),
+          (err: unknown) => this.deps.log.warn(`kanban: report persistence failed for ${leaseId} (${String(err)})`)
+        )
       }
     }, 0)
   }
 
-  private finalize(leaseId: string, lease: KanbanLease): void {
+  private async finalize(leaseId: string, lease: KanbanLease): Promise<void> {
     const d = lease.dispatch
     const terminal = lease.terminal
     const outcome: KanbanReportOutcome = terminal?.outcome ?? (lease.turnError ? 'failed' : 'protocol_violation')
@@ -272,7 +294,7 @@ export class KanbanWorker {
       ...(lease.sessionId ? { sessionId: lease.sessionId } : {}),
       ...(terminal?.prNumber ? { prNumber: terminal.prNumber } : {})
     }
-    this.deps.outbox.put(report, this.deps.clock.now())
+    await this.deps.outbox.put(report, this.deps.clock.now())
     this.leases.delete(leaseId)
     this.deps.log.info(`kanban: lease ${leaseId} ended (${outcome})`)
   }

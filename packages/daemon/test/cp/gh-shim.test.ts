@@ -40,7 +40,10 @@ describe('gh wrapper shim', () => {
       execFileSync(shim, args, {
         env: {
           ...process.env,
-          GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
+          GH_TOKEN: '',
+          GITHUB_TOKEN: '',
+          GH_ENTERPRISE_TOKEN: '',
+          GITHUB_ENTERPRISE_TOKEN: '',
           PATH: `${shimDir}:${realBin}`,
           AC_AGENT_ID: 'agent-1',
           AC_GITCRED_CAPABILITY: 'cap-agent-1',
@@ -180,7 +183,10 @@ describe('gh wrapper rendered for the sandbox runtime image', () => {
     execFileSync(wrapper, ['pr', 'view', '64', '-R', 'acme/infra'], {
       env: {
         ...process.env,
-        GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
+        GH_TOKEN: '',
+        GITHUB_TOKEN: '',
+        GH_ENTERPRISE_TOKEN: '',
+        GITHUB_ENTERPRISE_TOKEN: '',
         PATH: `${pathbin}:${realBin}`,
         AC_AGENT_ID: 'agent-1',
         ARGV_CAPTURE: argvCapture,
@@ -231,7 +237,10 @@ describe('gh wrapper on a failed token fetch', () => {
       encoding: 'utf8',
       env: {
         ...process.env,
-        GH_TOKEN: '', GITHUB_TOKEN: '', GH_ENTERPRISE_TOKEN: '', GITHUB_ENTERPRISE_TOKEN: '',
+        GH_TOKEN: '',
+        GITHUB_TOKEN: '',
+        GH_ENTERPRISE_TOKEN: '',
+        GITHUB_ENTERPRISE_TOKEN: '',
         PATH: `${pathbin}:${realBin}`,
         AC_AGENT_ID: 'agent-1',
         RAN_CAPTURE: ranCapture
