@@ -29,20 +29,36 @@ const entry: KanbanTerminalEntry = {
 
 interface Row extends KanbanCommentRow {
   nextAt: number
+  failed?: boolean
 }
 
 function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
   const rows = new Map<string, Row>()
   return {
     rows,
-    dueKanbanComments: (now, limit) => [...rows.values()].filter((row) => row.nextAt <= now).slice(0, limit),
-    markKanbanCommentAttempt: (leaseId, nextAt) => {
+    dueKanbanComments: (now, limit) =>
+      [...rows.values()].filter((row) => !row.failed && row.nextAt <= now).slice(0, limit),
+    markKanbanCommentAttempt: (leaseId, nextAt, at) => {
       const row = rows.get(leaseId)!
-      rows.set(leaseId, { ...row, attempts: row.attempts + 1, attempted: true, nextAt })
+      rows.set(leaseId, {
+        ...row,
+        attempts: row.attempts + 1,
+        attempted: true,
+        attemptedAt: row.attemptedAt ?? at,
+        nextAt
+      })
     },
     deferKanbanComment: (leaseId, nextAt) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, { ...row, nextAt })
+    },
+    deferKanbanCommentLookup: (leaseId, nextAt) => {
+      const row = rows.get(leaseId)!
+      rows.set(leaseId, { ...row, lookupMisses: row.lookupMisses + 1, nextAt })
+    },
+    failKanbanComment: (leaseId) => {
+      const row = rows.get(leaseId)!
+      rows.set(leaseId, { ...row, failed: true })
     },
     removeKanbanComment: (leaseId) => {
       rows.delete(leaseId)
@@ -55,10 +71,56 @@ function seed(store: { rows: Map<string, Row> }, patch: Partial<Row> = {}): void
     entry,
     attempts: 0,
     attempted: false,
+    lookupMisses: 0,
     recordedAt: 1,
     nextAt: 0,
     ...patch
   })
+}
+
+/** A GitHub issue-comments endpoint as it really behaves: oldest first, sort/direction ignored, since honoured. */
+function fakeGithub(now: () => number) {
+  const comments: Array<{ id: number; body: string; updatedAt: number }> = []
+  const lists: URL[] = []
+  let failPosts = 0
+  const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input))
+    if ((init?.method ?? 'GET') !== 'GET') {
+      const { body } = JSON.parse(String(init?.body)) as { body: string }
+      comments.push({ id: comments.length + 1, body, updatedAt: now() })
+      // The comment lands even when the response is lost.
+      if (failPosts > 0) {
+        failPosts -= 1
+        return new Response('bad gateway', { status: 502 })
+      }
+      return new Response(JSON.stringify({ id: comments.length }), { status: 201 })
+    }
+    lists.push(url)
+    const since = url.searchParams.get('since')
+    const perPage = Number(url.searchParams.get('per_page') ?? 30)
+    const page = Number(url.searchParams.get('page') ?? 1)
+    const matching = comments.filter((comment) => !since || comment.updatedAt >= Date.parse(since))
+    const slice = matching.slice((page - 1) * perPage, page * perPage)
+    const headers = new Headers()
+    if (page * perPage < matching.length) {
+      const next = new URL(url)
+      next.searchParams.set('page', String(page + 1))
+      headers.set('link', `<${next.toString()}>; rel="next"`)
+    }
+    return new Response(JSON.stringify(slice.map(({ id, body }) => ({ id, body }))), { status: 200, headers })
+  })
+  return {
+    comments,
+    lists,
+    fetchImpl: fetchImpl as typeof fetch,
+    failNextPost: () => {
+      failPosts += 1
+    },
+    seedOld: (count: number, at: number) => {
+      for (let i = 0; i < count; i++)
+        comments.push({ id: comments.length + 1, body: `old comment ${i}`, updatedAt: at })
+    }
+  }
 }
 
 describe('KanbanCommentPublisher', () => {
@@ -76,7 +138,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -110,7 +172,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => now },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -135,7 +197,7 @@ describe('KanbanCommentPublisher', () => {
     const fetchImpl = vi.fn()
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 5_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => {
         throw new Error('offline')
@@ -147,35 +209,55 @@ describe('KanbanCommentPublisher', () => {
     expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: false, nextAt: 20_000 })
   })
 
-  it('defers instead of posting when the marker is not in the newest 500 comments', async () => {
+  it('finds a marker posted after 600 older comments through since, and does not post it twice', async () => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    let now = t0
+    const github = fakeGithub(() => now)
+    github.seedOld(600, t0 - 24 * 60 * 60_000)
     const store = memoryStore()
-    seed(store, { attempted: true, attempts: 1 })
-    const posts: string[] = []
-    let pages = 0
-    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      if ((init?.method ?? 'GET') !== 'GET') {
-        posts.push(String(url))
-        return new Response(JSON.stringify({ id: 1 }), { status: 201 })
-      }
-      pages += 1
-      const comments = Array.from({ length: 100 }, (_, i) => ({ body: `older comment ${pages}-${i}` }))
-      const headers = new Headers({ link: `<https://api.test/comments?page=${pages + 1}>; rel="next"` })
-      return new Response(JSON.stringify(comments), { status: 200, headers })
-    })
+    seed(store, { recordedAt: t0 - 60 * 60_000 })
     const publisher = new KanbanCommentPublisher({
-      clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      clock: { now: () => now },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
-      fetchImpl: fetchImpl as typeof fetch,
+      fetchImpl: github.fetchImpl,
+      baseUrl: 'https://api.test'
+    })
+    github.failNextPost()
+    await publisher.drain()
+    expect(github.comments).toHaveLength(601)
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, attemptedAt: t0 })
+    now = t0 + 60_000
+    await publisher.drain()
+    expect(github.comments).toHaveLength(601)
+    expect(store.rows.size).toBe(0)
+    expect(github.lists).toHaveLength(1)
+    const listed = github.lists[0]!
+    expect(listed.searchParams.get('since')).toBe(new Date(t0 - 2 * 60_000).toISOString())
+    expect(listed.searchParams.get('per_page')).toBe('100')
+    expect(listed.searchParams.has('sort')).toBe(false)
+    expect(listed.searchParams.has('direction')).toBe(false)
+  })
+
+  it('defers instead of posting when more than five pages changed since the attempt', async () => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    const github = fakeGithub(() => t0)
+    github.seedOld(600, t0)
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1, attemptedAt: t0, recordedAt: t0 })
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => t0 },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: github.fetchImpl,
       baseUrl: 'https://api.test'
     })
     await publisher.drain()
-    expect(posts).toEqual([])
-    expect(pages).toBe(5)
-    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('sort=created')
-    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('direction=desc')
-    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
+    expect(github.comments).toHaveLength(600)
+    expect(github.lists).toHaveLength(5)
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: t0 + 30_000 })
   })
 
   it('defers a timed-out marker lookup without posting and still drains the next comment', async () => {
@@ -187,6 +269,7 @@ describe('KanbanCommentPublisher', () => {
       entry: other,
       attempts: 0,
       attempted: false,
+      lookupMisses: 0,
       recordedAt: 2,
       nextAt: 0
     })
@@ -211,7 +294,7 @@ describe('KanbanCommentPublisher', () => {
     })
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -241,7 +324,7 @@ describe('KanbanCommentPublisher', () => {
     )
     const publisher = new KanbanCommentPublisher({
       clock: { now: () => 1_000 },
-      log: { info: vi.fn(), warn: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
       store,
       token: async () => 'ghs_test',
       fetchImpl: fetchImpl as typeof fetch,
@@ -252,4 +335,86 @@ describe('KanbanCommentPublisher', () => {
     expect(fetchImpl).toHaveBeenCalledOnce()
     expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
   })
+
+  it('parks the comment as failed with an error after five undecided lookups, never posting', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1, attemptedAt: 1_000 })
+    let now = 1_000
+    const posts: string[] = []
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') !== 'GET') {
+        posts.push(String(url))
+        return new Response(JSON.stringify({ id: 1 }), { status: 201 })
+      }
+      return new Response('unavailable', { status: 503 })
+    })
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => now },
+      log,
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test'
+    })
+    const waits: number[] = []
+    for (let i = 0; i < 4; i++) {
+      await publisher.drain()
+      const row = store.rows.get(report.leaseId)!
+      expect(row).toMatchObject({ lookupMisses: i + 1 })
+      waits.push(row.nextAt - now)
+      now = row.nextAt
+    }
+    expect(waits).toEqual([30_000, 60_000, 120_000, 240_000])
+    expect(log.error).not.toHaveBeenCalled()
+    await publisher.drain()
+    expect(store.rows.get(report.leaseId)).toMatchObject({ failed: true })
+    expect(log.error).toHaveBeenCalledOnce()
+    expect(log.error.mock.calls[0]?.[0]).toContain(report.leaseId)
+    expect(log.error.mock.calls[0]?.[0]).toContain('acme/web#42')
+    now += 60 * 60_000
+    await publisher.drain()
+    expect(fetchImpl).toHaveBeenCalledTimes(5)
+    expect(posts).toEqual([])
+  })
+
+  it.each([401, 403])(
+    'drops the cached token when the marker lookup gets %i, then finds the marker with a fresh one',
+    async (status) => {
+      const store = memoryStore()
+      seed(store, { attempted: true, attempts: 1, attemptedAt: 1_000 })
+      let now = 1_000
+      let cached: string | undefined
+      let minted = 0
+      const invalidated: string[] = []
+      const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const auth = new Headers(init?.headers).get('authorization')
+        if (auth === 'Bearer ghs_1') return new Response('bad credentials', { status })
+        return new Response(JSON.stringify([{ body: `<!-- ${kanbanLeaseMarker(report.leaseId)} -->` }]), {
+          status: 200
+        })
+      })
+      const publisher = new KanbanCommentPublisher({
+        clock: { now: () => now },
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        store,
+        token: async () => (cached ??= `ghs_${++minted}`),
+        invalidateToken: (target, token) => {
+          expect(target.report.leaseId).toBe(report.leaseId)
+          invalidated.push(token)
+          if (cached === token) cached = undefined
+        },
+        fetchImpl: fetchImpl as typeof fetch,
+        baseUrl: 'https://api.test'
+      })
+      await publisher.drain()
+      expect(invalidated).toEqual(['ghs_1'])
+      expect(store.rows.get(report.leaseId)).toMatchObject({ lookupMisses: 1 })
+      now = store.rows.get(report.leaseId)!.nextAt
+      await publisher.drain()
+      expect(minted).toBe(2)
+      expect(store.rows.size).toBe(0)
+      expect(fetchImpl.mock.calls.every(([, init]) => (init?.method ?? 'GET') === 'GET')).toBe(true)
+    }
+  )
 })
