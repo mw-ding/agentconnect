@@ -5,6 +5,7 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
+import { PROMOTION_CLEARED } from './kanban.repo.js'
 import type { KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
@@ -23,13 +24,23 @@ const CLAIM_SCAN = 50
 /** Mismatch recovery backoff: 1 min doubling to a 1 h ceiling, so a parked card costs at most ~1 read an hour. */
 const RECOVERY_BASE_SEC = 60
 const RECOVERY_MAX_SEC = 3600
-/** Every status change settles recovery: the backoff, the last-read fingerprint, and any unconfirmed promotion. */
+/** Every status change settles recovery: the backoff, the last-read fingerprint, any unconfirmed promotion, and the flag. */
 const RECOVERY_RESET = {
   recoveryCheckAt: null,
   recoveryChecks: 0,
   recoveryObserved: null,
-  promotionPending: false
+  ...PROMOTION_CLEARED
 } as const
+/** Held for a human: the latest run ended as a pre-dispatch mismatch, or recovery gave up and flagged the card. */
+const PARKED = Prisma.sql`(c."needsAttention" OR (latest."reasonCode" = 'github_state_mismatch' AND latest."endedAt" IS NOT NULL))`
+const PENDING_UNLEASED = (id: string): Prisma.KanbanCardWhereInput => ({
+  id,
+  promotionPending: true,
+  status: { in: ['todo', 'ready'] },
+  runs: { none: { endedAt: null } }
+})
+const PROMOTION_COLUMNS = Prisma.sql`c."promotionEventCursor", c."promotionPostAccepted", c."promotionStartedAt",
+  c."promotionWatchUntil", c."promotionChecks", c."recoveryCheckAt"`
 
 interface BoardRow {
   id: string
@@ -140,6 +151,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             (c."priority" = ${cursor.priority} AND (c."createdAt", c."id") > (${cursor.createdAt}, ${cursor.id}::uuid)))`
               : Prisma.empty
           }
+          AND NOT c."promotionPending"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
         ORDER BY c."priority" DESC, c."createdAt" ASC, c."id" ASC
@@ -230,7 +242,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]> {
     return this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
-      SELECT c."id" AS "cardId", c."issueNumber", (c."status" = 'todo' AND c."promotionPending") AS "promotion"
+      SELECT c."id" AS "cardId", c."issueNumber",
+        (c."promotionPending" AND c."status" IN ('todo', 'ready')) AS "promotion", ${PROMOTION_COLUMNS}
       FROM "kanban_card" c
       LEFT JOIN LATERAL (
         SELECT "reasonCode", "endedAt" FROM "kanban_run"
@@ -239,9 +252,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       WHERE c."boardId" = ${boardId}::uuid
         AND (c."recoveryCheckAt" IS NULL OR c."recoveryCheckAt" <= ${now})
         AND (
-          (c."status" = 'todo' AND c."promotionPending")
-          OR (latest."reasonCode" = 'github_state_mismatch' AND latest."endedAt" IS NOT NULL
-            AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
+          (c."promotionPending" AND c."status" IN ('todo', 'ready'))
+          OR (${PARKED} AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
         )
       ORDER BY c."recoveryCheckAt" ASC NULLS FIRST, c."issueNumber" ASC
       LIMIT ${limit}
@@ -249,30 +261,29 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
   }
 
   async getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null> {
-    const card = await this.db.kanbanCard.findUnique({
-      where: { boardId_issueNumber: { boardId, issueNumber } },
-      select: {
-        status: true,
-        runs: { orderBy: { attempt: 'desc' }, take: 1, select: { endedAt: true, reasonCode: true } }
-      }
-    })
-    const latest = card?.runs[0]
-    return card && latest?.endedAt && latest.reasonCode === 'github_state_mismatch' ? card.status : null
+    const [card] = await this.db.$queryRaw<Array<{ status: KanbanStatus }>>(Prisma.sql`
+      SELECT c."status" FROM "kanban_card" c
+      LEFT JOIN LATERAL (
+        SELECT "reasonCode", "endedAt" FROM "kanban_run"
+        WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
+      ) latest ON true
+      WHERE c."boardId" = ${boardId}::uuid AND c."issueNumber" = ${issueNumber} AND ${PARKED}
+    `)
+    return card?.status ?? null
   }
 
   async ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean> {
     return this.inTransaction(async (tx) => {
       const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus }>>(Prisma.sql`
-        SELECT "id", "status" FROM "kanban_card"
-        WHERE "boardId" = ${boardId}::uuid AND "issueNumber" = ${issueNumber} FOR UPDATE
+        SELECT c."id", c."status" FROM "kanban_card" c
+        LEFT JOIN LATERAL (
+          SELECT "reasonCode", "endedAt" FROM "kanban_run"
+          WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
+        ) latest ON true
+        WHERE c."boardId" = ${boardId}::uuid AND c."issueNumber" = ${issueNumber} AND ${PARKED}
+        FOR UPDATE OF c
       `)
       if (!card || card.status !== from) return false
-      const latest = await tx.kanbanRun.findFirst({
-        where: { cardId: card.id },
-        orderBy: { attempt: 'desc' },
-        select: { endedAt: true, reasonCode: true }
-      })
-      if (!latest?.endedAt || latest.reasonCode !== 'github_state_mismatch') return false
       await tx.kanbanCard.update({
         where: { id: card.id },
         data: {
@@ -300,7 +311,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               make_interval(secs => ${RECOVERY_MAX_SEC}))
           END,
           "recoveryChecks" = CASE WHEN ${changed} THEN 1 ELSE "recoveryChecks" + 1 END,
-          "recoveryObserved" = COALESCE(${seen}::text, "recoveryObserved")
+          "recoveryObserved" = COALESCE(${seen}::text, "recoveryObserved"),
+          "promotionChecks" = "promotionChecks" + CASE WHEN "promotionPending" THEN 1 ELSE 0 END
       WHERE "id" = ${cardId}::uuid
     `)
   }
@@ -313,20 +325,37 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
   }
 
   async getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null> {
-    const card = await this.db.kanbanCard.findFirst({
-      where: { boardId, issueNumber, status: 'todo', promotionPending: true },
-      select: { id: true }
-    })
-    return card ? { cardId: card.id, issueNumber, promotion: true } : null
+    const [card] = await this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
+      SELECT c."id" AS "cardId", c."issueNumber", true AS "promotion", ${PROMOTION_COLUMNS}
+      FROM "kanban_card" c
+      WHERE c."boardId" = ${boardId}::uuid AND c."issueNumber" = ${issueNumber}
+        AND c."promotionPending" AND c."status" IN ('todo', 'ready')
+    `)
+    return card ?? null
   }
 
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
-    // Repair adopts the promotion that already landed on GitHub; otherwise only the pending flag clears.
+    // Repair adopts the promotion that already landed; a refusal clears the intent and returns a ready card to todo.
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, status: 'todo', promotionPending: true, runs: { none: { endedAt: null } } },
+      where: PENDING_UNLEASED(cardId),
       data: repaired
         ? { status: 'ready', stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...RECOVERY_RESET }
-        : { promotionPending: false }
+        : { status: 'todo', ...PROMOTION_CLEARED }
+    })
+    return count === 1
+  }
+
+  async escalatePromotion(cardId: string, reason: string): Promise<boolean> {
+    // The revision bump fences any in-flight graph CAS; only a human status edit un-parks the flagged card.
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: PENDING_UNLEASED(cardId),
+      data: {
+        status: 'todo',
+        stateRevision: { increment: 1 },
+        ...RECOVERY_RESET,
+        needsAttention: true,
+        attentionReason: reason
+      }
     })
     return count === 1
   }
@@ -449,7 +478,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           blockRecurrence: plan.blockRecurrence,
           cooldownUntil: plan.cooldownUntil,
           blockKind: plan.blockKind,
-          promotionPending: false,
+          ...PROMOTION_CLEARED,
           dispatchRevision: { increment: 1 },
           stateRevision: { increment: 1 }
         }

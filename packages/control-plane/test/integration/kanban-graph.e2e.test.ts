@@ -10,7 +10,7 @@ import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
 import { prisma } from '../setup.db.js'
 
 const TOKEN = process.env.GITHUB_TOKEN
-const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN
+const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN && !process.env.CI
 const OWNER = 'mw-ding'
 const REPO_NAME = 'agentconnect'
 const REPO_ID = 1332342098n
@@ -51,6 +51,7 @@ const poke = (deliveryKey: string, numbers: number[]) => ({
 describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
   const ts = Date.now()
   const issues: number[] = []
+  const createdLabels: string[] = []
   let boardId = ''
   let a = { id: 0, number: 0 }
   let b = { id: 0, number: 0 }
@@ -70,7 +71,7 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
   const log = { debug: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
   const realStore = () => new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
 
-  function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan'>) {
+  function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>) {
     const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
     return new KanbanGraphDoorbell({
       boards: new PgKanbanBoardRepo(prisma),
@@ -108,9 +109,18 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
   beforeAll(async () => {
     const repo = await gh<{ id: number }>('GET', `/repos/${FULL}`)
     expect(BigInt(repo.data.id)).toBe(REPO_ID)
+    const existingLabels = new Set<string>()
+    for (let page = 1; ; page++) {
+      const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100&page=${page}`)
+      expect(labels.status).toBe(200)
+      for (const label of labels.data) existingLabels.add(label.name)
+      if (labels.data.length < 100) break
+    }
     for (const name of [...STATUSES.map((s) => `ac/status:${s}`), 'ac/agent:eng-backend']) {
+      if (existingLabels.has(name)) continue
       const r = await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
-      if (r.status !== 201 && r.status !== 422) throw new Error(`label ${name}: ${r.status}`)
+      if (r.status === 201) createdLabels.push(name)
+      else if (r.status !== 422) throw new Error(`label ${name}: ${r.status}`)
     }
     a = await createIssue('blocker', ['ac/status:running', 'ac/agent:eng-backend'])
     b = await createIssue('dependent', ['ac/status:todo', 'ac/agent:eng-backend'])
@@ -124,8 +134,15 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
     for (const n of issues) {
       await gh('PATCH', `/repos/${FULL}/issues/${n}`, { state: 'closed', state_reason: 'not_planned' }).catch(() => {})
     }
+    const labelCleanup = await Promise.allSettled(
+      createdLabels.map(async (name) => {
+        const r = await gh('DELETE', `/repos/${FULL}/labels/${encodeURIComponent(name)}`)
+        expect(r.status).toBe(204)
+      })
+    )
     if (boardId) await prisma.kanbanBoard.delete({ where: { id: boardId } }).catch(() => {})
     console.log(`e2e: closed scratch issues ${issues.join(', ')}`)
+    for (const result of labelCleanup) if (result.status === 'rejected') throw result.reason
   }, 120_000)
 
   const card = (n: number) =>
@@ -185,7 +202,8 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
       readGraph: async () => {
         throw new Error('simulated github failure')
       },
-      applyPlan: realStore().applyPlan.bind(realStore())
+      applyPlan: realStore().applyPlan.bind(realStore()),
+      lastEventId: async () => 0
     })
     failing.poke(poke('e2e-4', [b.number]))
     await failing.settle()

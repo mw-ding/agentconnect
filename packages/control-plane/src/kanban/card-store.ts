@@ -49,11 +49,27 @@ export interface CardStore {
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
-  /** True only when {@link promotionAttributed} holds over the issue's full event history; unknown history is false. */
-  promotionAttributed(repo: KanbanRepoRef, issueNumber: number): Promise<boolean>
+  /** The newest visible issue-event id (0 for none): the pre-POST cursor bounding which events can be our write. */
+  lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number>
+  /** Judge a pending promotion from the events after `cursor`; an unreadable window is inconclusive. */
+  promotionVerdict(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    cursor: number,
+    postAccepted: boolean
+  ): Promise<PromotionVerdict>
   /** Write a reconcile plan's labels, issue state, and comment; a no-op plan makes no GitHub call. */
-  applyPlan(repo: KanbanRepoRef, issueNumber: number, observed: ObservedIssue, plan: LabelPlan): Promise<void>
+  applyPlan(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void>
 }
+
+/** Called after a label POST returns success, before any later write in the same plan. */
+export type LabelWriteObserver = (label: string) => void | Promise<void>
 
 export const WRITE_MODE_LABEL = 'ac/mode:write'
 const PAGE = 100
@@ -63,6 +79,7 @@ const MAX_EVENT_PAGES = 10
 export interface LabelEvent {
   id: number
   event: string
+  created_at?: string
   label?: { name?: string }
   actor?: { type?: string; login?: string } | null
   performed_via_github_app?: unknown
@@ -80,33 +97,46 @@ export function isAppActor(event: Pick<LabelEvent, 'actor'>, appSlug: string | u
   return !!appSlug && event.actor?.type === 'Bot' && login === `${appSlug}[bot]`.toLowerCase()
 }
 
-const PROMOTABLE_LABELS: ReadonlySet<string> = new Set([statusLabel('todo'), statusLabel('ready')])
+/** What the events after a promotion's pre-POST cursor prove: ours (or a human's) to adopt, not ours, or not yet visible. */
+export type PromotionVerdict = 'adopt' | 'reject' | 'inconclusive'
 
-/** Replays status and open/close events: ready must come from this App or a human, after the last human change left todo/ready. */
-export function promotionAttributed(events: readonly LabelEvent[], appSlug: string | undefined): boolean {
-  const labels = new Set<string>()
-  let open = true
-  let trusted = true
-  let readyAddTrusted = false
-  for (const event of [...events].sort((a, b) => a.id - b.id)) {
-    const name = event.label?.name
-    if (event.event === 'labeled' || event.event === 'unlabeled') {
-      if (!name?.startsWith(STATUS_LABEL_PREFIX)) continue
-      if (event.event === 'labeled') labels.add(name)
-      else labels.delete(name)
-    } else if (event.event === 'closed' || event.event === 'reopened') {
-      open = event.event === 'reopened'
-    } else {
-      continue
-    }
+/** Managed-label adds and removals plus issue close/reopen: every event that can change what a card means. */
+function isManagedEvent(event: LabelEvent): boolean {
+  if (event.event === 'closed' || event.event === 'reopened') return true
+  return (event.event === 'labeled' || event.event === 'unlabeled') && !!event.label?.name?.startsWith('ac/')
+}
+
+// The App identity is shared with agents, so an App ready-add is ours only after an acknowledged POST and with no other App ac/* write.
+export function judgePromotion(
+  events: readonly LabelEvent[],
+  appSlug: string | undefined,
+  cursor: number,
+  postAccepted: boolean
+): PromotionVerdict {
+  const window = events.filter((event) => event.id > cursor && isManagedEvent(event)).sort((a, b) => a.id - b.id)
+  const app: LabelEvent[] = []
+  let latestAdd: LabelEvent | undefined
+  for (const event of window) {
     const human = isHumanActor(event)
-    const known = human || isAppActor(event, appSlug)
-    if (event.event === 'labeled' && name === statusLabel('ready')) readyAddTrusted = known
-    // A human park (another status, or closed) stands until a human undoes it; any unknown writer forfeits trust.
-    if (human) trusted = open && labels.size > 0 && [...labels].every((l) => PROMOTABLE_LABELS.has(l))
-    else if (!known) trusted = false
+    if (!human && !isAppActor(event, appSlug)) return 'reject'
+    if (!human) app.push(event)
+    if (event.event === 'labeled' && event.label?.name === statusLabel('ready')) latestAdd = event
   }
-  return trusted && readyAddTrusted
+  if (!latestAdd) return 'inconclusive'
+  if (isHumanActor(latestAdd)) return 'adopt'
+  if (!postAccepted) return 'reject'
+  // Our write is exactly one ready add, then at most its own todo removal.
+  const [add, removal, ...rest] = app
+  const ownRemoval = !removal || (removal.event === 'unlabeled' && removal.label?.name === statusLabel('todo'))
+  return add === latestAdd && ownRemoval && rest.length === 0 ? 'adopt' : 'reject'
+}
+
+/** The page number GitHub's `Link: <…>; rel="last"` names, or null on a single page. */
+export function lastPageFromLink(link: string | null): number | null {
+  const url = link?.match(/<([^>]+)>;\s*rel="last"/)?.[1]
+  if (!url) return null
+  const page = Number(new URL(url, 'https://api.github.com').searchParams.get('page'))
+  return Number.isInteger(page) && page > 1 ? page : null
 }
 
 interface GhIssue {
@@ -176,45 +206,88 @@ export class GithubCardStore implements CardStore {
   }
 
   async statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean> {
-    const events = await this.issueEvents(repo, issueNumber)
-    if (!events) return false
     const target = statusLabel(status)
+    const isStatus = (event: LabelEvent) =>
+      !!event.label?.name?.startsWith(STATUS_LABEL_PREFIX) && ['labeled', 'unlabeled'].includes(event.event)
+    const isTargetAdd = (event: LabelEvent) => event.event === 'labeled' && event.label?.name === target
+    // Newest pages first, so a long history still finds the latest status change.
+    const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some(isStatus) && seen.some(isTargetAdd))
+    if (!events) return false
     let latest: LabelEvent | undefined
     let latestAdd: LabelEvent | undefined
     for (const event of events) {
-      const name = event.label?.name
-      if (!name?.startsWith(STATUS_LABEL_PREFIX) || !['labeled', 'unlabeled'].includes(event.event)) continue
+      if (!isStatus(event)) continue
       if (!latest || event.id > latest.id) latest = event
-      if (event.event === 'labeled' && name === target && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
+      if (isTargetAdd(event) && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
     }
     return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
   }
 
-  async promotionAttributed(repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
-    const events = await this.issueEvents(repo, issueNumber)
-    return !!events && promotionAttributed(events, this.deps.appSlug)
+  async lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number> {
+    // An empty `rel="last"` page walks back to the newest non-empty one; cursor 0 would admit every older App write.
+    const events = await this.recentEvents(repo, issueNumber, (seen) => seen.length > 0)
+    if (!events) throw new Error('kanban: no issue event within the page bound to anchor the promotion cursor')
+    return events.reduce((max, event) => Math.max(max, event.id), 0)
   }
 
-  /** The issue's whole event history, or null past the page bound so callers fail closed. */
-  private async issueEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[] | null> {
-    const all: LabelEvent[] = []
-    for (let page = 1; page <= MAX_EVENT_PAGES; page++) {
-      const events = await this.get<LabelEvent[]>(repo, `/issues/${issueNumber}/events?per_page=${PAGE}&page=${page}`)
-      all.push(...events)
-      if (events.length < PAGE) return all
+  async promotionVerdict(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    cursor: number,
+    postAccepted: boolean
+  ): Promise<PromotionVerdict> {
+    const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some((event) => event.id <= cursor))
+    return events ? judgePromotion(events, this.deps.appSlug, cursor, postAccepted) : 'inconclusive'
+  }
+
+  // Pages newest first (Link rel="last", then backward) until `enough` or page 1; null past the page bound.
+  private async recentEvents(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    enough: (seen: readonly LabelEvent[]) => boolean
+  ): Promise<LabelEvent[] | null> {
+    const first = await this.eventsPage(repo, issueNumber, 1)
+    const seen: LabelEvent[] = []
+    let reads = 1
+    for (let page = first.last ?? 1; page >= 1; page--) {
+      if (page > 1 && ++reads > MAX_EVENT_PAGES) return null
+      seen.push(...(page > 1 ? (await this.eventsPage(repo, issueNumber, page)).events : first.events))
+      if (enough(seen)) return seen
     }
-    return null
+    return seen
   }
 
-  applyPlan(repo: KanbanRepoRef, issueNumber: number, observed: ObservedIssue, plan: LabelPlan): Promise<void> {
-    return this.writer.apply(repo, issueNumber, observed, plan)
+  private async eventsPage(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    page: number
+  ): Promise<{ events: LabelEvent[]; last: number | null }> {
+    let link: string | null = null
+    const fetchImpl: FetchLike = async (url, init) => {
+      const response = await (this.deps.fetchImpl ?? fetch)(url, init)
+      link = response.headers.get('link')
+      return response
+    }
+    const path = `/issues/${issueNumber}/events?per_page=${PAGE}&page=${page}`
+    const events = await this.get<LabelEvent[]>(repo, path, fetchImpl)
+    return { events, last: lastPageFromLink(link) }
   }
 
-  private async get<T>(repo: KanbanRepoRef, path: string): Promise<T> {
+  applyPlan(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void> {
+    return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
+  }
+
+  private async get<T>(repo: KanbanRepoRef, path: string, fetchImpl = this.deps.fetchImpl): Promise<T> {
     const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'read')
     return githubRequest<T>(`/repositories/${repo.repoId}${path}`, {
       auth: grant.token,
-      fetchImpl: this.deps.fetchImpl,
+      fetchImpl,
       baseUrl: this.deps.baseUrl
     })
   }

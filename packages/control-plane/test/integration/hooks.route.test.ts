@@ -771,11 +771,12 @@ describe('hooks REST — CRUD, ingress gating, secret echo, runs, audit', () => 
     }
     await a.app.inject({ method: 'DELETE', url: `${ORG}/hooks/${id}` })
 
+    // Audit appends are not awaited, and ids are random, so match this hook rather than the first row.
     await vi.waitFor(async () => {
-      const rows = await prisma.auditEvent.findMany({ where: { kind: 'hook_change' }, orderBy: { id: 'asc' } })
-      expect(rows.length).toBeGreaterThanOrEqual(2)
-      expect((rows[0]!.details as { hookId: string }).hookId).toBe(id)
-      expect(rows[0]!.agentId).toBe(agentId)
+      const rows = await prisma.auditEvent.findMany({ where: { kind: 'hook_change' } })
+      const mine = rows.filter((row) => (row.details as { hookId?: string } | null)?.hookId === id)
+      expect(mine).toHaveLength(2)
+      expect(mine.every((row) => row.agentId === agentId)).toBe(true)
     })
   })
 })

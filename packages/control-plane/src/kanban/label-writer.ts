@@ -2,7 +2,7 @@
 import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
 import type { LabelPlan, ObservedIssue } from './card-state.js'
-import type { KanbanRepoRef } from './card-store.js'
+import type { KanbanRepoRef, LabelWriteObserver } from './card-store.js'
 
 export interface KanbanLabelWriterDeps {
   tokens: Pick<InstallationTokenService, 'mintKanbanCard'>
@@ -14,7 +14,13 @@ export class KanbanLabelWriter {
   constructor(private readonly deps: KanbanLabelWriterDeps) {}
 
   /** Per-label add/remove of only the managed diff, so a racing writer's other labels are never overwritten. */
-  async apply(repo: KanbanRepoRef, issueNumber: number, _observed: ObservedIssue, plan: LabelPlan): Promise<void> {
+  async apply(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    _observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void> {
     const labelsChanged = plan.addLabels.length > 0 || plan.removeLabels.length > 0
     if (!labelsChanged && !plan.issueState && !plan.comment) return
     const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'write')
@@ -27,8 +33,11 @@ export class KanbanLabelWriter {
         baseUrl: this.deps.baseUrl
       })
 
-    // Add before remove so GitHub never shows zero status labels mid-write.
-    for (const label of new Set(plan.addLabels)) await call('/labels', 'POST', { labels: [label] })
+    // Add before remove so GitHub never shows zero status labels mid-write. The observer runs before the removal.
+    for (const label of new Set(plan.addLabels)) {
+      await call('/labels', 'POST', { labels: [label] })
+      await onLabelAdded?.(label)
+    }
     for (const label of new Set(plan.removeLabels)) {
       try {
         await call(`/labels/${encodeURIComponent(label)}`, 'DELETE')
