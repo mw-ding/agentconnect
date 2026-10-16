@@ -1559,7 +1559,7 @@ function parseKanbanTerminal(name: string, args: Record<string, unknown>): Kanba
         summary,
         reason: boundedText(args, 'reason', KANBAN_REASON_MAX_CHARS)
       }
-    default:
+    case 'kanbanFail':
       assertKanbanKeys(name, args, ['summary', 'reason'])
       return {
         outcome: 'failed',
@@ -1567,6 +1567,8 @@ function parseKanbanTerminal(name: string, args: Record<string, unknown>): Kanba
         summary,
         reason: boundedText(args, 'reason', KANBAN_REASON_MAX_CHARS)
       }
+    default:
+      throw new Error(`unknown tool: ${name}`)
   }
 }
 

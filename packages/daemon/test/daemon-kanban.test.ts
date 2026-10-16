@@ -140,6 +140,8 @@ it('uses the exact GitHub hook coordinates and preserves untrusted-content guida
   expect(card.text).toContain('untrusted external content')
   expect(card.text).toContain('read-only')
   for (const family of ['ac/*', 'ac/status:*', 'ac/mode:*', 'ac/agent:*']) expect(card.text).toContain(family)
+  for (const tool of ['kanbanComplete', 'kanbanRequestReview', 'kanbanBlock', 'kanbanFail'])
+    expect(card.text).toContain(tool)
 })
 
 describe('Daemon Kanban dispatch', () => {
@@ -255,6 +257,50 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
   expect(store.listKanbanReports(1)).toEqual([])
   expect(store.hasKanbanReport(dispatch.leaseId)).toBe(true)
   store.close()
+})
+
+it('records one terminal per lease and queues its comment only after the report is accepted', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ac-kanban-terminal-'))
+  roots.push(root)
+  const store = new LocalStore(join(root, 'store.db'))
+  const report: KanbanReport = {
+    boardId: dispatch.boardId,
+    cardId: dispatch.cardId,
+    agentId: AGENT,
+    leaseId: dispatch.leaseId,
+    attempt: 1,
+    dispatchRevision: '3',
+    outcome: 'blocked',
+    blockKind: 'needs_input',
+    reasonCode: 'agent_blocked'
+  }
+  const entry = {
+    report,
+    repoFullName: dispatch.repoFullName,
+    issueNumber: dispatch.issueNumber,
+    summary: 'need a schema decision',
+    reason: 'which database?'
+  }
+  expect(store.recordKanbanTerminal(entry, 1)).toBe(true)
+  expect(store.recordKanbanTerminal({ ...entry, summary: 'second' }, 2)).toBe(false)
+  store.reserveKanbanLease(dispatch.leaseId, 1)
+  expect(store.orphanedKanbanTerminals().map((row) => row.summary)).toEqual(['need a schema decision'])
+  store.putKanbanReport(report, 3)
+  expect(store.orphanedKanbanTerminals()).toEqual([])
+  store.settleKanbanTerminal(dispatch.leaseId, false)
+  expect(store.dueKanbanComments(10, 10)).toEqual([])
+  expect(store.recordKanbanTerminal(entry, 4)).toBe(true)
+  store.settleKanbanTerminal(dispatch.leaseId, true)
+  expect(store.dueKanbanComments(0, 10)).toMatchObject([{ attempted: false, entry: { summary: entry.summary } }])
+  store.markKanbanCommentAttempt(dispatch.leaseId, 100)
+  expect(store.dueKanbanComments(50, 10)).toEqual([])
+  expect(store.dueKanbanComments(100, 10)[0]).toMatchObject({ attempted: true, attempts: 1 })
+  store.close()
+  const reopened = new LocalStore(join(root, 'store.db'))
+  expect(reopened.dueKanbanComments(100, 10)[0]?.entry.reason).toBe('which database?')
+  reopened.removeKanbanComment(dispatch.leaseId)
+  expect(reopened.dueKanbanComments(100, 10)).toEqual([])
+  reopened.close()
 })
 
 it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant'])(
