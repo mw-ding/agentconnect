@@ -408,10 +408,11 @@ export const RcGithubInstallation = z.object({
 })
 export type RcGithubInstallation = z.infer<typeof RcGithubInstallation>
 
-// R→C EVT (fire-and-forget) — Kanban graph doorbell (issue #2 spike §3): a verified
-// `sub_issues`/`issue_dependencies` delivery reduced to ids only; the CP re-reads the graph.
+// R→C EVT (fire-and-forget) — Kanban doorbell (issue #2 spike §3): a verified graph or card-status delivery, ids only
 export const GITHUB_GRAPH_EVENTS = ['sub_issues', 'issue_dependencies'] as const
-export const GithubGraphEvent = z.enum(GITHUB_GRAPH_EVENTS)
+/** `issues` rings for an `ac/status:*` label change or a close/reopen, so the CP re-reads that card at once. */
+export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues'] as const
+export const GithubGraphEvent = z.enum(KANBAN_DOORBELL_EVENTS)
 export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
 export const RcGithubGraph = z
   .object({
@@ -419,7 +420,7 @@ export const RcGithubGraph = z
     installationId: GithubNumericId,
     repoId: GithubNumericId,
     event: GithubGraphEvent,
-    action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|… — observational only
+    action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|labeled|… — observational only
     ids: z.array(GithubNumericId).max(4), // issue ids named by the payload (parent/sub, blocked/blocking)
     numbers: z.array(z.number().int().positive()).max(4) // the same issues' numbers, when same-repo
   })

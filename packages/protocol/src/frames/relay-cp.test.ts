@@ -810,7 +810,8 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(r.frame.payload).toEqual(poke)
     // A smuggled issue body or title is rejected, never stripped silently.
     expect(RcGithubGraph.safeParse({ ...poke, body: 'secret' }).success).toBe(false)
-    expect(RcGithubGraph.safeParse({ ...poke, event: 'issues' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'issues', action: 'labeled' }).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, ids: ['1', '2', '3', '4', '5'] }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, repoId: 'acme/web' }).success).toBe(false)
   })
