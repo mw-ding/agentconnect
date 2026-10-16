@@ -30,6 +30,7 @@ import { kanbanLeaseMarker } from '../../../daemon/src/kanban/kanban-comments.js
 import { writeGhShim } from '../../../daemon/src/cp/gh-shim.js'
 import { AcpHost } from '../../../daemon/src/acp/acp-host.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
+import { isLeakedAgentEnvKey, stripLeakedAgentEnv } from '../kanban-agent-env.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
 
@@ -55,15 +56,10 @@ function githubAppFromEnv(): GithubAppConfig | undefined {
 }
 
 function agentEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
+  return stripLeakedAgentEnv({
     ...process.env,
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --conditions=development`.trim()
-  }
-  for (const key of Object.keys(env)) {
-    if (/^(?:GH|GITHUB)_(?:.*_)?(?:TOKEN|PAT|AUTH_TOKEN)$|^GH_CONFIG_DIR$|^CLAUDECODE$|^AC_GITCRED_/i.test(key))
-      delete env[key]
-  }
-  return env
+  })
 }
 
 async function gh<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -404,10 +400,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       root,
       hostFactory: (_agent, onUpdate) => {
         if (selected) {
+          const adapterEnv = { ...agentEnv(), PATH: `${join(root!, 'run', 'bin')}:${process.env.PATH}` }
+          expect(Object.keys(adapterEnv).filter(isLeakedAgentEnvKey)).toEqual([])
           const runtime = new AcpHost(
             { command: 'npx', args: ['-y', selected.adapter], env: [] },
             {
-              env: { ...agentEnv(), PATH: `${join(root!, 'run', 'bin')}:${process.env.PATH}` },
+              env: adapterEnv,
               inheritProcessEnv: false,
               suppressChildStderr: true,
               onUpdate: (sid, update) => {
