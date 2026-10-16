@@ -292,7 +292,10 @@ only a CP log line.
   the watch's closing read leaves GitHub on `ready` and the card on `todo` with
   nothing pending or flagged. The relay ignores App senders, and the reconciler does
   not promote over existing `ready` labels. The window is 10 minutes from the rollback,
-  plus the wait for the next backoff step, against a 10-second request timeout.
+  plus the wait for the next backoff step, against a 10-second request timeout, so a
+  POST landing more than 10–15 minutes late leaves `todo` and `ready` both on GitHub
+  while the DB stays `todo`, unflagged. A future periodic scan of unparked `todo`
+  cards for an App-added `ready` would close it; that scan is an optional follow-up.
 - **Escalation comments are best-effort.** If the comment POST fails, the card still
   carries `needsAttention` and a warning is logged, but nothing shows on the issue.
   The console does not surface the flag yet.
@@ -345,3 +348,31 @@ minted for one run can be reused for a later run of the same mode on that
 repository until it is within 15 minutes of expiry. The daemon cache is keyed
 by the open lease and mode, so a read run does not reuse a write grant; this
 control-plane cache is not.
+
+M3 hardening (daemon and relay):
+
+- **Agent environment.** The e2e harness hands adapters an explicit allowlist
+  (`test/kanban-agent-env.ts`) instead of stripping known-bad names, so
+  `DATABASE_URL`, `*PASSWORD`, `AWS_*`, and App key material never reach an agent.
+  Unit tests plant sentinels for each.
+- **Webhook dedupe.** The relay marks an `X-GitHub-Delivery` id only after the reply
+  is out and no CP doorbell was dropped. A forward lost to a down relay-to-CP link
+  releases the id, so GitHub's redelivery is processed. A concurrent duplicate of an
+  in-flight id is dropped with a 202.
+- **Comment outbox schema.** `kanban_terminals` columns added after its first shape
+  come from a versioned local-store migration, not only `CREATE TABLE IF NOT EXISTS`.
+- **Clock skew.** The marker lookup's `since` bound is GitHub's `Date` header, read
+  by a GET just before the first POST. It is never this daemon's clock. When that
+  header is unreadable, the retry scans every comment page with no bound and, past
+  the page limit, parks the row instead of posting a duplicate.
+
+Known gaps (M3):
+
+- **Failed outbox rows are never cleaned up.** A comment that exhausts its undecided
+  marker lookups moves to state `failed` and stays in the daemon's SQLite store. The
+  only signal is the error log line; nothing alerts and nothing retires the row.
+- **An unbounded marker scan is capped.** With no readable GitHub clock, an issue
+  with more than five pages (500) of comments parks the row for a human, rather than
+  finding a marker beyond that.
+- **The pre-POST clock read is best-effort.** If that GET fails the POST still goes
+  out, and a lost response is then recovered by the unbounded scan above.
