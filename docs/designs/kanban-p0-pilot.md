@@ -108,7 +108,8 @@ attempt. Recovery accepts an edit only when the issue is open, carries exactly o
 valid status label, and the issue events show a GitHub `User` (not a `[bot]`
 login and without `performed_via_github_app`) both added that label and made the
 latest `ac/status:*` change. Any App, bot, or unknown actor, a missing event, an
-event history beyond 10 pages, or a read failure leaves the card parked. Agent
+event history that needs more than 10 page reads (newest page first), or a read
+failure leaves the card parked. Agent
 label writes reach GitHub as the App bot because the `gh` shim fails closed, so an
 agent can never un-park a card. A legal-looking edit the state machine forbids,
 such as `archived` straight to `ready`, is logged rather than silently dropped;
@@ -149,60 +150,62 @@ A graph doorbell does not reset it for a card whose promotion is still pending.
 With 100 parked cards, the first hour is capped at 25 reads per tick, and steady
 state is about one read per card per hour.
 
-If the graph promotion's ready-label write fails after the `todo`→`ready` CAS, the
-reconciler compare-and-sets the card back to `todo`, flags it `promotionPending`, and
-fails the doorbell. Before the GitHub write it records that intent while the card is
-still DB `ready`, including the search window (`promotionWriteStartedAt` through
-`promotionReadyNotAfter`). The next recovery check is a minute out, so a tick cannot
-settle the card while the write is running, and a failed write makes that check due
-immediately. A claim skips any card with the intent set, so a crash after the ready
-POST cannot dispatch the leftover. A successful write clears the intent. A claim
-therefore cannot mismatch the card into a stranded `todo`, and it cannot dispatch
-an unconfirmed `ready`. The write may still have half-landed. For example, the
-ready label was added and GitHub applied
-the `todo` removal, but the DELETE timed out. The next tick re-reads due flagged
-cards within the recovery batch limit. A lone `ready` label, or `todo`+`ready`
-residue, is adopted as `ready` and claimed only when two further checks pass, and
-the dispatch's `running` write then clears both labels. A ready intent whose labels
-never became ready is rolled back to `todo` instead of being claimed. While the
-intent is open the reconciler does not strip a leftover `todo` label; that would
-finish the write before attribution.
+If the graph promotion's ready-label write fails, recovery decides what landed. The
+reconciler first reads the issue's newest event id (the events cursor), then moves
+the card from `todo` to `ready` and opens the intent in one conditional write:
+`promotionPending`, `promotionEventCursor`, and `promotionStartedAt`. A claim
+therefore never sees a `ready` card without its intent, even across a crash. A
+claim skips any card with the intent set, so the leftover of a crash after the ready
+POST is never dispatched. The next recovery check is a minute out, so a tick cannot
+settle the card while the write is running. When the ready POST returns success the
+CP sets `promotionPostAccepted`. A successful write clears the intent. A failed one
+moves the card back to `todo`, keeps the intent, makes the next check due at once,
+and fails the doorbell. The write may still have half-landed. For example, the ready
+label was added and GitHub applied the `todo` removal, but the DELETE timed out. The
+next tick re-reads due flagged cards within the recovery batch limit. While the
+intent is open, the reconciler does not strip a leftover `todo` label, because that
+would finish the write before attribution.
 
-- **Attribution.** Right after the ready POST succeeds, the CP reads issue events
-  and stores `promotionReadyEventId`: the id of our App's `labeled ac/status:ready`
-  inside an inclusive `created_at` window. The window starts one second before the
-  write (GitHub stamps whole seconds) and ends at the POST response `Date` header.
-  That header is only the window's end (`promotionReadyNotAfter`), never a
-  timestamp to match. An event stamped at `:00` is still ours when the response
-  `Date` is `:01`. A missing Date header ends the window about eleven seconds after
-  the write, covering one timed-out POST and not a later agent add. The id is
-  stored only when that event is unique. Zero events (the events API is behind) or
-  several App ready-adds leave the id empty and keep the window. Adoption requires
-  that exact event id, or a human `User` ready-add. The CP and agents share the App
-  identity; the login alone never proves the promotion is ours. Replaying status
-  and close/reopen events preserves human parks until a human restores an open
-  issue with only `todo` and/or `ready`. Removing `ready` revokes the prior
-  promotion even when `todo` remains. A human who restores `todo` and an agent who
-  re-adds `ready` in the same second are not adopted, because the agent's event id
-  is not the one we stored. A history that does not yet contain our event, including
-  one that ends on an older human park while the labels already show ready, is not
-  a negative.
+- **Attribution.** GitHub's add-labels response is only the issue's label list,
+  with no event id, so the CP cannot capture a receipt for its own write. The CP and
+  agents also act as the same App bot. Recovery therefore reads only the events
+  after the cursor: managed (`ac/*`) label adds and removals, plus close and reopen.
+  It reads the `Link: rel="last"` page first and walks backward, so a long history
+  still reaches the cursor. An App `labeled ac/status:ready` is adopted only when
+  `promotionPostAccepted` is set and the App's events in that window are exactly that
+  add, optionally followed by an `unlabeled ac/status:todo`. These are the events
+  our own write produces. A timed-out or refused POST never adopts an App ready-add,
+  even when it is the only one. A second App ready-add, any other App `ac/*` write,
+  or a writer that is neither a human `User` nor this App rejects the promotion. If
+  the latest ready-add in the window came from a human `User`, the promotion is
+  adopted, because a human finished it.
+- **Shape.** The issue must be open and carry `ready` alone or `todo`+`ready`
+  residue. The dispatch's `running` write then clears both labels.
 - **Graph readiness.** Every blocker must still be closed as completed.
 
-A conclusive negative clears the pending flag, the event id, and the window, and
-leaves `todo`: no ready label landed, a human parked the card, the visible
-ready-add is not our event or a human, or a blocker reopened. A definitive GitHub
-refusal of the ready POST (not a timeout) drops the window, so a later App
-ready-add is not treated as ours. A thrown GitHub read, a history that does not
-yet contain our event, an unidentified App ready-add while the window is set, or a
-history past the 10-page bound is inconclusive: keep the flag and retry on the
-same exponential recovery backoff. That result is never a negative. A non-human
-doorbell does not reset the backoff or read early while the next check is still
-in the future. A human status doorbell still reads immediately. A later tick
-repairs the card once the events API shows a unique matching event. The graph
-reconciler never adopts a lone `ready` or `todo`+`ready` on a DB `todo` card
-itself. Any later status change clears the flag, the event id, and the window, so
-they cannot authorize a future promotion after the card returns to `todo`.
+If the issue carries no `ready` label (the POST did not land, or a human moved the
+card), the intent clears and the card stays `todo`. A redelivered graph doorbell
+promotes it again. Every other failed check hands the card to a human. The CP moves
+the card back to `todo`, clears the intent, sets `needsAttention` with an
+`attentionReason`, logs a warning, and posts a fixed, body-free issue comment so the
+board shows it. The reasons are:
+
+- `unattributed`: the window does not prove the add is ours.
+- `unexpected_labels`: `ready` sits next to another status.
+- `blockers_reopened`: a blocker reopened.
+- `unresolved`: the result stayed inconclusive.
+
+A thrown read, a window that does not yet show any ready-add, a window deeper than
+10 pages, or a truncated graph is inconclusive. The card keeps its intent and retries
+on the recovery backoff. Each deferred check counts in `promotionChecks`. After 12
+checks, or 6 hours after the intent opened, the card escalates as `unresolved`. A
+non-human doorbell does not reset the backoff or read early. A human status doorbell
+reads at once and still counts toward the cap. A `needsAttention` card is parked like
+a mismatch, so it is human-only: tick recovery and the label doorbell un-park it only
+when a human `User` re-adds `ac/status:ready` or sets another single status. A stale
+graph CAS cannot re-promote it, because escalation bumps the state revision. Any
+later status change clears the intent and the flag. They therefore cannot authorize
+a future promotion once the card returns to `todo`.
 
 Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`, or an
 unsuccessful/empty daemon token response. They never use stored human gh
@@ -254,6 +257,19 @@ only a CP log line.
   instead, about 60 seconds later because the doorbell reset the backoff, not when the
   webhook arrived. Attribution that cannot see the event fails closed; the same lag
   can likewise defer a half-landed promotion's adoption to a later tick.
+- **A half-landed promotion trusts the agents not to replay its exact write.** The CP
+  and its agents share the App identity, and the label POST returns no event id. An
+  agent that adds `ac/status:ready`, and optionally removes `ac/status:todo`, in the
+  seconds between the cursor read and an accepted POST is therefore indistinguishable
+  from the CP's own write. A POST with an existing label adds no event, so the agent's
+  add then stands alone in the window. That case is adopted. The resulting labels are
+  the ones the CP was writing anyway, for a card whose blockers are all complete, and
+  any second App ready-add or other App `ac/*` write in the window escalates the card
+  instead. Closing this would need a per-write identity GitHub does not expose, such
+  as a separate App for the control plane.
+- **Escalation comments are best-effort.** If the comment POST fails, the card still
+  carries `needsAttention` and a warning is logged, but nothing shows on the issue.
+  The console does not surface the flag yet.
 - **`sender.type === 'User'` does not prove a human.** An App acting with a
   user-to-server token, or a worker using a personal access token, is also reported
   as `User`, so it can ring the card-status doorbell. That only causes reads: un-park
