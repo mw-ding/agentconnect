@@ -4,6 +4,7 @@ import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
 import type { KanbanRunEndInput, KanbanRunOutcomeValue } from '../../src/persistence/ports.js'
 
@@ -547,10 +548,10 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     await park(boardId, 'archived')
     await park(boardId, 'ready')
     await seedCard(boardId, { status: 'todo' })
-    const listed = await repo().listMismatchedCards(boardId, NOW, 10)
+    const listed = await repo().listRecoveryDue(boardId, NOW, 10)
     expect(listed.map((c) => c.issueNumber)).toEqual([blocked, triage, todo].map((c) => c.issueNumber))
-    expect(listed[0]).toEqual({ cardId: blocked.id, issueNumber: blocked.issueNumber })
-    expect(await repo().listMismatchedCards(boardId, NOW, 2)).toHaveLength(2)
+    expect(listed[0]).toEqual({ cardId: blocked.id, issueNumber: blocked.issueNumber, promotion: false })
+    expect(await repo().listRecoveryDue(boardId, NOW, 2)).toHaveLength(2)
     expect(await repo().getParkedStatus(boardId, blocked.issueNumber)).toBe('blocked')
   })
 
@@ -566,10 +567,10 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       )
     }
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: a.id } })).recoveryChecks).toBe(expected.length)
-    expect((await repo().listMismatchedCards(boardId, NOW, 10)).map((c) => c.cardId)).toEqual([b.id])
+    expect((await repo().listRecoveryDue(boardId, NOW, 10)).map((c) => c.cardId)).toEqual([b.id])
     await repo().deferRecovery(b.id, new Date(NOW.getTime() - 3600_000))
     const later = new Date(NOW.getTime() + 3600_000)
-    expect((await repo().listMismatchedCards(boardId, later, 10)).map((c) => c.cardId)).toEqual([b.id, a.id])
+    expect((await repo().listRecoveryDue(boardId, later, 10)).map((c) => c.cardId)).toEqual([b.id, a.id])
   })
 
   it('applies a recovery move only from the expected parked status and resets the backoff', async () => {
@@ -584,6 +585,69 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       recoveryChecks: 0
     })
     expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(false)
+  })
+
+  it('restarts the backoff when the observed GitHub fingerprint changes, and on a webhook reset', async () => {
+    const boardId = await seedBoard()
+    const c = await park(boardId, 'blocked')
+    const checkAt = async () => (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).recoveryCheckAt
+    for (const sec of [60, 120, 240]) {
+      await repo().deferRecovery(c.id, NOW, 'blocked')
+      expect(await checkAt()).toEqual(new Date(NOW.getTime() + sec * 1000))
+    }
+    await repo().deferRecovery(c.id, NOW, 'triage+blocked')
+    expect(await checkAt()).toEqual(new Date(NOW.getTime() + 60_000))
+    await repo().deferRecovery(c.id, NOW, 'triage+blocked')
+    expect(await checkAt()).toEqual(new Date(NOW.getTime() + 120_000))
+    // An unread (failed) check keeps the fingerprint and keeps backing off.
+    await repo().deferRecovery(c.id, NOW)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      recoveryObserved: 'triage+blocked',
+      recoveryChecks: 3
+    })
+    await repo().resetRecovery(boardId, c.issueNumber)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      recoveryCheckAt: null,
+      recoveryChecks: 0,
+      recoveryObserved: null
+    })
+    expect((await repo().listRecoveryDue(boardId, NOW, 10)).map((d) => d.cardId)).toEqual([c.id])
+  })
+
+  it('lists a todo card with a reverted promotion and adopts or clears it exactly once', async () => {
+    const boardId = await seedBoard()
+    const plain = await seedCard(boardId, { status: 'todo' })
+    const pending = await seedCard(boardId, { status: 'ready' })
+    const cards = new PgKanbanCardRepo(prisma)
+    expect(await cards.revertPromotion(pending.id, 0n)).toBe(false)
+    const { stateRevision } = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: pending.id } })
+    expect(await cards.revertPromotion(pending.id, stateRevision)).toBe(true)
+    expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([
+      { cardId: pending.id, issueNumber: pending.issueNumber, promotion: true }
+    ])
+    expect(await repo().settlePromotion(plain.id, true)).toBe(false)
+    expect(await repo().settlePromotion(pending.id, true)).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: pending.id } })).toMatchObject({
+      status: 'ready',
+      promotionPending: false,
+      stateRevision: stateRevision + 2n
+    })
+    expect(await repo().settlePromotion(pending.id, true)).toBe(false)
+    expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([])
+
+    const cleared = await seedCard(boardId, { status: 'ready' })
+    const rev = (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).stateRevision
+    await cards.revertPromotion(cleared.id, rev)
+    expect(await repo().settlePromotion(cleared.id, false)).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).toMatchObject({
+      status: 'todo',
+      promotionPending: false
+    })
+    // Any later status move settles a pending flag, so a stale one can never promote a card that came back to todo.
+    expect(await cards.casStatus(cleared.id, rev + 1n, 'ready')).toBe(true)
+    expect(await cards.revertPromotion(cleared.id, rev + 2n)).toBe(true)
+    expect(await cards.casStatus(cleared.id, rev + 3n, 'blocked')).toBe(true)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).promotionPending).toBe(false)
   })
 
   it('resets the backoff when the card is claimed again', async () => {

@@ -678,7 +678,11 @@ async function graphHarness() {
     store,
     onGraph: async (board, repo, n, graph) => {
       await reconciler.apply(board, repo, n, graph)
-      await h.dispatcher.ingestCard(board.id, n)
+      await h.dispatcher.onCardChanged(board.id, n)
+      h.dispatcher.poke(board.id)
+    },
+    onCard: async (board, _repo, n) => {
+      await h.dispatcher.onCardChanged(board.id, n)
       h.dispatcher.poke(board.id)
     },
     log
@@ -696,8 +700,80 @@ async function graphHarness() {
     await bell.settle()
     await h.dispatcher.settle()
   }
-  return { ...h, graphs, store, bell, ring, ingest, poke }
+  // The relay's `issues` doorbell for a human status relabel; it never reads the graph.
+  const ringLabel = async (n: number, deliveryKey = 'label-1') => {
+    bell.poke({
+      deliveryKey,
+      installationId: '77',
+      repoId: REPO_ID.toString(),
+      event: 'issues',
+      action: 'labeled',
+      ids: [String(n)],
+      numbers: [n]
+    })
+    await bell.settle()
+    await h.dispatcher.settle()
+  }
+  return { ...h, graphs, store, bell, ring, ringLabel, ingest, poke }
 }
+
+describe('Kanban card-status doorbell un-parks a re-readied card at once (real Postgres)', () => {
+  // Park a card in blocked, then let recovery back it off to the one-hour ceiling.
+  const parkAtCeiling = async (h: Awaited<ReturnType<typeof graphHarness>>) => {
+    const c = await h.addCard(['ac/status:blocked'])
+    await h.dispatcher.tick()
+    for (let i = 0; i < 8; i++) {
+      const { recoveryCheckAt } = await h.card(c.id)
+      if (recoveryCheckAt) h.clock.advance(recoveryCheckAt.getTime() - h.clock.now())
+      await h.dispatcher.tick()
+    }
+    const parked = await h.card(c.id)
+    expect(parked.status).toBe('blocked')
+    expect(parked.recoveryCheckAt!.getTime() - h.clock.now()).toBe(60 * 60_000)
+    return c
+  }
+
+  it('dispatches a human-re-readied card on the labeled webhook instead of after the backoff', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    await h.ringLabel(c.issueNumber)
+    expect(h.store.reads.at(-2)).toBe(c.issueNumber)
+    expect(h.sent.map(({ d }) => d)).toEqual([expect.objectContaining({ cardId: c.id, attempt: 2 })])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', recoveryCheckAt: null, recoveryChecks: 0 })
+    expect(h.bell.landedDeliveryKeys(['label-1'])).toEqual(new Set(['label-1']))
+  })
+
+  it('resets the backoff on the webhook even when the change cannot un-park the card', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    h.store.statusActors.set(c.issueNumber, 'bot')
+    await h.ringLabel(c.issueNumber)
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'blocked', recoveryCheckAt: null, recoveryChecks: 0 })
+    // The very next tick re-reads it, so a human fix moments later is not stuck behind the old hour.
+    const reads = h.store.reads.length
+    await h.dispatcher.tick()
+    expect(h.store.reads.length).toBe(reads + 1)
+    h.store.statusActors.set(c.issueNumber, 'human')
+    h.clock.advance(60_000)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
+  })
+
+  it('restarts the backoff when a tick read sees GitHub changed, even without a webhook', async () => {
+    const h = await graphHarness()
+    const c = await parkAtCeiling(h)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked', 'ac/status:triage']
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    const card = await h.card(c.id)
+    expect(card).toMatchObject({ status: 'blocked', recoveryChecks: 1 })
+    expect(card.recoveryCheckAt!.getTime() - h.clock.now()).toBe(60_000)
+  })
+})
 
 describe('Kanban graph reconciliation composed with dispatch (real Postgres)', () => {
   it('promotes todo and writes ready before the dispatcher reads and claims it', async () => {
@@ -747,19 +823,16 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe('running')
   })
 
-  it.each([
-    { name: 'add landed, removal failed', partial: true },
-    { name: 'add failed', partial: false }
-  ])('survives a tick after a failed promotion label write ($name); redelivery promotes', async ({ partial }) => {
-    const h = await graphHarness()
+  // A failed promotion write: nothing landed, the add landed (todo+ready), or both landed but the DELETE timed out.
+  const failPromotion = async (h: Awaited<ReturnType<typeof graphHarness>>, landed: string[] | null) => {
     const c = await h.addCard(['ac/status:todo'])
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
     h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
       .mockImplementationOnce(async () => {
-        if (partial) h.store.issues.get(c.issueNumber)!.labels.push('ac/status:ready')
-        throw new Error('label write failed')
+        if (landed) h.store.issues.get(c.issueNumber)!.labels = landed
+        throw new Error('label write timed out')
       })
       .mockImplementation(apply)
     await h.ring(c.issueNumber)
@@ -767,16 +840,63 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.ingest).not.toHaveBeenCalled()
     expect(h.poke).not.toHaveBeenCalled()
     expect(h.sent).toEqual([])
-    // The undone promotion leaves DB todo, so a tick before redelivery neither dispatches nor mismatches the card.
-    expect((await h.card(c.id)).status).toBe('todo')
+    // The undone promotion leaves DB todo, flagged for recovery, so no claim can mismatch it.
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true })
+    return c
+  }
+
+  it.each([
+    { name: 'add landed, removal failed', landed: ['ac/status:todo', 'ac/status:ready'] },
+    { name: 'removal landed but timed out', landed: ['ac/status:ready'] }
+  ])('the next tick adopts a half-landed promotion ($name) without waiting for redelivery', async ({ landed }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, landed)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:running'])
+    expect(h.log.info).toHaveBeenCalledWith(
+      { boardId: h.board.id, issueNumber: c.issueNumber },
+      'kanban: adopted a half-landed graph promotion'
+    )
+  })
+
+  it('a redelivered doorbell adopts a ready label that landed before its removal timed out', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    await h.ring(c.issueNumber)
+    expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
+    expect(h.sent[0]?.d.cardId).toBe(c.id)
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+  })
+
+  it('a tick after a promotion whose add failed clears the flag and leaves todo; redelivery promotes', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null)
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
     expect(await prisma.kanbanRun.count()).toBe(0)
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+    // The recovery read happened once; the cleared flag is not re-read on later ticks.
+    const reads = h.store.reads.length
+    h.clock.advance(60 * 60_000)
+    await h.dispatcher.tick()
+    expect(h.store.reads.length).toBe(reads)
     await h.ring(c.issueNumber)
     expect(h.bell.landedDeliveryKeys(['graph-1'])).toEqual(new Set(['graph-1']))
     expect(h.sent[0]?.d.cardId).toBe(c.id)
     expect((await h.card(c.id)).status).toBe('running')
+  })
+
+  it('never adopts a pending promotion that a human moved elsewhere on GitHub', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:blocked'])
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
   })
 
   it('rejects a stale graph CAS after mismatch ingest advances the card revision', async () => {

@@ -47,10 +47,12 @@ function make(
     installation?: GithubInstallationRecord | null
     readGraph?: (repo: unknown, n: number) => Promise<CardGraph>
     onGraph?: () => void | Promise<void>
+    onCard?: () => void | Promise<void>
   } = {}
 ) {
   const readGraph = vi.fn(opts.readGraph ?? (async () => EMPTY))
   const onGraph = vi.fn()
+  const onCard = vi.fn(opts.onCard ?? (() => {}))
   const log = { debug: vi.fn(), warn: vi.fn() }
   const doorbell = new KanbanGraphDoorbell({
     boards: { listEnabledByRepoId: vi.fn(async () => opts.boards ?? [BOARD]) },
@@ -59,9 +61,10 @@ function make(
     },
     store: { readGraph },
     onGraph: opts.onGraph ?? onGraph,
+    onCard,
     log
   })
-  return { doorbell, readGraph, onGraph, log }
+  return { doorbell, readGraph, onGraph, onCard, log }
 }
 
 describe('KanbanGraphDoorbell', () => {
@@ -76,6 +79,28 @@ describe('KanbanGraphDoorbell', () => {
     ])
     expect(h.onGraph).toHaveBeenCalledWith(BOARD, repo, 7, EMPTY)
     expect(h.onGraph).toHaveBeenCalledWith(BOARD, repo, 8, EMPTY)
+  })
+
+  it('hands an issues status poke to onCard without reading the graph', async () => {
+    const h = make()
+    h.doorbell.poke(poke({ event: 'issues', action: 'labeled', ids: ['9001'], numbers: [7] }))
+    await h.doorbell.settle()
+    expect(h.readGraph).not.toHaveBeenCalled()
+    expect(h.onGraph).not.toHaveBeenCalled()
+    expect(h.onCard).toHaveBeenCalledWith(BOARD, { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }, 7)
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('does not land an issues poke whose card handling failed', async () => {
+    const h = make({
+      onCard: () => {
+        throw new Error('db down')
+      }
+    })
+    h.doorbell.poke(poke({ event: 'issues', action: 'labeled', ids: ['9001'], numbers: [7] }))
+    await h.doorbell.settle()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+    expect(h.log.warn).toHaveBeenCalled()
   })
 
   it('records the GUID as landed even when no board watches the repo', async () => {

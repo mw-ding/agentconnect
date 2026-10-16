@@ -1863,6 +1863,10 @@ model KanbanCard {
   // Mismatch recovery backoff: next GitHub re-read and checks since the last change.
   recoveryCheckAt     DateTime?        @db.Timestamptz(6)
   recoveryChecks      Int              @default(0)
+  // The GitHub status fingerprint recovery last read; a change restarts the backoff.
+  recoveryObserved    String?
+  // A graph promotion's label write failed after possibly landing; recovery re-reads the card on the same backoff.
+  promotionPending    Boolean          @default(false)
   linkedPrNumber      Int?
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)

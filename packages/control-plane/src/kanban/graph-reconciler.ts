@@ -62,17 +62,22 @@ export class KanbanGraphReconciler {
     if (!observed || observed.state !== 'open') return
     if (residueOnly) return this.writeReadyLabels(repo, issueNumber, true, observed)
     const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
-    // Human label moves are authoritative; todo+ready is our own earlier partial promotion, so retry it.
-    if ((statuses.length !== 1 || statuses[0] !== statusLabel('todo')) && !isPromotionResidue(observed)) return
+    // The ready label already landed (a write that timed out after GitHub applied it): adopt it, nothing to write.
+    const landed = statuses.length === 1 && statuses[0] === statusLabel('ready')
+    // Other human label moves are authoritative; todo+ready is our own earlier partial promotion, so retry it.
+    if (!landed && (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) && !isPromotionResidue(observed)) {
+      return
+    }
     if (!(await this.deps.cards.casStatus(card.id, card.stateRevision, 'ready'))) {
       this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
       return
     }
+    if (landed) return
     try {
       await this.writeReadyLabels(repo, issueNumber, false, observed)
     } catch (err) {
-      // Undo the promotion so a claim cannot mismatch it into todo; the redelivered doorbell retries it.
-      await this.deps.cards.casStatus(card.id, card.stateRevision + 1n, 'todo').catch(() => false)
+      // Undo so a claim cannot mismatch it into todo; the pending flag lets tick recovery adopt a half-landed write.
+      await this.deps.cards.revertPromotion(card.id, card.stateRevision + 1n).catch(() => false)
       throw err
     }
   }

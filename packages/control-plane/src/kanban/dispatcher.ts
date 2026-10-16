@@ -13,13 +13,16 @@ import type {
   KanbanBoardRef,
   KanbanClaimedLease,
   KanbanDispatchRepo,
+  KanbanRecoveryDue,
   KanbanRunEndResult,
   KanbanRunOutcomeValue
 } from '../persistence/ports.js'
 import {
+  STATUS_LABEL_PREFIX,
   isDispatchableIssue,
   isPromotionResidue,
   observedCardStatus,
+  parseStatusLabels,
   planRecovery,
   planStatusWrite,
   type KanbanStatus,
@@ -60,6 +63,19 @@ const DEFAULT_EPOCH_GRACE_MS = 3 * 60_000
 const REAP_BATCH = 500
 /** Mismatch-parked cards re-read per board per tick; per-card backoff keeps the steady rate far lower. */
 const RECOVERY_BATCH = 25
+
+/** One recovery re-read: whether the card moved, and the fingerprint of what GitHub showed when it was read. */
+interface RecoveryRead {
+  moved: boolean
+  observed?: string
+}
+
+/** What recovery compares between reads, so a GitHub change restarts the backoff: issue state and status labels only. */
+export function recoveryFingerprint(issue: ObservedIssue | null): string {
+  if (!issue) return 'missing'
+  const statuses = issue.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX)).sort()
+  return JSON.stringify([issue.state, issue.stateReason ?? null, statuses])
+}
 
 export class KanbanDispatcher {
   private timer: TimerHandle | undefined
@@ -159,43 +175,72 @@ export class KanbanDispatcher {
 
   private async recoverMismatches(boardId: string): Promise<void> {
     const now = await this.deps.repo.now()
-    for (const card of await this.deps.repo.listMismatchedCards(boardId, now, RECOVERY_BATCH)) {
-      let moved = false
+    for (const card of await this.deps.repo.listRecoveryDue(boardId, now, RECOVERY_BATCH)) {
+      let read: RecoveryRead = { moved: false }
       try {
-        moved = await this.ingestCard(boardId, card.issueNumber)
+        read = card.promotion
+          ? await this.recoverPromotion(boardId, card)
+          : await this.ingest(boardId, card.issueNumber)
       } catch (err) {
         this.deps.log.warn({ err, boardId, issueNumber: card.issueNumber }, 'kanban: mismatch recovery read failed')
       }
-      if (!moved) await this.deps.repo.deferRecovery(card.cardId, now)
+      if (!read.moved) await this.deps.repo.deferRecovery(card.cardId, now, read.observed)
     }
   }
 
-  /** Body-free ingest shared by the graph doorbell and tick recovery; only a human's status edit un-parks a card. */
+  /** A GitHub change to this card (status label, close/reopen, or graph): restart its backoff and re-read it now. */
+  async onCardChanged(boardId: string, issueNumber: number): Promise<boolean> {
+    await this.deps.repo.resetRecovery(boardId, issueNumber)
+    return this.ingestCard(boardId, issueNumber)
+  }
+
+  /** Body-free ingest shared by the doorbells and tick recovery; only a human's status edit un-parks a card. */
   async ingestCard(boardId: string, issueNumber: number): Promise<boolean> {
+    return (await this.ingest(boardId, issueNumber)).moved
+  }
+
+  private async ingest(boardId: string, issueNumber: number): Promise<RecoveryRead> {
     const from = await this.deps.repo.getParkedStatus(boardId, issueNumber)
-    if (!from) return false
-    const ref = await this.deps.repo.getBoardRef(boardId)
-    if (!ref) return false
-    const repo = await this.repoRef(ref)
-    if (!repo) return false
-    const plan = planRecovery(from, await this.deps.store.readCard(repo, issueNumber))
+    if (!from) return { moved: false }
+    const repo = await this.boardRepoRef(boardId)
+    if (!repo) return { moved: false }
+    const issue = await this.deps.store.readCard(repo, issueNumber)
+    const observed = recoveryFingerprint(issue)
+    const plan = planRecovery(from, issue)
     if (plan.kind === 'illegal') {
       this.deps.log.info(
         { boardId, issueNumber, from, requested: plan.requested },
         'kanban: recovery ignored a status move the state machine does not allow'
       )
-      return false
+      return { moved: false, observed }
     }
-    if (plan.kind === 'none') return false
+    if (plan.kind === 'none') return { moved: false, observed }
     // Agents write labels as the App bot, so an unattributed or non-human change never un-parks a card.
     if (!(await this.deps.store.statusSetByHuman(repo, issueNumber, plan.to))) {
       this.deps.log.info(
         { boardId, issueNumber, from, to: plan.to },
         'kanban: recovery ignored a non-human status label'
       )
-      return false
+      return { moved: false, observed }
     }
-    return this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
+    return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
+  }
+
+  /** A promotion whose label write failed: adopt it when the ready label landed on GitHub, else just clear the flag. */
+  private async recoverPromotion(boardId: string, card: KanbanRecoveryDue): Promise<RecoveryRead> {
+    const repo = await this.boardRepoRef(boardId)
+    if (!repo) return { moved: false }
+    const issue = await this.deps.store.readCard(repo, card.issueNumber)
+    const { statuses, malformed } = parseStatusLabels(issue?.labels ?? [])
+    const readyOnly = statuses.length === 1 && statuses[0] === 'ready' && malformed.length === 0
+    const landed = !!issue && issue.state === 'open' && (readyOnly || isPromotionResidue(issue))
+    const settled = await this.deps.repo.settlePromotion(card.cardId, landed)
+    if (landed && settled) {
+      // Residue is dispatchable as is, and the running write clears both labels.
+      this.deps.log.info({ boardId, issueNumber: card.issueNumber }, 'kanban: adopted a half-landed graph promotion')
+      return { moved: true }
+    }
+    return { moved: false, observed: recoveryFingerprint(issue) }
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */
@@ -353,6 +398,11 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  private async boardRepoRef(boardId: string): Promise<KanbanRepoRef | null> {
+    const ref = await this.deps.repo.getBoardRef(boardId)
+    return ref ? this.repoRef(ref) : null
   }
 
   /** The installation is resolved live from the board's org and repo owner, never trusted from a frame. */

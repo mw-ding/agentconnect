@@ -76,6 +76,11 @@ function make(
       const card = [...db.values()].find((c) => c.id === id)!
       card.status = to
       return true
+    }),
+    revertPromotion: vi.fn(async (id: string) => {
+      const card = [...db.values()].find((c) => c.id === id)!
+      card.status = 'todo'
+      return true
     })
   }
   const store = {
@@ -197,14 +202,27 @@ describe('KanbanGraphReconciler', () => {
     h.store.applyPlan.mockRejectedValueOnce(new Error('label add failed'))
     const g = graph({ blockedBy: [done] })
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
-    expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([
-      [1n, 'ready'],
-      [2n, 'todo']
-    ])
+    expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([[1n, 'ready']])
+    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n)
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')
     expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+  })
+
+  it('adopts a ready label that already landed when the old label removal timed out', async () => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:ready', 'ac/agent:eng'] } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([[1n, 'ready']])
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('ready')
+  })
+
+  it('leaves a DB todo with only a ready label alone while its blockers are open', async () => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:ready'] } })
+    await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [link(5, 'open')] }))
+    expect(h.cards.casStatus).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
   })
 
   it('preserves conflicting ready and blocked labels for dispatcher mismatch recovery', async () => {

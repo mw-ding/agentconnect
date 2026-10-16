@@ -5158,6 +5158,13 @@ export interface KanbanOpenLease extends OpenLeaseFacts {
   leaseId: string
 }
 
+/** A card whose recovery re-read is due; `promotion` marks a todo card whose promotion write may have half-landed. */
+export interface KanbanRecoveryDue {
+  cardId: string
+  issueNumber: number
+  promotion: boolean
+}
+
 export interface KanbanDispatchRepo {
   /** Enabled boards, for the periodic reconciler tick. */
   listEnabledBoardIds(): Promise<string[]>
@@ -5166,18 +5173,18 @@ export interface KanbanDispatchRepo {
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
-  // Non-terminal mismatch-parked cards whose recovery re-read is due, most overdue first.
-  listMismatchedCards(
-    boardId: string,
-    now: Date,
-    limit: number
-  ): Promise<Array<{ cardId: string; issueNumber: number }>>
+  // Non-terminal mismatch-parked cards and todo cards with a pending promotion whose re-read is due, most overdue first.
+  listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]>
   // The status a pre-dispatch mismatch parked the card in, or null when its latest run is not an ended mismatch.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
   ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
-  // Push the card's next recovery re-read out exponentially.
-  deferRecovery(cardId: string, now: Date): Promise<void>
+  // Push the card's next recovery re-read out exponentially; a changed `observed` fingerprint restarts the backoff.
+  deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
+  // GitHub changed this card, so its next recovery re-read is due on the next tick.
+  resetRecovery(boardId: string, issueNumber: number): Promise<void>
+  // Settle a pending promotion on a todo card: `repaired` adopts it as ready, otherwise the flag just clears.
+  settlePromotion(cardId: string, repaired: boolean): Promise<boolean>
   // Recheck the claim after the GitHub read, without changing its DB-selected mode.
   isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean>
   // Accept only the open run with the current card revision, placement, mode, and daemon epoch.
@@ -5205,4 +5212,6 @@ export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
+  /** Undo a promotion whose label write failed and flag it pending, so recovery re-reads what landed on GitHub. */
+  revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean>
 }
