@@ -19,6 +19,7 @@
 import { isFrame } from '@agentconnect.md/protocol'
 import { AgentId, HookId } from '../../domain/ids.js'
 import { GitCredDeniedError } from '../../github/service.js'
+import { kanbanGrantFor, kanbanRequestRepo } from '../../kanban/daemon-grant.js'
 import type { Handler } from './index.js'
 
 export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
@@ -40,6 +41,11 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
   }
 
   try {
+    const bucketKeys = [`daemon:${conn.daemonId}`, `org:${agent.orgId}`]
+    const runs = (await deps.kanbanGrants?.openScopes(agent.id, conn.daemonId)) ?? []
+    const askedRepo = kanbanRequestRepo(repoFullName, agent.workspace)
+    const kanbanScope = askedRepo ? kanbanGrantFor(runs, askedRepo) : undefined
+
     if (purpose === 'kanban_card_write') {
       const requested = new Set(capabilities ?? [])
       if (
@@ -67,7 +73,7 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         agent,
         repoFullName,
         allowed.repoId,
-        [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
+        bucketKeys,
         forceRefresh === true
       )
       conn.replyTo(frame, 'gitcred/grant', {
@@ -111,7 +117,7 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         agent,
         repoFullName,
         hook.repoId ?? undefined,
-        [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
+        bucketKeys,
         forceRefresh === true
       )
       conn.replyTo(frame, 'gitcred/grant', {
@@ -131,12 +137,26 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
     // through the agent's explicit AgentRepoAuthorization rows (multi-repo
     // design §2). GithubPoster requests take the purpose-gated path above;
     // general agent git/gh credentials stay constrained by this allowlist.
-    const cred = await deps.github.mintForAgent(
-      agent,
-      [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
-      capabilities,
-      repoFullName
-    )
+    // An open Kanban run replaces the workspace grant for that repo, so read mode is the token itself.
+    if (kanbanScope) {
+      const cred = await deps.github.mintForKanbanRun(
+        agent,
+        repoFullName ?? kanbanScope.repoFullName,
+        kanbanScope.repoId,
+        kanbanScope.mode,
+        bucketKeys
+      )
+      conn.replyTo(frame, 'gitcred/grant', {
+        username: 'x-access-token',
+        token: cred.token,
+        ttlSec: cred.ttlSec,
+        expiresAt: cred.expiresAt,
+        repoFullName: cred.repoFullName,
+        access: cred.access
+      })
+      return
+    }
+    const cred = await deps.github.mintForAgent(agent, bucketKeys, capabilities, repoFullName)
     conn.replyTo(frame, 'gitcred/grant', {
       username: 'x-access-token',
       token: cred.token,

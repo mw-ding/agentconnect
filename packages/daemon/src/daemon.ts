@@ -2867,6 +2867,11 @@ export class Daemon {
     // cache. The request fn resolves this.cpClient lazily (it connects later);
     // until the WS is READY a pull just fails fast and the prefetch retries at
     // first session. Everything written to disk here is secret-free.
+    const workspaceRepoOf = (agentId: string): string | undefined => {
+      const ws = this.agents.get(agentId)?.workspace
+      if (ws?.mode !== 'git-repo' || !ws.gitRepo) return undefined
+      return gitRepoLabel(ws.gitRepo) ?? undefined
+    }
     this.gitCreds = new GitCredentialCache({
       request: (payload) => {
         const client = this.cpClient
@@ -2874,20 +2879,17 @@ export class Daemon {
         return client.requestGitCred(payload)
       },
       log: { warn: (m: string) => this.log.warn(m) },
-      actionsSupported: () => this.cpClient?.supportsServerFeature?.('gitcred-actions-v1') ?? false
+      actionsSupported: () => this.cpClient?.supportsServerFeature?.('gitcred-actions-v1') ?? false,
+      kanbanRuns: () => this.kanban?.credentialScopes() ?? [],
+      workspaceRepoOf
     })
     this.gitCredServer = new GitCredServer(this.gitCreds, gitcredSocketPath(root), {
       log: {
         info: (m: string) => this.log.info(m),
         warn: (m: string) => this.log.warn(m)
       },
-      // Folds a helper request naming the workspace repo onto the repo-less
-      // cache key (shared with pre-warm/spawn; old-CP-safe).
-      workspaceRepoOf: (agentId: string) => {
-        const ws = this.agents.get(agentId)?.workspace
-        if (ws?.mode !== 'git-repo' || !ws.gitRepo) return undefined
-        return gitRepoLabel(ws.gitRepo) ?? undefined
-      }
+      // Folds a helper request naming the workspace repo onto the repo-less cache key (shared with pre-warm/spawn).
+      workspaceRepoOf
     })
     const daemonCredentialTarget = daemonGitCredentialTarget({
       shimPath: writeGitcredShim(root, daemonEntryForShims(root)),
@@ -20499,7 +20501,8 @@ export class Daemon {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: (agentId, sessionId) => (this.sessionSdkQuiescent(agentId, sessionId) ? 0 : 1)
       },
-      comments: this.kanbanComments()
+      comments: this.kanbanComments(),
+      onLeaseChanged: (dispatch) => this.gitCreds.dropAgentRepo(dispatch.agentId, dispatch.repoFullName)
     }))
   }
 

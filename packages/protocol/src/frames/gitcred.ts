@@ -37,9 +37,9 @@ export type GitCommitIdentity = z.infer<typeof GitCommitIdentity>
  * `actions` buys GitHub Actions inspection/execution. Every
  * General agent credentials mint every capability admitted by the repo's
  * `gitAccess` / authorization tier — a read-only agent gets read-only
- * issues/PR scopes and no Actions capability.
- * The one exception is purpose=github_hook_reply: a daemon-owned writer whose
- * token never enters the agent environment and is gated by an enabled hook.
+ * issues/PR scopes and no Actions capability. Two daemon-owned writers never
+ * enter the agent environment: purpose=github_hook_reply (an enabled hook)
+ * and purpose=kanban_card_write (an accepted Kanban lease, issues write only).
  */
 export const GitCredCapability = z.enum(['contents', 'issues', 'pull_requests', 'actions'])
 export type GitCredCapability = z.infer<typeof GitCredCapability>
@@ -50,11 +50,7 @@ export const GitCredRequest = z.object({
   reason: z.enum(['clone', 'fetch', 'pull', 'push', 'helper']).optional(), // observability only
   // Absent ⇒ ['contents'] — pre-P2.5 daemons keep byte-identical behavior.
   capabilities: z.array(GitCredCapability).nonempty().optional(),
-  // The daemon-owned GithubPoster is a narrower consumer than an agent's git/
-  // gh tools: its token never enters the agent environment and may only back
-  // the one final comment for an enabled GitHub hook turn, or the one Kanban
-  // summary comment. Marking that purpose lets the CP apply hook or lease
-  // authorization instead of clamping the token to workspace contents gitAccess.
+  // github_hook_reply is hook-gated issues/PR write. kanban_card_write is lease-gated issues write, minted after the run is accepted.
   purpose: z.enum(['github_hook_reply', 'kanban_card_write']).optional(),
   // The accepted Kanban run whose summary this token may post. The CP rechecks it.
   leaseId: z.string().uuid().optional(),
