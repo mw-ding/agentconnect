@@ -311,6 +311,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     })
   }
 
+  async getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null> {
+    const card = await this.db.kanbanCard.findFirst({
+      where: { boardId, issueNumber, status: 'todo', promotionPending: true },
+      select: { id: true }
+    })
+    return card ? { cardId: card.id, issueNumber, promotion: true } : null
+  }
+
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
     // Repair adopts the promotion that already landed on GitHub; otherwise only the pending flag clears.
     const { count } = await this.db.kanbanCard.updateMany({

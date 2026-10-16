@@ -625,6 +625,13 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([
       { cardId: pending.id, issueNumber: pending.issueNumber, promotion: true }
     ])
+    // A doorbell looks the pending card up by issue number; a plain todo card has nothing pending.
+    expect(await repo().getPendingPromotion(boardId, pending.issueNumber)).toEqual({
+      cardId: pending.id,
+      issueNumber: pending.issueNumber,
+      promotion: true
+    })
+    expect(await repo().getPendingPromotion(boardId, plain.issueNumber)).toBeNull()
     expect(await repo().settlePromotion(plain.id, true)).toBe(false)
     expect(await repo().settlePromotion(pending.id, true)).toBe(true)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: pending.id } })).toMatchObject({
@@ -634,6 +641,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     })
     expect(await repo().settlePromotion(pending.id, true)).toBe(false)
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toEqual([])
+    expect(await repo().getPendingPromotion(boardId, pending.issueNumber)).toBeNull()
 
     const cleared = await seedCard(boardId, { status: 'ready' })
     const rev = (await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).stateRevision

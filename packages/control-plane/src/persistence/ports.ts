@@ -5183,6 +5183,8 @@ export interface KanbanDispatchRepo {
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
   resetRecovery(boardId: string, issueNumber: number): Promise<void>
+  // The todo card whose promotion is still pending, or null.
+  getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null>
   // Settle a pending promotion on a todo card: `repaired` adopts it as ready, otherwise the flag just clears.
   settlePromotion(cardId: string, repaired: boolean): Promise<boolean>
   // Recheck the claim after the GitHub read, without changing its DB-selected mode.

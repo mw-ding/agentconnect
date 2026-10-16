@@ -1,7 +1,7 @@
 // GithubCardStore + KanbanLabelWriter over a scripted fetch: body-free reads, repo-id URLs, per-label add/remove writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { FetchLike } from '../github/api.js'
-import { GithubCardStore, isHumanActor, type KanbanRepoRef } from './card-store.js'
+import { GithubCardStore, isAppActor, isHumanActor, promotionAttributed, type KanbanRepoRef } from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
 
@@ -14,7 +14,7 @@ interface Call {
   body: unknown
 }
 
-function harness(routes: Record<string, () => Response>) {
+function harness(routes: Record<string, () => Response>, appSlug?: string) {
   const calls: Call[] = []
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? 'GET'
@@ -36,7 +36,12 @@ function harness(routes: Record<string, () => Response>) {
     repoFullName,
     access: 'read' as const
   }))
-  const store = new GithubCardStore({ tokens: { mintKanbanCard }, fetchImpl, baseUrl: 'https://api.test' })
+  const store = new GithubCardStore({
+    tokens: { mintKanbanCard },
+    fetchImpl,
+    baseUrl: 'https://api.test',
+    ...(appSlug ? { appSlug } : {})
+  })
   return { store, calls, mintKanbanCard }
 }
 
@@ -290,5 +295,93 @@ describe('status label attribution', () => {
     expect(isHumanActor({ actor: { type: 'User' } })).toBe(false)
     expect(isHumanActor({ actor: bot })).toBe(false)
     expect(isHumanActor({ actor: undefined })).toBe(false)
+  })
+})
+
+describe('half-landed promotion attribution', () => {
+  const human = { type: 'User', login: 'maintainer' }
+  const app = { type: 'Bot', login: 'AgentConnect[bot]' }
+  const other = { type: 'Bot', login: 'renovate[bot]' }
+  let id = 0
+  const add = (name: string, actor: unknown) => ({
+    id: ++id,
+    event: 'labeled',
+    label: { name: `ac/status:${name}` },
+    actor
+  })
+  const del = (name: string, actor: unknown) => ({
+    id: ++id,
+    event: 'unlabeled',
+    label: { name: `ac/status:${name}` },
+    actor
+  })
+  const state = (event: 'closed' | 'reopened', actor: unknown) => ({ id: ++id, event, actor })
+
+  it.each([
+    ['our promotion over a human todo', () => [add('todo', human), add('ready', app), del('todo', app)], true],
+    ['our residue (remove failed)', () => [add('todo', human), add('ready', app)], true],
+    ['all-App history', () => [add('todo', app), add('ready', app), del('todo', app)], true],
+    ['a human finished it', () => [add('todo', human), add('ready', human), del('todo', human)], true],
+    [
+      'human park, then an agent swap',
+      () => [add('todo', human), add('blocked', human), del('todo', human), add('ready', app), del('blocked', app)],
+      false
+    ],
+    ['human park left alongside todo', () => [add('todo', human), add('blocked', human), add('ready', app)], false],
+    [
+      'human closed it, an agent reopened it',
+      () => [add('todo', human), state('closed', human), state('reopened', app), add('ready', app)],
+      false
+    ],
+    [
+      'human unparked back to todo first',
+      () => [
+        add('todo', human),
+        add('blocked', human),
+        del('todo', human),
+        add('todo', human),
+        del('blocked', human),
+        add('ready', app)
+      ],
+      true
+    ],
+    ['another bot added ready', () => [add('todo', human), add('ready', other), del('todo', other)], false],
+    [
+      'another bot touched status later',
+      () => [add('todo', human), add('ready', app), add('triage', other), del('triage', other)],
+      false
+    ],
+    ['no ready add at all', () => [add('todo', human)], false],
+    [
+      'unrelated label events are ignored',
+      () => [
+        add('todo', human),
+        { id: ++id, event: 'labeled', label: { name: 'bug' }, actor: other },
+        add('ready', app)
+      ],
+      true
+    ]
+  ])('%s', (_name, events, expected) => {
+    expect(promotionAttributed(events(), 'agentconnect')).toBe(expected)
+  })
+
+  it('never trusts an App write without a configured slug, and replays by event id', () => {
+    expect(promotionAttributed([add('todo', human), add('ready', app)], undefined)).toBe(false)
+    const [park, swap] = [add('blocked', human), add('ready', app)]
+    expect(promotionAttributed([swap, park], 'agentconnect')).toBe(false)
+    expect(isAppActor({ actor: { type: 'User', login: 'agentconnect[bot]' } }, 'agentconnect')).toBe(false)
+  })
+
+  it('reads the event history through the store and fails closed past the bound', async () => {
+    const EVENTS = 'GET /repositories/42/issues/7/events?per_page=100&page=1'
+    const ok = harness({ [EVENTS]: () => json([add('todo', human), add('ready', app)]) }, 'agentconnect')
+    expect(await ok.store.promotionAttributed(REPO, 7)).toBe(true)
+    expect(ok.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
+    const routes: Record<string, () => Response> = {}
+    for (let page = 1; page <= 10; page++) {
+      routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
+        json(Array.from({ length: 100 }, () => add('ready', app)))
+    }
+    expect(await harness(routes, 'agentconnect').store.promotionAttributed(REPO, 7)).toBe(false)
   })
 })

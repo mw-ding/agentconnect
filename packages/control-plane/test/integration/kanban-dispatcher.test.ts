@@ -7,7 +7,13 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher, WRITE_MODE_LABEL } from '../../src/kanban/dispatcher.js'
-import type { CardGraph, CardIssue, KanbanRepoRef } from '../../src/kanban/card-store.js'
+import {
+  promotionAttributed,
+  type CardGraph,
+  type CardIssue,
+  type KanbanRepoRef,
+  type LabelEvent
+} from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
@@ -19,15 +25,52 @@ const D2 = 'd2222222-2222-4222-8222-222222222222'
 const A1 = 'a1111111-1111-4111-8111-111111111111'
 const REPO_ID = 987654321n
 const T0 = Date.parse('2026-10-15T12:00:00.000Z')
+const APP_SLUG = 'agentconnect'
+/** Who GitHub's issue events name for a label write: a person, this App's bot (CP and agents alike), or another bot. */
+const ACTORS = {
+  human: { type: 'User', login: 'maintainer' },
+  app: { type: 'Bot', login: `${APP_SLUG}[bot]` },
+  other: { type: 'Bot', login: 'renovate[bot]' }
+} as const
 
 class FakeStore {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   /** Who last set each issue's status label; unset means a human. */
   readonly statusActors = new Map<number, 'human' | 'bot'>()
+  /** The issue events API: label adds/removes with their actor, replayed by the real attribution check. */
+  readonly events = new Map<number, LabelEvent[]>()
+  readonly graphs = new Map<number, CardGraph>()
   readonly reads: number[] = []
+  private eventId = 0
   async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
     return (this.statusActors.get(n) ?? 'human') === 'human'
+  }
+  async promotionAttributed(_repo: KanbanRepoRef, n: number): Promise<boolean> {
+    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG)
+  }
+  async readGraph(_repo: KanbanRepoRef, n: number): Promise<CardGraph> {
+    return this.graphs.get(n) ?? emptyGraph()
+  }
+  /** Set an issue's labels as `actor`, recording the add-then-remove events GitHub would. */
+  relabel(n: number, labels: string[], actor: keyof typeof ACTORS): void {
+    const i = this.issues.get(n)!
+    this.record(
+      n,
+      labels.filter((l) => !i.labels.includes(l)),
+      i.labels.filter((l) => !labels.includes(l)),
+      actor
+    )
+    i.labels = [...labels]
+  }
+  private record(n: number, added: string[], removed: string[], actor: keyof typeof ACTORS): void {
+    const events = this.events.get(n) ?? []
+    for (const name of added)
+      events.push({ id: ++this.eventId, event: 'labeled', label: { name }, actor: ACTORS[actor] })
+    for (const name of removed) {
+      events.push({ id: ++this.eventId, event: 'unlabeled', label: { name }, actor: ACTORS[actor] })
+    }
+    this.events.set(n, events)
   }
   async readCard(_repo: KanbanRepoRef, n: number): Promise<CardIssue | null> {
     this.reads.push(n)
@@ -45,6 +88,7 @@ class FakeStore {
   async applyPlan(_repo: KanbanRepoRef, n: number, _observed: ObservedIssue, plan: LabelPlan): Promise<void> {
     this.writes.push(plan)
     const i = this.issues.get(n)!
+    this.record(n, plan.addLabels, plan.removeLabels, 'app')
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
       i.state = plan.issueState.state
@@ -118,7 +162,7 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, log, sent, repo, dispatcher, addCard, reportFor, card, run }
+  return { board, clock, store, graphs: store.graphs, log, sent, repo, dispatcher, addCard, reportFor, card, run }
 }
 
 describe('KanbanDispatcher — dispatch (real Postgres)', () => {
@@ -661,10 +705,7 @@ const completedBlocker = {
 
 async function graphHarness() {
   const h = await harness()
-  const graphs = new Map<number, CardGraph>()
-  const store = Object.assign(h.store, {
-    readGraph: async (_repo: KanbanRepoRef, n: number) => graphs.get(n) ?? emptyGraph()
-  })
+  const { graphs, store } = h
   const log = { debug: vi.fn(), warn: vi.fn() }
   const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
   const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
@@ -831,7 +872,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
       .mockImplementationOnce(async () => {
-        if (landed) h.store.issues.get(c.issueNumber)!.labels = landed
+        if (landed) h.store.relabel(c.issueNumber, landed, 'app')
         throw new Error('label write timed out')
       })
       .mockImplementation(apply)
@@ -892,11 +933,75 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
 
   it('never adopts a pending promotion that a human moved elsewhere on GitHub', async () => {
     const h = await graphHarness()
-    const c = await failPromotion(h, ['ac/status:blocked'])
+    const c = await failPromotion(h, null)
+    h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
     expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+  })
+
+  // Vera's #18 sequence: the promotion write fails, a human parks the card, then an agent (the App bot) or another bot readies it.
+  it.each([
+    { swapper: 'app' as const, doorbell: false },
+    { swapper: 'app' as const, doorbell: true },
+    { swapper: 'other' as const, doorbell: false }
+  ])(
+    'a $swapper swap to ready after a human park is never dispatched (human doorbell rang: $doorbell)',
+    async ({ swapper, doorbell }) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, null)
+      h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
+      if (doorbell) {
+        await h.ringLabel(c.issueNumber)
+        // Any doorbell settles the pending flag, so nothing is left for a later bot write to adopt.
+        expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+      }
+      h.store.relabel(c.issueNumber, ['ac/status:ready'], swapper)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      // A later graph doorbell for the card does not adopt the bot's ready either.
+      await h.ring(c.issueNumber, 'graph-2')
+      h.clock.advance(60 * 60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent).toEqual([])
+      expect(await prisma.kanbanRun.count()).toBe(0)
+      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+      expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:ready'])
+      if (!doorbell) {
+        expect(h.log.info).toHaveBeenCalledWith(
+          { boardId: h.board.id, issueNumber: c.issueNumber },
+          'kanban: refused a pending promotion whose ready label is not ours'
+        )
+      }
+    }
+  )
+
+  it('adopts a pending promotion a human finished by hand', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null)
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+  })
+
+  it('refuses a half-landed promotion once a blocker has reopened', async () => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, ['ac/status:ready'])
+    h.graphs.set(c.issueNumber, {
+      ...emptyGraph(),
+      blockedBy: [{ ...completedBlocker, state: 'open', stateReason: null }]
+    })
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+    expect(h.log.info).toHaveBeenCalledWith(
+      { boardId: h.board.id, issueNumber: c.issueNumber },
+      'kanban: refused a pending promotion whose blockers reopened'
+    )
   })
 
   it('rejects a stale graph CAS after mismatch ingest advances the card revision', async () => {

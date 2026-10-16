@@ -29,6 +29,7 @@ import {
   type ObservedIssue
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
@@ -45,7 +46,7 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'statusSetByHuman'>
+  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionAttributed'>
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -191,7 +192,14 @@ export class KanbanDispatcher {
   /** A GitHub change to this card (status label, close/reopen, or graph): restart its backoff and re-read it now. */
   async onCardChanged(boardId: string, issueNumber: number): Promise<boolean> {
     await this.deps.repo.resetRecovery(boardId, issueNumber)
-    return this.ingestCard(boardId, issueNumber)
+    const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
+    if (!pending) return this.ingestCard(boardId, issueNumber)
+    // Any doorbell settles a pending promotion: adopted only on proof, otherwise (a failed read included) the flag clears.
+    try {
+      return (await this.recoverPromotion(boardId, pending)).moved
+    } finally {
+      await this.deps.repo.settlePromotion(pending.cardId, false)
+    }
   }
 
   /** Body-free ingest shared by the doorbells and tick recovery; only a human's status edit un-parks a card. */
@@ -226,14 +234,15 @@ export class KanbanDispatcher {
     return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
   }
 
-  /** A promotion whose label write failed: adopt it when the ready label landed on GitHub, else just clear the flag. */
+  /** A promotion whose label write failed: adopt the ready label only if it is provably ours, else just clear the flag. */
   private async recoverPromotion(boardId: string, card: KanbanRecoveryDue): Promise<RecoveryRead> {
     const repo = await this.boardRepoRef(boardId)
     if (!repo) return { moved: false }
     const issue = await this.deps.store.readCard(repo, card.issueNumber)
     const { statuses, malformed } = parseStatusLabels(issue?.labels ?? [])
     const readyOnly = statuses.length === 1 && statuses[0] === 'ready' && malformed.length === 0
-    const landed = !!issue && issue.state === 'open' && (readyOnly || isPromotionResidue(issue))
+    const shaped = !!issue && issue.state === 'open' && (readyOnly || isPromotionResidue(issue))
+    const landed = shaped && (await this.promotionStillHolds(boardId, repo, card.issueNumber))
     const settled = await this.deps.repo.settlePromotion(card.cardId, landed)
     if (landed && settled) {
       // Residue is dispatchable as is, and the running write clears both labels.
@@ -241,6 +250,19 @@ export class KanbanDispatcher {
       return { moved: true }
     }
     return { moved: false, observed: recoveryFingerprint(issue) }
+  }
+
+  /** The ready label must be this App's or a human's with no later human park, and every blocker still closed completed. */
+  private async promotionStillHolds(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
+    if (!(await this.deps.store.promotionAttributed(repo, issueNumber))) {
+      this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose ready label is not ours')
+      return false
+    }
+    if (planGraphPromotion('todo', await this.deps.store.readGraph(repo, issueNumber)) !== 'promote') {
+      this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose blockers reopened')
+      return false
+    }
+    return true
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */

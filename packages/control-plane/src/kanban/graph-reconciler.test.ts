@@ -210,12 +210,12 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
   })
 
-  it('adopts a ready label that already landed when the old label removal timed out', async () => {
+  it('leaves a lone ready label on a todo card to attributed dispatcher recovery, even when unblocked', async () => {
     const h = make({ 7: { status: 'todo', labels: ['ac/status:ready', 'ac/agent:eng'] } })
     await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
-    expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([[1n, 'ready']])
+    expect(h.cards.casStatus).not.toHaveBeenCalled()
     expect(h.store.applyPlan).not.toHaveBeenCalled()
-    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.db.get(7)!.status).toBe('todo')
   })
 
   it('leaves a DB todo with only a ready label alone while its blockers are open', async () => {

@@ -136,12 +136,27 @@ fails the doorbell. A claim therefore cannot mismatch the card into a stranded
 `todo`. The write may still have half-landed. For example, the ready label was added
 and GitHub applied the `todo` removal, but the DELETE timed out. The next tick
 re-reads every flagged `todo` card. A lone `ready` label, or `todo`+`ready` residue,
-is adopted as `ready` and claimed, and the dispatch's `running` write clears both
-labels. Anything else clears the flag and leaves the card `todo`: nothing landed, or
-a human moved the card elsewhere. The redelivered doorbell then retries the promotion;
-it also adopts a lone `ready` label on a `todo` card whose blockers have all completed.
-Any later status change clears a stale flag, so it can never promote a card that comes
-back to `todo`.
+is adopted as `ready` and claimed only when two further checks pass, and the
+dispatch's `running` write then clears both labels.
+
+- **Attribution.** The issue events must show that this deployment's App bot
+  (`<slug>[bot]`) or a GitHub `User` added the `ready` label. The CP and its agents
+  share that App identity, so the check also replays the `ac/status:*` and
+  close/reopen events. The last human change must have left the issue open with
+  only `todo` and/or `ready`. A human park (any other status, or closing the issue)
+  therefore stands until a human undoes it, even if an agent later swaps in `ready`.
+  Any other bot or App touching status, a history beyond 10 pages, or a read
+  failure refuses adoption.
+- **Graph readiness.** Every blocker must still be closed as completed.
+
+Anything else clears the flag and leaves the card `todo`: nothing landed, the label is
+not attributable, a blocker reopened, or a human moved the card elsewhere.
+Any Kanban doorbell for the card (a human status relabel or a graph change) settles
+the flag at once with the same checks and clears it even if the read fails, so a
+human park observed by a webhook leaves nothing for a later bot write to adopt. The
+graph reconciler never adopts a lone `ready` itself; a redelivered graph doorbell
+reaches the same attributed repair. Any later status change also clears a stale
+flag, so it can never promote a card that comes back to `todo`.
 
 Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`, or an
 unsuccessful/empty daemon token response. They never use stored human gh

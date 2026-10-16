@@ -860,7 +860,9 @@ export function buildContainer(
       })
     : undefined
 
-  const kanbanCardStore = github ? new GithubCardStore({ tokens: github.tokens }) : undefined
+  const kanbanCardStore = github
+    ? new GithubCardStore({ tokens: github.tokens, appSlug: githubAppCfg?.slug })
+    : undefined
 
   // Kanban dispatcher (issue #2 M2): claim, dispatch, lease heartbeats, and the stale-lease reaper on a 60s tick.
   const kanbanDispatcher = kanbanCardStore
