@@ -866,7 +866,8 @@ export function buildContainer(
   const kanbanTokens = kanbanTokenSource({
     app: github?.tokens,
     injectedToken: opts.kanbanAccessToken,
-    log: { warn: (message) => http.log.warn(message) }
+    // `http` is assigned further down, so the boot-time warning is deferred past its initialisation.
+    log: { warn: (message) => queueMicrotask(() => http.log.warn(message)) }
   })
   const kanbanCardStore = kanbanTokens
     ? new GithubCardStore({

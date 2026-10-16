@@ -79,7 +79,10 @@ async function gh<T>(method: string, path: string, body?: unknown): Promise<T> {
     signal: AbortSignal.timeout(30_000)
   })
   if (!response.ok) throw new Error(`GitHub ${method} ${path}: ${response.status}`)
-  return (response.status === 204 ? undefined : await response.json()) as T
+  if (response.status === 204) return undefined as T
+  // Hook delivery ids exceed 2^53; keep 16+ digit integers as strings so they round-trip into URLs.
+  const text = (await response.text()).replace(/("id":\s*)(\d{16,})/g, '$1"$2"')
+  return JSON.parse(text) as T
 }
 
 interface Issue {
@@ -119,6 +122,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let webhookWhy = 'webhook path has not run'
   let terminalMode: 'real' | 'injected' = 'injected'
   let terminalWhy = 'terminal tool has not run'
+  let terminalFellBack = false
   let tokenMode: 'real' | 'injected' = 'injected'
   let tokenWhy = 'no GitHub App configured'
   let commentMode: 'real' | 'injected' = 'injected'
@@ -699,6 +703,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       cpReady = false
       const live = worker.get(d.leaseId)
       if (!live?.terminal) {
+        terminalFellBack = true
         terminalMode = 'injected'
         terminalWhy = `model did not call ${toolName}; the test recorded the outcome directly`
         console.error(
@@ -710,7 +715,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         })
         expect(worker.recordTerminal(d.leaseId, { outcome, summary }).recorded).toBe(true)
       } else {
-        if (terminalMode !== 'injected') {
+        // A fallback on an earlier card keeps the seam marked injected.
+        if (!terminalFellBack) {
           terminalMode = 'real'
           terminalWhy = 'the agent called the Kanban terminal MCP tool'
         }
@@ -903,10 +909,15 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
 
   async function replayReady(issueNumber: number): Promise<string> {
     const delivery = await labeledDelivery(issueNumber)
-    const installationId = delivery.payload.installation?.id
+    let installationId = delivery.payload.installation?.id
     if (!installationId) {
-      throw new Error(
-        `GitHub delivery ${delivery.guid ?? delivery.id} for #${issueNumber} has no installation.id, so the relay cannot ring the Kanban doorbell`
+      // A repository webhook (no GitHub App here) carries no installation block, and the relay routes
+      // Kanban doorbells by installation. Stamp the fixture installation the board uses, which is exactly
+      // the block an App delivery would carry, and say so.
+      installationId = Number(ref.installationId)
+      delivery.payload = { ...delivery.payload, installation: { id: installationId } }
+      console.log(
+        `KANBAN_E2E INJECTED installation.id=${installationId} into real delivery ${delivery.guid ?? delivery.id}: repo webhooks carry no installation without a GitHub App`
       )
     }
     await ensureInstallation(BigInt(installationId))
@@ -956,7 +967,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     })
     webhookMode = 'injected'
     webhookWhy =
-      'GitHub→smee did not un-park the card before the wait; the real delivery payload was signed and posted to the relay'
+      'GitHub→smee→relay delivered and verified the real labeled event, but a repository webhook has no installation block (no GitHub App), so the relay cannot route it to a board; the real payload was stamped with the board installation, re-signed and posted to the relay'
     return replayReady(issueNumber)
   }
 })
