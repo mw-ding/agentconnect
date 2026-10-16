@@ -16297,11 +16297,7 @@ export class Daemon {
       const session = this.store.getSessionByAcpIdForAgent(agentId, sessionId)
       const tool = JSON.stringify(params.toolCall ?? {})
       // Best-effort tool guard; write mode is CP configuration and recovery ignores non-human label writes.
-      if (
-        session &&
-        this.kanban?.forSession(session.key) &&
-        isKanbanLabelMutation(tool)
-      ) {
+      if (session && this.kanban?.forSession(session.key) && isKanbanLabelMutation(tool)) {
         this.permissionEvaluationDetails.set(params, { reason: 'kanban_label_mutation' })
         return { outcome: { outcome: 'cancelled' } }
       }
@@ -20518,7 +20514,7 @@ export class Daemon {
           .getKanbanCommentToken(entry.report.agentId, entry.repoFullName, entry.report.leaseId)
           .then((grant) => grant.token),
       invalidateToken: (entry, token) =>
-        this.gitCreds.invalidateKanbanComment(entry.report.agentId, entry.repoFullName, token)
+        this.gitCreds.invalidateKanbanComment(entry.report.agentId, entry.repoFullName, entry.report.leaseId, token)
     }))
   }
 
@@ -20547,8 +20543,7 @@ export class Daemon {
       outcome: req.terminal.outcome,
       card: `${d.repoFullName}#${d.issueNumber}`,
       attempt: d.attempt,
-      next:
-        'Finish your turn now. AgentConnect sends this outcome when the turn ends, moves the card, and posts your summary as the final issue comment. Do not post it or change any label yourself.'
+      next: 'Finish your turn now. AgentConnect sends this outcome when the turn ends, moves the card, and posts your summary as the final issue comment. Do not post it or change any label yourself.'
     }
   }
 

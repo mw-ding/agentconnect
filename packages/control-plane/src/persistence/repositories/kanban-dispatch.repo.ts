@@ -533,8 +533,10 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
   }
 
   async isIdempotentReport(daemonId: string, report: KanbanReport): Promise<boolean> {
+    // Same fence, outcome, reason, and block kind as the committed row. A changed replay is superseded, not a second write.
     const rows = await this.db.$queryRaw<Array<{ leaseId: string }>>(Prisma.sql`
       SELECT r."leaseId" FROM "kanban_run" r
+      JOIN "kanban_card" c ON c."id" = r."cardId"
       WHERE r."leaseId" = ${report.leaseId}::uuid
         AND r."daemonId" = ${daemonId}::uuid
         AND r."agentId" = ${report.agentId}::uuid
@@ -543,6 +545,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         AND r."dispatchRevision" = ${BigInt(report.dispatchRevision)}
         AND r."outcome" = ${report.outcome}::"KanbanRunOutcome"
         AND r."endedAt" IS NOT NULL
+        AND r."reasonCode" IS NOT DISTINCT FROM ${report.reasonCode ?? null}
+        AND c."blockKind" IS NOT DISTINCT FROM ${report.blockKind ?? null}::"KanbanBlockKind"
     `)
     return rows.length === 1
   }

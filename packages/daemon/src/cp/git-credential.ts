@@ -61,8 +61,9 @@ const keyOf = (agentId: string, plane: CachePlane, repo?: string): string =>
  *  it gets its own keyspace). One per (agent, repo). */
 const POST_KEY = (agentId: string, repo: string): string => `post\u0000${agentId}\u0000${repo.toLowerCase()}`
 
-/** Cache key for a Kanban summary comment token (issues write, one repo). One per (agent, repo). */
-const KANBAN_KEY = (agentId: string, repo: string): string => `kanban\u0000${agentId}\u0000${repo.toLowerCase()}`
+/** Cache key for a Kanban summary token. One per lease, so a grant for one run is not reused for another. */
+const KANBAN_KEY = (agentId: string, repo: string, leaseId: string): string =>
+  `kanban\u0000${agentId}\u0000${repo.toLowerCase()}\u0000${leaseId}`
 
 export class GitCredUnavailableError extends Error {
   constructor(
@@ -165,11 +166,9 @@ export class GitCredentialCache {
     return entry
   }
 
-  /** Drop the cached GithubPoster token after GitHub rejects it. Matching the
-   *  presented token avoids deleting a newer grant that won a concurrent race. */
-  /** Issues-write token for one accepted Kanban run's summary comment. The CP rechecks the lease. */
+  /** Issues-write token for one accepted Kanban run's summary comment. The CP rechecks this lease. */
   async getKanbanCommentToken(agentId: string, repo: string, leaseId: string): Promise<Entry> {
-    const key = KANBAN_KEY(agentId, repo)
+    const key = KANBAN_KEY(agentId, repo, leaseId)
     const forceRefresh = this.refreshKanban.has(key)
     const entry = await this.getKeyed(key, agentId, {
       agentId,
@@ -184,9 +183,9 @@ export class GitCredentialCache {
     return entry
   }
 
-  /** Drop the cached Kanban comment token after GitHub rejects it. */
-  invalidateKanbanComment(agentId: string, repo: string, presentedToken?: string): void {
-    const key = KANBAN_KEY(agentId, repo)
+  /** Drop the cached Kanban comment token after GitHub rejects it. Matching the presented token keeps a newer grant. */
+  invalidateKanbanComment(agentId: string, repo: string, leaseId: string, presentedToken?: string): void {
+    const key = KANBAN_KEY(agentId, repo, leaseId)
     const entry = this.entries.get(key)
     if (!entry) return
     if (presentedToken !== undefined && entry.token !== presentedToken) return
@@ -194,6 +193,7 @@ export class GitCredentialCache {
     this.refreshKanban.add(key)
   }
 
+  /** Drop the cached GithubPoster token after GitHub rejects it. Matching the presented token keeps a newer grant. */
   invalidatePost(agentId: string, repo: string, presentedToken?: string): void {
     const key = POST_KEY(agentId, repo)
     const entry = this.entries.get(key)

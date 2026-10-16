@@ -224,6 +224,63 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect((await h.card(c.id)).consecutiveFailures).toBe(0)
   })
 
+  it('replays the same report without writing again and grants a comment only for that lease', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    const report = h.reportFor(d, { reasonCode: 'agent_done' })
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.onReport(D1, 4, report)).toEqual({ leaseId: d.leaseId, accepted: true })
+    await h.dispatcher.settle()
+    const writes = h.store.writes.length
+    expect(await h.dispatcher.onReport(D1, 4, report)).toEqual({ leaseId: d.leaseId, accepted: true })
+    await h.dispatcher.settle()
+    expect(h.store.writes).toHaveLength(writes)
+    expect((await h.card(c.id)).status).toBe('done')
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+    expect(await h.dispatcher.commentGrant(D2, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/other')).toBeNull()
+    expect(await h.dispatcher.onReport(D1, 4, { ...report, reasonCode: 'turn_error' })).toMatchObject({
+      accepted: false,
+      reason: 'superseded'
+    })
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+  })
+
+  it('treats a blocked replay as the same report only when the block kind matches', async () => {
+    const h = await harness()
+    await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    const report = h.reportFor(d, { outcome: 'blocked', blockKind: 'needs_input', reasonCode: 'agent_blocked' })
+    expect(await h.dispatcher.onReport(D1, 4, report)).toMatchObject({ accepted: true })
+    await h.dispatcher.settle()
+    const writes = h.store.writes.length
+    expect(await h.dispatcher.onReport(D1, 4, report)).toEqual({ leaseId: d.leaseId, accepted: true })
+    expect(h.store.writes).toHaveLength(writes)
+    expect(await h.dispatcher.onReport(D1, 4, { ...report, blockKind: 'dependency' })).toMatchObject({
+      accepted: false,
+      reason: 'superseded'
+    })
+    expect(await h.card(d.cardId)).toMatchObject({ status: 'blocked', blockKind: 'needs_input' })
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+  })
+
+  it('does not grant a comment token when the run ended transient', async () => {
+    const h = await harness()
+    await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    expect(
+      await h.dispatcher.onReport(D1, 4, h.reportFor(d, { outcome: 'transient', reasonCode: 'turn_lost' }))
+    ).toMatchObject({
+      accepted: true
+    })
+    await h.dispatcher.settle()
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toBeNull()
+  })
+
   it('rejects a report from a daemon that does not hold the lease', async () => {
     const h = await harness()
     await h.addCard()

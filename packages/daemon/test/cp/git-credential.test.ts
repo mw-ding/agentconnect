@@ -165,7 +165,9 @@ describe('GitCredentialCache', () => {
       const leaseId = '44444444-4444-4444-8444-444444444444'
       const grant = await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
       await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
-      expect(h.calls()).toBe(1)
+      const other = '55555555-5555-4555-8555-555555555555'
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', other)
+      expect(h.calls()).toBe(2)
       expect(grant.token).toBe('ghs_1')
       expect(h.payloads[0]).toMatchObject({
         repoFullName: 'acme/web',
@@ -173,6 +175,7 @@ describe('GitCredentialCache', () => {
         purpose: 'kanban_card_write',
         leaseId
       })
+      expect(h.payloads[1]).toMatchObject({ leaseId: other })
       expect(h.payloads[0]!.capabilities).not.toContain('contents')
     })
 
