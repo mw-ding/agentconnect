@@ -146,4 +146,35 @@ describe('KanbanCommentPublisher', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
     expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: false, nextAt: 20_000 })
   })
+
+  it('defers instead of posting when the marker is not in the newest 500 comments', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1 })
+    const posts: string[] = []
+    let pages = 0
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') !== 'GET') {
+        posts.push(String(url))
+        return new Response(JSON.stringify({ id: 1 }), { status: 201 })
+      }
+      pages += 1
+      const comments = Array.from({ length: 100 }, (_, i) => ({ body: `older comment ${pages}-${i}` }))
+      const headers = new Headers({ link: `<https://api.test/comments?page=${pages + 1}>; rel="next"` })
+      return new Response(JSON.stringify(comments), { status: 200, headers })
+    })
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => 1_000 },
+      log: { info: vi.fn(), warn: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test'
+    })
+    await publisher.drain()
+    expect(posts).toEqual([])
+    expect(pages).toBe(5)
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('sort=created')
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain('direction=desc')
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, nextAt: 31_000 })
+  })
 })
