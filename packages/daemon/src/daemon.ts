@@ -20530,7 +20530,8 @@ export class Daemon {
         'No Kanban card run holds this session (it was never dispatched, already ended, or was superseded), so there is no outcome to report.'
       )
     }
-    const result = this.kanban.recordTerminal(leaseId, req.terminal)
+    // Mask before the row is stored: the SQLite terminal and the GitHub comment both post that copy.
+    const result = this.kanban.recordTerminal(leaseId, this.maskAgentSecrets(req.agentId, req.terminal))
     if (!result.recorded) {
       throw new Error(
         result.reason === 'already_reported'

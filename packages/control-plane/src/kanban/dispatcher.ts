@@ -403,6 +403,7 @@ export class KanbanDispatcher {
       reasonCode,
       now,
       ...extra,
+      ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
       plan: (card, board) => planRunEnd(card, board, end, now)
     })
     if (result.accepted && result.card.from !== result.card.to) {

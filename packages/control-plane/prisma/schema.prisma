@@ -1908,6 +1908,7 @@ model KanbanRun {
   endedAt          DateTime?         @db.Timestamptz(6)
   outcome          KanbanRunOutcome?
   reasonCode       String? // short, body-free
+  blockKind        KanbanBlockKind? // kind this run reported; replays match the run, not the card
 
   card KanbanCard @relation(fields: [cardId], references: [id], onDelete: Cascade)
 

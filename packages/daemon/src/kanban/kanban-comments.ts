@@ -6,6 +6,13 @@ import type { KanbanCommentRow } from '../store/local-store.js'
 const BATCH = 8
 const BACKOFF_BASE_MS = 15_000
 const BACKOFF_MAX_MS = 15 * 60_000
+/** Newest comments only. Five full pages is 500; anything older than that is inconclusive. */
+const MARKER_PAGE_LIMIT = 5
+const MARKER_PAGE_SIZE = 100
+/** Bounds the whole marker lookup, including every page fetch and its body. */
+const MARKER_LOOKUP_TIMEOUT_MS = 15_000
+
+type MarkerLookup = 'found' | 'absent' | 'inconclusive'
 
 /** Hidden lease marker. A crash during POST retries by looking for this before posting again. */
 export function kanbanLeaseMarker(leaseId: string): string {
@@ -14,6 +21,7 @@ export function kanbanLeaseMarker(leaseId: string): string {
 
 /** The comment body: the agent's summary, its reason when it gave one, and the lease marker. */
 export function kanbanFinalCommentBody(entry: KanbanTerminalEntry): string {
+  // @-mentions stay literal, matching GithubFinalPoster final-answer text.
   const parts = [entry.summary.trim()]
   if (entry.reason?.trim()) parts.push(entry.reason.trim())
   parts.push(`<!-- ${kanbanLeaseMarker(entry.report.leaseId)} -->`)
@@ -33,6 +41,55 @@ function nextLink(header: string | null): string | undefined {
   return undefined
 }
 
+/** Read a comment page under the lookup's abort signal, cancelling a stalled body instead of waiting it out. */
+function readJson(res: Response, signal: AbortSignal): Promise<unknown> {
+  const body = res.body
+  if (!body) return Promise.resolve(undefined)
+  const reader = body.getReader()
+  let settled = false
+  return new Promise((resolve, reject) => {
+    const finish = (err?: unknown, value?: unknown) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      if (err !== undefined) reject(err)
+      else resolve(value)
+    }
+    const onAbort = () => {
+      void reader.cancel().catch(() => undefined)
+      finish(signal.reason ?? new DOMException('The operation was aborted', 'TimeoutError'))
+    }
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    const chunks: Uint8Array[] = []
+    const pump = (): void => {
+      reader.read().then(
+        ({ done, value }) => {
+          if (settled) return
+          if (value) chunks.push(value)
+          if (!done) {
+            pump()
+            return
+          }
+          const text = Buffer.concat(chunks).toString('utf8')
+          try {
+            finish(undefined, text.length === 0 ? null : JSON.parse(text))
+          } catch (err) {
+            finish(err)
+          }
+        },
+        (err: unknown) => {
+          if (!settled) finish(signal.aborted ? (signal.reason ?? err) : err)
+        }
+      )
+    }
+    pump()
+  })
+}
+
 /** The sqlite rows the publisher drains. LocalStore implements this. */
 export interface KanbanCommentStore {
   dueKanbanComments(now: number, limit: number): KanbanCommentRow[]
@@ -50,6 +107,8 @@ export interface KanbanCommentPublisherDeps {
   invalidateToken?(entry: KanbanTerminalEntry, token: string): void
   fetchImpl?: typeof fetch
   baseUrl?: string
+  /** Marker lookup deadline. Covers the fetches and their bodies; a timeout defers that comment. */
+  markerLookupTimeoutMs?: number
 }
 
 /** Drains accepted summaries. A failed post leaves the card move in place; the lease marker is the durable idempotency key. */
@@ -95,17 +154,22 @@ export class KanbanCommentPublisher {
       return
     }
     if (row.attempted) {
-      let found = false
+      let lookup: MarkerLookup
       try {
-        found = await this.findMarker(entry, token)
+        lookup = await this.findMarker(entry, token)
       } catch (err) {
         this.deps.log.warn(`kanban: comment lookup failed for ${leaseId} (${String(err)})`)
         this.deps.store.deferKanbanComment(leaseId, later())
         return
       }
-      if (found) {
+      if (lookup === 'found') {
         this.deps.store.removeKanbanComment(leaseId)
         this.deps.log.info(`kanban: final comment already on ${entry.repoFullName}#${entry.issueNumber}`)
+        return
+      }
+      if (lookup === 'inconclusive') {
+        this.deps.log.warn(`kanban: comment lookup inconclusive for ${leaseId}; retrying before posting`)
+        this.deps.store.deferKanbanComment(leaseId, later())
         return
       }
     }
@@ -127,14 +191,17 @@ export class KanbanCommentPublisher {
     this.deps.log.info(`kanban: posted final comment on ${entry.repoFullName}#${entry.issueNumber}`)
   }
 
-  private async findMarker(entry: KanbanTerminalEntry, token: string): Promise<boolean> {
+  private async findMarker(entry: KanbanTerminalEntry, token: string): Promise<MarkerLookup> {
     const marker = kanbanLeaseMarker(entry.report.leaseId)
     const fetchImpl = this.deps.fetchImpl ?? fetch
     const base = this.deps.baseUrl ?? 'https://api.github.com'
+    const signal = AbortSignal.timeout(this.deps.markerLookupTimeoutMs ?? MARKER_LOOKUP_TIMEOUT_MS)
+    // Newest first: a comment this daemon just posted is on the first page, not behind the oldest history.
     let url: string | undefined =
-      `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?per_page=100`
-    for (let page = 0; page < 5 && url; page++) {
+      `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?per_page=${MARKER_PAGE_SIZE}&sort=created&direction=desc`
+    for (let page = 0; page < MARKER_PAGE_LIMIT && url; page++) {
       const res = await fetchImpl(url, {
+        signal,
         headers: {
           authorization: `Bearer ${token}`,
           accept: 'application/vnd.github+json',
@@ -145,10 +212,14 @@ export class KanbanCommentPublisher {
         await res.body?.cancel().catch(() => undefined)
         throw new Error(`GitHub GET ${res.status}`)
       }
-      const comments = (await res.json()) as Array<{ body?: string }>
-      if (comments.some((comment) => comment.body?.includes(marker))) return true
-      url = nextLink(res.headers.get('link'))
+      const comments = (await readJson(res, signal)) as Array<{ body?: string }>
+      if (!Array.isArray(comments)) throw new Error('GitHub GET comments was not a list')
+      if (comments.some((comment) => comment.body?.includes(marker))) return 'found'
+      const next = nextLink(res.headers.get('link'))
+      if (!next || comments.length < MARKER_PAGE_SIZE) return 'absent'
+      url = next
     }
-    return false
+    // The bound was hit with more pages left, so a miss is not proof the marker is absent.
+    return 'inconclusive'
   }
 }

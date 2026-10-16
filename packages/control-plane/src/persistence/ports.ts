@@ -10,7 +10,13 @@
  * nothing above this layer imports `@prisma/client`.
  */
 import type { KanbanStatus } from '../kanban/card-state.js'
-import type { AccountingBoard, AccountingCard, OpenLeaseFacts, RunEndPlan } from '../kanban/run-accounting.js'
+import type {
+  AccountingBoard,
+  AccountingCard,
+  KanbanBlockKind,
+  OpenLeaseFacts,
+  RunEndPlan
+} from '../kanban/run-accounting.js'
 import type {
   AuthReq,
   RegisterReq,
@@ -5146,6 +5152,8 @@ export interface KanbanRunEndInput {
   fence?: KanbanRunFence
   outcome: KanbanRunOutcomeValue
   reasonCode: string | null
+  /** Block kind this run reported. Null unless the outcome is blocked. Replays match the run, not the card. */
+  reportedBlockKind?: KanbanBlockKind | null
   sessionId?: string
   prNumber?: number
   now: Date
