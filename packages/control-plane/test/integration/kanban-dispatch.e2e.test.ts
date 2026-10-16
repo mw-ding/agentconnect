@@ -27,7 +27,7 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
 
 const TOKEN = process.env.GITHUB_TOKEN
-const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN
+const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN && !process.env.CI
 const OWNER = 'mw-ding'
 const FULL = `${OWNER}/agentconnect`
 const REPO_ID = 1332342098n
@@ -74,6 +74,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   const agentId = randomUUID()
   const epoch = 4
   const issues: number[] = []
+  const createdLabels: string[] = []
   const sends: KanbanDispatch[] = []
   const reports: KanbanReport[] = []
   let boardId = ''
@@ -155,11 +156,16 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     phase('setup: live repository and human token')
     expect(BigInt((await gh<{ id: number }>('GET', `/repos/${FULL}`)).id)).toBe(REPO_ID)
     expect((await gh<{ type: string }>('GET', '/user')).type).toBe('User')
+    const existingLabels = new Set<string>()
+    for (let page = 1; ; page++) {
+      const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100&page=${page}`)
+      for (const label of labels) existingLabels.add(label.name)
+      if (labels.length < 100) break
+    }
     for (const name of ['triage', 'ready', 'running', 'review', 'done'].map((s) => `ac/status:${s}`)) {
-      // Read before creating so existing repository labels are never modified.
-      const labels = await gh<Array<{ name: string }>>('GET', `/repos/${FULL}/labels?per_page=100`)
-      if (!labels.some((label) => label.name === name))
-        await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
+      if (existingLabels.has(name)) continue
+      await gh('POST', `/repos/${FULL}/labels`, { name, color: 'ededed' })
+      createdLabels.push(name)
     }
     root = mkdtempSync(join(tmpdir(), 'kanban-dispatch-e2e-'))
     const agentDir = join(root, 'agents', agentId)
@@ -313,6 +319,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         phase('cleanup: confirmed closed/not_planned', { issue: number })
       })
     ])
+    const labelCleanup = await Promise.allSettled(
+      createdLabels.map((name) => gh('DELETE', `/repos/${FULL}/labels/${encodeURIComponent(name)}`))
+    )
     const dbCleanup = await Promise.allSettled([
       (async () => {
         if (boardId) {
@@ -327,7 +336,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     ])
     if (root) rmSync(root, { recursive: true, force: true })
     vi.unstubAllEnvs()
-    for (const result of [...cleanup, ...dbCleanup]) if (result.status === 'rejected') throw result.reason
+    for (const result of [...cleanup, ...labelCleanup, ...dbCleanup])
+      if (result.status === 'rejected') throw result.reason
   }, 120_000)
 
   it('recovers human-readied cards, dispatches fenced read leases, refuses writes, and reports review/done', async () => {
