@@ -408,6 +408,24 @@ export const RcGithubInstallation = z.object({
 })
 export type RcGithubInstallation = z.infer<typeof RcGithubInstallation>
 
+// R→C EVT (fire-and-forget) — Kanban graph doorbell (issue #2 spike §3): a verified
+// `sub_issues`/`issue_dependencies` delivery reduced to ids only; the CP re-reads the graph.
+export const GITHUB_GRAPH_EVENTS = ['sub_issues', 'issue_dependencies'] as const
+export const GithubGraphEvent = z.enum(GITHUB_GRAPH_EVENTS)
+export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
+export const RcGithubGraph = z
+  .object({
+    deliveryKey: z.string().min(1).max(200), // X-GitHub-Delivery GUID — the redelivery landed marker
+    installationId: GithubNumericId,
+    repoId: GithubNumericId,
+    event: GithubGraphEvent,
+    action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|… — observational only
+    ids: z.array(GithubNumericId).max(4), // issue ids named by the payload (parent/sub, blocked/blocking)
+    numbers: z.array(z.number().int().positive()).max(4) // the same issues' numbers, when same-repo
+  })
+  .strict()
+export type RcGithubGraph = z.infer<typeof RcGithubGraph>
+
 // ── revocation (§9 revocation loop) ─────────────────────────────────────────
 
 // C→R EVT — the daemon's credential was revoked / membership removed: the relay
@@ -939,6 +957,7 @@ export const RELAY_CP_SCHEMAS = {
   'rc/hook-remove': RcHookRemove,
   'rc/run-report': RcRunReport,
   'rc/github-installation': RcGithubInstallation,
+  'rc/github-graph': RcGithubGraph,
   'rc/daemon-revoke': RcDaemonRevoke,
   'rc/bot-assign': RcBotAssign,
   'rc/bot-unassign': RcBotUnassign,
@@ -986,6 +1005,7 @@ export const RelayCpFrame = z.discriminatedUnion('type', [
   frameSchema('rc/hook-remove', RELAY_CP_SCHEMAS['rc/hook-remove']),
   frameSchema('rc/run-report', RELAY_CP_SCHEMAS['rc/run-report']),
   frameSchema('rc/github-installation', RELAY_CP_SCHEMAS['rc/github-installation']),
+  frameSchema('rc/github-graph', RELAY_CP_SCHEMAS['rc/github-graph']),
   frameSchema('rc/daemon-revoke', RELAY_CP_SCHEMAS['rc/daemon-revoke']),
   frameSchema('rc/bot-assign', RELAY_CP_SCHEMAS['rc/bot-assign']),
   frameSchema('rc/bot-unassign', RELAY_CP_SCHEMAS['rc/bot-unassign']),
