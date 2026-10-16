@@ -1,28 +1,35 @@
-// Live GitHub + Postgres + daemon/ACP. The model calls the real terminal tool; the comment token is the test PAT after the real lease grant.
+// Live GitHub + Postgres + daemon/ACP. Doorbells arrive via GitHub→smee→relay→CP. The model calls the real terminal tool.
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import SmeeClient from 'smee-client'
 import type { KanbanDispatch, KanbanReport } from '@agentconnect.md/protocol'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import { buildApp, type App } from '../../src/app.js'
+import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { OrgId } from '../../src/domain/ids.js'
+import { mintAppJwt } from '../../src/github/api.js'
+import { resolveGithubAppConfig, type GithubAppConfig } from '../../src/github/config.js'
+import { InstallationTokenService } from '../../src/github/installation-token.service.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
-import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
-import { PgKanbanBoardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
+import { ApiKeyCodec } from '../../src/registry/apiKey.js'
+import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import type { Daemon } from '../../../daemon/src/daemon.js'
 import type { KanbanWorker } from '../../../daemon/src/kanban/kanban-worker.js'
 import type { LocalStore } from '../../../daemon/src/store/local-store.js'
 import { kanbanLeaseMarker } from '../../../daemon/src/kanban/kanban-comments.js'
 import { writeGhShim } from '../../../daemon/src/cp/gh-shim.js'
 import { AcpHost } from '../../../daemon/src/acp/acp-host.js'
+import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
 
@@ -31,6 +38,21 @@ const enabled = process.env.KANBAN_E2E === '1' && !!TOKEN
 const OWNER = 'mw-ding'
 const FULL = `${OWNER}/agentconnect`
 const REPO_ID = 1332342098n
+const PEPPER = 'kanban-e2e-pepper-0123456789abcdef'
+const RELAY_TOKEN = 'kanban-e2e-relay-token-0123456789ab'
+
+function githubAppFromEnv(): GithubAppConfig | undefined {
+  const id = process.env.GITHUB_APP_ID
+  const key = process.env.GITHUB_APP_PRIVATE_KEY_B64
+  const slug = process.env.GITHUB_APP_SLUG
+  if (!id || !key || !slug) return undefined
+  return resolveGithubAppConfig({
+    GITHUB_APP_ID: Number(id),
+    GITHUB_APP_PRIVATE_KEY_B64: key,
+    GITHUB_APP_SLUG: slug,
+    GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID
+  })
+}
 
 function agentEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -72,18 +94,42 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   const started = Date.now()
   const daemonId = randomUUID()
   const agentId = randomUUID()
-  const epoch = 4
+  let epoch = 4
   const issues: number[] = []
   const sends: KanbanDispatch[] = []
   const reports: KanbanReport[] = []
+  const permissionDenials: string[] = []
+  const deliveryIds: string[] = []
   let boardId = ''
   let root: string | undefined
   let daemon: Daemon | undefined
   let worker: KanbanWorker
   let local: LocalStore
   let dispatcher: KanbanDispatcher | undefined
-  let bell: KanbanGraphDoorbell | undefined
+  let app: App | undefined
+  let link: RelayCpLink | undefined
+  let smee: SmeeClient | undefined
+  let hookId: number | undefined
+  let smeeUp = false
+  let smeeSkipReason = ''
+  let webhookSecret = ''
+  let installationGithubId: bigint | undefined
+  let appConfigured = false
+  let webhookMode: 'real' | 'injected' = 'injected'
+  let webhookWhy = 'webhook path has not run'
+  let terminalMode: 'real' | 'injected' = 'injected'
+  let terminalWhy = 'terminal tool has not run'
+  let tokenMode: 'real' | 'injected' = 'injected'
+  let tokenWhy = 'no GitHub App configured'
+  let commentMode: 'real' | 'injected' = 'injected'
+  let commentWhy = 'final comment has not been posted'
+  let shellRefusalObserved = false
+  let shellWhy = 'shell probe has not run'
+  let shellChecks = 0
+  let summarized = false
   let cpReady = false
+  let cpOrigin = ''
+  let selectedRuntime: { id: string; adapter: string } | undefined
   let releaseTurn: (() => void) | undefined
   let modelTurn: Promise<unknown> | undefined
   let runtimeId = 'claude'
@@ -112,8 +158,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     revokedAt: null,
     createdAt: new Date(0)
   }
-  // The supplied PAT stays in the test process; installation discovery and minting are not under test.
-  const store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+  // App minting when GITHUB_APP_* is complete; otherwise the PAT, logged as injected.
+  let store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
   const ref = { installationId: 1n, repoId: REPO_ID, repoFullName: FULL }
   let host: any = {
     start: vi.fn(async () => {}),
@@ -235,6 +281,120 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       `import { register } from ${JSON.stringify(tsxApi)}; register(); await import(${JSON.stringify(sourceEntry)});`
     )
     vi.stubEnv('AGENTCONNECT_DAEMON_ENTRY', daemonEntry)
+    appConfigured = !!githubAppFromEnv()
+    if (!appConfigured) {
+      tokenMode = 'injected'
+      tokenWhy = 'no GitHub App configured'
+      console.log('KANBAN_E2E INJECTED token: no GitHub App configured')
+    } else {
+      tokenMode = 'real'
+      tokenWhy = 'card and comment tokens are repository-scoped installation tokens'
+      phase('setup: GitHub App configured; card and comment tokens are installation tokens')
+    }
+    const githubApp = githubAppFromEnv()
+    if (githubApp) {
+      store = new GithubCardStore({
+        tokens: new InstallationTokenService(githubApp, systemClock),
+        appSlug: process.env.GITHUB_APP_SLUG
+      })
+    }
+    webhookSecret = randomBytes(32).toString('hex')
+    const cpConfig = AppConfigSchema.parse({
+      DATABASE_URL: 'postgresql://e2e/ignored',
+      API_KEY_PEPPER: PEPPER,
+      RELAY_TOKEN,
+      SECRETS_PROVIDER: 'memory',
+      NODE_ENV: 'test',
+      ...(githubApp
+        ? {
+            GITHUB_APP_ID: Number(process.env.GITHUB_APP_ID),
+            GITHUB_APP_PRIVATE_KEY_B64: process.env.GITHUB_APP_PRIVATE_KEY_B64,
+            GITHUB_APP_SLUG: process.env.GITHUB_APP_SLUG,
+            ...(process.env.GITHUB_APP_CLIENT_ID ? { GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID } : {})
+          }
+        : {})
+    })
+    app = buildApp({
+      prisma,
+      config: cpConfig,
+      clock: systemClock,
+      secretsProvider: new MemorySecretsProvider(),
+      ...(!githubApp && TOKEN ? { kanbanAccessToken: TOKEN } : {})
+    })
+    const cpUrl = await app.http.listen({ port: 0, host: '127.0.0.1' })
+    app.mountWs()
+    link = await startRelayCpLink({
+      cpUrl,
+      relayCredential: RELAY_TOKEN,
+      webhookSecret,
+      log: {
+        debug: () => {},
+        info: (message) => phase(`relay ${message}`),
+        warn: (message) => phase(`relay WARN ${message}`),
+        error: (message) => phase(`relay ERROR ${message}`)
+      }
+    })
+    phase('setup: real relay linked to the CP doorbell', { webhookUrl: link.webhookUrl })
+    installationGithubId = await discoverInstallationId(githubApp)
+    try {
+      const channel = await newSmeeChannel()
+      smee = new SmeeClient({
+        source: channel,
+        target: link.webhookUrl,
+        logger: {
+          info: (message) => phase('smee', { message: String(message ?? '') }),
+          error: (message) => phase('smee error', { message: String(message ?? '') })
+        }
+      })
+      await smee.start()
+      smeeUp = true
+      webhookMode = 'real'
+      webhookWhy = 'GitHub delivers to smee, which forwards to the relay; the relay verifies the signature and rings the CP'
+      phase('setup: smee channel forwarding to the relay', { channel })
+      await createHook(channel)
+    } catch (err) {
+      smeeUp = false
+      smeeSkipReason = err instanceof Error ? err.message : String(err)
+      webhookMode = 'injected'
+      webhookWhy = `smee unreachable (${smeeSkipReason}); the real GitHub delivery payload is signed and posted to the relay`
+      console.error(`KANBAN_E2E smee unreachable: ${smeeSkipReason}`)
+      phase('setup: smee unreachable', { reason: smeeSkipReason })
+      await createHook('https://example.invalid/kanban-e2e-webhook')
+    }
+    if (installationGithubId === undefined) installationGithubId = await installationIdFromPing()
+    if (installationGithubId !== undefined) {
+      installation.installationId = installationGithubId
+      ref.installationId = installationGithubId
+      phase('setup: github installation', { installationId: String(installationGithubId) })
+    }
+    // The daemon starts in the test, after the truncated database has the API key.
+    selectedRuntime = selected
+    cpOrigin = cpUrl
+    phase('setup: relay and webhook ready; daemon starts after the database seed', { agent: selected?.id ?? 'stub' })
+  }, 180_000)
+
+  async function startLinkedDaemon(): Promise<void> {
+    const minted = new ApiKeyCodec({ API_KEY_PEPPER: PEPPER }).mint()
+    await prisma.apiKey.create({
+      data: {
+        principalType: 'daemon',
+        orgId: DEFAULT_ORG_ID,
+        daemonId,
+        hash: minted.hash,
+        displayTail: minted.displayTail
+      }
+    })
+    writeFileSync(
+      join(root!, 'config.json'),
+      JSON.stringify({
+        version: 1,
+        controlPlane: { enabled: true, url: cpOrigin, key: minted.token },
+        logging: { level: 'error' },
+        runtimes: { [runtimeId]: { command: 'node', args: ['unused'] } }
+      })
+    )
+    const { Daemon } = await import('../../../daemon/src/daemon.js')
+    const selected = selectedRuntime
     daemon = new Daemon({
       root,
       hostFactory: (_agent, onUpdate) => {
@@ -249,7 +409,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
                 updates.push(update)
                 onUpdate(sid, update)
               },
-              onPermission: (sid, params) => (daemon as any).onAcpPermission(agentId, sid, params)
+              onPermission: async (sid, params) => {
+                const tool = JSON.stringify(params.toolCall ?? {})
+                const decision = await (daemon as any).onAcpPermission(agentId, sid, params)
+                if (decision?.outcome?.outcome === 'cancelled') permissionDenials.push(tool)
+                return decision
+              }
             }
           )
           const start = runtime.start.bind(runtime)
@@ -292,21 +457,35 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     await daemon.start()
     worker = (daemon as any).kanbanWorker()
     local = (daemon as any).store
-    phase('setup: real daemon started; in-process control link; terminal outcome comes from the agent tool', {
-      agent: selected?.id ?? 'stub'
-    })
-  }, 120_000)
+    const original = worker.dispatch.bind(worker)
+    worker.dispatch = (dispatch) => {
+      sends.push(dispatch)
+      phase('c: real daemon worker dispatch', {
+        issue: dispatch.issueNumber,
+        mode: dispatch.mode,
+        attempt: dispatch.attempt
+      })
+      return original(dispatch)
+    }
+    await vi.waitFor(() => expect((daemon as any).cpClient?.state).toBe('READY'), { timeout: 20_000, interval: 250 })
+    epoch = Number((await prisma.daemon.findUniqueOrThrow({ where: { id: daemonId } })).sessionEpoch)
+    phase('setup: daemon connected to the CP', { epoch, agent: selected?.id ?? 'stub' })
+  }
 
   afterAll(async () => {
     const cleanup = await Promise.allSettled([
       (async () => {
-        bell?.stop()
-        await bell?.settle()
         dispatcher?.stop()
         await dispatcher?.settle()
         cpReady = false
         releaseTurn?.()
         await daemon?.stop()
+        await smee?.stop()
+        await link?.close()
+        if (hookId !== undefined) {
+          await gh('DELETE', `/repos/${FULL}/hooks/${hookId}`)
+          phase('cleanup: temporary repository webhook deleted', { hookId })
+        }
       })(),
       ...issues.map(async (number) => {
         await gh('PATCH', `/repos/${FULL}/issues/${number}`, { state: 'closed', state_reason: 'not_planned' })
@@ -336,6 +515,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     // The integration harness truncates before each test, so seed all DB fixtures here.
     await seedDaemon(prisma, daemonId, { sessionEpoch: BigInt(epoch) })
     await seedAgent(prisma, agentId, { daemonId, runtime: runtimeId })
+    if (installationGithubId !== undefined) await ensureInstallation(installationGithubId)
+    await startLinkedDaemon()
     const board = await prisma.kanbanBoard.create({
       data: { orgId: DEFAULT_ORG_ID, name: `dispatch-e2e ${started}`, repoId: REPO_ID, repoFullName: FULL }
     })
@@ -344,14 +525,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       repo: new PgKanbanDispatchRepo(prisma),
       installations: { liveByOrgAndAccount: async () => installation },
       store,
+      // The live claim is the CP dispatcher behind the webhook. This one only parks the initial mismatch and accepts reports.
       send: async (id, dispatch) => {
         expect(id).toBe(daemonId)
-        sends.push(dispatch)
-        phase('c: real daemon worker dispatch', {
-          issue: dispatch.issueNumber,
-          mode: dispatch.mode,
-          attempt: dispatch.attempt
-        })
         return worker.dispatch(dispatch)
       },
       isDaemonLive: (id) => id === daemonId,
@@ -368,25 +544,15 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         return dispatcher!.onReport(daemonId, epoch, report)
       }
     }
-    // Keep the daemon's real worker/outbox and replace only the network boundary.
+    // Heartbeats and reports stay on this in-process fence. Dispatch and gitcred use the live CP socket.
     ;(worker as any).deps.cp = () => cp
-    // App minting is not under test. The publisher still asks the real grant, then posts with the supplied PAT.
-    ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
-      const allowed = await dispatcher!.commentGrant(daemonId, id, leaseId, repo)
-      if (!allowed) throw new Error(`kanban comment refused for lease ${leaseId} on ${repo}`)
-      return { token: TOKEN }
+    if (!appConfigured) {
+      ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
+        const allowed = await dispatcher!.commentGrant(daemonId, id, leaseId, repo)
+        if (!allowed) throw new Error(`kanban comment refused for lease ${leaseId} on ${repo}`)
+        return { token: TOKEN }
+      }
     }
-    bell = new KanbanGraphDoorbell({
-      boards: new PgKanbanBoardRepo(prisma),
-      installations: { getByInstallationId: async () => installation },
-      store,
-      onCard: async (changedBoard, _repo, number) => {
-        await dispatcher!.onCardChanged(changedBoard.id, number)
-        await snapshot('a: issues doorbell ingested human ready', currentCardId, number)
-        dispatcher!.poke(changedBoard.id)
-      },
-      log
-    })
     let currentCardId = ''
 
     for (const outcome of ['review_requested', 'completed'] as const) {
@@ -417,27 +583,18 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       expect(sends.filter((d) => d.cardId === c.id)).toHaveLength(0)
       await snapshot('a: mismatch parked; no daemon dispatch', c.id, created.number)
 
+      cpReady = true
+      const promptCount = host.prompt.mock.calls.length
       await gh('PUT', `/repos/${FULL}/issues/${created.number}/labels`, { labels: ['ac/status:ready'] })
       await vi.waitFor(async () => expect(await store.statusSetByHuman(ref, created.number, 'ready')).toBe(true), {
         timeout: 30_000,
         interval: 1_000
       })
-      cpReady = true
-      const deliveryKey = `dispatch-e2e-${created.number}`
-      const promptCount = host.prompt.mock.calls.length
-      bell.poke({
-        deliveryKey,
-        installationId: '1',
-        repoId: String(REPO_ID),
-        event: 'issues',
-        action: 'labeled',
-        ids: [String(created.id)],
-        numbers: [created.number]
-      })
-      await bell.settle()
-      await dispatcher.settle()
-      expect(bell.landedDeliveryKeys([deliveryKey])).toEqual(new Set([deliveryKey]))
-      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(promptCount + 1), { timeout: 30_000 })
+      const deliveryId = await deliverReady(created.number, created.id)
+      deliveryIds.push(deliveryId)
+      phase('a: relay delivery landed', { deliveryId, via: webhookMode })
+      console.log(`KANBAN_E2E webhook delivery ${deliveryId} via ${webhookMode}`)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(promptCount + 1), { timeout: 60_000 })
       const d = sends.at(-1)!
       expect(d).toMatchObject({ cardId: c.id, attempt: 2, mode: 'read' })
       expect(await run(d.leaseId)).toMatchObject({
@@ -446,7 +603,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         daemonEpoch: BigInt(epoch)
       })
       expect((await card(c.id)).status).toBe('running')
-      expect((await issue(created.number)).labels.map((label) => label.name)).toEqual(['ac/status:running'])
+      await vi.waitFor(
+        async () => expect((await issue(created.number)).labels.map((label) => label.name)).toEqual(['ac/status:running']),
+        { timeout: 20_000, interval: 500 }
+      )
       await snapshot('b/c: lease ACK persisted and running label observed', c.id, created.number)
       const lease = worker.get(d.leaseId)!
       expect(lease.sessionId).toBeTruthy()
