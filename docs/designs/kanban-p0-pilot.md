@@ -95,7 +95,7 @@ state, or comment writes occur. One exception keeps the M1 promotion contract: a
 open issue whose only status labels are `todo` and `ready` is unfinished promotion
 residue, so the claim dispatches it and the `running` write clears both labels.
 
-A later legal human status edit on a mismatch-parked card is ingested by the graph
+A later legal human status edit on a mismatch-parked card is ingested by a Kanban
 doorbell or periodic mismatch recovery, then a `ready` card is claimed as a fresh
 attempt. Recovery accepts an edit only when the issue is open, carries exactly one
 valid status label, and the issue events show a GitHub `User` (not a `[bot]`
@@ -107,28 +107,59 @@ agent can never un-park a card. A legal-looking edit the state machine forbids,
 such as `archived` straight to `ready`, is logged rather than silently dropped;
 the human must move it to `triage` first.
 
-Recovery reads GitHub only from the 60-second tick, never from a doorbell or report
-poke. Each pass reads at most 25 due cards per board. It excludes `ready`,
-`running`, `done`, and `archived` cards, so closed issues never stay in the scan.
-A check that changes nothing pushes `KanbanCard.recoveryCheckAt` out by 1, 2, 4,
-and so on up to 60 minutes (`recoveryChecks` counts the steps). An ingested move
-or a new claim resets both fields. With 100 parked cards, the first hour is capped
-at 25 reads per tick, and steady state is about one read per card per hour.
+When a GitHub `User` adds or removes an `ac/status:*` label, or closes or reopens the
+issue, the relay rings a body-free Kanban doorbell (`rc/github-graph` with event
+`issues`, carrying only the issue id and number). Hook matching for that delivery
+still runs. App and bot senders never ring it. On that doorbell, and on any
+`sub_issues` or `issue_dependencies` doorbell naming the card, the control plane
+resets the card's recovery backoff, re-reads that one issue, and pokes the board's
+claim. A parked card that a human re-readies is therefore claimed when the webhook
+arrives, subject to the usual claim gates (caps, cooldown, a live daemon), not after
+its backoff. If the webhook is lost or the read fails, the card waits for its next due
+tick, at most the backoff ceiling below.
+
+The backlog scan runs only on the 60-second tick; a report or claim poke never reads
+GitHub, and a doorbell reads only the card it names. Each pass reads at most 25 due
+cards per board. It excludes `ready`, `running`, `done`, and `archived` cards, so
+closed issues never stay in the scan. A check that changes nothing pushes
+`KanbanCard.recoveryCheckAt` out by 1, 2, 4, and so on up to 60 minutes
+(`recoveryChecks` counts the steps). Each check stores a fingerprint of the issue
+state and status labels it read (`recoveryObserved`). A check that sees a different
+fingerprint restarts the backoff at 1 minute, even when no webhook arrived. A
+doorbell for the card, an ingested move, or a new claim resets the backoff entirely.
+With 100 parked cards, the first hour is capped at 25 reads per tick, and steady
+state is about one read per card per hour.
 
 If the graph promotion's ready-label write fails after the `todo`→`ready` CAS, the
-reconciler compare-and-sets the card back to `todo` and fails the doorbell. A tick
-before the redelivery therefore cannot mismatch the card into a stranded `todo`, and
-the redelivered doorbell retries the promotion, including from `todo`+`ready` residue.
+reconciler compare-and-sets the card back to `todo`, flags it `promotionPending`, and
+fails the doorbell. A claim therefore cannot mismatch the card into a stranded
+`todo`. The write may still have half-landed. For example, the ready label was added
+and GitHub applied the `todo` removal, but the DELETE timed out. The next tick
+re-reads every flagged `todo` card. A lone `ready` label, or `todo`+`ready` residue,
+is adopted as `ready` and claimed, and the dispatch's `running` write clears both
+labels. Anything else clears the flag and leaves the card `todo`: nothing landed, or
+a human moved the card elsewhere. The redelivered doorbell then retries the promotion;
+it also adopts a lone `ready` label on a `todo` card whose blockers have all completed.
+Any later status change clears a stale flag, so it can never promote a card that comes
+back to `todo`.
 
-Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`,
-or an unsuccessful/empty daemon token response. They never use stored human gh
+Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`, or an
+unsuccessful/empty daemon token response. They never use stored human gh
 authentication. The shim sets only `GH_TOKEN` (never `GH_ENTERPRISE_TOKEN`), and it
-refuses a `--hostname` or `GH_HOST` other than `github.com`, so the github.com
-installation token cannot be sent to another host. Runtime spawn strips GitHub
-token/PAT environment variables and `GH_CONFIG_DIR` after all environment sources
-are merged. This does not prevent an unsandboxed worker from invoking a real binary
-or reading `~/.config/gh/hosts.yml` directly. Database-only mode authority and
-human-only recovery stay independent of that residual host access.
+refuses a `GH_HOST` other than `github.com`, so the github.com installation token
+cannot be sent to another host. It also refuses any real `--hostname` flag (or
+`auth`'s `-h`) naming another host. To find those flags, it parses argv the way gh
+does. Flags that take a value (`-f`/`--raw-field`, `-F`/`--field`, `-H`/`--header`,
+`--input`, `-q`/`--jq`, `-t`/`--template`, and so on) consume it, shorthand groups and
+`--` are honored, and a flag placed before the command name still counts. Text inside
+another flag's value, such as `--raw-field '--hostname=github.com'`, is never read as
+a host. Every real host flag must name `github.com`; the last one does not simply win.
+The shim sees only the literal argv, so a user-defined gh alias or extension is not
+inspected. Runtime spawn strips GitHub token/PAT environment variables and
+`GH_CONFIG_DIR` after all environment sources are merged. This does not prevent an
+unsandboxed worker from invoking a real binary or reading `~/.config/gh/hosts.yml`
+directly. Database-only mode authority and human-only recovery stay independent of
+that residual host access.
 
 A fenced heartbeat implicitly acknowledges an accepted dispatch and keeps the
 lease alive even when the original ACK write failed. Lease timestamps use the
