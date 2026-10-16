@@ -323,3 +323,47 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
     expect(BigInt(h.sent[1]!.d.dispatchRevision)).toBeGreaterThan(BigInt(d.dispatchRevision))
   })
 })
+
+it('orders slow running-label writes before terminal labels and persists the linked PR', async () => {
+  const h = await harness()
+  const c = await h.addCard()
+  let release!: () => void
+  let entered!: () => void
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const started = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  const apply = h.store.applyPlan.bind(h.store)
+  h.store.applyPlan = async (...args) => {
+    if (args[3].addLabels.includes('ac/status:running')) {
+      entered()
+      await held
+    }
+    await apply(...args)
+  }
+  await h.dispatcher.reconcileBoard(h.board.id)
+  await started
+  try {
+    expect((await h.dispatcher.onReport(D1, h.reportFor(h.sent[0]!.d, { prNumber: 12 }))).accepted).toBe(true)
+  } finally {
+    release()
+  }
+  await h.dispatcher.settle()
+  expect((await h.card(c.id)).linkedPrNumber).toBe(12)
+  expect(h.store.issues.get(c.issueNumber)).toMatchObject({ labels: ['ac/status:done'], state: 'closed' })
+})
+
+it('records write mode when a fast worker reports before its dispatch ACK arrives', async () => {
+  const h = await harness({
+    reply: async (d) => {
+      await h.dispatcher.onReport(D1, h.reportFor(d))
+      return { leaseId: d.leaseId, accepted: true }
+    }
+  })
+  await h.addCard(['ac/status:ready', WRITE_MODE_LABEL])
+  await h.dispatcher.reconcileBoard(h.board.id)
+  await h.dispatcher.settle()
+  expect(await h.run(h.sent[0]!.d.leaseId)).toMatchObject({ mode: 'write', outcome: 'completed' })
+})

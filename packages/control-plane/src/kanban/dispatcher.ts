@@ -1,7 +1,4 @@
-// Kanban dispatcher (issue #2 M2). Why push + central claim (D2): one Postgres SKIP LOCKED claim gives atomic single assignment,
-// board/agent caps, and a leaseId + dispatchRevision fence for free; the CP sends only ids (D3) and the daemon runs the turn.
-// Liveness is daemon-derived heartbeats, never the model's memory; a stale lease is reclaimed without counting a failure, and
-// every lease ends through one fenced write, so a superseded run's late report or heartbeat can never move a card.
+// Central claims enforce caps and fence every run; the daemon executes with body-free grants and derives its own liveness.
 import type {
   KanbanDispatch,
   KanbanDispatchOk,
@@ -61,6 +58,7 @@ export class KanbanDispatcher {
   private readonly running = new Map<string, Promise<void>>()
   private readonly rerun = new Set<string>()
   private readonly background = new Set<Promise<unknown>>()
+  private readonly statusWrites = new Map<string, Promise<void>>()
 
   constructor(private readonly deps: KanbanDispatcherDeps) {}
 
@@ -116,14 +114,22 @@ export class KanbanDispatcher {
       epochGraceMs: this.deps.epochGraceMs ?? DEFAULT_EPOCH_GRACE_MS
     }
     let reclaimed = 0
-    for (const lease of await this.deps.repo.listOpenLeases(REAP_BATCH)) {
-      const reason = staleLeaseReason(lease, now, opts)
-      if (!reason) continue
-      const result = await this.endRun(lease.leaseId, { outcome: 'reclaimed' }, `reclaimed:${reason}`)
-      if (result.accepted) {
-        reclaimed += 1
-        this.deps.log.info({ leaseId: lease.leaseId, reason }, 'kanban: reclaimed stale lease')
+    let afterLeaseId: string | undefined
+    for (;;) {
+      const leases = await this.deps.repo.listOpenLeases(REAP_BATCH, afterLeaseId)
+      for (const lease of leases) {
+        const reason = staleLeaseReason(lease, now, opts)
+        if (!reason) continue
+        const result = await this.endRun(lease.leaseId, { outcome: 'reclaimed' }, `reclaimed:${reason}`, {
+          reclaimIf: (current) => staleLeaseReason(current, now, opts) !== null
+        })
+        if (result.accepted) {
+          reclaimed += 1
+          this.deps.log.info({ leaseId: lease.leaseId, reason }, 'kanban: reclaimed stale lease')
+        }
       }
+      if (leases.length < REAP_BATCH) break
+      afterLeaseId = leases.at(-1)!.leaseId
     }
     return reclaimed
   }
@@ -161,10 +167,13 @@ export class KanbanDispatcher {
       fence: {
         daemonId,
         cardId: report.cardId,
+        boardId: report.boardId,
+        agentId: report.agentId,
         attempt: report.attempt,
         dispatchRevision: BigInt(report.dispatchRevision)
       },
-      ...(report.sessionId ? { sessionId: report.sessionId } : {})
+      ...(report.sessionId ? { sessionId: report.sessionId } : {}),
+      ...(report.prNumber !== undefined ? { prNumber: report.prNumber } : {})
     })
     if (!result.accepted) return { leaseId: report.leaseId, accepted: false, reason: 'superseded' }
     this.deps.log.info(
@@ -233,7 +242,7 @@ export class KanbanDispatcher {
     leaseId: string,
     end: KanbanRunEnd,
     reasonCode: string | null,
-    extra: { fence?: Parameters<KanbanDispatchRepo['endRun']>[0]['fence']; sessionId?: string } = {}
+    extra: Pick<Parameters<KanbanDispatchRepo['endRun']>[0], 'fence' | 'sessionId' | 'prNumber' | 'reclaimIf'> = {}
   ): Promise<KanbanRunEndResult> {
     const now = this.now()
     const outcome: KanbanRunOutcomeValue = end.outcome
@@ -259,15 +268,20 @@ export class KanbanDispatcher {
     status: KanbanStatus,
     observed?: ObservedIssue
   ): void {
-    const task = (async () => {
-      const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
-      if (!current) return
-      await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
-    })()
+    const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
+      .then(async () => {
+        const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
+        if (!current) return
+        await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
+      })
       .catch((err: unknown) =>
         this.deps.log.warn({ err, cardId: card.cardId, status }, 'kanban: status label write failed')
       )
-      .finally(() => this.background.delete(task))
+      .finally(() => {
+        this.background.delete(task)
+        if (this.statusWrites.get(card.cardId) === task) this.statusWrites.delete(card.cardId)
+      })
+    this.statusWrites.set(card.cardId, task)
     this.background.add(task)
   }
 

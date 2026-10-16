@@ -5116,17 +5116,22 @@ export interface KanbanClaimOpts {
 export interface KanbanRunFence {
   daemonId: string
   cardId: string
+  boardId?: string
+  agentId?: string
   attempt: number
   dispatchRevision: bigint
 }
 
 export interface KanbanRunEndInput {
+  // Recheck sampled stale leases under the same row locks as the end write.
+  reclaimIf?: (lease: OpenLeaseFacts) => boolean
   leaseId: string
   /** Absent for CP-side ends (nack, timeout, reaper); present for daemon reports. */
   fence?: KanbanRunFence
   outcome: KanbanRunOutcomeValue
   reasonCode: string | null
   sessionId?: string
+  prNumber?: number
   now: Date
   /** Pure accounting, evaluated under the row locks. */
   plan(card: AccountingCard, board: AccountingBoard): RunEndPlan
@@ -5162,6 +5167,6 @@ export interface KanbanDispatchRepo {
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult>
   /** Stamp liveness for the leases this daemon still holds; returns the superseded lease ids. */
   heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]>
-  /** Open runs with the facts the stale-lease predicate needs, oldest beat first. */
-  listOpenLeases(limit: number): Promise<KanbanOpenLease[]>
+  /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */
+  listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
 }

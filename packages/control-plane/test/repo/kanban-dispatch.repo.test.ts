@@ -4,7 +4,7 @@ import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
-import { planRunEnd, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
+import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
 import type { KanbanRunEndInput, KanbanRunOutcomeValue } from '../../src/persistence/ports.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -308,6 +308,8 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
       { ...fence, daemonId: D2 },
       { ...fence, attempt: 2 },
       { ...fence, cardId: crypto.randomUUID() },
+      { ...fence, boardId: crypto.randomUUID() },
+      { ...fence, agentId: A2 },
       { ...fence, dispatchRevision: lease.dispatchRevision - 1n }
     ]) {
       expect((await repo().endRun(end(lease.leaseId, 'completed', { fence: bad }))).accepted).toBe(false)
@@ -346,6 +348,7 @@ describe('PgKanbanDispatchRepo.heartbeat and open leases (real Postgres)', () =>
     await repo().endRun(end(b!.leaseId, 'reclaimed'))
 
     const later = new Date(NOW.getTime() + 30_000)
+    await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 8n } })
     const superseded = await repo().heartbeat(
       D1,
       8n,
@@ -395,4 +398,58 @@ describe('PgKanbanDispatchRepo.heartbeat and open leases (real Postgres)', () =>
     ;[open] = await repo().listOpenLeases(10)
     expect(open?.agentDaemonId).toBeUndefined()
   })
+})
+
+it('scans beyond a full page of capped or offline agents instead of starving eligible cards', async () => {
+  const boardId = await seedBoard({ maxInProgress: 3, maxInProgressPerAgent: 1 })
+  for (let i = 0; i < 51; i++) await seedCard(boardId, { priority: 5 })
+  const eligible = await seedCard(boardId, { agentId: A2 })
+  const claims = await repo().claim(boardId, live)
+  expect(claims.map((c) => c.cardId)).toContain(eligible.id)
+  expect(claims).toHaveLength(2)
+})
+
+it('does not reclaim a lease refreshed after the stale scan', async () => {
+  const boardId = await seedBoard()
+  await seedCard(boardId)
+  const [lease] = await repo().claim(boardId, live)
+  await repo().markAcked(lease!.leaseId, 'read', NOW)
+  const later = new Date(NOW.getTime() + 5 * 60 * 60_000)
+  const opts = { unackedGraceMs: 120_000, epochGraceMs: 180_000 }
+  const [sample] = await repo().listOpenLeases(10)
+  expect(staleLeaseReason(sample!, later, opts)).toBe('stale_heartbeat')
+  await repo().heartbeat(
+    D1,
+    7n,
+    [{ leaseId: lease!.leaseId, cardId: lease!.cardId, dispatchRevision: lease!.dispatchRevision }],
+    later
+  )
+  const result = await repo().endRun(
+    end(lease!.leaseId, 'reclaimed', {
+      now: later,
+      reclaimIf: (facts) => staleLeaseReason(facts, later, opts) !== null
+    })
+  )
+  expect(result.accepted).toBe(false)
+  expect((await prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId: lease!.leaseId } })).endedAt).toBeNull()
+})
+
+it('rejects old-epoch heartbeats and moved-agent writes before the reaper runs', async () => {
+  const boardId = await seedBoard()
+  await seedCard(boardId)
+  const [lease] = await repo().claim(boardId, live)
+  const beats = [{ leaseId: lease!.leaseId, cardId: lease!.cardId, dispatchRevision: lease!.dispatchRevision }]
+  await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 8n } })
+  expect(await repo().heartbeat(D1, 7n, beats, NOW)).toEqual([lease!.leaseId])
+  await prisma.agent.update({ where: { id: A1 }, data: { daemonId: D2 } })
+  expect(await repo().heartbeat(D1, 8n, beats, NOW)).toEqual([lease!.leaseId])
+  expect(
+    (
+      await repo().endRun(
+        end(lease!.leaseId, 'completed', {
+          fence: { daemonId: D1, cardId: lease!.cardId, attempt: 1, dispatchRevision: lease!.dispatchRevision }
+        })
+      )
+    ).accepted
+  ).toBe(false)
 })
