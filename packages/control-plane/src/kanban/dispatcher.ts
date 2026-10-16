@@ -90,6 +90,11 @@ function promotionExhausted(card: KanbanRecoveryDue, now: Date, pending: number)
   return !!card.promotionStartedAt && now.getTime() - card.promotionStartedAt.getTime() >= MAX_PROMOTION_AGE_MS
 }
 
+/** A rolled-back or crashed promotion whose POST never returned is still watched for a late landing. */
+function watching(card: KanbanRecoveryDue, now: Date): boolean {
+  return !card.promotionPostAccepted && !!card.promotionWatchUntil && now.getTime() < card.promotionWatchUntil.getTime()
+}
+
 /** One recovery re-read: whether the card moved, and the fingerprint of what GitHub showed when it was read. */
 interface RecoveryRead {
   moved: boolean
@@ -266,7 +271,7 @@ export class KanbanDispatcher {
     return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
   }
 
-  // A failed promotion is adopted on proof, cleared when no ready label landed, and otherwise retried up to a cap or escalated.
+  // A failed promotion is adopted on proof, cleared once no ready label landed by its watch's end, else retried or escalated.
   private async recoverPromotion(boardId: string, card: KanbanRecoveryDue): Promise<RecoveryRead> {
     const now = await this.deps.repo.now()
     // Reads that keep throwing never reach a verdict, so the cap is checked before reading too.
@@ -287,6 +292,8 @@ export class KanbanDispatcher {
       return { moved: true }
     }
     if (outcome === 'clear') {
+      // An unacknowledged POST may still land, so no ready label only clears once its watch has passed.
+      if (watching(card, now)) return { moved: false, observed }
       await this.deps.repo.settlePromotion(card.cardId, false)
       return { moved: false, observed }
     }
@@ -299,7 +306,7 @@ export class KanbanDispatcher {
     card: KanbanRecoveryDue,
     issue: CardIssue | null
   ): Promise<PendingOutcome> {
-    // No ready label on an open issue: nothing landed, or a human already moved it, so there is nothing to adopt or undo.
+    // No ready label on an open issue: nothing landed (yet), or a human moved it; the caller watches or clears.
     if (!issue || issue.state !== 'open' || !issue.labels.includes(statusLabel('ready'))) return 'clear'
     const { statuses, malformed } = parseStatusLabels(issue.labels)
     const readyOnly = statuses.length === 1 && malformed.length === 0

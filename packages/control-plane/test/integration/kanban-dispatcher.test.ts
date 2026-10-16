@@ -965,6 +965,16 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(await prisma.kanbanRun.count()).toBe(0)
   }
 
+  // Run recovery reads until the late-landing watch has passed and the closing read is done.
+  const outlastWatch = async (h: Awaited<ReturnType<typeof graphHarness>>, c: { id: string }) => {
+    const { promotionWatchUntil } = await h.card(c.id)
+    h.clock.advance(Math.max(0, promotionWatchUntil!.getTime() - h.clock.now()))
+    const { recoveryCheckAt } = await h.card(c.id)
+    if (recoveryCheckAt) h.clock.advance(Math.max(0, recoveryCheckAt.getTime() - h.clock.now()))
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+  }
+
   it.each([
     { name: 'add landed, removal failed', landed: ['ac/status:todo', 'ac/status:ready'] },
     { name: 'removal landed but timed out', landed: ['ac/status:ready'] }
@@ -1228,13 +1238,16 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
   })
 
-  it('a tick after a promotion whose add failed clears the flag and leaves todo; redelivery promotes', async () => {
+  it('a promotion whose add failed is watched, then cleared to todo once the window passes; redelivery promotes', async () => {
     const h = await graphHarness()
     const c = await failPromotion(h, null)
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(h.sent).toEqual([])
     expect(await prisma.kanbanRun.count()).toBe(0)
+    // The timed-out POST may still land, so the first empty read keeps watching instead of clearing.
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })
+    await outlastWatch(h, c)
     expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
     // The recovery read happened once; the cleared flag is not re-read on later ticks.
     const reads = h.store.reads.length
@@ -1253,8 +1266,30 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
     await h.dispatcher.tick()
     await h.dispatcher.settle()
+    await outlastWatch(h, c)
     expect(h.sent).toEqual([])
     expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, needsAttention: false })
+  })
+
+  // Vera's round-5 blocker 1: the timed-out POST commits on GitHub after the rollback and after empty recovery reads.
+  it.each([
+    { name: 'inside the watch', landsAtMinute: 2 },
+    { name: 'after the watch ends, before its closing read', landsAtMinute: 11 }
+  ])('flags a card whose timed-out ready POST lands late ($name)', async ({ landsAtMinute }) => {
+    const h = await graphHarness()
+    const c = await failPromotion(h, null, { acked: false })
+    for (let minute = 0; minute <= 20; minute++) {
+      if (minute > 0) h.clock.advance(60_000)
+      if (minute === landsAtMinute) h.store.relabel(c.issueNumber, ['ac/status:todo', 'ac/status:ready'], 'app')
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      const card = await h.card(c.id)
+      if (card.needsAttention) break
+      // Until the label lands, every read is empty, and the card is watched rather than cleared.
+      expect(card).toMatchObject({ status: 'todo', promotionPending: true })
+    }
+    await expectEscalated(h, c, 'unattributed')
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:todo', 'ac/status:ready'])
   })
 
   // Vera's #18 sequence: the promotion write fails, a human parks the card, then an agent (the App bot) or another bot readies it.
@@ -1270,8 +1305,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
       if (doorbell) {
         await h.ringLabel(c.issueNumber)
-        // A conclusive human park settles the pending flag.
-        expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
+        // The unacknowledged POST could still land on top of the park, so the intent stays watched.
+        expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true })
       }
       h.store.relabel(c.issueNumber, ['ac/status:ready'], swapper)
       await h.dispatcher.tick()
@@ -1285,8 +1320,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       expect(await prisma.kanbanRun.count()).toBe(0)
       expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
       expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:ready'])
-      // Without the doorbell the pending promotion saw the swap, so it went to a human rather than silently to todo.
-      if (!doorbell) await expectEscalated(h, c, 'unattributed')
+      // The watched promotion saw the swap, so it went to a human rather than silently to todo.
+      await expectEscalated(h, c, 'unattributed')
     }
   )
 

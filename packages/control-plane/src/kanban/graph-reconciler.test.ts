@@ -235,7 +235,7 @@ describe('KanbanGraphReconciler', () => {
     const g = graph({ blockedBy: [done] })
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
     expect(h.cards.beginPromotion.mock.calls.map((c) => c.slice(0, 2))).toEqual([['c7', 1n]])
-    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n)
+    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n, expect.any(Date))
     expect(h.cards.notePromotionPosted).not.toHaveBeenCalled()
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)

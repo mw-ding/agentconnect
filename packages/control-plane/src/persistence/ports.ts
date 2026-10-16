@@ -5179,6 +5179,8 @@ export interface KanbanRecoveryDue {
   promotionEventCursor: bigint | null
   promotionPostAccepted: boolean
   promotionStartedAt: Date | null
+  /** Until then an unacknowledged POST may still land, so a card without ready is watched, not cleared. */
+  promotionWatchUntil: Date | null
   promotionChecks: number
   recoveryCheckAt: Date | null
 }
@@ -5244,6 +5246,6 @@ export interface KanbanCardRepo {
   notePromotionPosted(cardId: string): Promise<void>
   /** The label write finished; drop the intent so the ready card can be claimed. */
   clearPromotionIntent(cardId: string): Promise<boolean>
-  /** Undo a promotion whose label write failed, keeping its intent so recovery judges what landed on GitHub. */
-  revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean>
+  /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
+  revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
 }

@@ -1872,6 +1872,8 @@ model KanbanCard {
   promotionEventCursor    BigInt?
   // The ready POST returned success. Without it no App ready-add is ours.
   promotionPostAccepted   Boolean   @default(false)
+  // An unacknowledged POST may still land until this time, so recovery watches rather than clears before it.
+  promotionWatchUntil     DateTime? @db.Timestamptz(6)
   // When the intent opened, and recovery reads since; either cap escalates the card.
   promotionStartedAt      DateTime? @db.Timestamptz(6)
   promotionChecks         Int       @default(0)

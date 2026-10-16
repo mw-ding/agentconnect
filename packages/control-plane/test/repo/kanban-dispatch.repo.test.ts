@@ -4,7 +4,7 @@ import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
-import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { PgKanbanCardRepo, PROMOTION_WATCH_MS } from '../../src/persistence/repositories/kanban.repo.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
 import type { KanbanRunEndInput, KanbanRunOutcomeValue } from '../../src/persistence/ports.js'
 
@@ -557,6 +557,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       promotionEventCursor: null,
       promotionPostAccepted: false,
       promotionStartedAt: null,
+      promotionWatchUntil: null,
       promotionChecks: 0,
       recoveryCheckAt: null
     })
@@ -637,8 +638,9 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const cards = new PgKanbanCardRepo(prisma)
     const pending = await begin(boardId)
     await cards.notePromotionPosted(pending.id)
-    expect(await cards.revertPromotion(pending.id, 0n)).toBe(false)
-    expect(await cards.revertPromotion(pending.id, pending.stateRevision)).toBe(true)
+    expect(await cards.revertPromotion(pending.id, 0n, NOW)).toBe(false)
+    const revertedAt = new Date(NOW.getTime() + 10_000)
+    expect(await cards.revertPromotion(pending.id, pending.stateRevision, revertedAt)).toBe(true)
     const due = {
       cardId: pending.id,
       issueNumber: pending.issueNumber,
@@ -646,6 +648,8 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       promotionEventCursor: 42n,
       promotionPostAccepted: true,
       promotionStartedAt: NOW,
+      // The rollback restarts the late-landing watch from its own time.
+      promotionWatchUntil: new Date(revertedAt.getTime() + PROMOTION_WATCH_MS),
       promotionChecks: 0,
       recoveryCheckAt: null
     }
@@ -667,7 +671,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     expect(await repo().getPendingPromotion(boardId, pending.issueNumber)).toBeNull()
 
     const cleared = await begin(boardId)
-    await cards.revertPromotion(cleared.id, cleared.stateRevision)
+    await cards.revertPromotion(cleared.id, cleared.stateRevision, NOW)
     expect(await repo().settlePromotion(cleared.id, false)).toBe(true)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).toMatchObject({
       status: 'todo',
@@ -676,7 +680,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     // Any later status move settles a pending flag, so a stale one can never promote a card that came back to todo.
     const rev = cleared.stateRevision + 1n
     expect(await cards.beginPromotion(cleared.id, rev, 7n, NOW)).toBe(true)
-    expect(await cards.revertPromotion(cleared.id, rev + 1n)).toBe(true)
+    expect(await cards.revertPromotion(cleared.id, rev + 1n, NOW)).toBe(true)
     expect(await cards.casStatus(cleared.id, rev + 2n, 'blocked')).toBe(true)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cleared.id } })).promotionPending).toBe(false)
   })
@@ -708,6 +712,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
         promotionEventCursor: 99n,
         promotionPostAccepted: false,
         promotionStartedAt: startedAt,
+        promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
         promotionChecks: 0,
         recoveryCheckAt: due
       }
@@ -722,7 +727,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const boardId = await seedBoard()
     const cards = new PgKanbanCardRepo(prisma)
     const c = await begin(boardId)
-    await cards.revertPromotion(c.id, c.stateRevision)
+    await cards.revertPromotion(c.id, c.stateRevision, NOW)
     await repo().deferRecovery(c.id, NOW, 'a')
     await repo().deferRecovery(c.id, NOW, 'b')
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
@@ -739,6 +744,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       attentionReason: 'unattributed',
       promotionPending: false,
       promotionEventCursor: null,
+      promotionWatchUntil: null,
       promotionChecks: 0,
       recoveryCheckAt: null
     })
@@ -767,7 +773,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const boardId = await seedBoard()
     const cards = new PgKanbanCardRepo(prisma)
     const c = await begin(boardId, 42n, NOW)
-    expect(await cards.revertPromotion(c.id, c.stateRevision)).toBe(true)
+    expect(await cards.revertPromotion(c.id, c.stateRevision, NOW)).toBe(true)
     await repo().deferRecovery(c.id, NOW, 'a')
     const before = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })
     expect(before).toMatchObject({ status: 'todo', promotionPending: true, promotionChecks: 1 })

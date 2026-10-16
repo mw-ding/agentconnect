@@ -12,11 +12,15 @@ import type {
 
 const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
 
+/** How long after its POST (or its rollback) an unacknowledged ready write is still watched for a late landing. */
+export const PROMOTION_WATCH_MS = 10 * 60_000
+
 /** No promotion in flight and no human flag: what every settled status move writes. */
 export const PROMOTION_CLEARED = {
   promotionPending: false,
   promotionEventCursor: null,
   promotionPostAccepted: false,
+  promotionWatchUntil: null,
   promotionStartedAt: null,
   promotionChecks: 0,
   needsAttention: false,
@@ -163,6 +167,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         promotionPending: true,
         promotionEventCursor: eventCursor,
         promotionStartedAt: startedAt,
+        promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
         // A minute out, so a tick cannot settle the card while this write is still in flight.
         recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
         recoveryChecks: 0
@@ -186,10 +191,17 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
     return count === 1
   }
 
-  async revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean> {
+  async revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean> {
+    // The timed-out POST can still land after this rollback, so the watch restarts from now.
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
-      data: { status: 'todo', stateRevision: { increment: 1 }, recoveryCheckAt: null, recoveryChecks: 0 }
+      data: {
+        status: 'todo',
+        stateRevision: { increment: 1 },
+        promotionWatchUntil: new Date(revertedAt.getTime() + PROMOTION_WATCH_MS),
+        recoveryCheckAt: null,
+        recoveryChecks: 0
+      }
     })
     return count === 1
   }

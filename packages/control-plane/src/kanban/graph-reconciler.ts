@@ -80,7 +80,8 @@ export class KanbanGraphReconciler {
       }
     } catch (err) {
       // Whatever landed, recovery judges the cursor window; the intent keeps the card unclaimable until then.
-      await this.deps.cards.revertPromotion(card.id, revision).catch(() => false)
+      const revertedAt = new Date(this.deps.clock?.now() ?? Date.now())
+      await this.deps.cards.revertPromotion(card.id, revision, revertedAt).catch(() => false)
       throw err
     }
   }

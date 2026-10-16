@@ -39,7 +39,7 @@ const PENDING_UNLEASED = (id: string): Prisma.KanbanCardWhereInput => ({
   runs: { none: { endedAt: null } }
 })
 const PROMOTION_COLUMNS = Prisma.sql`c."promotionEventCursor", c."promotionPostAccepted", c."promotionStartedAt",
-  c."promotionChecks", c."recoveryCheckAt"`
+  c."promotionWatchUntil", c."promotionChecks", c."recoveryCheckAt"`
 
 interface BoardRow {
   id: string
