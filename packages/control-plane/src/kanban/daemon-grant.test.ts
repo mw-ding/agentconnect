@@ -7,7 +7,9 @@ const write = { repoId: 7n, repoFullName: 'Acme/Web', mode: 'write' as const }
 describe('kanban daemon grant selection', () => {
   it('uses the named repo, else a github workspace, and ignores other workspace modes', () => {
     expect(kanbanRequestRepo('acme/web', undefined)).toBe('acme/web')
-    expect(kanbanRequestRepo(undefined, { mode: 'github', gitRepo: 'https://github.com/acme/web.git' })).toBe('acme/web')
+    expect(kanbanRequestRepo(undefined, { mode: 'github', gitRepo: 'https://github.com/acme/web.git' })).toBe(
+      'acme/web'
+    )
     expect(kanbanRequestRepo(undefined, { mode: 'scratch' })).toBeUndefined()
     expect(kanbanRequestRepo(undefined, undefined)).toBeUndefined()
   })

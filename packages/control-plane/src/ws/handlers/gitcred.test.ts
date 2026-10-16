@@ -219,13 +219,10 @@ describe('handleGitCredRequest — Kanban run grants', () => {
 
     await handleGitCredRequest(frame, conn, kanbanDeps([scope], { mintForAgent, mintForKanbanRun }))
 
-    expect(mintForKanbanRun).toHaveBeenCalledWith(
-      PLACED_AGENT,
-      'Acme/Web',
-      77n,
-      'read',
-      [`daemon:${DAEMON_ID}`, `org:org-a`]
-    )
+    expect(mintForKanbanRun).toHaveBeenCalledWith(PLACED_AGENT, 'Acme/Web', 77n, 'read', [
+      `daemon:${DAEMON_ID}`,
+      `org:org-a`
+    ])
     expect(mintForAgent).not.toHaveBeenCalled()
     expect(conn.replyTo).toHaveBeenCalledWith(frame, 'gitcred/grant', expect.objectContaining({ access: 'read' }))
   })
