@@ -12,7 +12,8 @@ import {
   type CardGraph,
   type CardIssue,
   type KanbanRepoRef,
-  type LabelEvent
+  type LabelEvent,
+  type LabelWriteObserver
 } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
@@ -46,8 +47,8 @@ class FakeStore {
   async statusSetByHuman(_repo: KanbanRepoRef, n: number): Promise<boolean> {
     return (this.statusActors.get(n) ?? 'human') === 'human'
   }
-  async promotionAttributed(_repo: KanbanRepoRef, n: number): Promise<boolean> {
-    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG)
+  async promotionAttributed(_repo: KanbanRepoRef, n: number, readyAddedAt: Date | null): Promise<boolean | null> {
+    return promotionAttributed(this.events.get(n) ?? [], APP_SLUG, readyAddedAt)
   }
   async readGraph(_repo: KanbanRepoRef, n: number): Promise<CardGraph> {
     return this.graphs.get(n) ?? emptyGraph()
@@ -66,7 +67,13 @@ class FakeStore {
   private record(n: number, added: string[], removed: string[], actor: keyof typeof ACTORS): void {
     const events = this.events.get(n) ?? []
     for (const name of added)
-      events.push({ id: ++this.eventId, event: 'labeled', label: { name }, actor: ACTORS[actor] })
+      events.push({
+        id: ++this.eventId,
+        event: 'labeled',
+        created_at: new Date(T0 + this.eventId * 1000).toISOString(),
+        label: { name },
+        actor: ACTORS[actor]
+      })
     for (const name of removed) {
       events.push({ id: ++this.eventId, event: 'unlabeled', label: { name }, actor: ACTORS[actor] })
     }
@@ -85,10 +92,20 @@ class FakeStore {
         }
       : null
   }
-  async applyPlan(_repo: KanbanRepoRef, n: number, _observed: ObservedIssue, plan: LabelPlan): Promise<void> {
+  async applyPlan(
+    _repo: KanbanRepoRef,
+    n: number,
+    _observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void> {
     this.writes.push(plan)
     const i = this.issues.get(n)!
     this.record(n, plan.addLabels, plan.removeLabels, 'app')
+    for (const label of plan.addLabels) {
+      const event = [...this.events.get(n)!].reverse().find((e) => e.event === 'labeled' && e.label?.name === label)!
+      onLabelAdded?.(label, new Date(event.created_at!))
+    }
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
     if (plan.issueState) {
       i.state = plan.issueState.state
@@ -894,13 +911,19 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     h.graphs.set(c.issueNumber, { ...emptyGraph(), blockedBy: [completedBlocker] })
     const apply = h.store.applyPlan.bind(h.store)
     vi.spyOn(h.store, 'applyPlan')
-      .mockImplementationOnce(async () => {
+      .mockImplementationOnce(async (_repo, _n, _observed, _plan, onLabelAdded) => {
         // #19: an owner flips the card's write mode while the promotion is in flight.
         if (changeMode)
           expect(
             await new PgKanbanBoardRepo(prisma).setCardMode(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID, 'read')
           ).toBe(true)
-        if (landed) h.store.relabel(c.issueNumber, landed, 'app')
+        if (landed) {
+          h.store.relabel(c.issueNumber, landed, 'app')
+          const event = [...h.store.events.get(c.issueNumber)!]
+            .reverse()
+            .find((e) => e.event === 'labeled' && e.label?.name === 'ac/status:ready')!
+          onLabelAdded?.('ac/status:ready', new Date(event.created_at!))
+        }
         throw new Error('label write timed out')
       })
       .mockImplementation(apply)
@@ -930,6 +953,85 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       'kanban: adopted a half-landed graph promotion'
     )
   })
+
+  it.each([{ labels: ['ac/status:ready'] }, { labels: ['ac/status:todo', 'ac/status:ready'] }])(
+    'never adopts $labels re-added by an agent using the same App after a human removal',
+    async ({ labels }) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, labels)
+      const receipt = (await h.card(c.id)).promotionReadyAddedAt
+      expect(receipt).not.toBeNull()
+      h.store.relabel(
+        c.issueNumber,
+        labels.filter((label) => label !== 'ac/status:ready'),
+        'human'
+      )
+      h.store.relabel(c.issueNumber, labels, 'app')
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      await h.ring(c.issueNumber, 'graph-2')
+      expect(h.sent).toEqual([])
+      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false, promotionReadyAddedAt: null })
+    }
+  )
+
+  it.each(['tick', 'doorbell'] as const)(
+    'a thrown %s read preserves the receipt and a later tick repairs',
+    async (trigger) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, ['ac/status:ready'])
+      const receipt = (await h.card(c.id)).promotionReadyAddedAt
+      vi.spyOn(h.store, 'readCard').mockRejectedValueOnce(new Error('GitHub 503'))
+      if (trigger === 'doorbell')
+        await expect(h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).rejects.toThrow('GitHub 503')
+      else await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({
+        status: 'todo',
+        promotionPending: true,
+        promotionReadyAddedAt: receipt,
+        recoveryChecks: 1
+      })
+      const reads = h.store.reads.length
+      await h.dispatcher.tick()
+      expect(h.store.reads.length).toBe(reads)
+      expect(h.sent).toEqual([])
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+      expect(await h.card(c.id)).toMatchObject({
+        status: 'running',
+        promotionPending: false,
+        promotionReadyAddedAt: null
+      })
+    }
+  )
+
+  it.each(['tick', 'doorbell'] as const)(
+    'lagging events on a %s keep pending and back off until a later tick repairs',
+    async (trigger) => {
+      const h = await graphHarness()
+      const c = await failPromotion(h, ['ac/status:todo', 'ac/status:ready'])
+      const events = h.store.events.get(c.issueNumber)!
+      h.store.events.set(c.issueNumber, [])
+      if (trigger === 'doorbell') expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber)).toBe(false)
+      else await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: true, recoveryChecks: 1 })
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      expect(await h.card(c.id)).toMatchObject({ promotionPending: true, recoveryChecks: 2 })
+      const reads = h.store.reads.length
+      h.store.events.set(c.issueNumber, events)
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      expect(h.store.reads.length).toBe(reads)
+      h.clock.advance(60_000)
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+      expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+      expect(await h.card(c.id)).toMatchObject({ status: 'running', promotionPending: false })
+    }
+  )
 
   it('a failed promotion rollback keeps a concurrent mode change (#19) and still flags the card', async () => {
     const h = await graphHarness()
@@ -994,7 +1096,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
       h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
       if (doorbell) {
         await h.ringLabel(c.issueNumber)
-        // Any doorbell settles the pending flag, so nothing is left for a later bot write to adopt.
+        // A conclusive human park settles the pending flag.
         expect(await h.card(c.id)).toMatchObject({ status: 'todo', promotionPending: false })
       }
       h.store.relabel(c.issueNumber, ['ac/status:ready'], swapper)

@@ -153,28 +153,38 @@ reconciler compare-and-sets the card back to `todo`, flags it `promotionPending`
 fails the doorbell. A claim therefore cannot mismatch the card into a stranded
 `todo`. The write may still have half-landed. For example, the ready label was added
 and GitHub applied the `todo` removal, but the DELETE timed out. The next tick
-re-reads every flagged `todo` card. A lone `ready` label, or `todo`+`ready` residue,
+re-reads due flagged `todo` cards within the recovery batch limit. A lone `ready`
+label, or `todo`+`ready` residue,
 is adopted as `ready` and claimed only when two further checks pass, and the
 dispatch's `running` write then clears both labels.
 
-- **Attribution.** The issue events must show that this deployment's App bot
-  (`<slug>[bot]`) or a GitHub `User` added the `ready` label. The CP and its agents
-  share that App identity, so the check also replays the `ac/status:*` and
-  close/reopen events. The last human change must have left the issue open with
-  only `todo` and/or `ready`. A human park (any other status, or closing the issue)
-  therefore stands until a human undoes it, even if an agent later swaps in `ready`.
-  Any other bot or App touching status, a history beyond 10 pages, or a read
-  failure refuses adoption.
+- **Attribution.** The failed promotion records `promotionReadyAddedAt` alongside
+  `promotionPending`: GitHub's server `Date` from our successful ready-label POST,
+  captured before removing `todo`. An App-authored `ready` event must match that
+  timestamp and the configured `<slug>[bot]` actor, and be the only App ready-add
+  at that timestamp in the full history. The CP and agents share the App identity;
+  the login alone never proves the promotion is ours. A human `User` ready-add
+  can also authorize adoption. Replaying status and close/reopen events preserves
+  human parks until a human restores an open issue with only `todo` and/or `ready`.
+  Removing `ready` also revokes the prior promotion even when `todo` remains.
+  A human removal followed by a same-App agent re-add is rejected, including when
+  the two App ready-adds share GitHub's second-resolution timestamp.
 - **Graph readiness.** Every blocker must still be closed as completed.
 
-Anything else clears the flag and leaves the card `todo`: nothing landed, the label is
-not attributable, a blocker reopened, or a human moved the card elsewhere.
-Any Kanban doorbell for the card (a human status relabel or a graph change) settles
-the flag at once with the same checks and clears it even if the read fails, so a
-human park observed by a webhook leaves nothing for a later bot write to adopt. The
-graph reconciler never adopts a lone `ready` itself; a redelivered graph doorbell
-reaches the same attributed repair. Any later status change also clears a stale
-flag, so it can never promote a card that comes back to `todo`.
+A conclusive negative clears both the pending flag and write receipt and leaves
+`todo`: no ready label landed, a human parked the card, the visible ready-add does
+not match our receipt or a human, or a blocker reopened. A thrown GitHub read,
+missing ready-add event, or history beyond the 10-page bound is inconclusive:
+keep the flag and receipt and retry using the same exponential recovery backoff.
+A doorbell runs these same checks immediately and defers an inconclusive result;
+it never clears the flag merely because a read failed. A later tick can repair
+once the events API catches up or GitHub recovers. If the ready POST itself times
+out before returning a receipt, or its server timestamp is unavailable, an App
+login cannot supply the missing proof; human intervention may be needed.
+The graph reconciler never adopts a lone `ready` or `todo`+`ready` on a DB `todo`
+card itself; a redelivered graph doorbell reaches the attributed repair. Any later
+status change clears the flag and receipt, so they cannot authorize a future
+promotion after the card returns to `todo`.
 
 Agent `gh` shims fail closed on inherited GitHub tokens, missing `AC_AGENT_ID`, or an
 unsuccessful/empty daemon token response. They never use stored human gh

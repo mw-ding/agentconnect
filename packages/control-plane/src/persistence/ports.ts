@@ -5176,6 +5176,7 @@ export interface KanbanRecoveryDue {
   cardId: string
   issueNumber: number
   promotion: boolean
+  promotionReadyAddedAt: Date | null
 }
 
 export interface KanbanDispatchRepo {
@@ -5228,5 +5229,5 @@ export interface KanbanCardRepo {
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** Undo a promotion whose label write failed and flag it pending, so recovery re-reads what landed on GitHub. */
-  revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean>
+  revertPromotion(cardId: string, expectedStateRevision: bigint, readyAddedAt: Date | null): Promise<boolean>
 }

@@ -194,11 +194,13 @@ export class KanbanDispatcher {
     await this.deps.repo.resetRecovery(boardId, issueNumber)
     const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
     if (!pending) return this.ingestCard(boardId, issueNumber)
-    // Any doorbell settles a pending promotion: adopted only on proof, otherwise (a failed read included) the flag clears.
+    const now = await this.deps.repo.now()
+    let read: RecoveryRead = { moved: false }
     try {
-      return (await this.recoverPromotion(boardId, pending)).moved
+      read = await this.recoverPromotion(boardId, pending)
+      return read.moved
     } finally {
-      await this.deps.repo.settlePromotion(pending.cardId, false)
+      if (!read.moved) await this.deps.repo.deferRecovery(pending.cardId, now, read.observed)
     }
   }
 
@@ -234,7 +236,7 @@ export class KanbanDispatcher {
     return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
   }
 
-  /** A promotion whose label write failed: adopt the ready label only if it is provably ours, else just clear the flag. */
+  // A failed promotion is adopted on proof, cleared on rejection, or left pending when evidence is incomplete.
   private async recoverPromotion(boardId: string, card: KanbanRecoveryDue): Promise<RecoveryRead> {
     const repo = await this.boardRepoRef(boardId)
     if (!repo) return { moved: false }
@@ -242,23 +244,34 @@ export class KanbanDispatcher {
     const { statuses, malformed } = parseStatusLabels(issue?.labels ?? [])
     const readyOnly = statuses.length === 1 && statuses[0] === 'ready' && malformed.length === 0
     const shaped = !!issue && issue.state === 'open' && (readyOnly || isPromotionResidue(issue))
-    const landed = shaped && (await this.promotionStillHolds(boardId, repo, card.issueNumber))
+    const observed = recoveryFingerprint(issue)
+    const landed = shaped && (await this.promotionStillHolds(boardId, repo, card))
+    if (landed === null) return { moved: false, observed }
     const settled = await this.deps.repo.settlePromotion(card.cardId, landed)
     if (landed && settled) {
       // Residue is dispatchable as is, and the running write clears both labels.
       this.deps.log.info({ boardId, issueNumber: card.issueNumber }, 'kanban: adopted a half-landed graph promotion')
       return { moved: true }
     }
-    return { moved: false, observed: recoveryFingerprint(issue) }
+    return { moved: false, observed }
   }
 
-  /** The ready label must be this App's or a human's with no later human park, and every blocker still closed completed. */
-  private async promotionStillHolds(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
-    if (!(await this.deps.store.promotionAttributed(repo, issueNumber))) {
+  // The ready-add must match our receipt or a human edit, with every blocker still closed completed.
+  private async promotionStillHolds(
+    boardId: string,
+    repo: KanbanRepoRef,
+    card: KanbanRecoveryDue
+  ): Promise<boolean | null> {
+    const { issueNumber, promotionReadyAddedAt } = card
+    const attributed = await this.deps.store.promotionAttributed(repo, issueNumber, promotionReadyAddedAt)
+    if (attributed === null) return null
+    if (!attributed) {
       this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose ready label is not ours')
       return false
     }
-    if (planGraphPromotion('todo', await this.deps.store.readGraph(repo, issueNumber)) !== 'promote') {
+    const graph = await this.deps.store.readGraph(repo, issueNumber)
+    if (graph.truncated) return null
+    if (planGraphPromotion('todo', graph) !== 'promote') {
       this.deps.log.info({ boardId, issueNumber }, 'kanban: refused a pending promotion whose blockers reopened')
       return false
     }

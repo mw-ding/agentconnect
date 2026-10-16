@@ -298,6 +298,34 @@ describe('status label attribution', () => {
   })
 })
 
+describe('label write receipts', () => {
+  it('captures GitHub server time before a later removal fails', async () => {
+    const h = harness({
+      'POST /repositories/42/issues/7/labels': () =>
+        new Response('[]', { headers: { date: 'Fri, 16 Oct 2026 00:00:00 GMT' } }),
+      'DELETE /repositories/42/issues/7/labels/ac%2Fstatus%3Atodo': () => json({ message: 'unavailable' }, 503)
+    })
+    const receipt = vi.fn()
+    await expect(
+      h.store.applyPlan(
+        REPO,
+        7,
+        { state: 'open', labels: ['ac/status:todo'] },
+        {
+          outcome: 'accepted',
+          status: 'ready',
+          releaseLease: false,
+          addLabels: ['ac/status:ready'],
+          removeLabels: ['ac/status:todo']
+        },
+        receipt
+      )
+    ).rejects.toThrow()
+    expect(receipt).toHaveBeenCalledWith('ac/status:ready', new Date('2026-10-16T00:00:00Z'))
+    expect(h.calls.map((call) => call.method)).toEqual(['POST', 'DELETE'])
+  })
+})
+
 describe('half-landed promotion attribution', () => {
   const human = { type: 'User', login: 'maintainer' }
   const app = { type: 'Bot', login: 'AgentConnect[bot]' }
@@ -306,6 +334,7 @@ describe('half-landed promotion attribution', () => {
   const add = (name: string, actor: unknown) => ({
     id: ++id,
     event: 'labeled',
+    created_at: '2026-10-16T00:00:00.000Z',
     label: { name: `ac/status:${name}` },
     actor
   })
@@ -351,7 +380,7 @@ describe('half-landed promotion attribution', () => {
       () => [add('todo', human), add('ready', app), add('triage', other), del('triage', other)],
       false
     ],
-    ['no ready add at all', () => [add('todo', human)], false],
+    ['no ready add visible yet', () => [add('todo', human)], null],
     [
       'unrelated label events are ignored',
       () => [
@@ -362,26 +391,62 @@ describe('half-landed promotion attribution', () => {
       true
     ]
   ])('%s', (_name, events, expected) => {
-    expect(promotionAttributed(events(), 'agentconnect')).toBe(expected)
+    expect(promotionAttributed(events(), 'agentconnect', new Date('2026-10-16T00:00:00Z'))).toBe(expected)
+  })
+
+  it.each([false, true])(
+    'rejects a same-App ready re-add after a human removes ready (same second: %s)',
+    (sameSecond) => {
+      const todo = add('todo', human)
+      const ownAdd = add('ready', app)
+      const removed = del('ready', human)
+      const agentAdd = { ...add('ready', app), created_at: sameSecond ? ownAdd.created_at : '2026-10-16T00:00:01Z' }
+      const events = [todo, ownAdd, removed, agentAdd]
+      expect(promotionAttributed(events, 'agentconnect', new Date(ownAdd.created_at))).toBe(false)
+    }
+  )
+
+  it('rejects a later agent add matching the response second when our event was in the preceding second', () => {
+    const todo = add('todo', human)
+    const ownAdd = add('ready', app)
+    const removed = del('ready', human)
+    const agentAdd = { ...add('ready', app), created_at: '2026-10-16T00:00:01Z' }
+    expect(promotionAttributed([todo, ownAdd, removed, agentAdd], 'agentconnect', new Date(agentAdd.created_at))).toBe(
+      false
+    )
+  })
+
+  it('cannot attribute a shared-App ready add without a receipt', () => {
+    expect(promotionAttributed([add('todo', human), add('ready', app)], 'agentconnect', null)).toBe(false)
+  })
+
+  it('defers when the recorded write is newer than the visible ready event', () => {
+    expect(
+      promotionAttributed([add('todo', human), add('ready', app)], 'agentconnect', new Date('2026-10-16T00:00:01Z'))
+    ).toBe(null)
   })
 
   it('never trusts an App write without a configured slug, and replays by event id', () => {
-    expect(promotionAttributed([add('todo', human), add('ready', app)], undefined)).toBe(false)
+    expect(
+      promotionAttributed([add('todo', human), add('ready', app)], undefined, new Date('2026-10-16T00:00:00Z'))
+    ).toBe(false)
     const [park, swap] = [add('blocked', human), add('ready', app)]
-    expect(promotionAttributed([swap, park], 'agentconnect')).toBe(false)
+    expect(promotionAttributed([swap, park], 'agentconnect', new Date('2026-10-16T00:00:00Z'))).toBe(false)
     expect(isAppActor({ actor: { type: 'User', login: 'agentconnect[bot]' } }, 'agentconnect')).toBe(false)
   })
 
   it('reads the event history through the store and fails closed past the bound', async () => {
     const EVENTS = 'GET /repositories/42/issues/7/events?per_page=100&page=1'
     const ok = harness({ [EVENTS]: () => json([add('todo', human), add('ready', app)]) }, 'agentconnect')
-    expect(await ok.store.promotionAttributed(REPO, 7)).toBe(true)
+    expect(await ok.store.promotionAttributed(REPO, 7, new Date('2026-10-16T00:00:00Z'))).toBe(true)
     expect(ok.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
     const routes: Record<string, () => Response> = {}
     for (let page = 1; page <= 10; page++) {
       routes[`GET /repositories/42/issues/7/events?per_page=100&page=${page}`] = () =>
         json(Array.from({ length: 100 }, () => add('ready', app)))
     }
-    expect(await harness(routes, 'agentconnect').store.promotionAttributed(REPO, 7)).toBe(false)
+    expect(
+      await harness(routes, 'agentconnect').store.promotionAttributed(REPO, 7, new Date('2026-10-16T00:00:00Z'))
+    ).toBe(null)
   })
 })

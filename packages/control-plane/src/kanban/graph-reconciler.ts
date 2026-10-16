@@ -1,13 +1,7 @@
 // Kanban graph reconciler (issue #2 M1): promotes todo cards whose blockers all completed, then writes the status label.
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
-import {
-  STATUS_LABEL_PREFIX,
-  isPromotionResidue,
-  statusLabel,
-  type KanbanStatus,
-  type LabelPlan
-} from './card-state.js'
-import type { CardGraph, CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import { STATUS_LABEL_PREFIX, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
+import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
 
 export interface GraphReconcilerLog {
   debug(obj: unknown, msg?: string): void
@@ -62,17 +56,20 @@ export class KanbanGraphReconciler {
     if (!observed || observed.state !== 'open') return
     if (residueOnly) return this.writeReadyLabels(repo, issueNumber, true, observed)
     const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
-    // A lone ready is left to the dispatcher, which adopts it only when attributed; todo+ready is our partial write.
-    if ((statuses.length !== 1 || statuses[0] !== statusLabel('todo')) && !isPromotionResidue(observed)) return
+    // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
+    if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
     if (!(await this.deps.cards.casStatus(card.id, card.stateRevision, 'ready'))) {
       this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: graph promotion lost the CAS')
       return
     }
+    let readyAddedAt: Date | null = null
     try {
-      await this.writeReadyLabels(repo, issueNumber, false, observed)
+      await this.writeReadyLabels(repo, issueNumber, false, observed, (_label, addedAt) => {
+        readyAddedAt = addedAt
+      })
     } catch (err) {
       // Undo so a claim cannot mismatch it into todo; the pending flag lets tick recovery adopt a half-landed write.
-      await this.deps.cards.revertPromotion(card.id, card.stateRevision + 1n).catch(() => false)
+      await this.deps.cards.revertPromotion(card.id, card.stateRevision + 1n, readyAddedAt).catch(() => false)
       throw err
     }
   }
@@ -82,7 +79,8 @@ export class KanbanGraphReconciler {
     repo: KanbanRepoRef,
     issueNumber: number,
     residueOnly: boolean,
-    observed: CardIssue
+    observed: CardIssue,
+    onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
     const keep = statusLabel('ready')
     const stale = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
@@ -96,6 +94,6 @@ export class KanbanGraphReconciler {
       addLabels: hasKeep ? [] : [keep],
       removeLabels: stale
     }
-    await this.deps.store.applyPlan(repo, issueNumber, observed, plan)
+    await this.deps.store.applyPlan(repo, issueNumber, observed, plan, onLabelAdded)
   }
 }

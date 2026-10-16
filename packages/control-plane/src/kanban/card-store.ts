@@ -49,11 +49,20 @@ export interface CardStore {
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
-  /** True only when {@link promotionAttributed} holds over the issue's full event history; unknown history is false. */
-  promotionAttributed(repo: KanbanRepoRef, issueNumber: number): Promise<boolean>
+  // Null means the bounded event history cannot yet establish attribution; retry without settling the promotion.
+  promotionAttributed(repo: KanbanRepoRef, issueNumber: number, readyAddedAt: Date | null): Promise<boolean | null>
   /** Write a reconcile plan's labels, issue state, and comment; a no-op plan makes no GitHub call. */
-  applyPlan(repo: KanbanRepoRef, issueNumber: number, observed: ObservedIssue, plan: LabelPlan): Promise<void>
+  applyPlan(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void>
 }
+
+// GitHub's server timestamp returned by a successful label POST, captured before any later write can fail.
+export type LabelWriteObserver = (label: string, addedAt: Date | null) => void
 
 export const WRITE_MODE_LABEL = 'ac/mode:write'
 const PAGE = 100
@@ -63,6 +72,7 @@ const MAX_EVENT_PAGES = 10
 export interface LabelEvent {
   id: number
   event: string
+  created_at?: string
   label?: { name?: string }
   actor?: { type?: string; login?: string } | null
   performed_via_github_app?: unknown
@@ -82,8 +92,18 @@ export function isAppActor(event: Pick<LabelEvent, 'actor'>, appSlug: string | u
 
 const PROMOTABLE_LABELS: ReadonlySet<string> = new Set([statusLabel('todo'), statusLabel('ready')])
 
-/** Replays status and open/close events: ready must come from this App or a human, after the last human change left todo/ready. */
-export function promotionAttributed(events: readonly LabelEvent[], appSlug: string | undefined): boolean {
+// Replay the complete history; an App ready-add must uniquely match the receipt of our pending write.
+export function promotionAttributed(
+  events: readonly LabelEvent[],
+  appSlug: string | undefined,
+  readyAddedAt: Date | null
+): boolean | null {
+  const receipt = readyAddedAt?.toISOString()
+  const matchesReceipt = (e: LabelEvent) =>
+    !!receipt && !!e.created_at && Date.parse(e.created_at) === Date.parse(receipt) && isAppActor(e, appSlug)
+  const readyAdds = events.filter((e) => e.event === 'labeled' && e.label?.name === statusLabel('ready'))
+  const matchingAdds = readyAdds.filter(matchesReceipt)
+  let latestReady: LabelEvent | undefined
   const labels = new Set<string>()
   let open = true
   let trusted = true
@@ -101,12 +121,20 @@ export function promotionAttributed(events: readonly LabelEvent[], appSlug: stri
     }
     const human = isHumanActor(event)
     const known = human || isAppActor(event, appSlug)
-    if (event.event === 'labeled' && name === statusLabel('ready')) readyAddTrusted = known
+    if (event.event === 'labeled' && name === statusLabel('ready')) {
+      latestReady = event
+      readyAddTrusted = human || (matchingAdds.length === 1 && matchesReceipt(event))
+    }
     // A human park (another status, or closed) stands until a human undoes it; any unknown writer forfeits trust.
     if (human) trusted = open && labels.size > 0 && [...labels].every((l) => PROMOTABLE_LABELS.has(l))
     else if (!known) trusted = false
+    // Removing ready revokes the old promotion, even if todo remains or the server clock crosses a second.
+    if (event.event === 'unlabeled' && name === statusLabel('ready')) trusted = false
   }
-  return trusted && readyAddTrusted
+  if (!trusted) return false
+  if (!latestReady || (readyAddedAt && latestReady.created_at && new Date(latestReady.created_at) < readyAddedAt))
+    return null
+  return readyAddTrusted
 }
 
 interface GhIssue {
@@ -190,9 +218,13 @@ export class GithubCardStore implements CardStore {
     return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
   }
 
-  async promotionAttributed(repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
+  async promotionAttributed(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    readyAddedAt: Date | null
+  ): Promise<boolean | null> {
     const events = await this.issueEvents(repo, issueNumber)
-    return !!events && promotionAttributed(events, this.deps.appSlug)
+    return events ? promotionAttributed(events, this.deps.appSlug, readyAddedAt) : null
   }
 
   /** The issue's whole event history, or null past the page bound so callers fail closed. */
@@ -206,8 +238,14 @@ export class GithubCardStore implements CardStore {
     return null
   }
 
-  applyPlan(repo: KanbanRepoRef, issueNumber: number, observed: ObservedIssue, plan: LabelPlan): Promise<void> {
-    return this.writer.apply(repo, issueNumber, observed, plan)
+  applyPlan(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    observed: ObservedIssue,
+    plan: LabelPlan,
+    onLabelAdded?: LabelWriteObserver
+  ): Promise<void> {
+    return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
   }
 
   private async get<T>(repo: KanbanRepoRef, path: string): Promise<T> {

@@ -27,7 +27,8 @@ const RECOVERY_RESET = {
   recoveryCheckAt: null,
   recoveryChecks: 0,
   recoveryObserved: null,
-  promotionPending: false
+  promotionPending: false,
+  promotionReadyAddedAt: null
 } as const
 
 interface BoardRow {
@@ -229,7 +230,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]> {
     return this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
-      SELECT c."id" AS "cardId", c."issueNumber", (c."status" = 'todo' AND c."promotionPending") AS "promotion"
+      SELECT c."id" AS "cardId", c."issueNumber", (c."status" = 'todo' AND c."promotionPending") AS "promotion", c."promotionReadyAddedAt"
       FROM "kanban_card" c
       LEFT JOIN LATERAL (
         SELECT "reasonCode", "endedAt" FROM "kanban_run"
@@ -314,9 +315,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
   async getPendingPromotion(boardId: string, issueNumber: number): Promise<KanbanRecoveryDue | null> {
     const card = await this.db.kanbanCard.findFirst({
       where: { boardId, issueNumber, status: 'todo', promotionPending: true },
-      select: { id: true }
+      select: { id: true, promotionReadyAddedAt: true }
     })
-    return card ? { cardId: card.id, issueNumber, promotion: true } : null
+    return card
+      ? { cardId: card.id, issueNumber, promotion: true, promotionReadyAddedAt: card.promotionReadyAddedAt }
+      : null
   }
 
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
@@ -325,7 +328,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       where: { id: cardId, status: 'todo', promotionPending: true, runs: { none: { endedAt: null } } },
       data: repaired
         ? { status: 'ready', stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...RECOVERY_RESET }
-        : { promotionPending: false }
+        : { promotionPending: false, promotionReadyAddedAt: null }
     })
     return count === 1
   }
@@ -448,6 +451,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           cooldownUntil: plan.cooldownUntil,
           blockKind: plan.blockKind,
           promotionPending: false,
+          promotionReadyAddedAt: null,
           dispatchRevision: { increment: 1 },
           stateRevision: { increment: 1 }
         }

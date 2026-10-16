@@ -183,7 +183,7 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/status:todo'])
   })
 
-  it('repairs the duplicate left when a write fails between add and remove', async () => {
+  it('leaves the duplicate after a failed write for attributed dispatcher recovery', async () => {
     const h = make({ 7: { status: 'todo', labels: todoLabels } })
     h.store.applyPlan.mockImplementationOnce(async (_r, n) => {
       h.labels.set(n, [...h.labels.get(n)!, 'ac/status:ready'])
@@ -193,8 +193,9 @@ describe('KanbanGraphReconciler', () => {
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('boom')
     expect(h.labels.get(7)).toEqual(['ac/status:todo', 'ac/agent:eng', 'ac/status:ready'])
     await h.reconciler.apply(BOARD, REPO, 7, g)
-    expect(h.store.applyPlan).toHaveBeenCalledTimes(2)
-    expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+    expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
+    expect(h.db.get(7)!.status).toBe('todo')
+    expect(h.labels.get(7)).toEqual(['ac/status:todo', 'ac/agent:eng', 'ac/status:ready'])
   })
 
   it('undoes the DB promotion when the ready label write fails, so the redelivered retry promotes again', async () => {
@@ -203,7 +204,7 @@ describe('KanbanGraphReconciler', () => {
     const g = graph({ blockedBy: [done] })
     await expect(h.reconciler.apply(BOARD, REPO, 7, g)).rejects.toThrow('label add failed')
     expect(h.cards.casStatus.mock.calls.map((c) => c.slice(1))).toEqual([[1n, 'ready']])
-    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n)
+    expect(h.cards.revertPromotion).toHaveBeenCalledWith('c7', 2n, null)
     expect(h.db.get(7)!.status).toBe('todo')
     await h.reconciler.apply(BOARD, REPO, 7, g)
     expect(h.db.get(7)!.status).toBe('ready')

@@ -1868,6 +1868,8 @@ model KanbanCard {
   recoveryObserved    String?
   // A graph promotion's label write failed after possibly landing; recovery re-reads the card on the same backoff.
   promotionPending    Boolean          @default(false)
+  // Server Date of our successful ready-label POST; a shared App login alone cannot attribute the write.
+  promotionReadyAddedAt DateTime?       @db.Timestamptz(6)
   linkedPrNumber      Int?
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)

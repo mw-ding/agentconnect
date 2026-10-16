@@ -122,18 +122,25 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision },
-      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), promotionPending: false }
+      data: {
+        status: to,
+        stateRevision: { increment: 1 },
+        githubSyncedAt: new Date(),
+        promotionPending: false,
+        promotionReadyAddedAt: null
+      }
     })
     return count === 1
   }
 
-  async revertPromotion(cardId: string, expectedStateRevision: bigint): Promise<boolean> {
+  async revertPromotion(cardId: string, expectedStateRevision: bigint, readyAddedAt: Date | null): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready' },
       data: {
         status: 'todo',
         stateRevision: { increment: 1 },
         promotionPending: true,
+        promotionReadyAddedAt: readyAddedAt,
         recoveryCheckAt: null,
         recoveryChecks: 0
       }
