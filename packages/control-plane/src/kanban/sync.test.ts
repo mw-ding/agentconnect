@@ -634,3 +634,182 @@ describe('labeled doorbell sender against an invisible remove+re-add', () => {
     expect(gone.card()).toMatchObject({ status: 'ready', syncDeferralCount: 0 })
   })
 })
+
+// Vera round 2 (review 5559523967): each case reproduces an attack against 5d610cb1e and failed there.
+describe('vera-r2: attribution holes', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+  const perms: Record<string, RepoPermissionLevel> = { bob: 'write', mallory: 'triage' }
+  const permissions = vi.fn(async (_r: unknown, login: string) => perms[login.toLowerCase()] ?? 'none')
+  const lease = { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+  const lookedUp = (f: ReturnType<typeof fixture>, login: string) =>
+    vi.mocked(f.deps.permissions.permission).mock.calls.some(([, l]) => l === login)
+
+  it("vera-r2: 1a a writer's reopen does not adopt a triage user's ready label", async () => {
+    const f = fixture({ status: 'done', syncEventCursor: 100n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready']
+    f.events.splice(
+      0,
+      f.events.length,
+      stateEvent(99, 'closed', bob),
+      labelEvent(100, 'labeled', 'ac/status:done', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:done', mallory),
+      labelEvent(102, 'labeled', 'ac/status:ready', mallory),
+      stateEvent(103, 'reopened', bob)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).not.toBe('ready')
+    expect(lookedUp(f, 'mallory')).toBe(true)
+  })
+
+  it('vera-r2: 1b the re-read after a reassignment re-judges a status swap made meanwhile', async () => {
+    const f = fixture({ status: 'todo', syncEventCursor: 10n, syncAgentCursor: 10n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:blocked', 'ac/agent:new']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:todo', bob),
+      labelEvent(20, 'unlabeled', 'ac/status:todo', bob),
+      labelEvent(21, 'labeled', 'ac/status:blocked', bob),
+      labelEvent(22, 'labeled', 'ac/agent:new', bob)
+    )
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const prev = f.card().assigneeAgentId
+      f.card().assigneeAgentId = agentId
+      f.card().dispatchRevision = f.card().dispatchRevision + 1n
+      // While setAssignee runs, mallory swaps blocked → ready; the swap is already visible to the re-read.
+      f.issue.labels = ['ac/status:ready', 'ac/agent:new']
+      f.events.push(
+        labelEvent(30, 'unlabeled', 'ac/status:blocked', mallory),
+        labelEvent(31, 'labeled', 'ac/status:ready', mallory)
+      )
+      return { ok: true as const, changed: true, card: {} as never, previousAgentId: prev, revokedLease: null }
+    })
+    await f.sync.onCardChanged('board', 1, true)
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).not.toBe('ready')
+    expect(lookedUp(f, 'mallory')).toBe(true)
+  })
+
+  it('vera-r2: 1b the re-read never acks a newer ac/agent edit it did not judge', async () => {
+    const f = fixture({ status: 'todo', syncEventCursor: 10n, syncAgentCursor: 10n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:todo', 'ac/agent:new']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:todo', bob),
+      labelEvent(22, 'labeled', 'ac/agent:new', bob)
+    )
+    let first = true
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const prev = f.card().assigneeAgentId
+      f.card().assigneeAgentId = agentId
+      if (first) {
+        first = false
+        // Mallory swaps the agent label while the first reassignment runs.
+        f.issue.labels = ['ac/status:todo', 'ac/agent:other']
+        f.events.push(
+          labelEvent(30, 'unlabeled', 'ac/agent:new', mallory),
+          labelEvent(31, 'labeled', 'ac/agent:other', mallory)
+        )
+      }
+      return { ok: true as const, changed: true, card: {} as never, previousAgentId: prev, revokedLease: null }
+    })
+    await f.sync.onCardChanged('board', 1, true)
+    // Either the cursor stops before mallory's edit, or mallory's edit was judged (and refused).
+    expect(f.card().syncAgentCursor <= 22n || lookedUp(f, 'mallory')).toBe(true)
+  })
+
+  it("vera-r2: 2 projectStatus defers a writer's edit made while the CP label write is pending", async () => {
+    const f = fixture({ status: 'review', labelWritePending: true, syncEventCursor: 10n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:running', bob),
+      labelEvent(20, 'unlabeled', 'ac/status:running', bob),
+      labelEvent(21, 'labeled', 'ac/status:ready', bob)
+    )
+    await f.sync.projectStatus('board', 1, 'review')
+    // Not overwritten, not acked: the cursor stays and no write forces `review` over bob's `ready`.
+    expect(f.card().syncEventCursor).toBe(10n)
+    for (const call of vi.mocked(f.deps.store.applyPlan).mock.calls) {
+      expect(call[3].removeLabels).not.toContain('ac/status:ready')
+    }
+    // The writer's doorbell then adopts the edit.
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('ready')
+  })
+
+  it("vera-r2: 4 a stale non-writer doorbell does not undo a writer's newer remove+re-add", async () => {
+    const f = fixture({ status: 'running', syncEventCursor: 104n, lease })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:running']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(100, 'labeled', 'ac/status:running', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:running', mallory),
+      labelEvent(102, 'labeled', 'ac/status:running', mallory),
+      labelEvent(103, 'unlabeled', 'ac/status:running', bob),
+      labelEvent(104, 'labeled', 'ac/status:running', bob)
+    )
+    await f.sync.onCardChanged('board', 1, true, {
+      action: 'labeled',
+      sender: { login: 'mallory', id: 7, type: 'User' },
+      label: 'ac/status:running'
+    })
+    expect(f.card().status).toBe('running')
+    expect(f.deps.revoke).not.toHaveBeenCalled()
+  })
+
+  it('vera-r2: 5 the deferral bound fails closed to triage, not the kept dispatchable status', async () => {
+    const start = new Date('2026-10-17T00:00:00Z')
+    const f = fixture({ status: 'ready', syncEventCursor: 40n, syncDeferredAt: start, syncDeferralCount: 3 })
+    f.deps.now = () => new Date(start.getTime() + 11 * 60_000)
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:blocked']
+    f.events.splice(0, f.events.length, labelEvent(40, 'labeled', 'ac/status:ready', bob))
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.deps.repo.failClosed).toHaveBeenCalled()
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({ status: 'triage' })
+  })
+
+  it('vera-r2: 6 the fail-closed comment is posted once, not again on later doorbells', async () => {
+    const start = new Date('2026-10-17T00:00:00Z')
+    let now = new Date(start.getTime() + 11 * 60_000)
+    const f = fixture({ status: 'blocked', syncEventCursor: 40n, syncDeferredAt: start, syncDeferralCount: 3 })
+    f.deps.now = () => now
+    vi.mocked(f.deps.repo.failClosed).mockImplementation(async () => {
+      Object.assign(f.card(), { needsAttention: true, syncDeferredAt: null, syncDeferralCount: 0 })
+      return true
+    })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:todo']
+    f.events.splice(0, f.events.length, labelEvent(40, 'labeled', 'ac/status:blocked', bob))
+    await f.sync.onCardChanged('board', 1, true)
+    now = new Date(now.getTime() + 11 * 60_000)
+    await f.sync.onCardChanged('board', 1, true)
+    now = new Date(now.getTime() + 11 * 60_000)
+    await f.sync.onCardChanged('board', 1, true)
+    const comments = vi.mocked(f.deps.store.applyPlan).mock.calls.filter(([, , , plan]) => !!plan.comment)
+    expect(comments).toHaveLength(1)
+  })
+
+  it('vera-r2: 7 an event history past the page bound defers and escalates instead of throwing every pass', async () => {
+    const start = new Date('2026-10-17T00:00:00Z')
+    let now = start
+    const f = fixture({ status: 'ready', syncEventCursor: 40n })
+    f.deps.now = () => now
+    vi.mocked(f.deps.store.readLabelEvents).mockRejectedValue(new Error('kanban: issue events run past the page bound'))
+    await f.sync.onCardChanged('board', 1, true).catch(() => {})
+    expect(f.deps.repo.defer).toHaveBeenCalled()
+    now = new Date(start.getTime() + 11 * 60_000)
+    await f.sync.onCardChanged('board', 1, true).catch(() => {})
+    expect(f.deps.repo.failClosed).toHaveBeenCalled()
+  })
+})

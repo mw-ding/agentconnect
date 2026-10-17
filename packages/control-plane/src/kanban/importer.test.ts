@@ -453,3 +453,20 @@ describe('Kanban import labeled-doorbell sender', () => {
     expect(upserted(gone)).toMatchObject({ status: 'ready', assigneeAgentId: 'agent' })
   })
 })
+
+// Vera round 2 (review 5559523967) 🔴3: a relay that has not rolled yet sends `labeled` doorbells without a sender;
+// with the remove and the re-add both invisible, the visible history still credits the writer's old add.
+describe('vera-r2: sender-less labeled doorbell', () => {
+  const levels: Levels = { alice: 'write', bob: 'write', mallory: 'triage' }
+  it('vera-r2: 3 imports a live managed label named by a sender-less labeled doorbell as triage, never ready', async () => {
+    const h = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, [
+      ...labeled('ac/status:ready', 'bob'),
+      ...labeled('ac/agent:worker', 'bob')
+    ])
+    const imported = await h.importer.import(board, repo, 1, { action: 'labeled' }).catch(() => false)
+    if (imported) expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+    expect(h.cards.upsertCard.mock.calls.some(([input]) => (input as { status?: string }).status === 'ready')).toBe(
+      false
+    )
+  })
+})
