@@ -5303,13 +5303,7 @@ export class LocalStore {
     await this.db.prepare("DELETE FROM kanban_terminals WHERE leaseId = ? AND state = 'comment'").run(leaseId)
   }
 
-
-  /**
-   * Save the latest metadata snapshot. Lifecycle milestones create an outbox
-   * row; enrichment-only updates merely coalesce into a row that is already
-   * pending, so startup name refreshes never backfill historical sessions.
-   * Returns the revision when a durable row exists after the write.
-   */
+  // Save the snapshot, enqueue lifecycle milestones, coalesce pending enrichment, and return any durable revision.
   async saveSessionMetadataSnapshot(
     agentId: string,
     sessionId: string,

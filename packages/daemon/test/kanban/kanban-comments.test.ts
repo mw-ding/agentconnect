@@ -36,9 +36,9 @@ function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
   const rows = new Map<string, Row>()
   return {
     rows,
-    dueKanbanComments: (now, limit) =>
+    dueKanbanComments: async (now, limit) =>
       [...rows.values()].filter((row) => !row.failed && row.nextAt <= now).slice(0, limit),
-    markKanbanCommentAttempt: (leaseId, nextAt, at) => {
+    markKanbanCommentAttempt: async (leaseId, nextAt, at) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, {
         ...row,
@@ -48,19 +48,19 @@ function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
         nextAt
       })
     },
-    deferKanbanComment: (leaseId, nextAt) => {
+    deferKanbanComment: async (leaseId, nextAt) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, { ...row, nextAt })
     },
-    deferKanbanCommentLookup: (leaseId, nextAt) => {
+    deferKanbanCommentLookup: async (leaseId, nextAt) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, { ...row, lookupMisses: row.lookupMisses + 1, nextAt })
     },
-    failKanbanComment: (leaseId) => {
+    failKanbanComment: async (leaseId) => {
       const row = rows.get(leaseId)!
       rows.set(leaseId, { ...row, failed: true })
     },
-    removeKanbanComment: (leaseId) => {
+    removeKanbanComment: async (leaseId) => {
       rows.delete(leaseId)
     }
   }

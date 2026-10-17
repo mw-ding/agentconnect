@@ -6,7 +6,17 @@ describe('GitHub App manifest', () => {
     expect(GITHUB_APP_EVENTS).toContain('sub_issues')
     expect(GITHUB_APP_EVENTS).toContain('issue_dependencies')
     expect(Object.keys(GITHUB_APP_PERMISSIONS).sort()).toEqual(
-      ['actions', 'checks', 'contents', 'deployments', 'emails', 'issues', 'metadata', 'pull_requests', 'workflows'].sort()
+      [
+        'actions',
+        'checks',
+        'contents',
+        'deployments',
+        'emails',
+        'issues',
+        'metadata',
+        'pull_requests',
+        'workflows'
+      ].sort()
     )
     expect(GITHUB_APP_PERMISSIONS.issues).toBe('write')
   })
