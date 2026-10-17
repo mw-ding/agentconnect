@@ -9424,10 +9424,9 @@ export class Daemon {
       consoleImages: this.relays?.supportsWebchatImages?.() === true
     })
     // Static descriptor, dynamic authority: the call resolves the current daemon-private turn and fails closed elsewhere.
-    tools = [...tools, ...GITHUB_REVIEW_TOOLS]
+    tools = [...tools, ...GITHUB_REVIEW_TOOLS, ...KANBAN_ORCHESTRATOR_TOOLS]
     // Kanban cards share the GitHub issue thread session (D4); the call binds to the live lease or fails closed.
-    if (platform === 'hook' && at.transportScope?.startsWith('github:'))
-      tools = [...tools, ...KANBAN_TOOLS, ...KANBAN_ORCHESTRATOR_TOOLS]
+    if (platform === 'hook' && at.transportScope?.startsWith('github:')) tools = [...tools, ...KANBAN_TOOLS]
     // Assistant mode's follow-ups (assistant-mode.md §5.12); each call re-checks the mode, since this list is fixed per session.
     tools = [...tools, ...followUpToolsFor(agent)]
     // A first look on request (§5.13), only to a place's long session where one could run, with `propose` for its report round where the place has cards.

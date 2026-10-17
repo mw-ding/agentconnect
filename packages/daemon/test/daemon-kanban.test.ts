@@ -10,6 +10,8 @@ import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { buildKanbanMessage } from '../src/messages/kanban-message.js'
 import { buildHookMessage } from '../src/messages/hook-message.js'
+import { executeTool, type SessionContext } from '../src/mcp/ops.js'
+import { KANBAN_ORCHESTRATOR_TOOLS } from '../src/mcp/tools.js'
 import type { KanbanDispatch, KanbanReport } from '@agentconnect.md/protocol'
 
 const AGENT = '33333333-3333-4333-8333-333333333333'
@@ -658,3 +660,21 @@ it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant
     await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
   }
 )
+
+for (const platform of ['slack', 'webchat', 'cli', 'hook']) {
+  it(`offers orchestrator tools in ${platform} sessions and returns the CP role refusal`, async () => {
+    const h = await harness()
+    const orchestrate = vi.fn(async () => ({ ok: false, op: 'list', code: 'not_orchestrator' }))
+    ;(h.daemon as any).cpClient = { stop: async () => {}, kanbanOrchestrate: orchestrate }
+    const at = { platform, channel: 'C1', thread: 'T1', isDm: true }
+    const tools = (h.daemon as any).sessionBridgeTools((h.daemon as any).agents.get(AGENT), at)
+    const names = tools.map((t: { name: string }) => t.name)
+    expect(names).toEqual(expect.arrayContaining(KANBAN_ORCHESTRATOR_TOOLS.map((t) => t.name)))
+    expect(names).not.toContain('kanbanShow')
+    expect(names).not.toContain('kanbanComment')
+    const ctx: SessionContext = { ...at, agentId: AGENT, integrationId: undefined, deliveryThread: 'T1', tools }
+    const result = await executeTool(ctx, 'kanbanList', {}, { ...(h.daemon as any).mcp.deps, canRun: () => true })
+    expect(orchestrate).toHaveBeenCalledWith({ op: 'list', agentId: AGENT })
+    expect(result).toEqual({ refused: 'this agent is not the orchestrator of that board' })
+  })
+}
