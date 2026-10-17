@@ -84,6 +84,23 @@ describe('kanban wire (issue #2 M2)', () => {
     expect(KanbanDispatch.safeParse({ ...dispatch, sessionKeyPrefix: 'acme/web', mode: 'write' }).success).toBe(true)
   })
 
+  it('kanban/dispatch carries an optional role: absent = work, and older frames without it still parse', () => {
+    expect(KanbanDispatch.safeParse(dispatch).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'work' }).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'verify' }).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'admin' }).success).toBe(false)
+    const parsed = KanbanDispatch.parse(dispatch)
+    expect(parsed.role).toBeUndefined()
+    expect(KanbanDispatch.parse({ ...dispatch, role: 'verify' }).role).toBe('verify')
+  })
+
+  it('kanban/report accepts changes_requested, a verifier-only outcome', () => {
+    expect(KanbanReport.safeParse({ ...report, outcome: 'changes_requested' }).success).toBe(true)
+    expect(KanbanReport.safeParse({ ...report, outcome: 'changes_requested', reasonCode: undefined }).success).toBe(
+      true
+    )
+  })
+
   it('kanban/dispatch/ok carries a typed refusal only when not accepted', () => {
     expect(KanbanDispatchOk.safeParse({ leaseId: LEASE, accepted: true }).success).toBe(true)
     expect(

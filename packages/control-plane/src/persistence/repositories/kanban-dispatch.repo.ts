@@ -12,6 +12,7 @@ import type {
   KanbanCardView,
   KanbanCardViewReq,
   KanbanClaimOpts,
+  KanbanClaimResult,
   KanbanClaimedLease,
   KanbanDispatchRepo,
   KanbanGrantScope,
@@ -19,7 +20,8 @@ import type {
   KanbanOpenLease,
   KanbanRecoveryDue,
   KanbanRunEndInput,
-  KanbanRunEndResult
+  KanbanRunEndResult,
+  KanbanSelfVerifyFlag
 } from '../ports.js'
 
 /** Ready cards examined per claim; caps or offline daemons can skip some, so scan past the free room. */
@@ -53,10 +55,12 @@ interface BoardRow {
   defaultMode: 'read' | 'write'
   maxInProgress: number
   maxInProgressPerAgent: number
+  verifierAgentId: string | null
 }
 
 interface CandidateRow {
   mode: 'read' | 'write' | null
+  role: 'work' | 'verify'
   priority: number
   createdAt: Date
   id: string
@@ -64,6 +68,8 @@ interface CandidateRow {
   agentId: string
   daemonId: string
   sessionEpoch: bigint
+  assigneeAgentId: string | null
+  latestWorkAgentId: string | null
 }
 
 interface RunEndRow {
@@ -81,6 +87,7 @@ interface RunEndRow {
   attempt: number
   agentId: string
   daemonId: string
+  role: 'work' | 'verify'
   runRevision: bigint
   endedAt: Date | null
   status: KanbanStatus
@@ -88,6 +95,8 @@ interface RunEndRow {
   consecutiveFailures: number
   protocolViolations: number
   blockRecurrence: number
+  reviewRounds: number
+  verifiedAt: Date | null
   cooldownUntil: Date | null
   blockKind: KanbanBlockKind | null
   boardId: string
@@ -115,16 +124,16 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return rows.map((r) => r.id)
   }
 
-  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]> {
+  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimResult> {
     return this.inTransaction(async (tx) => {
       // A concurrent claimer already holds this board: skip it rather than queue behind it.
       const [board] = await tx.$queryRaw<BoardRow[]>(Prisma.sql`
-        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode"
+        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode", "verifierAgentId"
         FROM "kanban_board"
         WHERE "id" = ${boardId}::uuid AND "enabled"
         FOR UPDATE SKIP LOCKED
       `)
-      if (!board) return []
+      if (!board) return { leases: [], flaggedSelfVerify: [] }
 
       // In progress = an open lease, so an unacked dispatch already occupies its slot.
       const open = await tx.$queryRaw<{ agentId: string; n: number }[]>(Prisma.sql`
@@ -136,18 +145,26 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       const perAgent = new Map(open.map((r) => [r.agentId, r.n]))
       let inProgress = open.reduce((sum, r) => sum + r.n, 0)
       const room = Math.min(board.maxInProgress - inProgress, opts.limit ?? Number.POSITIVE_INFINITY)
-      if (room <= 0) return []
+      if (room <= 0) return { leases: [], flaggedSelfVerify: [] }
 
       const claimed: KanbanClaimedLease[] = []
+      const flaggedSelfVerify: KanbanSelfVerifyFlag[] = []
       let cursor: CandidateRow | undefined
       while (claimed.length < room) {
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
-        SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt", c."assigneeAgentId" AS "agentId", a."daemonId", d."sessionEpoch"
+        SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
+               CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId",
+               CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
+               (SELECT w."agentId" FROM "kanban_run" w
+                 WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."endedAt" IS NOT NULL
+                 ORDER BY w."attempt" DESC LIMIT 1) AS "latestWorkAgentId"
         FROM "kanban_card" c
-        JOIN "agent" a ON a."id" = c."assigneeAgentId" AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
+        JOIN "agent" a ON a."id" = CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END
+          AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
         JOIN "daemon" d ON d."id" = a."daemonId"
         WHERE c."boardId" = ${boardId}::uuid
-          AND c."status" = 'ready'
+          AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL))
           ${
             cursor
               ? Prisma.sql`AND (c."priority" < ${cursor.priority} OR
@@ -157,6 +174,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           AND NOT c."promotionPending"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
+          AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)
         ORDER BY c."priority" DESC, c."createdAt" ASC, c."id" ASC
         LIMIT ${CLAIM_SCAN}
         FOR UPDATE OF c SKIP LOCKED
@@ -169,6 +187,30 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if ((perAgent.get(card.agentId) ?? 0) >= board.maxInProgressPerAgent) continue
           if (!opts.isDaemonLive(card.daemonId)) continue
 
+          // B8 self-approval guard: a review card whose verifier is the worker is never dispatched; flag it once.
+          if (
+            card.role === 'verify' &&
+            (board.verifierAgentId === card.assigneeAgentId || board.verifierAgentId === card.latestWorkAgentId)
+          ) {
+            const flagged = await tx.kanbanCard.updateMany({
+              where: {
+                id: card.id,
+                OR: [{ needsAttention: false }, { attentionReason: { not: 'verifier_is_worker' } }]
+              },
+              data: { needsAttention: true, attentionReason: 'verifier_is_worker', stateRevision: { increment: 1 } }
+            })
+            if (flagged.count === 1)
+              flaggedSelfVerify.push({
+                boardId: board.id,
+                orgId: OrgId(board.orgId),
+                repoId: board.repoId,
+                repoFullName: board.repoFullName,
+                cardId: card.id,
+                issueNumber: card.issueNumber
+              })
+            continue
+          }
+
           const [next] = await tx.$queryRaw<{ attempt: number }[]>(Prisma.sql`
           SELECT COALESCE(MAX("attempt"), 0)::int + 1 AS "attempt" FROM "kanban_run" WHERE "cardId" = ${card.id}::uuid
         `)
@@ -177,7 +219,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           const updated = await tx.kanbanCard.update({
             where: { id: card.id },
             data: {
-              status: 'running',
+              // A verify run keeps the card in `review`; a work run moves it to `running`.
+              status: card.role === 'verify' ? 'review' : 'running',
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -186,7 +229,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           })
           const run = await tx.kanbanRun.create({
             data: {
-              mode: card.mode ?? board.defaultMode,
+              mode: card.role === 'verify' ? 'read' : (card.mode ?? board.defaultMode),
+              role: card.role,
               cardId: card.id,
               attempt,
               agentId: card.agentId,
@@ -204,7 +248,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             select: { githubSessionKey: true }
           })
           claimed.push({
-            mode: card.mode ?? board.defaultMode,
+            mode: card.role === 'verify' ? 'read' : (card.mode ?? board.defaultMode),
+            role: card.role,
             runId: run.id,
             leaseId: run.leaseId,
             cardId: card.id,
@@ -224,7 +269,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           inProgress += 1
         }
       }
-      return claimed
+      return { leases: claimed, flaggedSelfVerify }
     })
   }
 
@@ -367,10 +412,12 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     const rows = await this.db.$queryRaw<Array<{ leaseId: string }>>(Prisma.sql`
       SELECT r."leaseId" FROM "kanban_run" r
       JOIN "kanban_card" c ON c."id" = r."cardId"
+      JOIN "kanban_board" b ON b."id" = c."boardId"
       JOIN "daemon" d ON d."id" = r."daemonId"
       JOIN "agent" a ON a."id" = r."agentId" AND a."daemonId" = r."daemonId"
       WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL AND r."mode" = ${mode}::"KanbanRunMode"
-        AND c."dispatchRevision" = r."dispatchRevision" AND c."assigneeAgentId" = r."agentId"
+        AND c."dispatchRevision" = r."dispatchRevision"
+        AND r."agentId" = CASE WHEN r."role" = 'verify' THEN b."verifierAgentId" ELSE c."assigneeAgentId" END
         AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
     `)
     return rows.length === 1
@@ -380,10 +427,10 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     const rows = await this.db.$queryRaw<{ leaseId: string }[]>(Prisma.sql`
       UPDATE "kanban_run" r
       SET "ackedAt" = COALESCE(r."ackedAt", ${now}), "heartbeatAt" = COALESCE(r."heartbeatAt", ${now})
-      FROM "kanban_card" c, "daemon" d
+      FROM "kanban_card" c, "kanban_board" b, "daemon" d
       WHERE r."leaseId" = ${leaseId}::uuid AND r."endedAt" IS NULL AND r."mode" = ${mode}::"KanbanRunMode"
-        AND c."id" = r."cardId" AND c."dispatchRevision" = r."dispatchRevision"
-        AND c."assigneeAgentId" = r."agentId"
+        AND c."id" = r."cardId" AND b."id" = c."boardId" AND c."dispatchRevision" = r."dispatchRevision"
+        AND r."agentId" = CASE WHEN r."role" = 'verify' THEN b."verifierAgentId" ELSE c."assigneeAgentId" END
         AND d."id" = r."daemonId" AND d."sessionEpoch" = ${epoch} AND r."daemonEpoch" = ${epoch}
         AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId")
       RETURNING r."leaseId"
@@ -394,10 +441,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult> {
     return this.inTransaction(async (tx) => {
       const [row] = await tx.$queryRaw<RunEndRow[]>(Prisma.sql`
-        SELECT r."id" AS "runId", r."cardId", r."attempt", r."agentId", r."daemonId",
+        SELECT r."id" AS "runId", r."cardId", r."attempt", r."agentId", r."daemonId", r."role",
                r."dispatchRevision" AS "runRevision", r."endedAt",
                c."status", c."dispatchRevision" AS "cardRevision", c."consecutiveFailures", c."protocolViolations",
-               c."blockRecurrence", c."cooldownUntil", c."blockKind", c."boardId", c."issueNumber", c."assigneeAgentId",
+               c."blockRecurrence", c."reviewRounds", c."verifiedAt", c."cooldownUntil", c."blockKind", c."boardId",
+               c."issueNumber", c."assigneeAgentId",
                r."dispatchedAt", r."ackedAt", r."heartbeatAt", r."daemonEpoch",
                d."sessionEpoch" AS "currentDaemonEpoch", a."id" AS "agentRowId", a."daemonId" AS "agentDaemonId", b."staleLeaseSec",
                b."orgId", b."repoId", b."repoFullName", b."failureLimit", b."protocolRetryLimit",
@@ -427,6 +475,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             }
           : null
       const fence = input.fence
+      // The run's holder is the assignee for work, the verifier for verify; the agent must still be placed on the run's daemon.
+      const holderAgentId = row.role === 'verify' ? row.verifierAgentId : row.assigneeAgentId
       const fenced =
         leaseAcceptsWrite(
           { dispatchRevision: row.cardRevision, lease },
@@ -439,7 +489,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             fence.attempt === row.attempt &&
             (fence.boardId === undefined || fence.boardId === row.boardId) &&
             (fence.agentId === undefined || fence.agentId === row.agentId) &&
-            row.assigneeAgentId === row.agentId &&
+            holderAgentId === row.agentId &&
             row.agentDaemonId === row.daemonId))
       if (!fenced) return { accepted: false }
 
@@ -452,6 +502,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           consecutiveFailures: row.consecutiveFailures,
           protocolViolations: row.protocolViolations,
           blockRecurrence: row.blockRecurrence,
+          reviewRounds: row.reviewRounds,
+          verifiedAt: row.verifiedAt,
           cooldownUntil: row.cooldownUntil,
           blockKind: row.blockKind
         },
@@ -462,7 +514,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           completionContract: row.completionContract,
           verifierAgentId: row.verifierAgentId
         },
-        { trailingProviderTransients }
+        { trailingProviderTransients, role: row.role }
       )
       await tx.kanbanRun.update({
         where: { id: row.runId },
@@ -483,6 +535,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,
+          reviewRounds: plan.reviewRounds,
+          verifiedAt: plan.verifiedAt,
           cooldownUntil: plan.cooldownUntil,
           blockKind: plan.blockKind,
           ...PROMOTION_CLEARED,
@@ -548,14 +602,16 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           UPDATE "kanban_run" r
           SET "heartbeatAt" = ${now}, "ackedAt" = COALESCE(r."ackedAt", ${now}), "daemonEpoch" = ${epoch},
               "sessionId" = COALESCE(${beat.sessionId ?? null}, r."sessionId")
-          FROM "kanban_card" c
+          FROM "kanban_card" c, "kanban_board" b
           WHERE r."leaseId" = ${beat.leaseId}::uuid
             AND r."cardId" = ${beat.cardId}::uuid
             AND c."id" = r."cardId"
+            AND b."id" = c."boardId"
             AND r."endedAt" IS NULL
             AND r."daemonId" = ${daemonId}::uuid
             AND EXISTS (SELECT 1 FROM "daemon" d WHERE d."id" = r."daemonId" AND d."sessionEpoch" = ${epoch})
-            AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId" AND a."id" = c."assigneeAgentId")
+            AND EXISTS (SELECT 1 FROM "agent" a WHERE a."id" = r."agentId" AND a."daemonId" = r."daemonId"
+              AND a."id" = CASE WHEN r."role" = 'verify' THEN b."verifierAgentId" ELSE c."assigneeAgentId" END)
             AND r."dispatchRevision" = ${beat.dispatchRevision}
             AND c."dispatchRevision" = ${beat.dispatchRevision}
           RETURNING r."leaseId"
@@ -644,9 +700,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         daemonId: string
         attempt: number
         mode: 'read' | 'write'
+        role: 'work' | 'verify'
         runRevision: bigint
         cardRevision: bigint
         assigneeAgentId: string | null
+        verifierAgentId: string | null
         currentDaemonEpoch: bigint | null
         repoId: bigint
         repoFullName: string
@@ -659,8 +717,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         linkedPrNumber: number | null
       }>
     >(Prisma.sql`
-      SELECT r."cardId", c."boardId", r."agentId", r."daemonId", r."attempt", r."mode",
+      SELECT r."cardId", c."boardId", r."agentId", r."daemonId", r."attempt", r."mode", r."role",
              r."dispatchRevision" AS "runRevision", c."dispatchRevision" AS "cardRevision", c."assigneeAgentId",
+             b."verifierAgentId",
              d."sessionEpoch" AS "currentDaemonEpoch", b."repoId", b."repoFullName", c."status"::text AS "status",
              c."priority", c."blockKind", c."consecutiveFailures", c."protocolViolations", c."blockRecurrence",
              c."linkedPrNumber"
@@ -672,6 +731,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       WHERE r."leaseId" = ${req.leaseId}::uuid AND r."endedAt" IS NULL
     `)
     if (!row) return null
+    const holderAgentId = row.role === 'verify' ? row.verifierAgentId : row.assigneeAgentId
     const fenced =
       leaseAcceptsWrite(
         {
@@ -687,7 +747,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       ) &&
       row.daemonId === daemonId &&
       row.currentDaemonEpoch === epoch &&
-      row.assigneeAgentId === row.agentId &&
+      holderAgentId === row.agentId &&
       (req.agentId === undefined || req.agentId === row.agentId) &&
       (req.cardId === undefined || req.cardId === row.cardId) &&
       (req.boardId === undefined || req.boardId === row.boardId)
@@ -753,6 +813,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         AND r."outcome" IN (
           'completed'::"KanbanRunOutcome",
           'review_requested'::"KanbanRunOutcome",
+          'changes_requested'::"KanbanRunOutcome",
           'blocked'::"KanbanRunOutcome",
           'failed'::"KanbanRunOutcome"
         )

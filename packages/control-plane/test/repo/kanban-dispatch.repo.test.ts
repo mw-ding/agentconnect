@@ -85,12 +85,16 @@ function end(
 
 const repo = () => new PgKanbanDispatchRepo(prisma)
 
+/** The claim's leases only: this suite exercises the dispatch path, not the self-verify flag. */
+const claimLeases = (boardId: string, opts: Parameters<PgKanbanDispatchRepo['claim']>[1]) =>
+  new PgKanbanDispatchRepo(prisma).claim(boardId, opts).then((r) => r.leases)
+
 describe('PgKanbanDispatchRepo.openGrantScopes (real Postgres)', () => {
   it('returns the board repo of an open run and drops it when the run ends', async () => {
     const boardId = await seedBoard()
     const card = await seedCard(boardId)
     await prisma.kanbanCard.update({ where: { id: card.id }, data: { mode: 'write' } })
-    const [lease] = await repo().claim(boardId, live)
+    const [lease] = await claimLeases(boardId, live)
     expect(await repo().openGrantScopes(A1, D1)).toEqual([{ repoId: REPO_ID, repoFullName: 'acme/web', mode: 'write' }])
     expect(await repo().openGrantScopes(A1, D2)).toEqual([])
     await prisma.kanbanRun.update({ where: { leaseId: lease!.leaseId }, data: { endedAt: NOW } })
@@ -105,7 +109,7 @@ describe('PgKanbanDispatchRepo.claim — priority, age, and gates (real Postgres
     const urgent = await seedCard(boardId, { priority: 5 })
     const young = await seedCard(boardId, { createdAt: new Date('2026-10-14T00:00:00Z') })
 
-    const claimed = await repo().claim(boardId, live)
+    const claimed = await claimLeases(boardId, live)
     expect(claimed.map((c) => c.cardId)).toEqual([urgent.id, old.id, young.id])
     const first = claimed[0]!
     expect(first).toMatchObject({
@@ -140,7 +144,7 @@ describe('PgKanbanDispatchRepo.claim — priority, age, and gates (real Postgres
         events: ['issues:labeled']
       }
     })
-    const [lease] = await repo().claim(boardId, live)
+    const [lease] = await claimLeases(boardId, live)
     expect(lease?.sessionKeyPrefix).toBe('acme/web')
   })
 
@@ -153,12 +157,12 @@ describe('PgKanbanDispatchRepo.claim — priority, age, and gates (real Postgres
     const offline = await seedCard(boardId, { agentId: A2 })
     const due = await seedCard(boardId, { cooldownUntil: new Date(NOW.getTime() - 1) })
 
-    const claimed = await repo().claim(boardId, { now: NOW, isDaemonLive: (d) => d === D1 })
+    const claimed = await claimLeases(boardId, { now: NOW, isDaemonLive: (d) => d === D1 })
     expect(claimed.map((c) => c.cardId)).toEqual([due.id])
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: offline.id } })).status).toBe('ready')
 
     await prisma.agent.update({ where: { id: A2 }, data: { status: 'paused' } })
-    expect(await repo().claim(boardId, live)).toEqual([])
+    expect(await claimLeases(boardId, live)).toEqual([])
   })
 
   it('never claims for an agent in another org', async () => {
@@ -166,7 +170,7 @@ describe('PgKanbanDispatchRepo.claim — priority, age, and gates (real Postgres
     const otherOrg = await prisma.org.create({ data: { name: 'other', slug: 'other' } })
     await prisma.agent.update({ where: { id: A1 }, data: { orgId: otherOrg.id } })
     await seedCard(boardId)
-    expect(await repo().claim(boardId, live)).toEqual([])
+    expect(await claimLeases(boardId, live)).toEqual([])
   })
 })
 
@@ -174,8 +178,8 @@ describe('PgKanbanDispatchRepo.claim — caps (real Postgres)', () => {
   it('honors maxInProgress across claims, counting unacked leases', async () => {
     const boardId = await seedBoard({ maxInProgress: 2 })
     for (let i = 0; i < 4; i++) await seedCard(boardId, { agentId: i % 2 ? A2 : A1 })
-    expect(await repo().claim(boardId, live)).toHaveLength(2)
-    expect(await repo().claim(boardId, live)).toHaveLength(0)
+    expect(await claimLeases(boardId, live)).toHaveLength(2)
+    expect(await claimLeases(boardId, live)).toHaveLength(0)
   })
 
   it('honors maxInProgressPerAgent while other agents still fill the board', async () => {
@@ -183,25 +187,25 @@ describe('PgKanbanDispatchRepo.claim — caps (real Postgres)', () => {
     await seedCard(boardId, { agentId: A1, priority: 3 })
     await seedCard(boardId, { agentId: A1, priority: 2 })
     await seedCard(boardId, { agentId: A2, priority: 1 })
-    const claimed = await repo().claim(boardId, live)
+    const claimed = await claimLeases(boardId, live)
     expect(claimed.map((c) => c.agentId).sort()).toEqual([A1, A2])
-    expect(await repo().claim(boardId, live)).toHaveLength(0)
+    expect(await claimLeases(boardId, live)).toHaveLength(0)
   })
 
   it('frees the slot when a run ends', async () => {
     const boardId = await seedBoard({ maxInProgress: 1 })
     await seedCard(boardId)
     await seedCard(boardId)
-    const [first] = await repo().claim(boardId, live)
-    expect(await repo().claim(boardId, live)).toHaveLength(0)
+    const [first] = await claimLeases(boardId, live)
+    expect(await claimLeases(boardId, live)).toHaveLength(0)
     expect((await repo().endRun(end(first!.leaseId, 'transient'))).accepted).toBe(true)
-    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await claimLeases(boardId, live)).toHaveLength(1)
   })
 
   it('respects a per-call limit', async () => {
     const boardId = await seedBoard()
     for (let i = 0; i < 3; i++) await seedCard(boardId)
-    expect(await repo().claim(boardId, { ...live, limit: 1 })).toHaveLength(1)
+    expect(await claimLeases(boardId, { ...live, limit: 1 })).toHaveLength(1)
   })
 })
 
@@ -212,7 +216,7 @@ describe('PgKanbanDispatchRepo.claim — concurrency (FOR UPDATE SKIP LOCKED, re
 
     // Several CP replicas tick the same board at once; the losers skip the locked board and retry next tick.
     for (let round = 0; round < 3; round++) {
-      await Promise.all(Array.from({ length: 6 }, () => repo().claim(boardId, live)))
+      await Promise.all(Array.from({ length: 6 }, () => claimLeases(boardId, live)))
     }
     const open = await prisma.kanbanRun.findMany({ where: { endedAt: null }, select: { cardId: true } })
     expect(open).toHaveLength(3)
@@ -237,11 +241,11 @@ describe('PgKanbanDispatchRepo.claim — concurrency (FOR UPDATE SKIP LOCKED, re
     )
     await lockTaken
     const started = Date.now()
-    expect(await repo().claim(boardId, live)).toEqual([])
+    expect(await claimLeases(boardId, live)).toEqual([])
     expect(Date.now() - started).toBeLessThan(5_000)
     release()
     await holder
-    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await claimLeases(boardId, live)).toHaveLength(1)
   })
 
   it('skips a card row another writer holds and claims the next one', async () => {
@@ -261,7 +265,7 @@ describe('PgKanbanDispatchRepo.claim — concurrency (FOR UPDATE SKIP LOCKED, re
       { timeout: 20_000 }
     )
     await lockTaken
-    const claimed = await repo().claim(boardId, live)
+    const claimed = await claimLeases(boardId, live)
     release()
     await holder
     expect(claimed.map((c) => c.cardId)).toEqual([next.id])
@@ -270,7 +274,7 @@ describe('PgKanbanDispatchRepo.claim — concurrency (FOR UPDATE SKIP LOCKED, re
   it('the storage layer refuses a second open run on one card', async () => {
     const boardId = await seedBoard()
     await seedCard(boardId)
-    const [lease] = await repo().claim(boardId, live)
+    const [lease] = await claimLeases(boardId, live)
     await expect(
       prisma.kanbanRun.create({
         data: {
@@ -291,7 +295,7 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
   async function leased() {
     const boardId = await seedBoard()
     await seedCard(boardId)
-    const [lease] = await repo().claim(boardId, live)
+    const [lease] = await claimLeases(boardId, live)
     await repo().markAcked(lease!.leaseId, 'read', NOW, 7n)
     return lease!
   }
@@ -337,7 +341,7 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
     const lease = await leased()
     const reaped = await repo().endRun(end(lease.leaseId, 'reclaimed', { reasonCode: 'stale_heartbeat' }))
     expect(reaped).toMatchObject({ accepted: true, card: { to: 'ready' }, plan: { countsAsFailure: false } })
-    const [next] = await repo().claim(lease.boardId, live)
+    const [next] = await claimLeases(lease.boardId, live)
     expect(next?.attempt).toBe(2)
 
     expect((await repo().endRun(end(lease.leaseId, 'completed', { fence: fenceOf(lease) }))).accepted).toBe(false)
@@ -359,7 +363,7 @@ describe('PgKanbanDispatchRepo.heartbeat and open leases (real Postgres)', () =>
     const first = await seedCard(boardId)
     await prisma.kanbanCard.update({ where: { id: first.id }, data: { mode: 'write' } })
     await seedCard(boardId)
-    const [a, b] = await repo().claim(boardId, live)
+    const [a, b] = await claimLeases(boardId, live)
     await repo().markAcked(a!.leaseId, 'write', NOW, 7n)
     await repo().markAcked(b!.leaseId, 'read', NOW, 7n)
     await repo().endRun(end(b!.leaseId, 'reclaimed'))
@@ -396,7 +400,7 @@ describe('PgKanbanDispatchRepo.heartbeat and open leases (real Postgres)', () =>
   it('lists open leases with the facts the reaper predicate needs', async () => {
     const boardId = await seedBoard()
     await seedCard(boardId)
-    const [lease] = await repo().claim(boardId, live)
+    const [lease] = await claimLeases(boardId, live)
     await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 9n } })
     let [open] = await repo().listOpenLeases(10)
     expect(open).toMatchObject({
@@ -421,7 +425,7 @@ it('scans beyond a full page of capped or offline agents instead of starving eli
   const boardId = await seedBoard({ maxInProgress: 3, maxInProgressPerAgent: 1 })
   for (let i = 0; i < 51; i++) await seedCard(boardId, { priority: 5 })
   const eligible = await seedCard(boardId, { agentId: A2 })
-  const claims = await repo().claim(boardId, live)
+  const claims = await claimLeases(boardId, live)
   expect(claims.map((c) => c.cardId)).toContain(eligible.id)
   expect(claims).toHaveLength(2)
 })
@@ -429,7 +433,7 @@ it('scans beyond a full page of capped or offline agents instead of starving eli
 it('does not reclaim a lease refreshed after the stale scan', async () => {
   const boardId = await seedBoard()
   await seedCard(boardId)
-  const [lease] = await repo().claim(boardId, live)
+  const [lease] = await claimLeases(boardId, live)
   await repo().markAcked(lease!.leaseId, 'read', NOW, 7n)
   const later = new Date(NOW.getTime() + 5 * 60 * 60_000)
   const opts = { unackedGraceMs: 120_000, epochGraceMs: 180_000 }
@@ -454,7 +458,7 @@ it('does not reclaim a lease refreshed after the stale scan', async () => {
 it('rejects old-epoch heartbeats and moved-agent writes before the reaper runs', async () => {
   const boardId = await seedBoard()
   await seedCard(boardId)
-  const [lease] = await repo().claim(boardId, live)
+  const [lease] = await claimLeases(boardId, live)
   const beats = [{ leaseId: lease!.leaseId, cardId: lease!.cardId, dispatchRevision: lease!.dispatchRevision }]
   await prisma.daemon.update({ where: { id: D1 }, data: { sessionEpoch: 8n } })
   expect(await repo().heartbeat(D1, 7n, beats, NOW)).toEqual([lease!.leaseId])
@@ -481,7 +485,7 @@ it('rechecks an unacked stale scan after a fenced heartbeat implicitly acknowled
   const boardId = await seedBoard()
   await seedCard(boardId)
   const r = repo()
-  const [lease] = await r.claim(boardId, live)
+  const [lease] = await claimLeases(boardId, live)
   const later = new Date(NOW.getTime() + 180_000)
   const opts = { unackedGraceMs: 120_000, epochGraceMs: 180_000 }
   const [sample] = await r.listOpenLeases(10)
@@ -505,7 +509,7 @@ it('rechecks an unacked stale scan after a fenced heartbeat implicitly acknowled
     heartbeatAt: later,
     endedAt: null
   })
-  expect(await r.claim(boardId, { ...live, now: later })).toEqual([])
+  expect(await claimLeases(boardId, { ...live, now: later })).toEqual([])
 })
 
 it('fences ACK writes against ended leases, stale epochs, and superseded revisions', async () => {
@@ -513,7 +517,7 @@ it('fences ACK writes against ended leases, stale epochs, and superseded revisio
   await seedCard(boardId)
   await prisma.kanbanBoard.update({ where: { id: boardId }, data: { defaultMode: 'write' } })
   const r = repo()
-  const [lease] = await r.claim(boardId, live)
+  const [lease] = await claimLeases(boardId, live)
   expect(await r.isCurrentLease(lease!.leaseId, 'write', 6n)).toBe(false)
   expect(await r.isCurrentLease(lease!.leaseId, 'read', 7n)).toBe(false)
   expect(await r.isCurrentLease(lease!.leaseId, 'write', 7n)).toBe(true)
@@ -541,7 +545,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
   // A card whose latest run ended as a pre-dispatch mismatch, parked in `status`.
   async function park(boardId: string, status: 'blocked' | 'triage' | 'todo' | 'done' | 'archived' | 'ready') {
     const card = await seedCard(boardId)
-    const [lease] = await repo().claim(boardId, { ...live, limit: 1 })
+    const [lease] = await claimLeases(boardId, { ...live, limit: 1 })
     await repo().endRun({
       leaseId: lease!.leaseId,
       outcome: 'transient',
@@ -713,7 +717,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     })
     // A stale revision or a card that is no longer todo loses the CAS and opens no intent.
     expect(await cards.beginPromotion(c.id, rev, 99n, startedAt)).toBe(false)
-    expect(await repo().claim(boardId, live)).toEqual([])
+    expect(await claimLeases(boardId, live)).toEqual([])
     // The in-flight intent is not due yet, so a tick cannot settle it under the write.
     expect(await repo().listRecoveryDue(boardId, startedAt, 10)).toEqual([])
     const due = new Date(startedAt.getTime() + 60_000)
@@ -733,7 +737,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     await cards.notePromotionPosted(c.id)
     expect(await repo().getPendingPromotion(boardId, c.issueNumber)).toMatchObject({ promotionPostAccepted: true })
     expect(await cards.clearPromotionIntent(c.id)).toBe(true)
-    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await claimLeases(boardId, live)).toHaveLength(1)
   })
 
   it('counts pending-promotion checks on deferral, and escalates once to a human-only attention park', async () => {
@@ -765,7 +769,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     expect(await cards.beginPromotion(c.id, c.stateRevision + 1n, 1n, NOW)).toBe(false)
     expect(await cards.beginPromotion(c.id, c.stateRevision + 2n, 1n, NOW)).toBe(false)
     expect(await cards.findByIssueNumber(boardId, c.issueNumber)).toMatchObject({ needsAttention: true })
-    expect(await repo().claim(boardId, live)).toEqual([])
+    expect(await claimLeases(boardId, live)).toEqual([])
     // It is parked like a mismatch: listed for recovery, ingestible only from its parked status, and cleared by the move.
     expect(await repo().listRecoveryDue(boardId, NOW, 10)).toMatchObject([{ cardId: c.id, promotion: false }])
     expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBe('todo')
@@ -779,7 +783,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       attentionReason: null
     })
     expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBeNull()
-    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await claimLeases(boardId, live)).toHaveLength(1)
   })
 
   it('refuses a second intent while one is pending, keeping its checks, start, and cursor', async () => {
@@ -801,11 +805,11 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const todo = await Promise.all(Array.from({ length: 8 }, () => seedCard(boardId, { status: 'todo' })))
     const claims: Promise<unknown[]>[] = []
     const begins = todo.map(async (c, i) => {
-      if (i % 2 === 0) claims.push(repo().claim(boardId, live))
+      if (i % 2 === 0) claims.push(claimLeases(boardId, live))
       return cards.beginPromotion(c.id, 1n, 5n, NOW)
     })
     expect(await Promise.all(begins)).toEqual(todo.map(() => true))
-    claims.push(repo().claim(boardId, live))
+    claims.push(claimLeases(boardId, live))
     expect((await Promise.all(claims)).flat()).toEqual([])
     const rows = await prisma.kanbanCard.findMany({
       where: { boardId },
@@ -820,7 +824,7 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const c = await park(boardId, 'blocked')
     await repo().deferRecovery(c.id, NOW)
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'ready' } })
-    expect(await repo().claim(boardId, live)).toHaveLength(1)
+    expect(await claimLeases(boardId, live)).toHaveLength(1)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
       recoveryCheckAt: null,
       recoveryChecks: 0

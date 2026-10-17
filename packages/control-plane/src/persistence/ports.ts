@@ -7931,7 +7931,14 @@ export interface KanbanBoardRepo {
 // ── Kanban dispatch (issue #2 M2) — claim, lease fence, heartbeat, and reaper reads; still body-free ──
 
 export type KanbanRunOutcomeValue =
-  'completed' | 'review_requested' | 'blocked' | 'failed' | 'protocol_violation' | 'reclaimed' | 'transient'
+  | 'completed'
+  | 'review_requested'
+  | 'blocked'
+  | 'failed'
+  | 'protocol_violation'
+  | 'reclaimed'
+  | 'transient'
+  | 'changes_requested'
 
 /** The board facts a dispatch needs to address GitHub and the daemon. */
 export interface KanbanBoardRef {
@@ -7941,9 +7948,10 @@ export interface KanbanBoardRef {
   repoFullName: string
 }
 
-/** One lease the claim minted: the card is `running` in the CP and awaits the daemon's ack. */
+/** One lease the claim minted: the card is `running` in the CP (or `review` for a verify run) and awaits the daemon's ack. */
 export interface KanbanClaimedLease extends KanbanBoardRef {
   mode: 'read' | 'write'
+  role: 'work' | 'verify'
   runId: string
   leaseId: string
   cardId: string
@@ -7955,6 +7963,18 @@ export interface KanbanClaimedLease extends KanbanBoardRef {
   dispatchRevision: bigint
   /** `HookDef.githubSessionKey` of the agent's GitHub hook on this repo, else `github:<repoId>` (design D4). */
   sessionKeyPrefix: string
+}
+
+/** A review card the claim refused to dispatch because its verifier is the worker (B8); flagged once, never claimed. */
+export interface KanbanSelfVerifyFlag extends KanbanBoardRef {
+  cardId: string
+  issueNumber: number
+}
+
+export interface KanbanClaimResult {
+  leases: KanbanClaimedLease[]
+  /** Newly flagged self-verify cards, so the caller can post their one body-free comment. */
+  flaggedSelfVerify: KanbanSelfVerifyFlag[]
 }
 
 export interface KanbanClaimOpts {
@@ -8046,8 +8066,8 @@ export type KanbanCardView = Extract<KanbanCardShowOk, { accepted: true }>['card
 export interface KanbanDispatchRepo {
   /** Enabled boards, for the periodic reconciler tick. */
   listEnabledBoardIds(): Promise<string[]>
-  /** Claim ready cards by priority then age under the board caps (`FOR UPDATE SKIP LOCKED`). */
-  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
+  /** Claim ready cards to their assignee and review cards to the verifier, by priority then age, under the caps. */
+  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimResult>
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
