@@ -1,6 +1,9 @@
 // Kanban worker (issue #2 M2): owns this daemon's card leases; liveness comes from turn and background-task state, never the model.
 import {
   KANBAN_MAX_LEASES_PER_BEAT,
+  KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
+  KANBAN_REASON_NO_TERMINAL_CALL,
+  KANBAN_REASON_NUDGE_UNAVAILABLE,
   type KanbanBlockKind,
   type KanbanDispatch,
   type KanbanDispatchOk,
@@ -13,6 +16,7 @@ import {
   type KanbanReportOutcome
 } from '@agentconnect.md/protocol'
 import { WireError, type Clock, type TimerHandle } from '@agentconnect.md/connection'
+import { UNCLASSIFIED_PROVIDER_ERROR, classifyProviderError, type ProviderErrorClass } from './provider-error.js'
 
 /** How a run ended, as the terminal tools record it; absent at turn end ⇒ `protocol_violation`. */
 export interface KanbanTerminal {
@@ -49,6 +53,14 @@ export interface KanbanLease {
   /** The dispatched turn has ended (successfully or not); later turns in the session are tracked by probe only. */
   turnSettled: boolean
   turnError?: string
+  /** Classified once when the turn errored; transient reports `transient`, everything else a counted `failed`. */
+  turnErrorClass?: ProviderErrorClass
+  /** The one protocol-violation nudge was spent (or refused); a lease is never nudged twice. The flag is in memory, so a restart falls to the CP reaper instead of re-nudging. */
+  nudged: boolean
+  /** The turn was interrupted by the operator; that is reported as it ended, never nudged. */
+  interrupted?: boolean
+  /** The nudge could not be started, so the violation is reported at once. */
+  nudgeRefused?: boolean
   terminal?: KanbanTerminal
 }
 
@@ -98,6 +110,8 @@ export interface KanbanWorkerDeps {
   gate(d: KanbanDispatch): Promise<KanbanDispatchRefusal | undefined>
   /** Admit the turn; resolves once the serial gate settles admission. `onSessionReady` fires once the ACP session exists. */
   start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult>
+  /** Run one more turn in the lease's session with the fixed nudge prompt; same admission machinery as `start`. */
+  nudge(d: KanbanDispatch): Promise<KanbanStartResult>
   cancel(lease: KanbanLease): void | Promise<void>
   probe: KanbanLivenessProbe
   comments?: KanbanFinalComments
@@ -115,6 +129,8 @@ export class KanbanWorker {
   private readonly admitting = new Map<string, Promise<KanbanDispatchOk>>()
   private timer: TimerHandle | undefined
   private stopped = true
+  // Set only by stop(), so a worker that was never started still nudges (the daemon always starts it).
+  private halted = false
   private flushing = false
   private beating = false
 
@@ -123,6 +139,7 @@ export class KanbanWorker {
   start(): void {
     if (!this.stopped) return
     this.stopped = false
+    this.halted = false
     // Comments recorded before a restart are already due; don't wait a heartbeat to post them.
     void this.requeueOrphans().then(() => this.drainComments())
     this.arm()
@@ -130,6 +147,7 @@ export class KanbanWorker {
 
   stop(): void {
     this.stopped = true
+    this.halted = true
     if (this.timer !== undefined) this.deps.clock.clearTimeout(this.timer)
     this.timer = undefined
   }
@@ -187,14 +205,12 @@ export class KanbanWorker {
       dispatch: d,
       sessionKey: started.sessionKey,
       sessionId: readySessionId,
-      turnSettled: false
+      turnSettled: false,
+      nudged: false
     }
     this.leases.set(d.leaseId, lease)
     this.deps.onLeaseChanged?.(d)
-    started.done.then(
-      (sessionId) => this.settleTurn(d.leaseId, sessionId ?? undefined),
-      (err: unknown) => this.settleTurn(d.leaseId, undefined, err instanceof Error ? err.message : String(err))
-    )
+    this.watchTurn(d.leaseId, started.done)
     return { leaseId: d.leaseId, accepted: true }
   }
 
@@ -271,7 +287,7 @@ export class KanbanWorker {
       for (const [leaseId, lease] of [...this.leases]) {
         const live = await this.liveness(lease)
         if (live === null) {
-          if (lease.turnSettled) await this.finalize(leaseId, lease)
+          if (lease.turnSettled) await this.conclude(leaseId, lease)
           continue
         }
         beats.push({
@@ -363,29 +379,64 @@ export class KanbanWorker {
     }
   }
 
-  private settleTurn(leaseId: string, sessionId?: string, error?: string): void {
+  private watchTurn(leaseId: string, done: Promise<string | null>): void {
+    done.then(
+      // A null session id is an operator interrupt, which is not a forgotten terminal call.
+      (sessionId) => this.settleTurn(leaseId, sessionId ?? undefined, undefined, sessionId === null),
+      (err: unknown) => this.settleTurn(leaseId, undefined, err)
+    )
+  }
+
+  private settleTurn(leaseId: string, sessionId?: string, error?: unknown, interrupted = false): void {
     const lease = this.leases.get(leaseId)
     if (!lease) return
     lease.turnSettled = true
     if (sessionId) lease.sessionId ??= sessionId
-    if (error) {
-      lease.turnError = error
-      this.deps.log.warn(`kanban: lease ${leaseId} turn failed (${error})`)
+    if (error !== undefined) {
+      lease.turnError = error instanceof Error ? error.message : String(error)
+      lease.turnErrorClass = classifyProviderError(error)
+      this.deps.log.warn(`kanban: lease ${leaseId} turn failed (${lease.turnError})`)
     }
+    // An interrupted turn is the operator's call, so it is reported as it ended rather than nudged.
+    if (interrupted) lease.interrupted = true
     // The dispatch bookkeeping clears just after the turn promise settles, so re-check on the next timer turn.
     this.deps.clock.setTimeout(() => {
       const current = this.leases.get(leaseId)
       if (!current) return
       void this.liveness(current)
         .then(async (live) => {
-          if (live !== null || this.leases.get(leaseId) !== current) return
-          await this.finalize(leaseId, current)
+          if (live !== null || this.leases.get(leaseId) !== current || !current.turnSettled) return
+          await this.conclude(leaseId, current)
           await this.flush()
         })
         .catch((err: unknown) =>
           this.deps.log.warn(`kanban: report persistence failed for ${leaseId} (${String(err)})`)
         )
     }, 0)
+  }
+
+  /** A settled, idle lease ends here: with no terminal call and no error it gets its one nudge turn first. */
+  private async conclude(leaseId: string, lease: KanbanLease): Promise<void> {
+    if (lease.terminal || lease.turnError || lease.interrupted || lease.nudged || this.halted)
+      return this.finalize(leaseId, lease)
+    // Claimed before any await so the tick and the settle timer cannot both nudge.
+    lease.nudged = true
+    lease.turnSettled = false
+    let started: KanbanStartResult | undefined
+    try {
+      started = await this.deps.nudge(lease.dispatch)
+    } catch (err) {
+      this.deps.log.warn(`kanban: nudge for lease ${leaseId} failed to start (${String(err)})`)
+    }
+    // A supersede during admission drops the lease; its report must not be written.
+    if (this.leases.get(leaseId) !== lease) return
+    if (!started?.accepted) {
+      lease.nudgeRefused = true
+      lease.turnSettled = true
+      return this.finalize(leaseId, lease)
+    }
+    this.deps.log.info(`kanban: lease ${leaseId} ended its turn without a terminal call; nudged once`)
+    this.watchTurn(leaseId, started.done)
   }
 
   private async finalize(leaseId: string, lease: KanbanLease): Promise<void> {
@@ -399,9 +450,20 @@ export class KanbanWorker {
   private buildReport(leaseId: string, lease: KanbanLease): KanbanReport {
     const d = lease.dispatch
     const terminal = lease.terminal
-    const outcome: KanbanReportOutcome = terminal?.outcome ?? (lease.turnError ? 'failed' : 'protocol_violation')
+    const errorClass = lease.turnError ? (lease.turnErrorClass ?? UNCLASSIFIED_PROVIDER_ERROR) : undefined
+    const outcome: KanbanReportOutcome =
+      terminal?.outcome ??
+      (errorClass ? (errorClass.kind === 'transient' ? 'transient' : 'failed') : 'protocol_violation')
     const reasonCode =
-      terminal?.reasonCode ?? (terminal ? undefined : lease.turnError ? 'turn_error' : 'no_terminal_call')
+      terminal?.reasonCode ??
+      (terminal
+        ? undefined
+        : (errorClass?.reasonCode ??
+          (lease.nudgeRefused
+            ? KANBAN_REASON_NUDGE_UNAVAILABLE
+            : lease.nudged
+              ? KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE
+              : KANBAN_REASON_NO_TERMINAL_CALL)))
     return {
       boardId: d.boardId,
       cardId: d.cardId,

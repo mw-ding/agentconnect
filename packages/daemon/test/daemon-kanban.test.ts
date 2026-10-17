@@ -185,8 +185,15 @@ describe('Daemon Kanban dispatch', () => {
   it('runs and resumes the GitHub issue session, enforcing read-only after runtime settings', async () => {
     const h = await harness()
     expect((await h.worker.dispatch(dispatch)).accepted).toBe(true)
-    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(1))
+    // The dispatched turn ends without a terminal call, so the same session gets exactly one nudge turn before the report.
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(2))
     await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
+    expect(JSON.stringify(h.host.prompt.mock.calls[1])).toContain('has not been closed')
+    expect(JSON.stringify(h.host.prompt.mock.calls[0])).not.toContain('has not been closed')
+    expect((await h.store.listKanbanReports(10))[0]).toMatchObject({
+      outcome: 'protocol_violation',
+      reasonCode: 'no_terminal_call_after_nudge'
+    })
     expect(h.host.setSessionPermissionMode).toHaveBeenLastCalledWith('acp-card', 'read-only')
     const rec = (await h.store.getSession(key()))!
     expect(rec).toMatchObject({
@@ -205,11 +212,29 @@ describe('Daemon Kanban dispatch', () => {
         })
       ).accepted
     ).toBe(true)
-    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledTimes(4))
     expect(h.host.newSession).toHaveBeenCalledTimes(1)
     expect((await h.store.getSession(key()))?.acpSessionId).toBe(rec.acpSessionId)
     expect(await h.store.listInboxBySessionKeyFifo()).toHaveLength(0)
   })
+
+  it.each([
+    ['API Error: 429 rate_limit_error', 'transient', 'provider_rate_limited'],
+    ['Incorrect API key provided', 'failed', 'provider_auth'],
+    ['something odd', 'failed', 'turn_error']
+  ])(
+    'classifies a failing turn (%s) from the ACP error and does not nudge it',
+    async (message, outcome, reasonCode) => {
+      const h = await harness()
+      h.host.prompt.mockRejectedValueOnce(
+        Object.assign(new Error('Internal error'), { code: -32603, data: { message } })
+      )
+      await h.worker.dispatch(dispatch)
+      await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
+      expect((await h.store.listKanbanReports(10))[0]).toMatchObject({ outcome, reasonCode })
+      expect(h.host.prompt).toHaveBeenCalledOnce()
+    }
+  )
 
   it('keeps live read-only cards protected from chat permission changes and configuration refreshes', async () => {
     const h = await harness()
@@ -258,7 +283,7 @@ describe('Daemon Kanban dispatch', () => {
   it('forces a separate worktree for write cards even when the agent defaults to shared', async () => {
     const h = await harness(true)
     expect((await h.worker.dispatch({ ...dispatch, mode: 'write' })).accepted).toBe(true)
-    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalled(), { timeout: 10_000 })
     expect((await h.store.getSession(key()))?.workspaceIsolation).toBe('session')
     const options = h.host.newSession.mock.calls[0] as unknown as [string]
     expect(options[0]).toContain('worktrees')

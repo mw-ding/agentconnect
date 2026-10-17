@@ -26493,6 +26493,10 @@ export class Daemon {
       },
       gate: (dispatch) => this.kanbanGate(dispatch),
       start: (dispatch, onSessionReady) => this.startKanban(dispatch, onSessionReady),
+      nudge: async (dispatch) => {
+        const refusal = await this.kanbanGate(dispatch)
+        return refusal ? { accepted: false, reason: refusal } : this.startKanban(dispatch, () => {}, true)
+      },
       cancel: async (lease) => {
         const agentId = lease.dispatch.agentId
         const session = await this.store.getSession(lease.sessionKey)
@@ -26581,9 +26585,10 @@ export class Daemon {
   // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.
   private async startKanban(
     d: KanbanDispatch,
-    onSessionReady: (sessionId: string) => void
+    onSessionReady: (sessionId: string) => void,
+    nudge = false
   ): Promise<KanbanStartResult> {
-    const msg = buildKanbanMessage(d, randomUUID())
+    const msg = buildKanbanMessage(d, randomUUID(), nudge)
     const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
     let admitted!: (result: { accepted: boolean; reason?: string }) => void
     const admission = new Promise<{ accepted: boolean; reason?: string }>((resolve) => (admitted = resolve))

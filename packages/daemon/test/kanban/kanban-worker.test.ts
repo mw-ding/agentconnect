@@ -22,7 +22,15 @@ function harness() {
   const reports = new Map<string, KanbanReport | null>()
   const terminals = new Map<string, { entry: KanbanTerminalEntry; state: 'held' | 'comment' }>()
   const comments = { drain: vi.fn(async () => {}) }
-  const state = { active: true, tasks: 0, ready: true, refusal: undefined as KanbanDispatchRefusal | undefined }
+  const state = {
+    active: true,
+    tasks: 0,
+    ready: true,
+    refusal: undefined as KanbanDispatchRefusal | undefined,
+    nudgeRefusal: undefined as KanbanDispatchRefusal | undefined,
+    nudgeThrows: false
+  }
+  const nudgeTurns: Array<{ resolve: (id: string | null) => void; reject: (err: unknown) => void }> = []
   let resolve!: (id: string) => void
   let reject!: (err: Error) => void
   const done = new Promise<string>((res, rej) => {
@@ -38,12 +46,20 @@ function harness() {
     ready('acp-1')
     return { accepted: true as const, sessionKey: 'session-42', done }
   })
+  const nudge = vi.fn(async (_d: KanbanDispatch) => {
+    if (state.nudgeThrows) throw new Error('start exploded')
+    if (state.nudgeRefusal) return { accepted: false as const, reason: state.nudgeRefusal }
+    state.active = true
+    const nudgeDone = new Promise<string | null>((resolve, reject) => nudgeTurns.push({ resolve, reject }))
+    return { accepted: true as const, sessionKey: 'session-42', done: nudgeDone }
+  })
   const cancel = vi.fn()
   const worker = new KanbanWorker({
     clock,
     log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
     cp: () => cp,
     start,
+    nudge,
     cancel,
     gate: async () => state.refusal,
     probe: { turnActive: () => state.active, liveBackgroundTasks: () => state.tasks },
@@ -86,7 +102,34 @@ function harness() {
     await Promise.resolve()
     await worker.tick()
   }
-  return { worker, cp, start, cancel, state, clock, settle, reject, reports, terminals, comments }
+  const settleNudge = async (sessionId: string | null = 'acp-1') => {
+    state.active = false
+    nudgeTurns.at(-1)!.resolve(sessionId)
+    await Promise.resolve()
+    await worker.tick()
+  }
+  const failNudge = async (err: unknown) => {
+    state.active = false
+    nudgeTurns.at(-1)!.reject(err)
+    await Promise.resolve()
+    await worker.tick()
+  }
+  return {
+    worker,
+    cp,
+    start,
+    nudge,
+    cancel,
+    state,
+    clock,
+    settle,
+    settleNudge,
+    failNudge,
+    reject,
+    reports,
+    terminals,
+    comments
+  }
 }
 
 describe('Kanban worker leases', () => {
@@ -157,10 +200,11 @@ describe('Kanban worker leases', () => {
     const h = harness()
     await h.worker.dispatch(dispatch)
     h.state.ready = false
+    h.state.nudgeRefusal = 'draining'
     await h.settle()
     expect(h.reports.get(dispatch.leaseId)).toMatchObject({
       outcome: 'protocol_violation',
-      reasonCode: 'no_terminal_call'
+      reasonCode: 'nudge_unavailable'
     })
     h.state.ready = true
     h.cp.report.mockRejectedValueOnce(new WireError('INTERNAL', 'offline', true))
@@ -178,6 +222,7 @@ describe('Kanban worker leases', () => {
     await Promise.resolve()
     await h.worker.tick()
     expect(h.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reasonCode: 'turn_error' }))
+    expect(h.nudge).not.toHaveBeenCalled()
     expect(JSON.stringify(h.cp.report.mock.calls)).not.toContain('sensitive')
   })
 
@@ -303,5 +348,148 @@ describe('Kanban worker leases', () => {
     expect(r.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'review_requested' }))
     expect(r.terminals.get(dispatch.leaseId)?.state).toBe('comment')
     r.worker.stop()
+  })
+})
+
+describe('Kanban worker protocol-violation nudge', () => {
+  it('nudges a terminal-less turn once, in the same lease, and keeps beating while the nudge turn runs', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    expect(h.nudge).toHaveBeenCalledOnce()
+    expect(h.nudge).toHaveBeenCalledWith(dispatch)
+    // The nudge turn is live: no report yet, and the lease still heartbeats as a turn.
+    expect(h.cp.report).not.toHaveBeenCalled()
+    expect(h.worker.leaseForSession('session-42')).toBe(dispatch.leaseId)
+    await h.worker.tick()
+    expect(h.cp.heartbeat).toHaveBeenLastCalledWith({ leases: [expect.objectContaining({ liveness: 'turn' })] })
+  })
+
+  it('reports the terminal the nudge turn produced under its own outcome and reason', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', reasonCode: 'agent_done', summary: 's' })
+    await h.settleNudge()
+    expect(h.cp.report).toHaveBeenCalledOnce()
+    expect(h.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'completed', reasonCode: 'agent_done' })
+    )
+    expect(h.nudge).toHaveBeenCalledOnce()
+  })
+
+  it('reports protocol_violation after the nudge when the agent still ignores the protocol, and never nudges twice', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    await h.settleNudge()
+    expect(h.cp.report).toHaveBeenCalledOnce()
+    expect(h.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'protocol_violation', reasonCode: 'no_terminal_call_after_nudge' })
+    )
+    await h.worker.tick()
+    expect(h.nudge).toHaveBeenCalledOnce()
+    expect(h.worker.get(dispatch.leaseId)).toBeUndefined()
+  })
+
+  it.each<KanbanDispatchRefusal>(['busy', 'draining', 'paused', 'no_agent'])(
+    'reports protocol_violation at once when the nudge is refused (%s)',
+    async (reason) => {
+      const h = harness()
+      h.state.nudgeRefusal = reason
+      await h.worker.dispatch(dispatch)
+      await h.settle()
+      expect(h.cp.report).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'protocol_violation', reasonCode: 'nudge_unavailable' })
+      )
+    }
+  )
+
+  it('reports protocol_violation at once when starting the nudge throws', async () => {
+    const h = harness()
+    h.state.nudgeThrows = true
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    expect(h.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'protocol_violation', reasonCode: 'nudge_unavailable' })
+    )
+  })
+
+  it('classifies an erroring nudge turn like any turn error and does not nudge again', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    await h.failNudge(new Error('API Error: 529 overloaded'))
+    expect(h.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'transient', reasonCode: 'provider_overloaded' })
+    )
+    expect(h.nudge).toHaveBeenCalledOnce()
+
+    const g = harness()
+    await g.worker.dispatch(dispatch)
+    await g.settle()
+    await g.failNudge(new Error('Incorrect API key provided'))
+    expect(g.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'failed', reasonCode: 'provider_auth' })
+    )
+  })
+
+  it('does not nudge a turn that errored, was interrupted, or whose lease was superseded', async () => {
+    const errored = harness()
+    await errored.worker.dispatch(dispatch)
+    errored.state.active = false
+    errored.reject(new Error('boom'))
+    await Promise.resolve()
+    await errored.worker.tick()
+    expect(errored.nudge).not.toHaveBeenCalled()
+
+    const interrupted = harness()
+    await interrupted.worker.dispatch(dispatch)
+    interrupted.state.active = false
+    ;(
+      interrupted.worker as unknown as { settleTurn(id: string, s?: string, e?: unknown, i?: boolean): void }
+    ).settleTurn(dispatch.leaseId, undefined, undefined, true)
+    await interrupted.worker.tick()
+    expect(interrupted.nudge).not.toHaveBeenCalled()
+    expect(interrupted.cp.report).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'protocol_violation', reasonCode: 'no_terminal_call' })
+    )
+
+    const superseded = harness()
+    await superseded.worker.dispatch(dispatch)
+    superseded.cp.heartbeat.mockResolvedValueOnce({ superseded: [dispatch.leaseId] })
+    await superseded.worker.tick()
+    await superseded.settle()
+    expect(superseded.nudge).not.toHaveBeenCalled()
+    expect(superseded.cp.report).not.toHaveBeenCalled()
+  })
+
+  it('drops the report when the lease is superseded while the nudge is being admitted', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    h.nudge.mockImplementationOnce(async () => {
+      ;(h.worker as unknown as { leases: Map<string, unknown> }).leases.delete(dispatch.leaseId)
+      return { accepted: false as const, reason: 'busy' as const }
+    })
+    await h.settle()
+    expect(h.cp.report).not.toHaveBeenCalled()
+  })
+
+  it('does not nudge when the worker is stopping and does not double-nudge concurrent settle paths', async () => {
+    const h = harness()
+    h.worker.stop()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    expect(h.nudge).not.toHaveBeenCalled()
+    expect(h.cp.report).toHaveBeenCalledWith(expect.objectContaining({ reasonCode: 'no_terminal_call' }))
+
+    const g = harness()
+    await g.worker.dispatch(dispatch)
+    g.state.active = false
+    g.state.tasks = 0
+    // The settle timer and the heartbeat tick both see an idle settled lease at once; only one nudge may start.
+    await Promise.resolve()
+    await Promise.all([g.settle(), g.worker.tick(), g.clock.advance(1)])
+    expect(g.nudge).toHaveBeenCalledOnce()
   })
 })
