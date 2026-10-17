@@ -140,7 +140,9 @@ read, or no synthesizer configured leaves it alone. This is `planSynthesis` in
 `cp/src/kanban/graph-reconciler.ts`, evaluated beside the existing blocker
 promotion, with a sub-issue close re-evaluating its parent epic (the mirror of a
 blocker re-evaluating its dependents). The write uses the same CAS + promotion
-intent + idempotent label-write pattern as graph promotion.
+intent + idempotent label-write pattern as graph promotion, replacing prior
+`ac/agent:*` labels with `ac/agent:<synthesizer-slug>`. An `issues.closed` or
+`issues.reopened` doorbell re-reads the changed child and its parent graph.
 
 ### Write-card branch (B3)
 
@@ -150,3 +152,15 @@ reused on later attempts and after a restart; it is never reused for another
 card. The branch name comes from `kanbanCardBranch` in
 `packages/daemon/src/kanban/card-branch.ts` and is told to the worker in the
 kanban prompt. Read-mode runs are unchanged.
+
+Skip, restart and synthesis enqueue body-free `kanban_notification` rows in the
+same transaction as the status move (unique on card id and state revision).
+Restart and synthesis use reason codes `restarted` and `synthesis` for ready
+notifications. Headless boards and status self-moves stay silent.
+
+For `ac/card-<n>`, an existing checked-out worktree is never detached or deleted
+by a competing session. Removed daemon session registrations can be pruned and
+the branch reused, preserving committed progress. Existing directories require
+explicit retirement before another session can acquire their branch. A confined
+session's clone keeps the branch locally; separate clones do not share unpushed
+commits.

@@ -566,5 +566,22 @@ still only reads `blockedBy`), so it escalates to a human like any other
 unattributed promotion. The skip comment names the actor's GitHub login only when
 a linked `github_repo_identity` row exists; otherwise it omits the login. Board
 pause/resume and card skip/restart leave body-free audit rows (`board_paused`,
-`board_resumed`, `card_skipped`, `card_restarted`); a claim-eligibility predicate
-that reports the gate code `board_paused` is left to the notification lane.
+`board_resumed`, `card_skipped`, `card_restarted`). The claim predicate now
+reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.1).
+
+M4 controls continuation: synthesis re-evaluates the parent on an `issues.closed`
+or `issues.reopened` doorbell, assigns the configured organization agent, and
+writes `ac/agent:<slug>` beside `ac/status:ready`. Skip, restart and synthesis
+status moves enqueue body-free notifications in the same PostgreSQL transaction;
+headless boards stay silent. An existing worktree holding `ac/card-<n>` is
+preserved and a competing session is refused. A removed worktree registration can
+be pruned and its committed card branch resumed. The daemon cannot prove that an
+existing session directory is inactive, so the operator must retire it before
+another session can acquire its branch. Cross-session isolated clones do not
+share unpushed local refs; they retain a card branch within their own clone.
+
+Known validation limits (M4 controls): the live suite uses GitHub scratch issues,
+real PostgreSQL, a real daemon with a fake ACP runtime, and interactive OIDC
+fixtures. Branch creation, preserved commits, removed registrations and live
+worktree exclusion are covered by real-git daemon tests; no live remote write
+agent is provisioned. Slack delivery is tested with fakes only.
