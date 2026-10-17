@@ -87,7 +87,7 @@ const BATCH = 25
 /** How long an unattributed edit may stay deferred (from its first deferral) before it fails closed. */
 const DEFERRAL_TIMEOUT_MS = 10 * 60_000
 
-type EditVerdict = 'accept' | 'refuse' | 'ignore'
+type EditVerdict = 'accept' | 'refuse' | 'revert' | 'ignore'
 
 // Exactly undoes one refused `ac/agent:*` label edit against the labels the issue carries now.
 function undoLabelEdit(event: NonNullable<LabelEvent>, labels: readonly string[]): { add: string[]; remove: string[] } {
@@ -188,7 +188,23 @@ export class KanbanSync {
       return newStatus ? this.judgeEvent(repo, statusEvent, writers) : 'ignore'
     }
     const requested = planLabelReconcile({ status: card.status, leased: card.lease !== null }, issue).requested
-    if (requested === undefined) return 'ignore'
+    if (requested === undefined) {
+      // The card already matches the live status, but a non-writer's later remove+re-add can still re-author that
+      // label. A dispatchable card (ready/running) whose current status label is no longer writer-attributed reverts.
+      if (card.status !== 'ready' && card.status !== 'running') return 'ignore'
+      const current = attributeLabel(events, statusLabel(card.status))
+      if (current.kind !== 'add') return 'ignore'
+      if (BigInt(current.event.id) <= card.syncEventCursor) return 'ignore'
+      if (!humanDoorbell && card.labelWritePending) return 'pending'
+      const verdict = await judgeLabelAdd(current, {
+        repo,
+        permissions: this.deps.permissions,
+        appSlug: this.deps.appSlug,
+        writers,
+        warn: (err, repoId) => this.deps.log.warn({ err, repoId }, 'kanban: permission lookup failed')
+      })
+      return verdict === 'non_writer' ? 'revert' : 'ignore'
+    }
     const attribution = attributeLabel(events, statusLabel(requested))
     if (attribution.kind !== 'add') return 'pending'
     if (BigInt(attribution.event.id) <= card.syncEventCursor) return 'ignore'
@@ -260,6 +276,7 @@ export class KanbanSync {
 
     let changed = false
     let acceptStatus = statusVerdict === 'accept'
+    const revertStatus = statusVerdict === 'revert'
 
     if (agentVerdict === 'accept') {
       const target =
@@ -343,7 +360,9 @@ export class KanbanSync {
           }
         : issue
     const proposed = planLabelReconcile({ status: card.status, leased: card.lease !== null }, observed)
-    const plan = acceptStatus ? proposed : planStatusWrite(card.status, issue)
+    // A non-writer re-authoring a dispatchable card's status label reverts it to triage, the safe non-dispatch status.
+    const plan = acceptStatus ? proposed : planStatusWrite(revertStatus ? 'triage' : card.status, issue)
+    if (revertStatus && card.lease !== null) plan.releaseLease = true
     const shape = parseStatusLabels(issue.labels)
     if (!acceptStatus && !plan.comment && (shape.statuses.length > 1 || shape.malformed.length > 0)) {
       plan.comment = `AgentConnect Kanban: a card carries exactly one status label. Restored \`${statusLabel(card.status)}\`.`
@@ -351,7 +370,11 @@ export class KanbanSync {
     // A refused ac/agent edit is undone before its cursor advances, so a failed undo is retried next pass.
     const agentCursorCommit = agentVerdict === 'refuse' ? card.syncAgentCursor : agentCursor
     const actor =
-      statusVerdict === 'accept' || statusVerdict === 'refuse' ? statusEditActor(card, issue, events, edits) : undefined
+      statusVerdict === 'accept' || statusVerdict === 'refuse'
+        ? statusEditActor(card, issue, events, edits)
+        : statusVerdict === 'revert'
+          ? revertActor(card, events)
+          : undefined
     const result = await this.deps.repo.apply(card, plan, cursor, acceptStatus, agentCursorCommit, actor)
     if (!result) return changed
     if (result.revoked) await this.deps.revoke(result.revoked, card.id)
@@ -363,7 +386,7 @@ export class KanbanSync {
     projection.addLabels.push(...undo.add)
     projection.removeLabels.push(...undo.remove)
     const reverted = projection.addLabels.length > 0 || projection.removeLabels.length > 0 || !!projection.issueState
-    const refused = statusVerdict === 'refuse' || agentVerdict === 'refuse'
+    const refused = statusVerdict === 'refuse' || statusVerdict === 'revert' || agentVerdict === 'refuse'
     const comment = plan.comment ?? (refused && reverted ? permissionRefusalComment(current.status) : undefined)
     await this.deps.store.applyPlan(repo, issueNumber, issue, { ...projection, ...(comment ? { comment } : {}) })
     const finalAgentCursor = agentVerdict === 'refuse' ? agentCursor : current.syncAgentCursor
@@ -424,6 +447,12 @@ function statusEditActor(
   const requested = planLabelReconcile({ status: card.status, leased: card.lease !== null }, issue).requested
   if (requested === undefined) return undefined
   const attribution = attributeLabel(events, statusLabel(requested))
+  return attribution.kind === 'add' ? actorFrom(attribution.event) : undefined
+}
+
+/** The actor whose re-add of the card's current status label forced a revert, for the audit row. */
+function revertActor(card: SyncCard, events: readonly LabelEvent[]): GitHubActor | undefined {
+  const attribution = attributeLabel(events, statusLabel(card.status))
   return attribution.kind === 'add' ? actorFrom(attribution.event) : undefined
 }
 

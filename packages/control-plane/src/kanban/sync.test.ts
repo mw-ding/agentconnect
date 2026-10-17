@@ -474,3 +474,75 @@ describe('lagging-event attribution regression', () => {
     expect(f.card().assigneeAgentId).toBe('next-agent')
   })
 })
+
+// A non-writer re-authoring a card's current status label must revert it: the label the card relies on is no longer
+// a live writer's, so the card is pushed to triage, its lease is revoked, and nothing is left to dispatch.
+describe('non-writer re-add of the current status label', () => {
+  const bob = { type: 'User', login: 'bob' }
+  const mallory = { type: 'User', login: 'mallory' }
+  const perms: Record<string, RepoPermissionLevel> = { bob: 'write', mallory: 'triage' }
+  const permissions = vi.fn(async (_r: unknown, login: string) => perms[login.toLowerCase()] ?? 'none')
+
+  it('reverts a ready card to triage when a non-writer remove+re-adds the label', async () => {
+    const f = fixture({ status: 'ready', syncEventCursor: 100n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(100, 'labeled', 'ac/status:ready', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:ready', mallory),
+      labelEvent(102, 'labeled', 'ac/status:ready', mallory)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('triage')
+    expect(vi.mocked(f.deps.permissions.permission)).toHaveBeenCalledWith(target, 'mallory')
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      status: 'triage',
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:ready'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+  })
+
+  it('revokes the lease when a non-writer re-adds a running card', async () => {
+    const f = fixture({
+      status: 'running',
+      syncEventCursor: 100n,
+      lease: { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+    })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:running']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(100, 'labeled', 'ac/status:running', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:running', mallory),
+      labelEvent(102, 'labeled', 'ac/status:running', mallory)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('triage')
+    expect(f.deps.revoke).toHaveBeenCalledWith(expect.objectContaining({ leaseId: 'lease' }), 'card')
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:running']
+    })
+  })
+
+  it('leaves a non-dispatchable card alone when a non-writer re-adds its label', async () => {
+    const f = fixture({ status: 'done', syncEventCursor: 100n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:done']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(100, 'labeled', 'ac/status:done', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:done', mallory),
+      labelEvent(102, 'labeled', 'ac/status:done', mallory)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('done')
+    expect(f.deps.revoke).not.toHaveBeenCalled()
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).not.toMatchObject({ status: 'triage' })
+  })
+})

@@ -1,7 +1,11 @@
 // Per-label attribution (Lane 1a importer, reused by Lane 1b): the latest visible labeled/unlabeled event decides who may
 // have set a label currently on the issue, so a stale add never authorizes a newer removal or a lagged re-add.
-import type { RepoPermissionLevel } from '../github/repo-permission.js'
-import { checkWriteAccess, type RepoPermissionLookup, type RepoPermissionTarget } from '../github/repo-permission.js'
+import {
+  checkWriteAccess,
+  type RepoPermissionLevel,
+  type RepoPermissionLookup,
+  type RepoPermissionTarget
+} from '../github/repo-permission.js'
 import { isAppActor, isHumanActor, type LabelEvent } from './card-store.js'
 
 /** The latest event matching `match`, tie-broken by id then created_at; events need not be pre-sorted. */

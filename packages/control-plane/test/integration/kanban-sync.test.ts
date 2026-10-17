@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
-import { planLabelReconcile, planStatusWrite } from '../../src/kanban/card-state.js'
+import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
+import { KanbanSync } from '../../src/kanban/sync.js'
+import { planLabelReconcile, planStatusWrite, type LabelPlan } from '../../src/kanban/card-state.js'
+import type { CardIssue, LabelEvent } from '../../src/kanban/card-store.js'
 import { prisma } from '../setup.db.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 
@@ -200,5 +203,211 @@ describe('Kanban synchronization transactions (Postgres)', () => {
       syncDeferredAt: null,
       syncDeferralCount: 0
     })
+  })
+})
+
+// A full KanbanSync over the real PG repo with a fake GitHub store/events: a non-writer's later remove+re-add of the
+// card's current status label must revert the card to triage (and revoke its lease), so nothing is left to dispatch.
+describe('KanbanSync full pass (non-writer re-add)', () => {
+  const bob = { type: 'User', login: 'bob' }
+  const mallory = { type: 'User', login: 'mallory' }
+
+  async function syncFixture(status: 'ready' | 'running', leased: boolean) {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'sync-full', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: { boardId: board.id, issueId: 1n, issueNumber: 1, status, assigneeAgentId: AGENT, syncEventCursor: 100n }
+    })
+    const run = leased
+      ? await prisma.kanbanRun.create({
+          data: {
+            cardId: card.id,
+            attempt: 1,
+            agentId: AGENT,
+            daemonId: DAEMON,
+            dispatchRevision: card.dispatchRevision,
+            dispatchedAt: new Date(),
+            leaseId: crypto.randomUUID()
+          }
+        })
+      : null
+    const label = `ac/status:${status}`
+    const issue: CardIssue = { issueId: 1n, nodeId: 'I_1', number: 1, state: 'open', labels: [label] }
+    const events: LabelEvent[] = [
+      { id: 100, event: 'labeled', label: { name: label }, actor: bob },
+      { id: 101, event: 'unlabeled', label: { name: label }, actor: mallory },
+      { id: 102, event: 'labeled', label: { name: label }, actor: mallory }
+    ]
+    const writes: LabelPlan[] = []
+    const revoked: unknown[] = []
+    const sync = new KanbanSync({
+      repo: new PgKanbanSyncRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      store: {
+        readCard: async () => issue,
+        readLabelEvents: async () => events,
+        applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+          writes.push(plan)
+        }
+      },
+      permissions: {
+        permission: async (_r: unknown, login: string) => (login.toLowerCase() === 'bob' ? 'write' : 'triage')
+      },
+      appSlug: 'agentconnect',
+      repoRef: async () => ({ installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }),
+      revoke: async (lease: unknown) => {
+        revoked.push(lease)
+      },
+      promote: async () => {},
+      log: { warn: () => {} }
+    })
+    return { board, card, run, sync, writes, revoked }
+  }
+
+  it('reverts a ready card to triage, refuses, and leaves nothing to claim', async () => {
+    const f = await syncFixture('ready', false)
+    await f.sync.onCardChanged(f.board.id, 1, true)
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row.status).toBe('triage')
+    expect(row.syncEventCursor).toBe(102n)
+    expect(f.writes.at(-1)).toMatchObject({
+      status: 'triage',
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:ready'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    expect(
+      await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+    ).toHaveLength(0)
+    const audit = await prisma.auditEvent.findFirstOrThrow({ where: { kind: 'kanban_card_change' } })
+    expect(audit.details).toMatchObject({ from: 'ready', to: 'triage', source: 'human_label', actorLogin: 'mallory' })
+  })
+
+  it('revokes the lease and reclaims the run when a non-writer re-adds a running card', async () => {
+    const f = await syncFixture('running', true)
+    await f.sync.onCardChanged(f.board.id, 1, true)
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row.status).toBe('triage')
+    expect(row.dispatchRevision).toBe(2n)
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: f.run!.id } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'human_status',
+      endedAt: expect.any(Date)
+    })
+    expect(f.revoked).toHaveLength(1)
+    expect(f.writes.at(-1)).toMatchObject({ status: 'triage', removeLabels: ['ac/status:running'] })
+  })
+})
+
+// Two KanbanSync replicas over the same Postgres with a shared fake GitHub: replica A commits a lease-revoking
+// reassignment while replica B applies a newer human status event. A must re-read GitHub before planning labels, so B's
+// newer state (and cursor) win instead of A re-writing the stale pre-reassignment label.
+describe('two CP replicas (stale snapshot after reassignment)', () => {
+  const bob = { type: 'User', login: 'bob' }
+
+  async function replicas() {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await seedAgent(prisma, NEXT, { daemonId: DAEMON, name: 'new' })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'replicas', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: {
+        boardId: board.id,
+        issueId: 1n,
+        issueNumber: 1,
+        status: 'running',
+        assigneeAgentId: AGENT,
+        syncEventCursor: 10n,
+        syncAgentCursor: 10n
+      }
+    })
+    const run = await prisma.kanbanRun.create({
+      data: {
+        cardId: card.id,
+        attempt: 1,
+        agentId: AGENT,
+        daemonId: DAEMON,
+        dispatchRevision: card.dispatchRevision,
+        dispatchedAt: new Date(),
+        leaseId: crypto.randomUUID()
+      }
+    })
+    const repo = new PgKanbanSyncRepo(prisma)
+    const cards = new PgKanbanCardRepo(prisma)
+    const state = {
+      issue: {
+        issueId: 1n,
+        nodeId: 'I_1',
+        number: 1,
+        state: 'open',
+        labels: ['ac/status:running', 'ac/agent:new']
+      } as CardIssue,
+      events: [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+        { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob }
+      ] as LabelEvent[]
+    }
+    const writes: LabelPlan[] = []
+    const store = {
+      readCard: async () => state.issue,
+      readLabelEvents: async () => state.events,
+      applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+        writes.push(plan)
+      }
+    }
+    const ref = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
+    const mk = (overrides: Partial<ConstructorParameters<typeof KanbanSync>[0]> = {}) =>
+      new KanbanSync({
+        repo,
+        cards,
+        store,
+        permissions: { permission: async () => 'write' },
+        appSlug: 'agentconnect',
+        repoRef: async () => ref,
+        revoke: async () => {},
+        promote: async () => {},
+        log: { warn: () => {} },
+        ...overrides
+      })
+    return { board, card, run, repo, cards, state, writes, mk }
+  }
+
+  it('replica B newer status wins over replica A stale snapshot', async () => {
+    const f = await replicas()
+    const syncB = f.mk()
+    // A's setAssignee runs B (a newer human status event) before returning, so A's later re-read sees B's commit.
+    let bRan = false
+    const syncA = f.mk({
+      cards: {
+        resolveAgentSlug: f.cards.resolveAgentSlug.bind(f.cards),
+        setAssignee: async (input) => {
+          const result = await f.cards.setAssignee(input)
+          if (!bRan) {
+            bRan = true
+            f.state.issue = { ...f.state.issue, labels: ['ac/status:blocked', 'ac/agent:new'] }
+            f.state.events = [
+              { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+              { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+              { id: 30, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: bob },
+              { id: 31, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: bob }
+            ]
+            await syncB.onCardChanged(f.board.id, 1, true)
+          }
+          return result
+        }
+      }
+    })
+    await syncA.onCardChanged(f.board.id, 1, true)
+
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row.status).toBe('blocked')
+    expect(row.syncEventCursor).toBe(31n)
+    // A's stale snapshot must not re-write the pre-reassignment status label.
+    expect(f.writes.some((w) => w.removeLabels.includes('ac/status:running'))).toBe(false)
   })
 })
