@@ -55,7 +55,7 @@ export interface KanbanLease {
 /** What the daemon can observe about a lease's session right now. */
 export interface KanbanLivenessProbe {
   turnActive(sessionKey: string): boolean
-  liveBackgroundTasks(agentId: string, sessionId: string, sessionKey: string): number
+  liveBackgroundTasks(agentId: string, sessionId: string, sessionKey: string): number | Promise<number>
 }
 
 export type KanbanStartResult =
@@ -98,7 +98,7 @@ export interface KanbanWorkerDeps {
   gate(d: KanbanDispatch): Promise<KanbanDispatchRefusal | undefined>
   /** Admit the turn; resolves once the serial gate settles admission. `onSessionReady` fires once the ACP session exists. */
   start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult>
-  cancel(lease: KanbanLease): void
+  cancel(lease: KanbanLease): void | Promise<void>
   probe: KanbanLivenessProbe
   comments?: KanbanFinalComments
   heartbeatMs?: number
@@ -252,11 +252,11 @@ export class KanbanWorker {
   }
 
   /** Liveness for one lease, or null when nothing is running for it. */
-  liveness(lease: KanbanLease): KanbanLeaseBeat['liveness'] | null {
+  async liveness(lease: KanbanLease): Promise<KanbanLeaseBeat['liveness'] | null> {
     if (this.deps.probe.turnActive(lease.sessionKey)) return 'turn'
     if (
       lease.sessionId &&
-      this.deps.probe.liveBackgroundTasks(lease.dispatch.agentId, lease.sessionId, lease.sessionKey) > 0
+      (await this.deps.probe.liveBackgroundTasks(lease.dispatch.agentId, lease.sessionId, lease.sessionKey)) > 0
     )
       return 'background'
     return null
@@ -269,7 +269,7 @@ export class KanbanWorker {
     try {
       const beats: KanbanLeaseBeat[] = []
       for (const [leaseId, lease] of [...this.leases]) {
-        const live = this.liveness(lease)
+        const live = await this.liveness(lease)
         if (live === null) {
           if (lease.turnSettled) await this.finalize(leaseId, lease)
           continue
@@ -291,7 +291,7 @@ export class KanbanWorker {
               const lease = this.leases.get(id)
               if (lease) {
                 this.leases.delete(id)
-                this.deps.cancel(lease)
+                await this.deps.cancel(lease)
                 this.deps.onLeaseChanged?.(lease.dispatch)
                 this.deps.log.info(`kanban: lease ${id} superseded by the control plane`)
               }
@@ -375,13 +375,16 @@ export class KanbanWorker {
     // The dispatch bookkeeping clears just after the turn promise settles, so re-check on the next timer turn.
     this.deps.clock.setTimeout(() => {
       const current = this.leases.get(leaseId)
-      if (current && this.liveness(current) === null) {
-        void this.finalize(leaseId, current).then(
-          () =>
-            this.flush().catch((err: unknown) => this.deps.log.warn(`kanban: outbox flush failed (${String(err)})`)),
-          (err: unknown) => this.deps.log.warn(`kanban: report persistence failed for ${leaseId} (${String(err)})`)
+      if (!current) return
+      void this.liveness(current)
+        .then(async (live) => {
+          if (live !== null || this.leases.get(leaseId) !== current) return
+          await this.finalize(leaseId, current)
+          await this.flush()
+        })
+        .catch((err: unknown) =>
+          this.deps.log.warn(`kanban: report persistence failed for ${leaseId} (${String(err)})`)
         )
-      }
     }, 0)
   }
 

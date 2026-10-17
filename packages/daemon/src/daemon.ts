@@ -26493,11 +26493,13 @@ export class Daemon {
       },
       gate: (dispatch) => this.kanbanGate(dispatch),
       start: (dispatch, onSessionReady) => this.startKanban(dispatch, onSessionReady),
-      cancel: (lease) => {
+      cancel: async (lease) => {
         const agentId = lease.dispatch.agentId
-        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', lease.sessionId)
+        const session = await this.store.getSession(lease.sessionKey)
+        const acpSessionId = session?.acpSessionId ?? undefined
+        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
         // SDK background work has no Pending turn for interruptTurn to cancel; stop its host before admitting another writer.
-        if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), lease.sessionId)) {
+        if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), acpSessionId)) {
           void this.stopHost(agentId).catch((err) =>
             this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
           )
@@ -26505,8 +26507,10 @@ export class Daemon {
       },
       probe: {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
-        liveBackgroundTasks: (agentId, sessionId, sessionKey) =>
-          this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, sessionKey), sessionId) ? 0 : 1
+        liveBackgroundTasks: async (agentId, _sessionId, sessionKey) => {
+          const session = await this.store.getSession(sessionKey)
+          return this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, sessionKey), session?.acpSessionId) ? 0 : 1
+        }
       },
       comments: this.kanbanComments(),
       onLeaseChanged: (dispatch) => this.gitCreds.dropAgentRepo(dispatch.agentId, dispatch.repoFullName)

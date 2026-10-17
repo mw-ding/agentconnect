@@ -423,7 +423,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
               },
               onPermission: async (sid, params) => {
                 const tool = JSON.stringify(params.toolCall ?? {})
-                const decision = await (daemon as any).onAcpPermission(agentId, sid, params)
+                const decision = await (daemon as any).permissions.onAcpPermission(agentId, sid, params)
                 if (decision?.outcome?.outcome === 'cancelled') permissionDenials.push(tool)
                 return decision
               }
@@ -628,12 +628,15 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await snapshot('b/c: lease ACK persisted and running label observed', c.id, created.number)
       const lease = worker.get(d.leaseId)!
       expect(lease.sessionId).toBeTruthy()
-      expect(await local.getSession(lease.sessionKey)).toMatchObject({
+      const session = await local.getSession(lease.sessionKey)
+      expect(session).toMatchObject({
         externalProvider: 'github',
-        externalResourceKey: String(REPO_ID)
+        externalResourceKey: String(REPO_ID),
+        sessionId: lease.sessionId
       })
+      const acpSessionId = session!.acpSessionId!
       expect(host.setSessionPermissionMode).toHaveBeenLastCalledWith(
-        lease.sessionId,
+        acpSessionId,
         expect.stringMatching(/^(read-only|plan)$/)
       )
       expect(await worker.dispatch(d)).toEqual({ leaseId: d.leaseId, accepted: true })
@@ -659,8 +662,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       expect((await run(d.leaseId)).endedAt).toBeNull()
       phase('b: wrong daemon, epoch and revision reports refused; lease remains open')
 
-      const permission = await (daemon as any).onAcpPermission(agentId, lease.sessionId, {
-        sessionId: lease.sessionId,
+      const permission = await (daemon as any).permissions.onAcpPermission(agentId, acpSessionId, {
+        sessionId: acpSessionId,
         toolCall: {
           title: 'gh issue edit',
           rawInput: { command: `gh issue edit ${created.number} -R ${FULL} --add-label ac/mode:write` }
@@ -668,7 +671,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         options: [{ kind: 'allow_once', optionId: 'allow', name: 'Allow' }]
       })
       expect(permission).toEqual({ outcome: { outcome: 'cancelled' } })
-      expect((daemon as any).setPermissionModeByKey(lease.sessionKey, 'agent-full-access')).toBe(false)
+      expect(await (daemon as any).commands.setPermissionModeByKey(lease.sessionKey, 'agent-full-access')).toBe(false)
       // Exercise the real generated shell shim with no credential ever copied into the child environment.
       const shim = join(writeGhShim(root!, daemonEntry), 'gh')
       const env: NodeJS.ProcessEnv = { ...agentEnv(), AC_AGENT_ID: agentId }
@@ -936,6 +939,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       )
     }
     await ensureInstallation(BigInt(installationId))
+    await vi.waitFor(() => expect(link!.client.isReady()).toBe(true), { timeout: 30_000, interval: 250 })
     const sent = await postGithubWebhook(link!.webhookUrl, {
       secret: webhookSecret,
       event: 'issues',

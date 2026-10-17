@@ -115,6 +115,43 @@ function key() {
   return sessionKey(m.platform, m.channel, m.thread!, AGENT, m.transportScope)
 }
 
+it('tracks background work by the runtime id while reporting the outward session id', async () => {
+  const h = await harness()
+  let release!: () => void
+  h.host.prompt.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = () => resolve({ stopReason: 'end_turn' })
+      })
+  )
+  await h.worker.dispatch(dispatch)
+  await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
+  const lease = h.worker.get(dispatch.leaseId)!
+  const session = await h.store.getSession(lease.sessionKey)
+  expect(lease.sessionId).toBe(session!.sessionId)
+  expect(lease.sessionId).not.toBe(session!.acpSessionId)
+  await (h.daemon as any).onSdkLifecycle(AGENT, session!.acpSessionId, {
+    type: 'system',
+    subtype: 'task_started',
+    task_id: 'kanban-background',
+    subagent_type: 'test'
+  })
+  await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
+  release()
+  await vi.waitFor(async () => expect(await h.worker.liveness(lease)).toBe('background'))
+  expect(await h.store.listKanbanReports(10)).toHaveLength(0)
+
+  await (h.daemon as any).onSdkLifecycle(AGENT, session!.acpSessionId, {
+    type: 'system',
+    subtype: 'background_tasks_changed',
+    tasks: []
+  })
+  await h.worker.tick()
+  expect(await h.store.listKanbanReports(10)).toEqual([
+    expect.objectContaining({ outcome: 'completed', sessionId: session!.sessionId })
+  ])
+})
+
 it('uses the exact GitHub hook coordinates and preserves untrusted-content guidance', () => {
   const card = buildKanbanMessage(dispatch, 'trace')
   const hook = buildHookMessage(
