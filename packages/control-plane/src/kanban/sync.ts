@@ -89,8 +89,7 @@ export interface KanbanSyncDeps {
 }
 
 const BATCH = 25
-/** How many deferred passes (or how long) an unattributed edit may stay deferred before it fails closed. */
-const MAX_DEFERRALS = 10
+/** How long an unattributed edit may stay deferred (from its first deferral) before it fails closed. */
 const DEFERRAL_TIMEOUT_MS = 10 * 60_000
 
 type EditVerdict = 'accept' | 'refuse' | 'ignore'
@@ -185,8 +184,9 @@ export class KanbanSync {
     events: readonly LabelEvent[]
     repo: KanbanRepoRef
     writers: Map<string, Promise<boolean>>
+    humanDoorbell: boolean
   }): Promise<EditVerdict | 'pending'> {
-    const { card, edits, issue, events, repo, writers } = opts
+    const { card, edits, issue, events, repo, writers, humanDoorbell } = opts
     const statusEvent = edits.status
     const newStatus = !!statusEvent && BigInt(statusEvent.id) > card.syncEventCursor
     if (statusEvent?.event === 'closed' || statusEvent?.event === 'reopened') {
@@ -197,6 +197,11 @@ export class KanbanSync {
     const attribution = attributeLabel(events, statusLabel(requested))
     if (attribution.kind !== 'add') return 'pending'
     if (BigInt(attribution.event.id) <= card.syncEventCursor) return 'ignore'
+    // A failed CP status write leaves the replaced label live; a tick must project the committed status, not
+    // adopt that old label. A genuine new human edit in that window defers so it is never acked unprocessed.
+    if (!humanDoorbell && card.labelWritePending) {
+      return isHumanActor(attribution.event) && !isAppActor(attribution.event, this.deps.appSlug) ? 'pending' : 'ignore'
+    }
     const verdict = await judgeLabelAdd(attribution, {
       repo,
       permissions: this.deps.permissions,
@@ -234,13 +239,13 @@ export class KanbanSync {
     if (!card || card.promotionPending) return false
     const repo = await this.deps.repoRef(boardId)
     if (!repo) return false
-    const issue = await this.deps.store.readCard(repo, issueNumber)
+    let issue = await this.deps.store.readCard(repo, issueNumber)
     if (!issue) return false
     // Visible history oldest-first; a read past the page bound throws and this pass fails closed.
-    const events = await this.deps.store.readLabelEvents(repo, issueNumber)
-    const edits = latestManagedEdits(events)
-    const cursor = BigInt(edits.status?.id ?? 0)
-    const agentCursor = BigInt(edits.assignee?.id ?? 0)
+    let events = await this.deps.store.readLabelEvents(repo, issueNumber)
+    let edits = latestManagedEdits(events)
+    let cursor = BigInt(edits.status?.id ?? 0)
+    let agentCursor = BigInt(edits.assignee?.id ?? 0)
 
     // Event lag: the visible events must reproduce the live managed labels, or nothing here can be attributed.
     if (!setsEqual(replayManagedLabels(events), liveManagedLabels(issue))) {
@@ -253,7 +258,7 @@ export class KanbanSync {
     const agentVerdict: EditVerdict = newAgent
       ? await this.agentVerdict(repo, parsed, edits.assignee!, events, writers)
       : 'ignore'
-    const statusVerdict = await this.statusVerdict({ card, edits, issue, events, repo, writers })
+    const statusVerdict = await this.statusVerdict({ card, edits, issue, events, repo, writers, humanDoorbell })
 
     // A fail-closed card is human-only: only a fresh, cleanly-attributed human writer edit moves it again.
     if (card.needsAttention && statusVerdict !== 'accept' && agentVerdict !== 'accept') return false
@@ -282,6 +287,8 @@ export class KanbanSync {
         })
         if (!result.ok) return false
         changed = result.changed
+        // A reassignment that revokes a lease already moved the card (running → ready); project that status
+        // instead of adopting the live status label it left behind.
         if (result.changed && result.revokedLease) acceptStatus = false
         if (result.revokedLease) {
           const planned = planReassign(
@@ -311,12 +318,21 @@ export class KanbanSync {
             })
           }
         }
-        // A reassignment changed the card under us: re-read everything before planning labels.
+        // The reassignment changed the card under us: re-read the card and GitHub snapshot so labels are not
+        // planned from a stale issue or event list a competing replica may have advanced.
         if (result.changed || result.revokedLease) {
-          return this.reconcile(boardId, issueNumber, humanDoorbell)
+          card = await this.deps.repo.get(boardId, issueNumber)
+          if (!card || card.promotionPending) return changed
+          issue = await this.deps.store.readCard(repo, issueNumber)
+          if (!issue) return changed
+          events = await this.deps.store.readLabelEvents(repo, issueNumber)
+          if (!setsEqual(replayManagedLabels(events), liveManagedLabels(issue))) {
+            return this.defer(card, repo, issue, boardId, issueNumber)
+          }
+          edits = latestManagedEdits(events)
+          cursor = BigInt(edits.status?.id ?? 0)
+          agentCursor = BigInt(edits.assignee?.id ?? 0)
         }
-        card = await this.deps.repo.get(boardId, issueNumber)
-        if (!card || card.promotionPending) return changed
       }
     }
 
@@ -371,10 +387,12 @@ export class KanbanSync {
   ): Promise<boolean> {
     const refreshed = await this.deps.repo.defer(card, this.now())
     if (!refreshed) return false
+    // The bound is the wall-clock time since the first deferral, not a deferral count: a doorbell (or a
+    // redelivery storm) can re-run a reconcile far more often than the 60s tick, and a count bound would then
+    // fail a still-lagging edit closed in seconds.
     const overdue =
-      refreshed.syncDeferralCount >= MAX_DEFERRALS ||
-      (refreshed.syncDeferredAt !== null &&
-        this.now().getTime() - refreshed.syncDeferredAt.getTime() >= DEFERRAL_TIMEOUT_MS)
+      refreshed.syncDeferredAt !== null &&
+      this.now().getTime() - refreshed.syncDeferredAt.getTime() >= DEFERRAL_TIMEOUT_MS
     if (!overdue) return false
     const plan = planStatusWrite(refreshed.status, issue)
     plan.comment = `AgentConnect Kanban: this card's status label could not be attributed within the retry window, so \`${statusLabel(refreshed.status)}\` was kept. Remove and re-add the label to retry.`

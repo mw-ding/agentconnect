@@ -46,8 +46,15 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
           { timeout: 30_000 }
         )
         .toBe('mw-ding')
-      await f.ring(issue.number)
-      expect((await f.cards.getCard(card.id))?.status).toBe('ready')
+      await expect
+        .poll(
+          async () => {
+            await f.ring(issue.number)
+            return (await f.cards.getCard(card.id))?.status
+          },
+          { timeout: 30_000, interval: 500 }
+        )
+        .toBe('ready')
       expect(await gh('GET', `/repos/${FULL}/issues/${issue.number}`)).toMatchObject({ state: 'open' })
       record(`human ${status} to ready and reopen`, [issue.number], started)
     },
@@ -77,11 +84,15 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
       .toBe(true)
     await f.ring(issue.number)
     expect(f.permission.logins).toContain('mw-ding')
-    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
-      status: 'todo',
-      stateRevision: card.stateRevision,
-      labelWritePending: false
-    })
+    await expect
+      .poll(
+        async () => {
+          await f.ring(issue.number)
+          return prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toMatchObject({ status: 'todo', stateRevision: card.stateRevision, labelWritePending: false })
     const live = await gh<{ labels: { name: string }[] }>('GET', `/repos/${FULL}/issues/${issue.number}`)
     expect(live.labels.map((l) => l.name).filter((l) => l.startsWith('ac/status:'))).toEqual(['ac/status:todo'])
     const comments = await gh<{ body: string }[]>('GET', `/repos/${FULL}/issues/${issue.number}/comments`)
@@ -100,9 +111,16 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
     await gh('POST', `/repos/${FULL}/issues/${issue.number}/labels`, {
       labels: ['ac/status:ready', 'ac/status:blocked']
     })
-    await f.ring(issue.number)
-    const live = await gh<{ labels: { name: string }[] }>('GET', `/repos/${FULL}/issues/${issue.number}`)
-    expect(live.labels.map((l) => l.name).filter((l) => l.startsWith('ac/status:'))).toEqual(['ac/status:todo'])
+    await expect
+      .poll(
+        async () => {
+          await f.ring(issue.number)
+          const live = await gh<{ labels: { name: string }[] }>('GET', `/repos/${FULL}/issues/${issue.number}`)
+          return live.labels.map((l) => l.name).filter((l) => l.startsWith('ac/status:'))
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toEqual(['ac/status:todo'])
     const comments = await gh<{ body: string }[]>('GET', `/repos/${FULL}/issues/${issue.number}/comments`)
     expect(comments.some((c) => c.body.includes('exactly one status label'))).toBe(true)
     record('multi-status drift repaired with comment', [issue.number], started)
@@ -138,16 +156,32 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
         }
       })
       await gh('PUT', `/repos/${FULL}/issues/${issue.number}/labels`, { labels: [`ac/status:${status}`] })
-      await f.ring(issue.number)
-      expect((await f.cards.getCard(card.id))?.status).toBe(status === 'ready' ? 'running' : 'blocked')
+      await expect
+        .poll(
+          async () => {
+            await f.ring(issue.number)
+            return (await f.cards.getCard(card.id))?.status
+          },
+          { timeout: 30_000, interval: 500 }
+        )
+        .toBe(status === 'ready' ? 'running' : 'blocked')
       const saved = await prisma.kanbanRun.findUniqueOrThrow({ where: { id: run.id } })
       if (status === 'blocked') {
         expect(saved.outcome).toBe('reclaimed')
         expect(f.revoked).toHaveLength(1)
       } else {
         expect(saved.endedAt).toBe(null)
-        const comments = await gh<{ body: string }[]>('GET', `/repos/${FULL}/issues/${issue.number}/comments`)
-        expect(comments.some((c) => c.body.includes('leased to a running agent'))).toBe(true)
+        // The refusal posts the explanation after the label write lands; a lagging events read can defer a ring.
+        await expect
+          .poll(
+            async () => {
+              await f.ring(issue.number)
+              const comments = await gh<{ body: string }[]>('GET', `/repos/${FULL}/issues/${issue.number}/comments`)
+              return comments.some((c) => c.body.includes('leased to a running agent'))
+            },
+            { timeout: 30_000, interval: 500 }
+          )
+          .toBe(true)
       }
       record(`leased ${status}: ${status === 'ready' ? 'refused with comment' : 'revoked'}`, [issue.number], started)
     },
@@ -194,13 +228,19 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
     await gh('PUT', `/repos/${FULL}/issues/${issue.number}/labels`, {
       labels: ['ac/status:running', 'ac/agent:lane1-next']
     })
-    await f.ring(issue.number)
-    await expect.poll(async () => (await f.cards.getCard(card.id))?.assigneeAgentId, { timeout: 30_000 }).toBe(NEXT)
-    expect(await f.cards.getCard(card.id)).toMatchObject({
-      assigneeAgentId: NEXT,
-      status: 'ready',
-      dispatchRevision: 2n
-    })
+    await expect
+      .poll(
+        async () => {
+          await f.ring(issue.number)
+          return f.cards.getCard(card.id)
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toMatchObject({
+        assigneeAgentId: NEXT,
+        status: 'ready',
+        dispatchRevision: 2n
+      })
     expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: run.id } })).toMatchObject({
       outcome: 'reclaimed',
       reasonCode: 'reassigned'

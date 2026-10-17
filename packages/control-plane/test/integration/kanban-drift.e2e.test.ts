@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { enabled, FULL, gh, ensureLabels, createIssue, closeIssues, record } from '../fixtures/kanban-live.js'
+import { enabled, FULL, gh, ensureLabels, createIssue, closeIssues, record, repoRef } from '../fixtures/kanban-live.js'
 import { liveSync } from '../fixtures/kanban-sync-live.js'
 import { prisma } from '../setup.db.js'
 
@@ -17,13 +17,29 @@ describe.skipIf(!enabled)('Kanban drift and graph E2E (live GitHub)', () => {
     const f = await liveSync()
     boards.push(f.board.id)
     const issue = await createIssue(issues, 'failed projection drift', ['ac/status:ready'])
+    let cursor = 0n
+    await expect
+      .poll(
+        async () => {
+          try {
+            cursor = BigInt((await f.store.managedEdits(repoRef, issue.number)).cursor)
+          } catch {
+            cursor = 0n
+          }
+          return cursor
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toBeGreaterThan(0n)
     const card = await prisma.kanbanCard.create({
       data: {
         boardId: f.board.id,
         issueId: BigInt(issue.id),
         issueNumber: issue.number,
         status: 'review',
-        labelWritePending: true
+        labelWritePending: true,
+        // The review transition consumed the ready add; seed its cursor so the tick projects, not re-adopts.
+        syncEventCursor: cursor
       }
     })
     await f.dispatcher.tick()
