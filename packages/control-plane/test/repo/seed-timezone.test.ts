@@ -19,8 +19,14 @@ describe('prisma/seed.ts client (database default America/Los_Angeles)', () => {
     await prisma.$executeRawUnsafe(`ALTER DATABASE "${dbName}" RESET timezone`)
   })
 
-  it('opens a UTC-pinned session', async () => {
-    const client = openSeedClient(url)
+  it.each(['ordinary', 'empty-host'])('opens a UTC-pinned session on a %s URL', async (shape) => {
+    await disconnectPrisma()
+    const parsed = new URL(url)
+    const connection =
+      shape === 'empty-host'
+        ? `${parsed.protocol}//${parsed.username}:${parsed.password}@${parsed.pathname}?host=${parsed.hostname}&port=${parsed.port || '5432'}`
+        : url
+    const client = openSeedClient(connection)
     const [tz] = await client.$queryRaw<{ tz: string }[]>`SELECT current_setting('TimeZone') AS tz`
     expect(tz!.tz).toBe('UTC')
   })

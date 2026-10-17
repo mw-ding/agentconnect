@@ -1,3 +1,6 @@
+import { execFile } from 'node:child_process'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AcpHost } from '../src/acp/acp-host.js'
 import type { SpawnRequest } from '../src/acp/spawn-driver.js'
@@ -122,7 +125,7 @@ describe('runtimeHomeEnvironment', () => {
     const env = runtimeHomeEnvironment('x', '/h', { LANG: 'C.UTF-8', HOME: '/evil' }, { ...ALLOWED, ...SECRETS })
     expect(env.LANG).toBe('C.UTF-8')
     expect(env.HOME).toBe('/h')
-    expect(env.XDG_CONFIG_HOME).toBe('/h/.config')
+    expect(env.XDG_CONFIG_HOME).toBe(join('/h', '.config'))
   })
 
   it('drops host state roots and npm config overrides that would defeat HOME isolation', () => {
@@ -138,7 +141,7 @@ describe('runtimeHomeEnvironment', () => {
         npm_config_cache: '/host/cache'
       }
     )
-    expect(env.XDG_DATA_HOME).toBe('/h/.local/share')
+    expect(env.XDG_DATA_HOME).toBe(join('/h', '.local', 'share'))
     expect(env).not.toHaveProperty('CODEX_HOME')
     expect(env).not.toHaveProperty('NPM_CONFIG_USERCONFIG')
     expect(env).not.toHaveProperty('npm_config_cache')
@@ -259,5 +262,31 @@ describe('AcpHost spawn environment', () => {
     expect(env).not.toHaveProperty('GH_TOKEN')
     expect(env).not.toHaveProperty('GITHUB_TOKEN')
     expect(env.KEEP).toBe('yes')
+  })
+})
+
+// Exercise the production HOME/env builder across an actual OS process boundary.
+describe('real child environment integration', () => {
+  it('never passes planted daemon credentials or the agent GitHub token to a real child', async () => {
+    const saved = { ...process.env }
+    try {
+      Object.assign(process.env, SECRETS, { GITHUB_TOKEN: 'planted-agent-token', GH_TOKEN: 'planted-gh-token' })
+      const env = runtimeHomeEnvironment('x', '/tmp/kanban-env-child', { AC_AGENT_ID: 'explicit-agent' })
+      const { stdout } = await promisify(execFile)(
+        process.execPath,
+        ['-e', 'console.log(JSON.stringify(process.env))'],
+        {
+          env,
+          timeout: 15_000
+        }
+      )
+      const actual = JSON.parse(stdout) as Record<string, string>
+      for (const name of [...Object.keys(SECRETS), 'GITHUB_TOKEN', 'GH_TOKEN']) expect(actual).not.toHaveProperty(name)
+      expect(actual.AC_AGENT_ID).toBe('explicit-agent')
+      expect(actual.HOME).toBe('/tmp/kanban-env-child')
+    } finally {
+      for (const name of Object.keys(process.env)) if (!(name in saved)) delete process.env[name]
+      Object.assign(process.env, saved)
+    }
   })
 })
