@@ -32,7 +32,7 @@ describe('kanban terminal tools', () => {
     })
     await expect(
       executeTool(ctx, 'kanbanComplete', { summary: 'x', leaseId: '44444444-4444-4444-8444-444444444444' }, d)
-    ).rejects.toThrow(/unexpected argument leaseId/)
+    ).rejects.toThrow(/unexpected argument: leaseId/)
     await expect(
       executeTool(ctx, 'kanbanRequestReview', { summary: 'x', dispatchRevision: '3', epoch: 4 }, d)
     ).rejects.toThrow(/unexpected argument/)

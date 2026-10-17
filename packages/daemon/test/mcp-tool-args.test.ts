@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
 import { SEND_MESSAGE_ACTION_SCHEMAS, TOOL_ARG_SCHEMAS } from '../src/mcp/ops.js'
-import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS, toolsForIntegrations } from '../src/mcp/tools.js'
+import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS, KANBAN_TOOLS, toolsForIntegrations } from '../src/mcp/tools.js'
 import { externalMemoryTools } from '../src/memory/tools.js'
 import { FOLLOW_UP_TOOL, PROPOSE_TOOL, RECORD_CHECK_TOOL } from '../src/mcp/ops/assistant-items.js'
 import { ASSISTANT_REMINDER_TOOLS } from '../src/mcp/ops/assistant-reminders.js'
@@ -11,12 +11,7 @@ import { allPortPlatforms, sessionToolsFor } from '../src/platforms/read-ports.j
 import type { ToolDescriptor } from '../src/tool-schema/descriptor.js'
 import type { Integration } from '../src/agents/agent-schema.js'
 
-/**
- * The advertised JSON Schema and the zod validator are two views of ONE tool contract: the
- * descriptor carries the model-facing prose and the narrowed platform enums, the zod schema
- * is what the dispatch boundary actually enforces. Nothing derives one from the other, so
- * this is what keeps them from drifting — a field added to only one side fails here.
- */
+// Keep advertised JSON Schemas and dispatch validators aligned across every tool surface.
 const slackInt: Integration = {
   id: 'int-1',
   platform: 'slack',
@@ -75,6 +70,7 @@ const advertised: ToolDescriptor[] = [
   ...externalMemoryTools(ALL_CAPABILITIES),
   ...GITHUB_REVIEW_TOOLS,
   ...CODE_HOST_EFFECT_TOOLS,
+  ...KANBAN_TOOLS,
   FOLLOW_UP_TOOL,
   FIRST_LOOK_TOOL,
   RECORD_CHECK_TOOL,
