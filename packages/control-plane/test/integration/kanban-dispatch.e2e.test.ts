@@ -55,10 +55,10 @@ function githubAppFromEnv(): GithubAppConfig | undefined {
   })
 }
 
-function agentEnv(): NodeJS.ProcessEnv {
+function agentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return stripLeakedAgentEnv({
-    ...process.env,
-    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --conditions=development`.trim()
+    ...base,
+    NODE_OPTIONS: `${base.NODE_OPTIONS ?? ''} --conditions=development`.trim()
   })
 }
 
@@ -411,6 +411,16 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         if (selected) {
           const adapterEnv = { ...agentEnv(), PATH: `${join(root!, 'run', 'bin')}:${process.env.PATH}` }
           expect(Object.keys(adapterEnv).filter(isLeakedAgentEnvKey)).toEqual([])
+          // Planted sentinels prove the allowlist itself strips, independent of the live process env.
+          const planted = agentEnv({
+            ...process.env,
+            DATABASE_URL: 'sentinel',
+            PGPASSWORD: 'sentinel',
+            AWS_SECRET_ACCESS_KEY: 'sentinel',
+            GITHUB_APP_PRIVATE_KEY_B64: 'sentinel',
+            FOO_PASSWORD: 'sentinel'
+          })
+          expect(Object.values(planted)).not.toContain('sentinel')
           const runtime = new AcpHost(
             { command: 'npx', args: ['-y', selected.adapter], env: [] },
             {

@@ -12,6 +12,7 @@ import {
 import { isAbsolute, join, resolve } from 'node:path'
 import { SandboxManager, SandboxRuntimeConfigSchema } from '@anthropic-ai/sandbox-runtime'
 import { SANDBOX_TEMP_DIR_ENV } from './sandbox-temp.js'
+import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
@@ -107,7 +108,7 @@ function trackedLegacyNames(cwd: string): Set<string> {
   try {
     const out = execFileSync('git', ['-C', cwd, 'ls-files', '-z', '--', ...LEGACY_MOUNT_POINT_NAMES], {
       // Read-only and hook-free, but never the host's or the checkout's ambient config routing.
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+      env: { ...agentBaseEnvironment(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
       stdio: ['ignore', 'pipe', 'ignore'],
       encoding: 'utf8'
     })

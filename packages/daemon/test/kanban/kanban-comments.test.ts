@@ -38,13 +38,18 @@ function memoryStore(): KanbanCommentStore & { rows: Map<string, Row> } {
     rows,
     dueKanbanComments: async (now, limit) =>
       [...rows.values()].filter((row) => !row.failed && row.nextAt <= now).slice(0, limit),
-    markKanbanCommentAttempt: async (leaseId, nextAt, at) => {
+    markKanbanCommentAttempt: async (leaseId, nextAt, githubAt) => {
       const row = rows.get(leaseId)!
+      const { attemptedAt: _first, ...rest } = row
       rows.set(leaseId, {
-        ...row,
+        ...rest,
         attempts: row.attempts + 1,
         attempted: true,
-        attemptedAt: row.attemptedAt ?? at,
+        ...(!row.attempted && githubAt !== null
+          ? { attemptedAt: githubAt }
+          : row.attemptedAt !== undefined
+            ? { attemptedAt: row.attemptedAt }
+            : {}),
         nextAt
       })
     },
@@ -79,7 +84,7 @@ function seed(store: { rows: Map<string, Row> }, patch: Partial<Row> = {}): void
 }
 
 /** A GitHub issue-comments endpoint as it really behaves: oldest first, sort/direction ignored, since honoured. */
-function fakeGithub(now: () => number) {
+function fakeGithub(now: () => number, opts: { sendDate?: boolean } = {}) {
   const comments: Array<{ id: number; body: string; updatedAt: number }> = []
   const lists: URL[] = []
   let failPosts = 0
@@ -95,13 +100,14 @@ function fakeGithub(now: () => number) {
       }
       return new Response(JSON.stringify({ id: comments.length }), { status: 201 })
     }
-    lists.push(url)
+    if (url.searchParams.get('per_page') !== '1') lists.push(url)
     const since = url.searchParams.get('since')
     const perPage = Number(url.searchParams.get('per_page') ?? 30)
     const page = Number(url.searchParams.get('page') ?? 1)
     const matching = comments.filter((comment) => !since || comment.updatedAt >= Date.parse(since))
     const slice = matching.slice((page - 1) * perPage, page * perPage)
     const headers = new Headers()
+    if (opts.sendDate !== false) headers.set('date', new Date(now()).toUTCString())
     if (page * perPage < matching.length) {
       const next = new URL(url)
       next.searchParams.set('page', String(page + 1))
@@ -146,9 +152,10 @@ describe('KanbanCommentPublisher', () => {
     })
     await publisher.drain()
     await publisher.drain()
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.test/repos/acme/web/issues/42/comments' })
-    const posted = JSON.parse(calls[0]!.body!) as { body: string }
+    // One GET reads GitHub's clock before the single POST.
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'POST'])
+    expect(calls[1]).toMatchObject({ method: 'POST', url: 'https://api.test/repos/acme/web/issues/42/comments' })
+    const posted = JSON.parse(calls[1]!.body!) as { body: string }
     expect(posted.body).toContain('shipped the fix')
     expect(posted.body).toContain('needed a migration')
     expect(posted.body).toContain(kanbanLeaseMarker(report.leaseId))
@@ -261,6 +268,199 @@ describe('KanbanCommentPublisher', () => {
     expect(listed.searchParams.get('per_page')).toBe('100')
     expect(listed.searchParams.has('sort')).toBe(false)
     expect(listed.searchParams.has('direction')).toBe(false)
+  })
+
+  it.each([60 * 60_000, -60 * 60_000])(
+    'does not repost when the local clock is %i ms off GitHub and the POST response is lost',
+    async (skew) => {
+      const githubT0 = Date.parse('2026-10-16T10:00:00Z')
+      let githubNow = githubT0
+      const github = fakeGithub(() => githubNow)
+      const store = memoryStore()
+      seed(store)
+      const publisher = new KanbanCommentPublisher({
+        clock: { now: () => githubNow + skew },
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        store,
+        token: async () => 'ghs_test',
+        fetchImpl: github.fetchImpl,
+        baseUrl: 'https://api.test'
+      })
+      github.failNextPost()
+      await publisher.drain()
+      expect(github.comments).toHaveLength(1)
+      // The bound is GitHub's clock, not the skewed local one.
+      expect(store.rows.get(report.leaseId)).toMatchObject({ attempted: true, attemptedAt: githubT0 })
+      githubNow += 5_000
+      const row = store.rows.get(report.leaseId)!
+      const retry = new KanbanCommentPublisher({
+        clock: { now: () => row.nextAt },
+        log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        store,
+        token: async () => 'ghs_test',
+        fetchImpl: github.fetchImpl,
+        baseUrl: 'https://api.test'
+      })
+      await retry.drain()
+      expect(github.comments).toHaveLength(1)
+      expect(store.rows.size).toBe(0)
+    }
+  )
+
+  it('scans without a since bound when GitHub gave no readable clock, and still does not repost', async () => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    const github = fakeGithub(() => t0, { sendDate: false })
+    const store = memoryStore()
+    seed(store)
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => t0 + 60 * 60_000 },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: github.fetchImpl,
+      baseUrl: 'https://api.test'
+    })
+    github.failNextPost()
+    await publisher.drain()
+    expect(store.rows.get(report.leaseId)?.attemptedAt).toBeUndefined()
+    store.rows.get(report.leaseId)!.nextAt = 0
+    await publisher.drain()
+    expect(github.comments).toHaveLength(1)
+    expect(store.rows.size).toBe(0)
+    expect(github.lists[0]!.searchParams.has('since')).toBe(false)
+  })
+
+  const publisherFor = (
+    store: ReturnType<typeof memoryStore>,
+    fetchImpl: typeof fetch,
+    now: () => number,
+    extra: Partial<ConstructorParameters<typeof KanbanCommentPublisher>[0]> = {}
+  ) =>
+    new KanbanCommentPublisher({
+      clock: { now },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl,
+      baseUrl: 'https://api.test',
+      ...extra
+    })
+
+  it.each([
+    ['a garbled Date header', 'not a date'],
+    ['an empty Date header', '']
+  ])('records no bound for %s, and the lookup that follows scans from the start', async (_label, date) => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    const github = fakeGithub(() => t0)
+    const garbled = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const res = await github.fetchImpl(input, init)
+      if ((init?.method ?? 'GET') !== 'GET') return res
+      const headers = new Headers(res.headers)
+      headers.set('date', date)
+      return new Response(await res.text(), { status: res.status, headers })
+    })
+    const store = memoryStore()
+    seed(store)
+    const publisher = publisherFor(store, garbled as typeof fetch, () => t0)
+    github.failNextPost()
+    await publisher.drain()
+    expect(store.rows.get(report.leaseId)?.attemptedAt).toBeUndefined()
+    store.rows.get(report.leaseId)!.nextAt = 0
+    await publisher.drain()
+    expect(github.comments).toHaveLength(1)
+    expect(github.lists[0]!.searchParams.has('since')).toBe(false)
+  })
+
+  it.each([
+    ['a non-2xx clock read', () => new Response('nope', { status: 500, headers: { date: new Date(0).toUTCString() } })],
+    [
+      'a clock read that throws',
+      () => {
+        throw new Error('socket hang up')
+      }
+    ]
+  ])('posts anyway with no bound after %s', async (_label, onClockRead) => {
+    const store = memoryStore()
+    seed(store)
+    const posts: string[] = []
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return onClockRead()
+      posts.push(String(url))
+      return new Response(JSON.stringify({ id: 1 }), { status: 201 })
+    })
+    await publisherFor(store, fetchImpl as typeof fetch, () => 1_000).drain()
+    expect(posts).toHaveLength(1)
+    expect(store.rows.size).toBe(0)
+  })
+
+  it('stops waiting on a clock read that never returns, then posts with no bound', async () => {
+    const store = memoryStore()
+    seed(store)
+    const posts: string[] = []
+    const fetchImpl = vi.fn(
+      (url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          if ((init?.method ?? 'GET') !== 'GET') {
+            posts.push(String(url))
+            resolve(new Response(JSON.stringify({ id: 1 }), { status: 201 }))
+            return
+          }
+          init?.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true })
+        })
+    )
+    await publisherFor(store, fetchImpl as typeof fetch, () => 1_000, { serverTimeTimeoutMs: 30 }).drain()
+    expect(fetchImpl.mock.calls[0]?.[1]).toMatchObject({ signal: expect.any(AbortSignal) })
+    expect(posts).toHaveLength(1)
+    expect(store.rows.size).toBe(0)
+  })
+
+  it('keeps the first attempt bound on a retry, reads the clock only once, and posts again when the marker is absent', async () => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    let githubNow = t0
+    const github = fakeGithub(() => githubNow)
+    const store = memoryStore()
+    seed(store)
+    const publisher = publisherFor(store, github.fetchImpl, () => githubNow + 3_600_000)
+    // A 502 before the comment is stored would leave no marker: model it by dropping the comment again.
+    github.failNextPost()
+    await publisher.drain()
+    expect(store.rows.get(report.leaseId)).toMatchObject({ attemptedAt: t0 })
+    github.comments.length = 0
+    githubNow = t0 + 120_000
+    const row = store.rows.get(report.leaseId)!
+    await publisherFor(store, github.fetchImpl, () => row.nextAt).drain()
+    expect(github.comments).toHaveLength(1)
+    expect(store.rows.size).toBe(0)
+    // One clock read (per_page=1) in total: the retry reused the stored bound.
+    const clockReads = (github.fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([url]) => String(url).includes('per_page=1&') || String(url).endsWith('per_page=1')
+    )
+    expect(clockReads).toHaveLength(1)
+  })
+
+  it('does not repost after five page-bound lookups; it parks the row for an operator', async () => {
+    const t0 = Date.parse('2026-10-16T10:00:00Z')
+    const github = fakeGithub(() => t0)
+    github.seedOld(600, t0)
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1, attemptedAt: t0, recordedAt: t0 })
+    let now = t0
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => now },
+      log,
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: github.fetchImpl,
+      baseUrl: 'https://api.test'
+    })
+    for (let i = 0; i < 5; i++) {
+      await publisher.drain()
+      now = store.rows.get(report.leaseId)!.nextAt
+    }
+    expect(store.rows.get(report.leaseId)).toMatchObject({ failed: true })
+    expect(log.error).toHaveBeenCalledOnce()
+    expect(github.comments).toHaveLength(600)
   })
 
   it('defers instead of posting when more than five pages changed since the attempt', async () => {

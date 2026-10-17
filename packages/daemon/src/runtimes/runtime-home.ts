@@ -21,6 +21,7 @@ import { extractOmpCredentials } from './omp-credentials.js'
 import { MAX_SEED_FILE_BYTES } from './runtime-seeded-credentials.js'
 import { withDescentSync } from '../shim/safe-descent.js'
 import { readRegularFileSync, RegularFileError } from '../fs/regular-file.js'
+import { AMBIENT_STATE_ENV, agentBaseEnvironment } from './agent-env.js'
 
 const LEGACY_RUNTIME_STATE: Record<string, string[]> = {
   'claude-acp': ['.claude'],
@@ -319,61 +320,10 @@ export function prepareRuntimeHome(
   return home
 }
 
-const AMBIENT_STATE_ENV = new Set([
-  'HOME',
-  'USERPROFILE',
-  'XDG_CONFIG_HOME',
-  'XDG_CACHE_HOME',
-  'XDG_DATA_HOME',
-  'XDG_STATE_HOME',
-  'MUSE_PROJECTS_HOME',
-  'MUSE_SESSIONS',
-  'MUSE_AUTH_PATH',
-  'CARGO_HOME',
-  'RUSTUP_HOME',
-  'CLAUDE_CONFIG_DIR',
-  'CODEX_HOME',
-  'COPILOT_HOME',
-  'GEMINI_HOME',
-  'CURSOR_CONFIG_DIR',
-  'HERMES_HOME',
-  'INTERPRETER_HOME',
-  'KIRO_HOME',
-  'ZEROCLAW_CONFIG_DIR',
-  'ZEROCLAW_DATA_DIR',
-  'AMP_SETTINGS_FILE',
-  'PI_CODING_AGENT_DIR',
-  'GROK_HOME',
-  'GROK_AUTH_PATH',
-  'QWEN_HOME',
-  'QWEN_RUNTIME_DIR',
-  'CLINE_DIR',
-  'CLINE_DATA_DIR',
-  'CLINE_PROVIDER_SETTINGS_PATH',
-  'KIMI_CODE_HOME',
-  'KIMI_SHARE_DIR',
-  // Qoder (a Gemini-CLI fork) resolves its config + agents dirs from these; drop
-  // the host values so the child falls back to the private HOME. Covers both the
-  // international and CN brands plus the shared Gemini fallback.
-  'QODER_CONFIG_DIR',
-  'QODER_CLI_HOME',
-  'QODERCN_CONFIG_DIR',
-  'QODERCN_CLI_HOME',
-  'GEMINI_CLI_HOME',
-  // DeepSeek Harness state root; $DSH_PATH (the harness install location) is not
-  // user state and stays inherited.
-  'DSH_HOME',
-  // OpenClaw state/config roots. The gateway connection overrides
-  // ($OPENCLAW_GATEWAY_URL/_TOKEN/_PASSWORD) are credentials, not state — inherited.
-  'OPENCLAW_HOME',
-  'OPENCLAW_STATE_DIR',
-  'OPENCLAW_CONFIG_PATH'
-])
-
 function inheritedEnvironment(source: NodeJS.ProcessEnv): Record<string, string> {
   const out: Record<string, string> = {}
-  for (const [name, value] of Object.entries(source)) {
-    if (value === undefined || AMBIENT_STATE_ENV.has(name)) continue
+  for (const [name, value] of Object.entries(agentBaseEnvironment(source))) {
+    if (AMBIENT_STATE_ENV.has(name)) continue
     // npm's ambient cache/userconfig overrides defeat HOME isolation. Explicit
     // runtime/agent env is merged later and may intentionally add them back.
     if (name.startsWith('NPM_CONFIG_') || name.startsWith('npm_config_')) continue

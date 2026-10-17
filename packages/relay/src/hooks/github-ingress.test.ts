@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHmac } from 'node:crypto'
+import { once } from 'node:events'
+import { request } from 'node:http'
+import type { AddressInfo, Socket } from 'node:net'
 import { FakeClock } from '@agentconnect.md/connection'
 import {
   CODE_HOST_SUBJECT_MAX_BYTES,
@@ -253,12 +256,16 @@ interface Harness {
   rerequestRequests: RcGithubRerequest[]
   feedback: RcPullRequestFeedback[]
   feedbackError: boolean
+  /** Holds the CP feedback write open until it resolves. */
+  feedbackGate?: () => Promise<void>
   rerequestResult: RcGithubRerequestResult | (() => Promise<RcGithubRerequestResult>)
   authzResult: boolean | ((request: RcGithubCommentAuthz) => boolean | Promise<boolean>)
   ack: RdAck | (() => Promise<RdAck>)
   /** The routing host's answer to a host copy; the default selects every candidate as Otherwise. */
   routeAck: (msg: RdMsgHook) => RdAck | Promise<RdAck>
   offline: boolean
+  /** The CP link is down: the doorbell emits report a drop. */
+  cpDown: boolean
   cleanupSupported: boolean
   noticeSupported: boolean
   routingSupported: boolean
@@ -293,6 +300,7 @@ function makeHarness(authzCapacity = 20): Harness {
     rerequestResult: { allowed: false },
     ack: { msgId: 'x', accepted: true },
     offline: false,
+    cpDown: false,
     noticeSupported: true,
     routingSupported: true,
     routeAck: (msg) => ({
@@ -332,13 +340,20 @@ function makeHarness(authzCapacity = 20): Harness {
       }
     }),
     report: (r) => h.reports.push(r),
-    doorbell: (p) => h.doorbells.push(p),
+    doorbell: (p) => {
+      h.doorbells.push(p)
+      return !h.cpDown
+    },
     reportPullRequestFeedback: async (signal) => {
       if (h.feedbackError) throw new Error('CP unavailable')
+      await h.feedbackGate?.()
       h.feedback.push(signal)
       return true
     },
-    graphDoorbell: (p) => h.graphDoorbells.push(p),
+    graphDoorbell: (p) => {
+      h.graphDoorbells.push(p)
+      return !h.cpDown
+    },
     authorizeComment: async (request) => {
       h.authzRequests.push(request)
       return typeof h.authzResult === 'function' ? h.authzResult(request) : h.authzResult!
@@ -519,6 +534,60 @@ describe('github ingress', () => {
       expect(res.statusCode).toBe(503)
     })
 
+    it('processes a redelivery after GitHub hung up during a slow feedback write', async () => {
+      h.table.upsert(rule({}, { events: ['pull_request_review_comment:*'] }))
+      const payload = pullPayload({
+        action: 'created',
+        comment: { id: 555, body: 'please change this', user: { login: 'alice' }, author_association: 'MEMBER' }
+      })
+      const options = { headers: { 'x-github-delivery': 'feedback-abort' } }
+      let release!: () => void
+      let started!: () => void
+      const writing = new Promise<void>((resolve) => (started = resolve))
+      h.feedbackGate = () => {
+        started()
+        return new Promise<void>((resolve) => (release = resolve))
+      }
+      await h.app.listen({ port: 0, host: '127.0.0.1' })
+      const accepted = once(h.app.server, 'connection') as Promise<[Socket]>
+      const body = JSON.stringify(payload)
+      const req = request({
+        host: '127.0.0.1',
+        port: (h.app.server.address() as AddressInfo).port,
+        method: 'POST',
+        path: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(body),
+          'x-github-event': 'pull_request_review_comment',
+          'x-github-delivery': 'feedback-abort'
+        }
+      })
+      req.on('error', () => {})
+      req.end(body)
+      const [socket] = await accepted
+      await writing
+      req.destroy()
+      if (!socket.destroyed) await once(socket, 'close')
+      release()
+      await flush()
+      h.feedbackGate = undefined
+
+      const retry = await post('pull_request_review_comment', payload, options)
+      expect(retry.statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+
+      // Past the committed TTL the same GUID is new again.
+      h.clock.advance(11 * 60 * 1000)
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(2)
+    })
+
     it('persists feedback when the same delivery retries after a 503', async () => {
       const payload = pullPayload({ action: 'created', comment: { body: 'please change this' } })
       const options = { headers: { 'x-github-delivery': 'feedback-retry' } }
@@ -634,6 +703,121 @@ describe('github ingress', () => {
     })
   })
 
+  describe('delivery dedupe vs the CP same-GUID redelivery (Vera #74)', () => {
+    const labeled = () => issuesPayload({ action: 'labeled', label: { name: 'ac/status:ready' }, issue: { id: 5042 } })
+    const redeliver = async (guid: string) => {
+      await post('issues', labeled(), { headers: { 'x-github-delivery': guid } })
+      await flush()
+    }
+
+    it.each([
+      ['rejected:draining', { msgId: 'x', accepted: false, reason: 'draining' }],
+      ['rejected:not_holder', { msgId: 'x', accepted: false, reason: 'not_holder' }]
+    ] as const)('forgets a delivery rejected with %s, then commits the redelivery that lands', async (reason, ack) => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      h.ack = { ...ack }
+      await redeliver('gh-retryable')
+      expect(h.reports).toEqual([expect.objectContaining({ status: 'failed', reason })])
+
+      h.ack = { msgId: 'x', accepted: true }
+      await redeliver('gh-retryable')
+      expect(h.sent).toHaveLength(2)
+      expect(h.reports.at(-1)).toMatchObject({ status: 'accepted' })
+
+      // The redelivery that worked is committed: a further copy is a duplicate.
+      await redeliver('gh-retryable')
+      expect(h.sent).toHaveLength(2)
+    })
+
+    it('forgets a delivery whose daemon was offline, then runs the redelivery', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      h.offline = true
+      await post('issues', labeled(), { headers: { 'x-github-delivery': 'gh-offline' } })
+      h.clock.advance(12_000)
+      await flush()
+      expect(h.reports).toEqual([expect.objectContaining({ status: 'failed', reason: 'daemon_offline' })])
+
+      h.offline = false
+      await redeliver('gh-offline')
+      expect(h.sent).toHaveLength(1)
+      expect(h.reports.at(-1)).toMatchObject({ status: 'accepted' })
+      await redeliver('gh-offline')
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it('forgets a delivery held for a maintainer review request, so the same GUID reports again', async () => {
+      h.table.upsert(rule({}, { events: ['pull_request:*'] }))
+      h.authzResult = false
+      const headers = { 'x-github-delivery': 'gh-review-request' }
+      await post('pull_request', pullPayload(), { headers })
+      await flush()
+      await post('pull_request', pullPayload(), { headers })
+      await flush()
+      expect(h.reports.map((r) => r.reason)).toEqual([
+        HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
+        HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED
+      ])
+    })
+
+    it.each([
+      ['rejected:paused', { msgId: 'x', accepted: false, reason: 'paused' }],
+      ['rejected:agent_busy', { msgId: 'x', accepted: false, reason: 'agent_busy' }]
+    ] as const)('keeps deduping a delivery that failed with the non-retryable %s', async (reason, ack) => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      h.ack = { ...ack }
+      await redeliver('gh-final')
+      await redeliver('gh-final')
+      expect(h.reports.map((r) => r.reason)).toEqual([reason])
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it('keeps deduping a delivery whose dispatch timed out', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      h.ack = () => Promise.reject(new Error('timeout'))
+      await redeliver('gh-timeout')
+      await redeliver('gh-timeout')
+      expect(h.reports.map((r) => r.reason)).toEqual(['dispatch_timeout'])
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it('processes a committed delivery again once the dedupe TTL has expired', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      await redeliver('gh-ttl')
+      h.clock.advance(10 * 60 * 1000 - 1)
+      await redeliver('gh-ttl')
+      expect(h.sent).toHaveLength(1)
+
+      h.clock.advance(2)
+      await redeliver('gh-ttl')
+      expect(h.sent).toHaveLength(2)
+    })
+
+    it('answers a copy that arrives while the first is still in flight with a retryable 503', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => (release = resolve))
+      let held = 0
+      h.app.addHook('onSend', async () => {
+        if (held++ === 0) await gate
+      })
+      const headers = { 'x-github-delivery': 'gh-in-flight' }
+      const first = post('issues', labeled(), { headers })
+      await flush()
+      const second = await post('issues', labeled(), { headers })
+      expect(second.statusCode).toBe(503)
+      expect(second.headers['retry-after']).toBe('1')
+      expect(h.sent).toHaveLength(1)
+
+      release()
+      expect((await first).statusCode).toBe(202)
+      await flush()
+      // Once the first copy committed, a later copy is a plain duplicate again.
+      expect((await post('issues', labeled(), { headers })).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+    })
+  })
+
   describe('Kanban card-status doorbell (issue #2)', () => {
     const labeled = (name: string, overrides: Record<string, unknown> = {}) =>
       issuesPayload({ action: 'labeled', label: { name }, issue: { id: 5042 }, ...overrides })
@@ -669,6 +853,55 @@ describe('github ingress', () => {
       await flush()
       expect(h.graphDoorbells).toHaveLength(2)
       expect(h.graphDoorbells[1]).toEqual(h.graphDoorbells[0])
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it("leaves a delivery unmarked when the CP doorbell is dropped, so GitHub's redelivery is processed", async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-cp-down' }
+      h.cpDown = true
+      expect((await post('issues', labeled('ac/status:ready'), { headers })).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+
+      h.cpDown = false
+      expect((await post('issues', labeled('ac/status:ready'), { headers })).statusCode).toBe(202)
+      await flush()
+      // Processed afresh (not replayed as a duplicate): the hook is dispatched again and the doorbell rings once more.
+      expect(h.sent).toHaveLength(2)
+      expect(h.graphDoorbells).toHaveLength(2)
+
+      // Now forwarded successfully, a third copy is a duplicate.
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.sent).toHaveLength(2)
+    })
+
+    it('forgets a delivery whose hook failed before daemon admission, so the CP redelivery of the same GUID runs', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-draining' }
+      h.ack = { msgId: 'x', accepted: false, reason: 'draining' }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.reports).toEqual([expect.objectContaining({ status: 'failed', reason: 'rejected:draining' })])
+      expect(h.sent).toHaveLength(1)
+
+      // The CP's redelivery keeps the same X-GitHub-Delivery and lands inside the TTL.
+      h.ack = { msgId: 'x', accepted: true }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.sent).toHaveLength(2)
+      expect(h.reports.at(-1)).toMatchObject({ status: 'accepted' })
+    })
+
+    it('keeps deduping a delivery whose hook failure is not retryable', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-rejected' }
+      h.ack = { msgId: 'x', accepted: false, reason: 'agent_busy' }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
       expect(h.sent).toHaveLength(1)
     })
 

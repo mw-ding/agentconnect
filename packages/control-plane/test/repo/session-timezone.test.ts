@@ -43,11 +43,20 @@ describe('Postgres session timezone (database default America/Los_Angeles)', () 
     }
   })
 
-  it('createPrisma pins UTC, so now() and bound Dates stay correct', async () => {
-    const client = createPrisma(url)
-    const [tz] = await client.$queryRaw<{ tz: string }[]>`SELECT current_setting('TimeZone') AS tz`
-    expect(tz!.tz).toBe('UTC')
-    expect(await clockSkewMs(client)).toBeLessThan(60_000)
-    expect(await boundDateMatches(client, new Date('2026-10-16T18:54:49.691Z'))).toBe(true)
-  })
+  it.each(['ordinary', 'empty-host'])(
+    'createPrisma pins UTC on a %s URL, so now() and bound Dates stay correct',
+    async (shape) => {
+      await disconnectPrisma()
+      const parsed = new URL(url)
+      const connection =
+        shape === 'empty-host'
+          ? `${parsed.protocol}//${parsed.username}:${parsed.password}@${parsed.pathname}?host=${parsed.hostname}&port=${parsed.port || '5432'}`
+          : url
+      const client = createPrisma(connection)
+      const [tz] = await client.$queryRaw<{ tz: string }[]>`SELECT current_setting('TimeZone') AS tz`
+      expect(tz!.tz).toBe('UTC')
+      expect(await clockSkewMs(client)).toBeLessThan(60_000)
+      expect(await boundDateMatches(client, new Date('2026-10-16T18:54:49.691Z'))).toBe(true)
+    }
+  )
 })

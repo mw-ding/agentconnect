@@ -1,18 +1,14 @@
-/**
- * Vitest global setup for the `store-postgres` project.
- *
- * Boots ONE `postgres:16-alpine` via Testcontainers and hands each Vitest pool its own
- * database, so the store suites run the real `LocalStore` SQL through the real
- * `PostgresAsyncDatabase` pool instead of SQLite. Per-test isolation is a schema-wide
- * sweep in `setup.ts`; per-worker isolation is the separate database created here.
- */
+// Provision one disposable database per store worker, using local Postgres when TEST_DATABASE_URL is supplied.
+import pg from 'pg'
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql'
 import type { ProvidedContext } from 'vitest'
 import { storePostgresWorkerCount } from './workers.js'
 
 let container: StartedPostgreSqlContainer | undefined
+let localAdmin: pg.Client | undefined
+const localDatabases: string[] = []
 
-/** Vitest 4 passes a `TestProject` but exports no `GlobalSetupContext`, so type what we use. */
+// Vitest supplies the project context.
 interface GlobalSetupContext {
   provide<K extends keyof ProvidedContext & string>(key: K, value: ProvidedContext[K]): void
 }
@@ -24,21 +20,33 @@ function databaseUrl(baseUrl: string, database: string): string {
 }
 
 export async function setup({ provide }: GlobalSetupContext): Promise<void> {
-  container = await new PostgreSqlContainer('postgres:16-alpine').start()
-  const base = container.getConnectionUri()
+  const local = process.env.TEST_DATABASE_URL
+  if (local) {
+    localAdmin = new pg.Client({ connectionString: databaseUrl(local, 'postgres') })
+    await localAdmin.connect()
+  } else {
+    container = await new PostgreSqlContainer('postgres:16-alpine').start()
+  }
+  const base = local ?? container!.getConnectionUri()
   const urls: string[] = []
   for (let poolId = 1; poolId <= storePostgresWorkerCount(); poolId += 1) {
-    const database = `store_worker_${poolId}`
-    const result = await container.exec([
+    const database = local ? `store_test_${process.pid}_${poolId}` : `store_worker_${poolId}`
+    if (localAdmin) {
+      await localAdmin.query(`CREATE DATABASE "${database}"`)
+      localDatabases.push(database)
+      urls.push(databaseUrl(base, database))
+      continue
+    }
+    const result = await container!.exec([
       'psql',
       '-v',
       'ON_ERROR_STOP=1',
       '-U',
-      container.getUsername(),
+      container!.getUsername(),
       '-d',
       'postgres',
       '-c',
-      `CREATE DATABASE "${database}" OWNER "${container.getUsername()}"`
+      `CREATE DATABASE "${database}" OWNER "${container!.getUsername()}"`
     ])
     if (result.exitCode !== 0) throw new Error(`failed to create ${database}: ${result.output}`)
     urls.push(databaseUrl(base, database))
@@ -47,7 +55,14 @@ export async function setup({ provide }: GlobalSetupContext): Promise<void> {
 }
 
 export async function teardown(): Promise<void> {
-  await container?.stop()
+  try {
+    for (const database of localDatabases.splice(0))
+      await localAdmin?.query(`DROP DATABASE IF EXISTS "${database}" WITH (FORCE)`)
+  } finally {
+    await localAdmin?.end()
+    localAdmin = undefined
+    await container?.stop()
+  }
 }
 
 declare module 'vitest' {

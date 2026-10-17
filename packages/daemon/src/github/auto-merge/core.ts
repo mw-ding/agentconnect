@@ -275,3 +275,6 @@ export async function tick(
 /** Default poll cadence. One pull request per armed box and a handful of boxes at a time, so a
  *  minute is well inside GitHub's budget while still merging promptly after the last check. */
 export const AUTO_MERGE_POLL_MS = 30_000
+
+/** Poll cadence override, so an operator can tighten it without a new image. */
+export const AUTO_MERGE_POLL_ENV = 'AC_AUTO_MERGE_POLL_MS'
