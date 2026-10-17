@@ -7850,6 +7850,77 @@ export interface KanbanModeAdminRepo {
   ): Promise<boolean>
 }
 
+/** A board's full CP configuration; body-free, and `repoId` is always the one GitHub resolved, never client input. */
+export interface KanbanBoardView {
+  id: string
+  orgId: OrgId
+  name: string
+  repoId: bigint
+  repoFullName: string
+  orchestratorAgentId: string | null
+  verifierAgentId: string | null
+  maxInProgress: number
+  maxInProgressPerAgent: number
+  staleLeaseSec: number
+  failureLimit: number
+  protocolRetryLimit: number
+  blockRecurrenceLimit: number
+  defaultMode: 'read' | 'write'
+  completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  enabled: boolean
+  configRevision: bigint
+  visibility: 'org' | 'restricted'
+  sharedWith: string[]
+  createdByUserId: string | null
+  lastModifiedByUserId: string | null
+  lastModifiedAt: Date
+  createdAt: Date
+}
+
+/** The owner-editable configuration; run mode is set only through KanbanModeAdminRepo. */
+export interface KanbanBoardConfigInput {
+  name?: string
+  repoId?: bigint
+  repoFullName?: string
+  orchestratorAgentId?: string | null
+  verifierAgentId?: string | null
+  maxInProgress?: number
+  maxInProgressPerAgent?: number
+  staleLeaseSec?: number
+  failureLimit?: number
+  protocolRetryLimit?: number
+  blockRecurrenceLimit?: number
+  completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+  enabled?: boolean
+  visibility?: 'org' | 'restricted'
+  sharedWith?: string[]
+}
+
+export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
+
+export type KanbanBoardWriteRefusal = 'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs'
+
+export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
+
+/** Board CRUD: callers pass the authenticated human's id, and the write rechecks owner membership in its own transaction. */
+export interface KanbanBoardAdminRepo {
+  listForOrg(orgId: string): Promise<KanbanBoardView[]>
+  getForOrg(orgId: string, boardId: string): Promise<KanbanBoardView | null>
+  createBoard(
+    orgId: string,
+    userId: string,
+    input: KanbanBoardCreateInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
+  updateBoard(
+    orgId: string,
+    boardId: string,
+    userId: string,
+    patch: KanbanBoardConfigInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
+  /** Refused while any card holds an open lease: disable the board and let its runs end first. */
+  deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>
+}
+
 export interface KanbanBoardRepo {
   /** Enabled boards watching one repository, across orgs (graph doorbell lookup). */
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>

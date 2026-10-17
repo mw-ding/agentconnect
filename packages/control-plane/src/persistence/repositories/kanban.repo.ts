@@ -6,8 +6,13 @@ import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
 import {
   KanbanCardUpsertError,
+  type KanbanBoardAdminRepo,
+  type KanbanBoardConfigInput,
+  type KanbanBoardCreateInput,
   type KanbanBoardRecord,
   type KanbanBoardRepo,
+  type KanbanBoardView,
+  type KanbanBoardWriteResult,
   type KanbanCardRecord,
   type KanbanCardRepo,
   type KanbanCardRow,
@@ -37,6 +42,34 @@ const CARD_ROW_SELECT = {
   createdAt: true
 } as const
 
+const BOARD_VIEW_SELECT = {
+  id: true,
+  orgId: true,
+  name: true,
+  repoId: true,
+  repoFullName: true,
+  orchestratorAgentId: true,
+  verifierAgentId: true,
+  maxInProgress: true,
+  maxInProgressPerAgent: true,
+  staleLeaseSec: true,
+  failureLimit: true,
+  protocolRetryLimit: true,
+  blockRecurrenceLimit: true,
+  defaultMode: true,
+  completionContract: true,
+  enabled: true,
+  configRevision: true,
+  visibility: true,
+  sharedWith: true,
+  createdByUserId: true,
+  lastModifiedByUserId: true,
+  lastModifiedAt: true,
+  createdAt: true
+} as const
+
+const isUniqueViolation = (err: unknown) => err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
+
 /** A concurrent delete between the conflicting insert and the re-read is retried this many times. */
 const UPSERT_ATTEMPTS = 3
 
@@ -55,8 +88,116 @@ export const PROMOTION_CLEARED = {
   attentionReason: null
 } as const
 
-export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo {
+export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, KanbanBoardAdminRepo {
   constructor(private readonly db: PrismaLike) {}
+
+  async listForOrg(orgId: string): Promise<KanbanBoardView[]> {
+    const rows = await this.db.kanbanBoard.findMany({
+      where: { orgId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: BOARD_VIEW_SELECT
+    })
+    return rows.map(toBoardView)
+  }
+
+  async getForOrg(orgId: string, boardId: string): Promise<KanbanBoardView | null> {
+    const row = await this.db.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
+    return row ? toBoardView(row) : null
+  }
+
+  async createBoard(
+    orgId: string,
+    userId: string,
+    input: KanbanBoardCreateInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
+    try {
+      return await withAmbientTx(this.db, async (tx) => {
+        if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
+        const config = await normalizeConfig(tx, orgId, input)
+        if (!config.ok) return config
+        if (await tx.kanbanBoard.findFirst({ where: { orgId, repoId: input.repoId }, select: { id: true } })) {
+          return { ok: false, reason: 'repo_taken' }
+        }
+        const row = await tx.kanbanBoard.create({
+          data: {
+            ...config.value,
+            name: input.name,
+            repoId: input.repoId,
+            repoFullName: input.repoFullName,
+            orgId,
+            createdByUserId: userId,
+            lastModifiedByUserId: userId
+          },
+          select: BOARD_VIEW_SELECT
+        })
+        await auditBoard(tx, orgId, userId, row.id, 'created', Object.keys(config.value), row.repoId)
+        return { ok: true, value: toBoardView(row) }
+      })
+    } catch (err) {
+      // Two owners racing to the same repository: the (orgId, repoId) unique decides.
+      if (isUniqueViolation(err)) return { ok: false, reason: 'repo_taken' }
+      throw err
+    }
+  }
+
+  async updateBoard(
+    orgId: string,
+    boardId: string,
+    userId: string,
+    patch: KanbanBoardConfigInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
+    try {
+      return await withAmbientTx(this.db, async (tx) => {
+        await tx.$queryRaw`
+          SELECT "id" FROM "kanban_board" WHERE "id" = ${boardId}::uuid AND "orgId" = ${orgId} FOR UPDATE
+        `
+        if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
+        const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
+        if (!current) return { ok: false, reason: 'not_found' }
+        // Restricting a board keeps its current audience unless the patch names a new one.
+        const config = await normalizeConfig(tx, orgId, {
+          ...patch,
+          visibility: patch.visibility ?? current.visibility,
+          sharedWith: patch.sharedWith ?? current.sharedWith
+        })
+        if (!config.ok) return config
+        const changed = Object.keys(config.value).filter(
+          (k) => !sameValue(current[k as keyof typeof current], config.value[k as keyof typeof config.value])
+        )
+        if (changed.length === 0) return { ok: true, value: toBoardView(current) }
+        const row = await tx.kanbanBoard.update({
+          where: { id: boardId },
+          data: {
+            ...config.value,
+            configRevision: { increment: 1 },
+            lastModifiedByUserId: userId,
+            lastModifiedAt: new Date()
+          },
+          select: BOARD_VIEW_SELECT
+        })
+        await auditBoard(tx, orgId, userId, boardId, 'updated', changed, row.repoId)
+        return { ok: true, value: toBoardView(row) }
+      })
+    } catch (err) {
+      if (isUniqueViolation(err)) return { ok: false, reason: 'repo_taken' }
+      throw err
+    }
+  }
+
+  async deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>> {
+    return withAmbientTx(this.db, async (tx) => {
+      // The board lock is the claim mutex, so no lease can be minted between this check and the delete.
+      const [board] = await tx.$queryRaw<Array<{ id: string; repoId: bigint }>>`
+        SELECT "id", "repoId" FROM "kanban_board" WHERE "id" = ${boardId}::uuid AND "orgId" = ${orgId} FOR UPDATE
+      `
+      if (!board || !(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
+      const open = await tx.kanbanRun.count({ where: { endedAt: null, card: { boardId } } })
+      if (open > 0) return { ok: false, reason: 'active_runs' }
+      await tx.kanbanBoard.delete({ where: { id: boardId } })
+      await auditBoard(tx, orgId, userId, boardId, 'deleted', [], board.repoId)
+      return { ok: true, value: null }
+    })
+  }
 
   // Only the human-authenticated owner route calls this, with the caller's user id; never expose it on worker RPCs.
   async setDefaultMode(orgId: string, boardId: string, userId: string, mode: 'read' | 'write'): Promise<boolean> {
@@ -450,4 +591,70 @@ function toCardRow(row: {
 }): KanbanCardRow {
   if (!isKanbanStatus(row.status)) throw new Error(`kanban card ${row.id} has unknown status ${row.status}`)
   return { ...row, status: row.status }
+}
+
+async function isOwner(tx: Prisma.TransactionClient, orgId: string, userId: string): Promise<boolean> {
+  const member = await tx.membership.findFirst({ where: { orgId, userId, role: 'owner' }, select: { userId: true } })
+  return member !== null
+}
+
+type BoardData = Omit<KanbanBoardConfigInput, 'visibility'> & { visibility?: 'org' | 'restricted' }
+
+/** Same-org agent references and a current-member audience, checked inside the write transaction. */
+async function normalizeConfig(
+  tx: Prisma.TransactionClient,
+  orgId: string,
+  input: KanbanBoardConfigInput
+): Promise<KanbanBoardWriteResult<BoardData>> {
+  const data: BoardData = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined) (data as Record<string, unknown>)[key] = value
+  }
+  const agentIds = [data.orchestratorAgentId, data.verifierAgentId].filter((id): id is string => !!id)
+  if (agentIds.length > 0) {
+    const found = await tx.agent.count({ where: { orgId, id: { in: [...new Set(agentIds)] } } })
+    if (found !== new Set(agentIds).size) return { ok: false, reason: 'agent_not_in_org' }
+  }
+  if (data.sharedWith !== undefined) {
+    const members = await tx.membership.findMany({
+      where: { orgId, userId: { in: data.sharedWith } },
+      select: { userId: true }
+    })
+    const current = new Set(members.map((m) => m.userId))
+    data.sharedWith = [...new Set(data.sharedWith)].filter((id) => current.has(id))
+  }
+  if (data.visibility === 'restricted' && (data.sharedWith ?? []).length === 0) {
+    return { ok: false, reason: 'empty_audience' }
+  }
+  return { ok: true, value: data }
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((v, i) => v === b[i])
+  return a === b
+}
+
+// Field names only: the audit row never carries the board's values beyond its repository id.
+async function auditBoard(
+  tx: Prisma.TransactionClient,
+  orgId: string,
+  userId: string,
+  boardId: string,
+  change: 'created' | 'updated' | 'deleted',
+  fields: string[],
+  repoId: bigint
+): Promise<void> {
+  await tx.auditEvent.create({
+    data: {
+      kind: 'kanban_board_change',
+      orgId,
+      actorUserId: userId,
+      message: `kanban board ${boardId} ${change}`,
+      details: { boardId, change, fields: [...fields].sort(), repoId: repoId.toString() }
+    }
+  })
+}
+
+function toBoardView(row: Omit<KanbanBoardView, 'orgId'> & { orgId: string }): KanbanBoardView {
+  return { ...row, orgId: OrgId(row.orgId) }
 }

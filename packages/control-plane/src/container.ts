@@ -2061,7 +2061,8 @@ export function buildContainer(
       audit: repos.audit,
       webchatMcpOperation: repos.webchatMcpOperation,
       oauth: repos.oauth,
-      kanbanMode: repos.kanbanBoard
+      kanbanMode: repos.kanbanBoard,
+      kanbanBoards: repos.kanbanBoard
     },
     registry,
     agentSpecs,
