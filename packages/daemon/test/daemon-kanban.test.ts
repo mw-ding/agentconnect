@@ -604,3 +604,68 @@ it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant
     await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
   }
 )
+
+describe('kanban/notify', () => {
+  const INTEGRATION = '55555555-5555-4555-8555-555555555555'
+  const notify = {
+    notifyId: '66666666-6666-4666-8666-666666666666',
+    boardId: dispatch.boardId,
+    cardId: dispatch.cardId,
+    repoFullName: 'acme/web',
+    issueNumber: 42,
+    from: 'running',
+    to: 'blocked',
+    blockKind: 'needs_input' as const,
+    mention: { slackUserId: 'U0REQUEST1' },
+    target: { platform: 'slack', channel: 'C0ANCHOR', integrationId: INTEGRATION }
+  }
+
+  async function notifyHarness(post = vi.fn(async () => undefined)) {
+    const h = await harness(false, ['read-only', 'agent'], [{ name: 'GH_TOKEN', value: 'sk-kanban-secret-value' }])
+    ;(h.daemon as any).agents.get(AGENT).integrations = [{ id: INTEGRATION }]
+    vi.spyOn(h.daemon as any, 'connForIntegration').mockReturnValue({ postMessage: post })
+    return { ...h, post }
+  }
+
+  it('posts the assembled metadata-only text with the mention and a link to the issue', async () => {
+    const h = await notifyHarness()
+    await expect((h.daemon as any).kanbanNotify(notify)).resolves.toEqual({ notifyId: notify.notifyId, ok: true })
+    expect(h.post).toHaveBeenCalledExactlyOnceWith(
+      'C0ANCHOR',
+      '<@U0REQUEST1> Kanban: acme/web#42 → blocked (needs input) <https://github.com/acme/web/issues/42>'
+    )
+  })
+
+  it('omits the mention when none resolved', async () => {
+    const h = await notifyHarness()
+    await (h.daemon as any).kanbanNotify({ ...notify, mention: undefined, to: 'review', blockKind: undefined })
+    expect(h.post).toHaveBeenCalledExactlyOnceWith(
+      'C0ANCHOR',
+      'Kanban: acme/web#42 → review <https://github.com/acme/web/issues/42>'
+    )
+  })
+
+  it('masks an agent secret in the assembled text before posting', async () => {
+    const h = await notifyHarness()
+    await (h.daemon as any).kanbanNotify({ ...notify, repoFullName: 'acme/sk-kanban-secret-value' })
+    const [, text] = h.post.mock.calls[0] as unknown as [string, string]
+    expect(text).not.toContain('sk-kanban-secret-value')
+    expect(text).toContain('Kanban: acme/')
+  })
+
+  it('dedupes a redelivered notifyId', async () => {
+    const h = await notifyHarness()
+    await (h.daemon as any).kanbanNotify(notify)
+    await expect((h.daemon as any).kanbanNotify(notify)).resolves.toEqual({ notifyId: notify.notifyId, ok: true })
+    expect(h.post).toHaveBeenCalledOnce()
+  })
+
+  it('refuses an integration this daemon does not hold and reports a failed post as data', async () => {
+    const h = await notifyHarness(vi.fn(async () => Promise.reject(new Error('slack down'))))
+    await expect(
+      (h.daemon as any).kanbanNotify({ ...notify, target: { ...notify.target, integrationId: dispatch.cardId } })
+    ).resolves.toMatchObject({ ok: false, reason: 'integration_missing' })
+    await expect((h.daemon as any).kanbanNotify(notify)).resolves.toMatchObject({ ok: false, reason: 'post_failed' })
+    expect((h.daemon as any).seenNotifyIds.has(notify.notifyId)).toBe(false)
+  })
+})

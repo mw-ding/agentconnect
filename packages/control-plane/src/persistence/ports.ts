@@ -7946,7 +7946,14 @@ export interface KanbanBoardRepo {
 // ── Kanban dispatch (issue #2 M2) — claim, lease fence, heartbeat, and reaper reads; still body-free ──
 
 export type KanbanRunOutcomeValue =
-  'completed' | 'review_requested' | 'blocked' | 'failed' | 'protocol_violation' | 'reclaimed' | 'transient'
+  | 'completed'
+  | 'review_requested'
+  | 'blocked'
+  | 'failed'
+  | 'protocol_violation'
+  | 'reclaimed'
+  | 'transient'
+  | 'changes_requested'
 
 /** The board facts a dispatch needs to address GitHub and the daemon. */
 export interface KanbanBoardRef {
@@ -7956,9 +7963,10 @@ export interface KanbanBoardRef {
   repoFullName: string
 }
 
-/** One lease the claim minted: the card is `running` in the CP and awaits the daemon's ack. */
+/** One lease the claim minted: the card is `running` in the CP (or `review` for a verify run) and awaits the daemon's ack. */
 export interface KanbanClaimedLease extends KanbanBoardRef {
   mode: 'read' | 'write'
+  role: 'work' | 'verify'
   runId: string
   leaseId: string
   cardId: string
@@ -7970,6 +7978,18 @@ export interface KanbanClaimedLease extends KanbanBoardRef {
   dispatchRevision: bigint
   /** `HookDef.githubSessionKey` of the agent's GitHub hook on this repo, else `github:<repoId>` (design D4). */
   sessionKeyPrefix: string
+}
+
+/** A review card the claim refused to dispatch because its verifier is the worker (B8); flagged once, never claimed. */
+export interface KanbanSelfVerifyFlag extends KanbanBoardRef {
+  cardId: string
+  issueNumber: number
+}
+
+export interface KanbanClaimResult {
+  leases: KanbanClaimedLease[]
+  /** Newly flagged self-verify cards, so the caller can post their one body-free comment. */
+  flaggedSelfVerify: KanbanSelfVerifyFlag[]
 }
 
 export interface KanbanClaimOpts {
@@ -8016,6 +8036,9 @@ export type KanbanRunEndResult =
       plan: RunEndPlan
     }
 
+/** An ingest move's outcome: `moved` carries the card's id and post-move revision for the notification outbox. */
+export type KanbanIngestResult = { moved: false } | { moved: true; cardId: string; stateRevision: bigint }
+
 export interface KanbanLeaseBeatInput {
   leaseId: string
   cardId: string
@@ -8061,8 +8084,8 @@ export type KanbanCardView = Extract<KanbanCardShowOk, { accepted: true }>['card
 export interface KanbanDispatchRepo {
   /** Enabled boards, for the periodic reconciler tick. */
   listEnabledBoardIds(): Promise<string[]>
-  /** Claim ready cards by priority then age under the board caps (`FOR UPDATE SKIP LOCKED`). */
-  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimedLease[]>
+  /** Claim ready cards to their assignee and review cards to the verifier, by priority then age, under the caps. */
+  claim(boardId: string, opts: KanbanClaimOpts): Promise<KanbanClaimResult>
   // Database time is the authority across CP replicas.
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
@@ -8071,7 +8094,7 @@ export interface KanbanDispatchRepo {
   // The status a mismatch or an attention flag parked the card in; null when neither holds it.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
-  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
+  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<KanbanIngestResult>
   // Push the next re-read out exponentially (a changed `observed` restarts it); counts a pending promotion's check.
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
@@ -8113,6 +8136,50 @@ export interface KanbanDispatchRepo {
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
   /** Open runs for one agent on one daemon: the repos whose daemon grants must follow the run mode. */
   openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+}
+
+// ── Kanban notifications (M4) — a body-free outbox drained to the board's anchor channel ──
+
+export interface KanbanNotificationInsert {
+  boardId: string
+  cardId: string
+  issueNumber: number
+  stateRevision: bigint
+  from: KanbanStatus
+  to: KanbanStatus
+  blockKind?: KanbanBlockKind | null
+  reasonCode?: string | null
+  tripped?: string | null
+  mention: boolean
+}
+
+export interface KanbanNotificationRow extends KanbanNotificationInsert {
+  id: string
+  createdAt: Date
+  attempts: number
+}
+
+/** The board facts the notifier needs to address one pending row's target. */
+export interface KanbanNotifyTarget {
+  orgId: OrgId
+  repoFullName: string
+  targetPlatform: string
+  targetChannel: string | null
+  targetIntegrationId: string | null
+  createdByUserId: string | null
+}
+
+export interface KanbanNotifyRepo {
+  /** Insert a notification unless one already exists for this card revision (replay-safe). */
+  enqueue(row: KanbanNotificationInsert): Promise<void>
+  /** Pending rows (unsent and next attempt due) oldest first, bounded. */
+  pending(limit: number, now: Date): Promise<KanbanNotificationRow[]>
+  markSent(id: string): Promise<void>
+  /** Retry later with exponential backoff; a row that exhausted its attempts is parked with lastError. */
+  markFailed(id: string, nextAttemptAt: Date, attempts: number, lastError: string): Promise<void>
+  giveUp(id: string, lastError: string): Promise<void>
+  /** The board's notification anchor + org/repo facts for one row; null when the board is gone. */
+  target(boardId: string): Promise<KanbanNotifyTarget | null>
 }
 
 export interface KanbanCardRecord {

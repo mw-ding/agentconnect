@@ -44,6 +44,10 @@ export const KANBAN_REASON_NUDGE_DEFERRED = 'nudge_deferred'
 export const KanbanRunMode = z.enum(['read', 'write'])
 export type KanbanRunMode = z.infer<typeof KanbanRunMode>
 
+/** A dispatch's role: `work` runs a ready card, `verify` reviews one. Absent means work, so old peers interoperate. */
+export const KanbanDispatchRole = z.enum(['work', 'verify'])
+export type KanbanDispatchRole = z.infer<typeof KanbanDispatchRole>
+
 export const KANBAN_BLOCK_KINDS = ['dependency', 'needs_input', 'capability', 'transient'] as const
 export const KanbanBlockKind = z.enum(KANBAN_BLOCK_KINDS)
 export type KanbanBlockKind = z.infer<typeof KanbanBlockKind>
@@ -66,7 +70,9 @@ export const KanbanDispatch = z
     dispatchRevision: KanbanRevision,
     // `github:<repoId>` or a legacy `owner/repo`; the session key is `<prefix>#<issueNumber>`.
     sessionKeyPrefix: z.string().regex(/^[^#\s]{1,200}$/),
-    mode: KanbanRunMode
+    mode: KanbanRunMode,
+    // Trusted turn context (like leaseId): work (ready card) or verify (review card). Absent = work.
+    role: KanbanDispatchRole.optional()
   })
   .strict()
 export type KanbanDispatch = z.infer<typeof KanbanDispatch>
@@ -114,14 +120,16 @@ export const KanbanLeaseHeartbeatOk = z
   .strict()
 export type KanbanLeaseHeartbeatOk = z.infer<typeof KanbanLeaseHeartbeatOk>
 
-/** Terminal outcomes a worker run may report; `reclaimed` is CP-only (the reaper), so it is not on the wire. */
+/** Terminal outcomes a run may report; `reclaimed` is CP-only (the reaper), so it is not on the wire. */
 export const KanbanReportOutcome = z.enum([
   'completed',
   'review_requested',
   'blocked',
   'failed',
   'protocol_violation',
-  'transient'
+  'transient',
+  // A verifier asked the worker for changes; only emitted on verify runs, so only a new CP understands it (deploy CP first).
+  'changes_requested'
 ])
 export type KanbanReportOutcome = z.infer<typeof KanbanReportOutcome>
 
@@ -211,3 +219,45 @@ export const KanbanCardShowOk = z.discriminatedUnion('accepted', [
   z.object({ leaseId: z.string().uuid(), accepted: z.literal(false), reason: z.enum(['superseded']) }).strict()
 ])
 export type KanbanCardShowOk = z.infer<typeof KanbanCardShowOk>
+
+/** A short, body-free status or trip reason for a notification's `from`/`to`/`tripped` fields. */
+const KanbanNotifyCode = z
+  .string()
+  .min(1)
+  .max(40)
+  .regex(/^[a-z0-9_:-]+$/)
+
+/** `kanban/notify` (C→D REQ → `kanban/notify/ok`) — a body-free transition notification to post in the board's anchor channel. */
+export const KanbanNotify = z
+  .object({
+    notifyId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    cardId: z.string().uuid(),
+    repoFullName: z
+      .string()
+      .min(3)
+      .max(200)
+      .regex(/^[\w.-]+\/[\w.-]+$/),
+    issueNumber: z.number().int().positive(),
+    from: KanbanNotifyCode,
+    to: KanbanNotifyCode,
+    blockKind: KanbanBlockKind.optional(),
+    reasonCode: KanbanReasonCode.optional(),
+    tripped: KanbanNotifyCode.optional(),
+    /** Present only when the board owner's Slack user id resolved; never a GitHub login. */
+    mention: z.object({ slackUserId: z.string().min(1).max(40) }).optional(),
+    target: z
+      .object({
+        platform: z.string().min(1).max(20),
+        channel: z.string().min(1).max(200),
+        integrationId: z.string().uuid()
+      })
+      .strict()
+  })
+  .strict()
+export type KanbanNotify = z.infer<typeof KanbanNotify>
+
+export const KanbanNotifyOk = z
+  .object({ notifyId: z.string().uuid(), ok: z.boolean(), reason: z.string().max(100).optional() })
+  .strict()
+export type KanbanNotifyOk = z.infer<typeof KanbanNotifyOk>

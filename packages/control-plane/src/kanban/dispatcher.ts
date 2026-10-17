@@ -17,13 +17,15 @@ import type {
   KanbanDispatchRepo,
   KanbanRecoveryDue,
   KanbanRunEndResult,
-  KanbanRunOutcomeValue
+  KanbanRunOutcomeValue,
+  KanbanSelfVerifyFlag
 } from '../persistence/ports.js'
 import {
   isStatusLabel,
   statusLabel,
   isDispatchableIssue,
   isPromotionResidue,
+  isReviewDispatchableIssue,
   observedCardStatus,
   parseStatusLabels,
   planRecovery,
@@ -35,6 +37,7 @@ import {
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
+import type { KanbanTransition } from './notifier.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
 
@@ -56,6 +59,8 @@ export interface KanbanDispatcherDeps {
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
+  /** Enqueues a transition notification (planNotification + outbox insert); undefined when notifications are off. */
+  notify?: { enqueue(transition: KanbanTransition, stateRevision: bigint): Promise<void>; drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   tickMs?: number
   unackedGraceMs?: number
@@ -84,6 +89,14 @@ export function attentionComment(reason: PromotionAttention): string {
     `AgentConnect Kanban: this card's automatic promotion to \`ac/status:ready\` could not be confirmed ` +
     `(${reason}), so it was not dispatched. Remove and re-add \`ac/status:ready\` yourself (even if it is ` +
     `already present), or set another status, to continue.`
+  )
+}
+
+/** Body-free comment for a self-approval guard (B8): the verifier is the worker, so review can never run. */
+export function verifierIsWorkerComment(): string {
+  return (
+    'AgentConnect Kanban: this card is in review, but its configured verifier agent is also its worker, so it ' +
+    'cannot review its own work. Configure a different verifier agent on the board, then set the card status again.'
   )
 }
 
@@ -143,6 +156,7 @@ export class KanbanDispatcher {
   /** Doorbell: reconcile one board now, single-flight with one trailing rerun. */
   poke(boardId: string): void {
     if (this.stopped) return
+    void this.deps.notify?.drain().catch(() => undefined)
     if (this.running.has(boardId)) {
       this.rerun.add(boardId)
       return
@@ -162,6 +176,7 @@ export class KanbanDispatcher {
   /** One reconciler pass: reap stale leases first so their slots are claimable, then claim every board. */
   async tick(): Promise<void> {
     await this.reap()
+    await this.deps.notify?.drain().catch(() => undefined)
     for (const boardId of await this.deps.repo.listEnabledBoardIds()) {
       this.recoveryDue.add(boardId)
       this.poke(boardId)
@@ -200,11 +215,14 @@ export class KanbanDispatcher {
   async reconcileBoard(boardId: string): Promise<void> {
     // Recovery reads GitHub, so only the periodic tick runs it, never a doorbell or report poke.
     if (this.recoveryDue.delete(boardId)) await this.recoverMismatches(boardId)
-    const leases = await this.deps.repo.claim(boardId, {
+    const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
     })
-    await Promise.allSettled(leases.map((lease) => this.dispatchLease(lease)))
+    await Promise.allSettled([
+      ...result.leases.map((lease) => this.dispatchLease(lease)),
+      ...result.flaggedSelfVerify.map((card) => this.commentSelfVerify(card))
+    ])
   }
 
   private async recoverMismatches(boardId: string): Promise<void> {
@@ -271,7 +289,14 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
-    return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
+    const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
+    if (result.moved) {
+      await this.deps.notify?.enqueue(
+        { cardId: result.cardId, boardId, issueNumber, from, to: plan.to },
+        result.stateRevision
+      )
+    }
+    return { moved: result.moved, observed }
   }
 
   // A failed promotion is adopted on proof, cleared once no ready label landed by its watch's end, else retried or escalated.
@@ -450,6 +475,9 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_installation_unavailable')
       return
     }
+    // Our own label write for the move that made this card claimable (running→review, review→ready) may still be in
+    // flight; reading before it lands would see the previous status and park a valid claim as a GitHub mismatch.
+    await this.statusWrites.get(lease.cardId)
     let observed: CardIssue | null
     try {
       observed = await this.deps.store.readCard(repo, lease.issueNumber)
@@ -459,7 +487,9 @@ export class KanbanDispatcher {
       return
     }
     // Preserve human changes in GitHub and release the DB card into its observed status; promotion residue is ready.
-    if (!observed || !(isDispatchableIssue(observed) || isPromotionResidue(observed))) {
+    const dispatchable = (o: ObservedIssue): boolean =>
+      lease.role === 'verify' ? isReviewDispatchableIssue(o) : isDispatchableIssue(o) || isPromotionResidue(o)
+    if (!observed || !dispatchable(observed)) {
       await this.deps.repo.endRun({
         leaseId: lease.leaseId,
         outcome: 'transient',
@@ -490,7 +520,9 @@ export class KanbanDispatcher {
         attempt: lease.attempt,
         dispatchRevision: lease.dispatchRevision.toString(),
         sessionKeyPrefix: lease.sessionKeyPrefix,
-        mode
+        mode,
+        // Absent = work, so a verify role is the only addition and older daemons still read the frame.
+        ...(lease.role === 'verify' ? { role: 'verify' as const } : {})
       })
     } catch (err) {
       // Nack or timeout → ready with a cooldown; if the daemon did start, the fence rejects that run's writes.
@@ -507,7 +539,31 @@ export class KanbanDispatcher {
       return
     }
     if (!(await this.deps.repo.markAcked(lease.leaseId, mode, await this.deps.repo.now(), lease.daemonEpoch))) return
-    this.writeStatus(lease, repo, 'running', observed)
+    // A verify run keeps the card in `review`; only a work run writes the `running` label.
+    if (lease.role !== 'verify') this.writeStatus(lease, repo, 'running', observed)
+  }
+
+  /** B8 self-approval: post the one body-free comment for a newly flagged card; best-effort like the escalation comment. */
+  private async commentSelfVerify(card: KanbanSelfVerifyFlag): Promise<void> {
+    try {
+      const repo = await this.repoRef(card)
+      if (!repo) return
+      const issue = await this.deps.store.readCard(repo, card.issueNumber)
+      const plan: LabelPlan = {
+        outcome: 'noop',
+        status: 'review',
+        releaseLease: false,
+        addLabels: [],
+        removeLabels: [],
+        comment: verifierIsWorkerComment()
+      }
+      await this.deps.store.applyPlan(repo, card.issueNumber, issue ?? { labels: [], state: 'open' }, plan)
+    } catch (err) {
+      this.deps.log.warn(
+        { err, cardId: card.cardId, issueNumber: card.issueNumber },
+        'kanban: verifier_is_worker comment failed'
+      )
+    }
   }
 
   private async endRun(

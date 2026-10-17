@@ -404,6 +404,7 @@ export class CpClient {
     this.controlDeps = {
       configApply: deps.configApply,
       kanbanDispatch: deps.kanbanDispatch,
+      kanbanNotify: deps.kanbanNotify,
       sessionRead: deps.sessionRead,
       childSessionStatusProbe: deps.childSessionStatusProbe && ((probe) => deps.childSessionStatusProbe!(probe)),
       pullRequestFeedback: deps.pullRequestFeedback && ((req) => deps.pullRequestFeedback!(req)),

@@ -87,6 +87,8 @@ import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
 import { KanbanControls } from './kanban/controls.js'
+import { enqueueTransition } from './kanban/notifier.js'
+import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -183,6 +185,7 @@ import {
   PgKanbanBoardRepo,
   PgKanbanDispatchRepo,
   PgKanbanCardRepo,
+  PgKanbanNotifyRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -562,6 +565,7 @@ export function buildContainer(
     kanbanBoard: new PgKanbanBoardRepo(prisma),
     kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     kanbanCard: new PgKanbanCardRepo(prisma),
+    kanbanNotify: new PgKanbanNotifyRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
@@ -1781,6 +1785,21 @@ export function buildContainer(
         })
       : undefined
 
+  // Kanban transition notifier (issue #2 M4): drains the notification outbox to the board's anchor channel.
+  const kanbanNotifier = kanbanCardStore
+    ? new KanbanNotifier({
+        repo: repos.kanbanNotify,
+        integration: repos.integration,
+        agent: repos.agent,
+        // No CP linkage maps a CP user to a Slack user id today, so needs_input posts without a ping (known gap).
+        resolveMention: async () => null,
+        isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
+        send: (daemonId, n) => sender.kanbanNotify(daemonId, n),
+        clock,
+        log: { warn: (o, m) => http.log.warn(o, m), info: (o, m) => http.log.info(o, m) }
+      })
+    : undefined
+
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
@@ -1790,6 +1809,15 @@ export function buildContainer(
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
         isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
         clock,
+        ...(kanbanNotifier
+          ? {
+              notify: {
+                enqueue: (transition, stateRevision) =>
+                  enqueueTransition(repos.kanbanNotify, transition, stateRevision),
+                drain: () => kanbanNotifier.drain()
+              }
+            }
+          : {}),
         log: {
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),

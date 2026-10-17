@@ -50,7 +50,7 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
     })
     expect(await prisma.kanbanCard.count()).toBe(0)
     expect(await cardAudit()).toHaveLength(0)
-    expect(await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).toEqual([])
+    expect((await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
   })
 
   it('files a todo card with a smuggled write mode as inherit, so its later claim is a read lease', async () => {
@@ -65,7 +65,7 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
     })
     // A human promotion (1b's casStatus) makes it claimable; the claim takes the board's read default.
     expect(await cards.casStatus(card.id, card.stateRevision, 'ready')).toBe(true)
-    const [lease] = await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })
+    const [lease] = (await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).leases
     expect(lease).toMatchObject({ cardId: card.id, mode: 'read' })
     expect(await prisma.auditEvent.count({ where: { kind: 'kanban_mode_change' } })).toBe(0)
   })
@@ -103,7 +103,7 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
     ).rejects.toMatchObject({ code: 'status_not_allowed' })
     expect(await prisma.kanbanCard.count()).toBe(0)
     expect(await cardAudit()).toHaveLength(0)
-    expect(await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).toEqual([])
+    expect((await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
   })
 
   it.each(['triage', 'read', 'none'] as const)('refuses ready with a %s-level human authority', async (level) => {
