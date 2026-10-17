@@ -44,12 +44,8 @@ describe.skipIf(!enabled)('Kanban drift and graph E2E (live GitHub)', () => {
       const blocker = await createIssue(issues, `blocker ${source}`, ['ac/status:todo'])
       const dependent = await createIssue(issues, `dependent ${source}`, ['ac/status:todo'])
       await gh('POST', `/repos/${FULL}/issues/${dependent.number}/dependencies/blocked_by`, { issue_id: blocker.id })
-      const { card } = await f.cards.upsertCard({
-        boardId: f.board.id,
-        issueId: BigInt(dependent.id),
-        issueNumber: dependent.number,
-        status: 'todo',
-        source: 'e2e'
+      const card = await prisma.kanbanCard.create({
+        data: { boardId: f.board.id, issueId: BigInt(dependent.id), issueNumber: dependent.number, status: 'todo' }
       })
       await gh('PATCH', `/repos/${FULL}/issues/${blocker.number}`, { state: 'closed', state_reason: 'completed' })
       if (source === 'closed_doorbell') await f.ring(blocker.number, 'closed')

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { enabled, FULL, gh, ensureLabels, createIssue, closeIssues, record } from '../fixtures/kanban-live.js'
+import { enabled, FULL, gh, ensureLabels, createIssue, closeIssues, record, repoRef } from '../fixtures/kanban-live.js'
 import { liveSync } from '../fixtures/kanban-sync-live.js'
 import { prisma } from '../setup.db.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
@@ -26,12 +26,9 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
       const f = await liveSync()
       boards.push(f.board.id)
       const issue = await createIssue(issues, `sync ${status} to ready`, [`ac/status:${status}`])
-      const { card } = await f.cards.upsertCard({
-        boardId: f.board.id,
-        issueId: BigInt(issue.id),
-        issueNumber: issue.number,
-        status,
-        source: 'e2e'
+      // Seeded directly: upsertCard's initial status is import policy, not a test seam.
+      const card = await prisma.kanbanCard.create({
+        data: { boardId: f.board.id, issueId: BigInt(issue.id), issueNumber: issue.number, status }
       })
       if (status === 'done')
         await gh('PATCH', `/repos/${FULL}/issues/${issue.number}`, { state: 'closed', state_reason: 'completed' })
@@ -57,17 +54,48 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
     120_000
   )
 
+  it('refuses a relabel by an actor without write access, restoring the status with a comment', async () => {
+    const started = Date.now()
+    const f = await liveSync()
+    boards.push(f.board.id)
+    // One real account: the seam answers 'read' for the PAT's own login to model a triage/read collaborator.
+    f.permission.override = 'read'
+    const issue = await createIssue(issues, 'non-write relabel refused', ['ac/status:todo'])
+    const card = await prisma.kanbanCard.create({
+      data: { boardId: f.board.id, issueId: BigInt(issue.id), issueNumber: issue.number, status: 'todo' }
+    })
+    await gh('PUT', `/repos/${FULL}/issues/${issue.number}/labels`, { labels: ['ac/status:ready'] })
+    // GitHub records the ready add and the todo removal separately; either may be the newest status event.
+    await expect
+      .poll(
+        async () => {
+          const e = (await f.store.managedEdits(repoRef, issue.number)).status
+          return e?.label?.name === (e?.event === 'labeled' ? 'ac/status:ready' : 'ac/status:todo')
+        },
+        { timeout: 30_000, interval: 500 }
+      )
+      .toBe(true)
+    await f.ring(issue.number)
+    expect(f.permission.logins).toContain('mw-ding')
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
+      status: 'todo',
+      stateRevision: card.stateRevision,
+      labelWritePending: false
+    })
+    const live = await gh<{ labels: { name: string }[] }>('GET', `/repos/${FULL}/issues/${issue.number}`)
+    expect(live.labels.map((l) => l.name).filter((l) => l.startsWith('ac/status:'))).toEqual(['ac/status:todo'])
+    const comments = await gh<{ body: string }[]>('GET', `/repos/${FULL}/issues/${issue.number}/comments`)
+    expect(comments.some((c) => c.body.includes('only collaborators with write access'))).toBe(true)
+    record('non-write relabel refused and reverted with comment', [issue.number], started)
+  }, 120_000)
+
   it('repairs multi-status drift with one status and an explanatory comment', async () => {
     const started = Date.now()
     const f = await liveSync()
     boards.push(f.board.id)
     const issue = await createIssue(issues, 'multi-status drift', ['ac/status:todo'])
-    await f.cards.upsertCard({
-      boardId: f.board.id,
-      issueId: BigInt(issue.id),
-      issueNumber: issue.number,
-      status: 'todo',
-      source: 'e2e'
+    await prisma.kanbanCard.create({
+      data: { boardId: f.board.id, issueId: BigInt(issue.id), issueNumber: issue.number, status: 'todo' }
     })
     await gh('POST', `/repos/${FULL}/issues/${issue.number}/labels`, {
       labels: ['ac/status:ready', 'ac/status:blocked']
