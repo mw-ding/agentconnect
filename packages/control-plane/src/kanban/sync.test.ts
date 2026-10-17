@@ -840,6 +840,99 @@ describe('vera-r2: attribution holes', () => {
     }
   })
 
+  it('does not ack an unrelated assignee edit while refusing an invisible doorbell add', async () => {
+    const f = fixture({ status: 'ready', syncEventCursor: 10n, syncAgentCursor: 10n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready', 'ac/agent:new']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:ready', bob),
+      labelEvent(20, 'labeled', 'ac/agent:new', bob),
+      stateEvent(21, 'closed', bob)
+    )
+    await f.sync.onCardChanged('board', 1, true, {
+      action: 'labeled',
+      sender: { login: 'mallory', id: 7, type: 'User' },
+      label: 'ac/status:ready'
+    })
+    expect(f.card().status).toBe('triage')
+    expect(f.card().syncEventCursor).toBe(10n)
+    expect(f.card().syncAgentCursor).toBe(10n)
+    expect(f.deps.cards.setAssignee).not.toHaveBeenCalled()
+    expect(f.deps.permissions.permission).not.toHaveBeenCalledWith(expect.anything(), 'bob')
+    f.issue.labels = ['ac/status:triage', 'ac/agent:new']
+    f.events.push(
+      labelEvent(22, 'unlabeled', 'ac/status:ready', app),
+      labelEvent(23, 'labeled', 'ac/status:triage', app)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.deps.cards.setAssignee).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'next-agent' }))
+  })
+
+  it('a superseded non-writer doorbell still refuses the newer non-writer label add', async () => {
+    const f = fixture({ status: 'running', syncEventCursor: 10n, lease })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:running']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:running', bob),
+      { ...labelEvent(20, 'unlabeled', 'ac/status:running', mallory), created_at: '2026-10-17T00:02:00Z' },
+      {
+        ...labelEvent(21, 'labeled', 'ac/status:running', mallory),
+        actor: { type: 'User', login: 'eve', id: 8 },
+        created_at: '2026-10-17T00:02:00Z'
+      }
+    )
+    await f.sync.onCardChanged('board', 1, true, {
+      action: 'labeled',
+      sender: { login: 'mallory', id: 7, type: 'User' },
+      label: 'ac/status:running',
+      at: '2026-10-17T00:01:00Z'
+    })
+    expect(lookedUp(f, 'eve')).toBe(true)
+    expect(f.card().status).toBe('triage')
+    expect(f.deps.revoke).toHaveBeenCalledWith(lease, 'card')
+  })
+
+  it('a revoking reassignment consumes only its original snapshot, not a newer writer status edit', async () => {
+    const f = fixture({ status: 'running', syncEventCursor: 10n, syncAgentCursor: 10n, lease })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:running', 'ac/agent:new']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:running', bob),
+      labelEvent(20, 'labeled', 'ac/agent:new', bob)
+    )
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const previousAgentId = f.card().assigneeAgentId
+      Object.assign(f.card(), {
+        status: 'ready',
+        assigneeAgentId: agentId,
+        lease: null,
+        stateRevision: 2n,
+        dispatchRevision: 2n
+      })
+      f.issue.labels = ['ac/status:blocked', 'ac/agent:new']
+      f.events.push(
+        labelEvent(30, 'unlabeled', 'ac/status:running', bob),
+        labelEvent(31, 'labeled', 'ac/status:blocked', bob)
+      )
+      return {
+        ok: true as const,
+        changed: true,
+        card: { status: 'ready' } as never,
+        previousAgentId,
+        revokedLease: lease
+      }
+    })
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card()).toMatchObject({ status: 'blocked', syncEventCursor: 31n })
+    expect(f.deps.revoke).toHaveBeenCalledOnce()
+  })
+
   it('vera-r2: 5 the deferral bound fails closed to triage, not the kept dispatchable status', async () => {
     const start = new Date('2026-10-17T00:00:00Z')
     const f = fixture({ status: 'ready', syncEventCursor: 40n, syncDeferredAt: start, syncDeferralCount: 3 })

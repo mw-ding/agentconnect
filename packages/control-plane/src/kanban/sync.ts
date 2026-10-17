@@ -455,10 +455,12 @@ export class KanbanSync {
     if (!acceptStatus && !plan.comment && (shape.statuses.length > 1 || shape.malformed.length > 0)) {
       plan.comment = `AgentConnect Kanban: a card carries exactly one status label. Restored \`${statusLabel(card.status)}\`.`
     }
+    // An immediate doorbell refusal judges no visible edit; both independent event cursors must stay for the next pass.
+    const statusCursorCommit = doorbellRefusal ? card.syncEventCursor : cursor
     // A refused ac/agent edit is undone before its cursor advances, so a failed undo is retried next pass.
-    const agentCursorCommit = agentVerdict === 'refuse' ? card.syncAgentCursor : agentCursor
+    const agentCursorCommit = doorbellRefusal || agentVerdict === 'refuse' ? card.syncAgentCursor : agentCursor
     const actor = status.verdict === 'ignore' ? undefined : status.actor
-    const result = await this.deps.repo.apply(card, plan, cursor, acceptStatus, agentCursorCommit, actor)
+    const result = await this.deps.repo.apply(card, plan, statusCursorCommit, acceptStatus, agentCursorCommit, actor)
     if (!result) return done(changed)
     if (result.revoked) await this.deps.revoke(result.revoked, card.id)
     changed ||= result.changed
@@ -473,7 +475,7 @@ export class KanbanSync {
     const comment = plan.comment ?? (refused && reverted ? permissionRefusalComment(current.status) : undefined)
     await this.deps.store.applyPlan(repo, issueNumber, issue, { ...projection, ...(comment ? { comment } : {}) })
     const finalAgentCursor = agentVerdict === 'refuse' ? agentCursor : current.syncAgentCursor
-    if (!(await this.deps.repo.ack(current, cursor, finalAgentCursor))) return done(changed)
+    if (!(await this.deps.repo.ack(current, statusCursorCommit, finalAgentCursor))) return done(changed)
     if (current.status === 'todo') await this.deps.promote(boardId, repo, issueNumber)
     return done(changed)
   }
