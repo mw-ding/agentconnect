@@ -29,7 +29,7 @@ export interface KanbanCreateReq {
   blockedBy?: number[]
 }
 
-const REFUSAL_TEXT: Record<KanbanOrchestrateRefusalCode, string> = {
+export const KANBAN_ORCHESTRATE_REFUSAL_TEXT: Record<KanbanOrchestrateRefusalCode, string> = {
   not_orchestrator: 'this agent is not the orchestrator of that board',
   board_not_found: 'no such board (or it belongs to another organization)',
   board_disabled: 'that board is disabled',
@@ -42,13 +42,17 @@ const REFUSAL_TEXT: Record<KanbanOrchestrateRefusalCode, string> = {
   agent_not_assignable: 'the assignee is a restricted agent and cannot be assigned',
   key_conflict: 'the card already carries a different idempotency key',
   issue_mismatch: 'the issue number belongs to a different GitHub issue',
-  invalid_link: 'that link would be a self-link or a cycle',
+  invalid_link:
+    'that link is a self-link, a cycle, a re-parent of a card that already has an epic, or GitHub refused it',
   cross_repo: "that blocker is not a card on this board's repository",
+  repo_mismatch: 'the board now watches a different repository; list the board again',
+  status_not_allowed: 'an orchestrator may only file a card into triage or todo',
+  card_conflict: 'the card changed while this ran; read it again and retry',
   github_unavailable: 'GitHub is unavailable right now',
   github_partial: 'the card was registered but some GitHub metadata writes failed (safe to retry)'
 }
 
-const refusalText = (code: KanbanOrchestrateRefusalCode): string => REFUSAL_TEXT[code] ?? code
+const refusalText = (code: KanbanOrchestrateRefusalCode): string => KANBAN_ORCHESTRATE_REFUSAL_TEXT[code] ?? code
 
 /** sha256 over the masked title and body; the CP keys the B1 idempotency record on this, so no spec text crosses. */
 export function orchestratorSpecDigest(title: string, body: string): string {

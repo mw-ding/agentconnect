@@ -17,7 +17,12 @@ import {
   KanbanReasonCode,
   KanbanReport,
   KanbanReportOk,
+  KANBAN_ORCHESTRATE_REFUSAL_CODES,
   buildEnvelope,
+  kanbanCardKey,
+  kanbanCardKeyMarker,
+  kanbanOrchestrateCardKey,
+  parseKanbanCardKeyMarker,
   decodeEnvelope,
   isFrame
 } from '../index.js'
@@ -237,6 +242,70 @@ describe('kanban wire (issue #2 M2)', () => {
         .success
     ).toBe(false)
     expect(KanbanOrchestrate.safeParse({ ...create, status: 'ready' }).success).toBe(false)
+  })
+
+  it('kanban/orchestrate bounds blockers, priority, and the list reply', () => {
+    const base = { agentId: AGENT, boardId: BOARD, issueNumber: 7 }
+    const many = Array.from({ length: 21 }, (_, i) => i + 1)
+    expect(KanbanOrchestrate.safeParse({ op: 'unblock', ...base, blockers: many }).success).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ op: 'unblock', ...base, blockers: many.slice(0, 20) }).success).toBe(true)
+    expect(KanbanOrchestrate.safeParse({ op: 'link', ...base, blockedBy: many }).success).toBe(false)
+    const create = { op: 'prepare_create', agentId: AGENT, boardId: BOARD, step: 's', specDigest: 'a'.repeat(64) }
+    for (const priority of [-1000, 0, 1000]) {
+      expect(KanbanOrchestrate.safeParse({ ...create, priority }).success, String(priority)).toBe(true)
+    }
+    for (const priority of [-1001, 1001, 2 ** 31, 1.5]) {
+      expect(KanbanOrchestrate.safeParse({ ...create, priority }).success, String(priority)).toBe(false)
+    }
+    const list = (boards: unknown[]) => KanbanOrchestrateOk.safeParse({ ok: true, op: 'list', truncated: true, boards })
+    const card = {
+      issueNumber: 1,
+      status: 'todo',
+      assigneeAgentId: null,
+      assigneeSlug: null,
+      priority: 0,
+      blockKind: null,
+      epicIssueNumber: null,
+      leased: false
+    }
+    const board = (over: Record<string, unknown> = {}) => ({
+      boardId: BOARD,
+      repoFullName: 'acme/web',
+      cards: [],
+      ...over
+    })
+    expect(list([board({ cards: Array.from({ length: 200 }, () => card) })]).success).toBe(true)
+    expect(list([board({ cards: Array.from({ length: 201 }, () => card) })]).success).toBe(false)
+    expect(list(Array.from({ length: 101 }, () => board())).success).toBe(false)
+    for (const repoFullName of ['acme', 'acme/web/x', '-acme/web', 'acme/we b', '']) {
+      expect(list([board({ repoFullName })]).success, repoFullName).toBe(false)
+    }
+    expect(list([board({ repoFullName: 'Acme-Org/web.site_2' })]).success).toBe(true)
+  })
+
+  it('every refusal code rides kanban/orchestrate/ok', () => {
+    for (const code of KANBAN_ORCHESTRATE_REFUSAL_CODES) {
+      expect(KanbanOrchestrateOk.safeParse({ ok: false, op: 'commit_create', code }).success, code).toBe(true)
+    }
+    expect(KANBAN_ORCHESTRATE_REFUSAL_CODES).toEqual(
+      expect.arrayContaining(['repo_mismatch', 'status_not_allowed', 'card_conflict'])
+    )
+  })
+
+  it('the B1 key helper keys on the epic issue number (or the board) and its marker round-trips', () => {
+    const digest = 'b'.repeat(64)
+    expect(kanbanOrchestrateCardKey({ boardId: BOARD, epicIssueNumber: 5, step: 's', specDigest: digest })).toBe(
+      kanbanCardKey({ epic: '5', step: 's', spec: digest })
+    )
+    expect(kanbanOrchestrateCardKey({ boardId: BOARD, step: 's', specDigest: digest })).toBe(
+      kanbanCardKey({ epic: `board:${BOARD}`, step: 's', spec: digest })
+    )
+    const key = kanbanOrchestrateCardKey({ boardId: BOARD, step: 's', specDigest: digest })
+    expect(parseKanbanCardKeyMarker(`body text\n\n${kanbanCardKeyMarker(key)}\n`)).toBe(key)
+    expect(parseKanbanCardKeyMarker('no marker')).toBeNull()
+    expect(parseKanbanCardKeyMarker(null)).toBeNull()
+    expect(parseKanbanCardKeyMarker('<!-- agentconnect:kanban-card-key:XYZ -->')).toBeNull()
+    expect(() => kanbanCardKeyMarker('not-hex')).toThrow()
   })
 
   it('kanban/orchestrate/ok answers data or a stable refusal code', () => {

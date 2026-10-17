@@ -224,6 +224,20 @@ export const KanbanOrchestrateStatus = z.enum(['triage', 'todo'])
 /** `ac/agent:<slug>` assignee; the CP resolves the slug against the board's org. */
 export const KanbanAssigneeSlug = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
 export const KANBAN_ORCHESTRATE_MAX_BLOCKERS = 20
+/** A card's priority band; the DB column is int4, and a sane band keeps an agent from pinning the claim order. */
+export const KANBAN_ORCHESTRATE_PRIORITY_MIN = -1000
+export const KANBAN_ORCHESTRATE_PRIORITY_MAX = 1000
+/** `list` reply bounds: the CP stops at this many cards (setting `truncated`) and never lists more boards. */
+export const KANBAN_ORCHESTRATE_LIST_MAX_CARDS = 200
+export const KANBAN_ORCHESTRATE_LIST_MAX_BOARDS = 100
+const KanbanOrchestratePriority = z
+  .number()
+  .int()
+  .min(KANBAN_ORCHESTRATE_PRIORITY_MIN)
+  .max(KANBAN_ORCHESTRATE_PRIORITY_MAX)
+const KanbanOrchestrateIssueList = z.array(z.number().int().positive()).max(KANBAN_ORCHESTRATE_MAX_BLOCKERS)
+/** `owner/repo` as GitHub spells it: a login, a slash, and a repository name. */
+const KanbanRepoFullName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/)
 
 /** `list` → boards this agent orchestrates and their cards, bounded with a `truncated` flag. */
 export const KanbanOrchestrateList = z
@@ -244,7 +258,7 @@ const KanbanOrchestrateCreateFields = {
   step: KanbanOrchestrateStep,
   specDigest: KanbanSpecDigest,
   assignee: KanbanAssigneeSlug.optional(),
-  priority: z.number().int().optional(),
+  priority: KanbanOrchestratePriority.optional(),
   status: KanbanOrchestrateStatus.optional()
 }
 
@@ -260,7 +274,7 @@ export const KanbanOrchestrateCommitCreate = z
     op: z.literal('commit_create'),
     ...KanbanOrchestrateCreateFields,
     issueNumber: z.number().int().positive(),
-    blockedBy: z.array(z.number().int().positive()).max(KANBAN_ORCHESTRATE_MAX_BLOCKERS).optional()
+    blockedBy: KanbanOrchestrateIssueList.optional()
   })
   .strict()
 export type KanbanOrchestrateCommitCreate = z.infer<typeof KanbanOrchestrateCommitCreate>
@@ -271,7 +285,7 @@ export const KanbanOrchestrateLink = z
     agentId: z.string().uuid(),
     boardId: z.string().uuid(),
     issueNumber: z.number().int().positive(),
-    blockedBy: z.array(z.number().int().positive()).max(KANBAN_ORCHESTRATE_MAX_BLOCKERS).optional(),
+    blockedBy: KanbanOrchestrateIssueList.optional(),
     parentIssueNumber: z.number().int().positive().optional()
   })
   .strict()
@@ -283,7 +297,7 @@ export const KanbanOrchestrateUnblock = z
     agentId: z.string().uuid(),
     boardId: z.string().uuid(),
     issueNumber: z.number().int().positive(),
-    blockers: z.array(z.number().int().positive()).optional()
+    blockers: KanbanOrchestrateIssueList.optional()
   })
   .strict()
 export type KanbanOrchestrateUnblock = z.infer<typeof KanbanOrchestrateUnblock>
@@ -325,6 +339,9 @@ export const KANBAN_ORCHESTRATE_REFUSAL_CODES = [
   'issue_mismatch',
   'invalid_link',
   'cross_repo',
+  'repo_mismatch',
+  'status_not_allowed',
+  'card_conflict',
   'github_unavailable',
   'github_partial'
 ] as const
@@ -346,7 +363,7 @@ export const KanbanOrchestrateCard = z
     issueNumber: z.number().int().positive(),
     status: z.string().min(1).max(40),
     assigneeAgentId: z.string().uuid().nullable(),
-    assigneeSlug: z.string().nullable(),
+    assigneeSlug: z.string().min(1).max(64).nullable(),
     priority: z.number().int(),
     blockKind: z.string().min(1).max(40).nullable(),
     epicIssueNumber: z.number().int().positive().nullable(),
@@ -358,8 +375,8 @@ export type KanbanOrchestrateCard = z.infer<typeof KanbanOrchestrateCard>
 export const KanbanOrchestrateBoard = z
   .object({
     boardId: z.string().uuid(),
-    repoFullName: z.string(),
-    cards: z.array(KanbanOrchestrateCard)
+    repoFullName: KanbanRepoFullName,
+    cards: z.array(KanbanOrchestrateCard).max(KANBAN_ORCHESTRATE_LIST_MAX_CARDS)
   })
   .strict()
 
@@ -368,7 +385,7 @@ export const KanbanOrchestrateListOk = z
     ok: z.literal(true),
     op: z.literal('list'),
     truncated: z.boolean(),
-    boards: z.array(KanbanOrchestrateBoard)
+    boards: z.array(KanbanOrchestrateBoard).max(KANBAN_ORCHESTRATE_LIST_MAX_BOARDS)
   })
   .strict()
 
