@@ -1,8 +1,4 @@
-// Coverage of every path where agent text leaves the daemon: the turn-output surface
-// registry (runtime-discovered), the code-host turn-final, webchat, and the code-host
-// write surfaces (broker operations and review methods). Each outbound check drives the
-// REAL daemon mask over a seeded BYOK secret and asserts the masked placeholder — never
-// the raw value — reaches the poster / broker / adapter.
+// Every registered outbound surface must pass the real daemon mask over seeded BYOK secrets.
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,8 +7,10 @@ import { Daemon } from '../src/daemon.js'
 import { executeTool, type SessionContext } from '../src/mcp/ops.js'
 import { agentHostKey } from '../src/acp/host-key.js'
 import { maskableSecrets, secretPlaceholder } from '../src/session/secret-mask.js'
-import { CODE_HOST_PROVIDERS } from '@agentconnect.md/protocol'
-import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS } from '../src/mcp/tools.js'
+import { CODE_HOST_PROVIDERS, KANBAN_ORCHESTRATE_REFUSAL_CODES } from '@agentconnect.md/protocol'
+import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS, KANBAN_ORCHESTRATOR_TOOLS } from '../src/mcp/tools.js'
+import { KANBAN_ORCHESTRATOR_ARG_SCHEMAS, KANBAN_ORCHESTRATOR_HANDLERS } from '../src/mcp/ops/kanban.js'
+import { KANBAN_ORCHESTRATE_REFUSAL_TEXT, orchestratorSpecDigest } from '../src/kanban/orchestrator-tools.js'
 import type { CodeHostBrokerOperation } from '../src/codehost/broker.js'
 import { GithubReplyCollector } from '../src/github/poster.js'
 import { emitWebchatUpdate } from '../src/webchat/turn-output.js'
@@ -70,9 +68,7 @@ function seedProviderSecrets(daemon: Daemon): void {
 
 const chunk = (text: string) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
 
-// The set registered around daemon.ts L1622-1750. A newly registered platform is covered
-// by the enqueueApply iteration below; this snapshot forces the author to add masking and
-// update the list when the registry gains (or loses) a member.
+// Pin the surface registry so new platforms require a masking coverage decision.
 const TURN_SURFACE_PLATFORMS = ['slack', 'telegram', 'discord', 'feishu', 'qq', 'linear', 'googlechat']
 
 describe('turn-output surface registry coverage', () => {
@@ -323,18 +319,12 @@ describe('code-host turn-final coverage', () => {
   })
 
   it('enumerates the code-host providers whose final is masked by the daemon-wired maskFinal', () => {
-    // Every provider's assembled final goes through the SAME daemon-wired hook — maskFinal
-    // (daemon.ts settleTurn, maskAgentSecretsIn over p.maskEntries) — driven by the real-wiring
-    // case above. A new provider adds a turn-final member and must fail this snapshot until it
-    // is covered by that shared path.
+    // New providers must share the daemon's assembled-final mask exercised above.
     expect([...CODE_HOST_PROVIDERS]).toEqual(['github', 'gitlab', 'gitea'])
   })
 })
 
-// The broker operation kinds that carry agent-authored public text, matched by
-// maskCodeHostOperation (daemon.ts L13838). Adding one forces this snapshot update.
-// Exhaustive over the broker's operation union: a new kind fails typecheck until it is classified here,
-// and a new text-carrying kind then fails the masking case below until it is driven and masked.
+// Exhaustive broker classification makes new text-carrying operations require a masking test.
 const BROKER_KIND_CARRIES_TEXT: Record<CodeHostBrokerOperation['kind'], boolean> = {
   createComment: true,
   updateComment: true,
@@ -448,8 +438,7 @@ describe('code-host broker and review outbound coverage', () => {
       expect(req.body).not.toContain(API_KEY)
       expect(req.comments[0]!.body).toContain(HEADER_PH)
       expect(req.comments[0]!.body).not.toContain(HEADER)
-      // The comment path is the API diff-path anchor (must match the diff exactly), never
-      // rendered as visible text — it is deliberately left unmasked while the body is masked.
+      // Diff-path anchors must stay exact; only the visible comment body is masked.
       expect(req.comments[0]!.path).toBe('a.ts')
     } finally {
       await close()
@@ -611,6 +600,126 @@ describe('code-host broker and review outbound coverage', () => {
       expect(replyReq.replies[0]!.body).toBe(`leak ${KEY_PH}`)
     } finally {
       await close()
+    }
+  })
+})
+
+// Pin each tool's entire argument surface so a new text/reason field requires an outbound coverage decision.
+const ORCHESTRATOR_PATHS = {
+  kanbanList: { fields: ['board', 'status'], args: { status: API_KEY } },
+  kanbanCreate: {
+    fields: ['board', 'title', 'body', 'epic', 'step', 'assignee', 'priority', 'status', 'blockedBy'],
+    args: { title: API_KEY, body: HEADER, assignee: API_KEY }
+  },
+  kanbanLink: { fields: ['board', 'issue', 'blockedBy', 'parent'], args: { issue: 7 } },
+  kanbanUnblock: { fields: ['board', 'issue', 'blockers'], args: { issue: 7 } },
+  kanbanAssign: { fields: ['board', 'issue', 'assignee'], args: { issue: 7, assignee: API_KEY } }
+}
+
+describe('orchestrator outbound coverage', () => {
+  async function boot() {
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold() })
+    await daemon.start()
+    seedProviderSecrets(daemon)
+    return daemon
+  }
+
+  const board = '22222222-2222-4222-8222-222222222222'
+
+  it('enumerates every orchestrator tool and argument, including any future reason text', () => {
+    expect(KANBAN_ORCHESTRATOR_TOOLS.map((t) => t.name)).toEqual(Object.keys(ORCHESTRATOR_PATHS))
+    expect(KANBAN_ORCHESTRATOR_ARG_SCHEMAS.map(([name]) => name)).toEqual(Object.keys(ORCHESTRATOR_PATHS))
+    expect(KANBAN_ORCHESTRATOR_HANDLERS.map(([name]) => name)).toEqual(Object.keys(ORCHESTRATOR_PATHS))
+    for (const [name, { fields }] of Object.entries(ORCHESTRATOR_PATHS)) {
+      const descriptor = KANBAN_ORCHESTRATOR_TOOLS.find((t) => t.name === name)!
+      const schema = KANBAN_ORCHESTRATOR_ARG_SCHEMAS.find(([n]) => n === name)![1]
+      expect(Object.keys(descriptor.inputSchema.properties!), name).toEqual(fields)
+      expect(Object.keys((schema as any).shape), name).toEqual(fields)
+    }
+    expect(Object.keys(KANBAN_ORCHESTRATE_REFUSAL_TEXT)).toEqual([...KANBAN_ORCHESTRATE_REFUSAL_CODES])
+  })
+
+  it('masks the issue title/body at mcp.deps.kanbanCreate before the actual GitHub POST and digest', async () => {
+    const daemon = await boot()
+    const orchestrate = vi.fn(async (p: { op: string }) => {
+      if (p.op === 'list')
+        return {
+          ok: true,
+          op: p.op,
+          boards: [{ boardId: board, repoFullName: 'acme/web', cards: [] }],
+          truncated: false
+        }
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      return { ok: true, op: p.op, cardId: 'card-1', issueNumber: 42 }
+    })
+    ;(daemon as any).cpClient = { kanbanOrchestrate: orchestrate, stop: async () => {} }
+    vi.spyOn((daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+    const post = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+    try {
+      await (daemon as any).mcp.deps.kanbanCreate({
+        agentId: AGENT,
+        board,
+        title: `title ${API_KEY}`,
+        body: `body ${HEADER}`
+      })
+      expect(post).toHaveBeenCalledTimes(1)
+      const [url, init] = post.mock.calls[0]!
+      expect(url).toBe('https://api.github.com/repos/acme/web/issues')
+      expect(init?.method).toBe('POST')
+      const payload = JSON.parse(String(init?.body))
+      expect(payload).toEqual({ title: `title ${KEY_PH}`, body: `body ${HEADER_PH}` })
+      expect(init?.body).not.toContain(API_KEY)
+      expect(init?.body).not.toContain(HEADER)
+      const digest = orchestratorSpecDigest(payload.title, payload.body)
+      for (const [req] of orchestrate.mock.calls) {
+        if (req.op === 'list') continue
+        expect(req).toMatchObject({ specDigest: digest })
+        expect(req).not.toHaveProperty('title')
+        expect(req).not.toHaveProperty('body')
+      }
+    } finally {
+      post.mockRestore()
+      await daemon.stop()
+    }
+  })
+
+  it('keeps every refusal fixed and rejects reason text on metadata-only link/unblock/assign paths', async () => {
+    const daemon = await boot()
+    let code: (typeof KANBAN_ORCHESTRATE_REFUSAL_CODES)[number] = KANBAN_ORCHESTRATE_REFUSAL_CODES[0]
+    const orchestrate = vi.fn(async (p: { op: string }) => ({ ok: false, op: p.op, code }))
+    ;(daemon as any).cpClient = { kanbanOrchestrate: orchestrate, stop: async () => {} }
+    const ctx: SessionContext = {
+      agentId: AGENT,
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      deliveryThread: 'T1',
+      integrationId: undefined,
+      isDm: true,
+      tools: KANBAN_ORCHESTRATOR_TOOLS
+    }
+    const deps = { ...(daemon as any).mcp.deps, canRun: () => true }
+    try {
+      for (const refusalCode of KANBAN_ORCHESTRATE_REFUSAL_CODES) {
+        code = refusalCode
+        for (const [name, { args }] of Object.entries(ORCHESTRATOR_PATHS)) {
+          const result = await executeTool(ctx, name, { board, ...args }, deps)
+          expect(result, `${name}:${code}`).toEqual({ refused: KANBAN_ORCHESTRATE_REFUSAL_TEXT[code] })
+          expect(JSON.stringify(result)).not.toContain(API_KEY)
+          expect(JSON.stringify(result)).not.toContain(HEADER)
+        }
+      }
+      for (const name of ['kanbanLink', 'kanbanUnblock', 'kanbanAssign'] as const) {
+        orchestrate.mockClear()
+        await expect(
+          executeTool(ctx, name, { board, ...ORCHESTRATOR_PATHS[name].args, reason: API_KEY }, deps)
+        ).rejects.toThrow(/unexpected argument/)
+        expect(orchestrate).not.toHaveBeenCalled()
+      }
+    } finally {
+      await daemon.stop()
     }
   })
 })
