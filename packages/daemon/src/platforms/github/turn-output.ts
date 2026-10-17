@@ -91,6 +91,8 @@ export interface GithubTurnHost {
   }): void | Promise<void | string>
   /** Monotonic transcript timestamp — core owns ordering across surfaces. */
   monotonicTs(): string
+  /** Mask secrets in the assembled final — per-chunk masking misses a secret split across chunks. */
+  maskFinal(text: string): string
   /** Record the durable `in_flight` barrier. `false` means the write could not
    *  be made durable, and the caller must NOT perform the public POST. `hasFinal`
    *  says whether a body was actually owed, so core can tell a lost publication
@@ -140,10 +142,11 @@ export async function finalizeGithubTurn<TTurn extends GithubTurn>(
   // A headless GitHub hook has no platform-send boundary. Explicit final chunks
   // were withheld from the core converger, so persist the collector's one
   // logical final now instead of one row per idle/size flush.
-  const final =
+  const assembled =
     !opts.suppressed && opts.atEnd
       ? state.collector.finalText(true, { resolvesRelativeTargets: true, resolveFileLink: turn.resolveFileLink })
       : undefined
+  const final = assembled === undefined ? undefined : host.maskFinal(assembled)
   if (state.deferredFinalTranscript && final?.trim()) {
     await host.appendTranscript({
       channel: turn.plan.transcriptChannel,

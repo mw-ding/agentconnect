@@ -8,6 +8,8 @@ import type { NormalizedMessage } from '../src/messages/normalized.js'
 import { FakeClock } from './cp/fake-clock.js'
 import { fakeSlackAppFactory } from './fakes/slack-app.js'
 import { WAIT } from './wait-support.js'
+import { agentHostKey } from '../src/acp/host-key.js'
+import { maskableSecrets } from '../src/session/secret-mask.js'
 
 function scaffold(turnFinalContextRefresh = true): string {
   const root = mkdtempSync(join(tmpdir(), 'ac-turn-output-'))
@@ -803,6 +805,67 @@ describe('TurnOutputWorkflow', () => {
     await expect(turn).resolves.toBeNull()
     expect(conn.postMessage).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('must remain private'))
 
+    await daemon.stop()
+  })
+
+  it('masks a provider secret split across chunks in the posted reply, the transcript, and the captured output', async () => {
+    const apiKey = 'sk-batchprobe-SECRET-value-0001'
+    const header = 'batchprobe-header-SECRET-0002'
+    let onUpdate!: (sessionId: string, update: unknown) => void
+    const chunk = (sessionUpdate: string, text: string) => ({ sessionUpdate, content: { type: 'text', text } })
+    const host = {
+      start: vi.fn(async () => {}),
+      newSession: vi.fn(async () => 'acp-1'),
+      hasSession: vi.fn(() => true),
+      prompt: vi.fn(async (sessionId: string) => {
+        // What buildAcpHost records for a host launched with a BYOK provider credential.
+        ;(daemon as any).modelProviderSecrets.set(
+          agentHostKey('bot-a'),
+          maskableSecrets({
+            runtimeOverrides: {
+              secrets: [
+                { name: 'MODEL_API_KEY', value: apiKey },
+                { name: 'MODEL_HEADER_x-workspace', value: header }
+              ]
+            }
+          })
+        )
+        onUpdate(sessionId, chunk('agent_thought_chunk', 'thinking about sk-batchprobe-'))
+        onUpdate(sessionId, chunk('agent_thought_chunk', 'SECRET-value-0001'))
+        onUpdate(sessionId, chunk('agent_message_chunk', 'key sk-batchprobe-SECRET-'))
+        onUpdate(sessionId, chunk('agent_message_chunk', 'value-0001 header batchprobe-'))
+        onUpdate(sessionId, chunk('agent_message_chunk', 'header-SECRET-0002 done'))
+        return { stopReason: 'end_turn' }
+      }),
+      cancel: vi.fn(async () => {}),
+      stop: vi.fn(async () => {})
+    }
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: (_agent, update) => {
+        onUpdate = update
+        return host as any
+      }
+    })
+    await daemon.start()
+    const conn = connect(daemon, { setTitle: vi.fn(async () => {}) })
+    const queueMemoryPostTurn = vi.spyOn(daemon as any, 'queueMemoryPostTurn')
+    const message = msg('100.1', 'leak check')
+
+    await (daemon as any).dispatch('bot-a', message, 'int-a')
+
+    const posted = conn.postMessage.mock.calls.map((call) => String(call[1])).join('\n')
+    const rows = await (daemon as any).store.threadTranscript(transcriptChannelKey('C1', message.transportScope), 'T1')
+    const stored = JSON.stringify(rows)
+    expect(rows.map((row: { kind: string }) => row.kind)).toEqual(expect.arrayContaining(['reasoning', 'text']))
+    const captured = String(queueMemoryPostTurn.mock.calls[0]?.[4])
+    for (const text of [posted, stored, captured]) {
+      expect(text).toContain('[secret:MODEL_API_KEY]')
+      expect(text).not.toContain(apiKey)
+      expect(text).not.toContain(header)
+    }
+    for (const text of [posted, captured]) expect(text).toContain('[secret:MODEL_HEADER_x-workspace]')
     await daemon.stop()
   })
 })
