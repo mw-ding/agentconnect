@@ -206,6 +206,32 @@ describe('GitCredentialCache', () => {
       expect(h.payloads[2]).toMatchObject({ purpose: 'kanban_card_write', leaseId, forceRefresh: true })
     })
 
+    it('revalidates live Kanban tool grants on every call even with a cached token', async () => {
+      const h = buildRecording()
+      const lease = '44444444-4444-4444-8444-444444444444'
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', lease)
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', lease, { revalidate: true })
+      await h.cache.getKanbanCommentToken(AGENT, 'acme/web', lease, { revalidate: true })
+      expect(h.calls()).toBe(3)
+      expect(h.payloads.every((p) => p.leaseId === lease && p.purpose === 'kanban_card_write')).toBe(true)
+    })
+
+    it.each(['SCOPE_DENIED', 'INTERNAL'])(
+      'never falls back to a cached live Kanban tool grant after %s',
+      async (code) => {
+        const h = build((n) => {
+          if (n === 1) return grant('ghs_cached', 3540)
+          throw Object.assign(new Error('lease validation failed'), { code })
+        })
+        const lease = '44444444-4444-4444-8444-444444444444'
+        await h.cache.getKanbanCommentToken(AGENT, 'acme/infra', lease)
+        await expect(h.cache.getKanbanCommentToken(AGENT, 'acme/infra', lease, { revalidate: true })).rejects.toThrow(
+          'lease validation failed'
+        )
+        expect(h.calls()).toBe(2)
+      }
+    )
+
     it('invalidates only the matching cached poster token after an auth rejection', async () => {
       const h = buildRecording()
       await h.cache.getPostToken(AGENT, 'acme/infra', HOOK)

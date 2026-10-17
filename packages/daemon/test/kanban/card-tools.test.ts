@@ -203,14 +203,12 @@ describe('kanbanShow', () => {
     expect(github).toContain('sub_issues (0):')
   })
 
-  it('still shows GitHub when the control plane cannot be reached', async () => {
+  it('refuses a card read when the lease cannot be checked', async () => {
     const h = await harness({}, async () => {
       throw new Error('offline')
     })
-    const shown = (await h.tools.show(h.s)) as Shown
-    expect(shown.controlPlane).toBeNull()
-    expect(shown.controlPlaneNote).toMatch(/unavailable/)
-    expect(shown.github).toContain('title: Fix login')
+    await expect(h.tools.show(h.s)).rejects.toThrow('offline')
+    expect(h.github.reads).toEqual([])
   })
 
   it('fails with a typed error when the CP says the lease was superseded or refuses the token', async () => {
@@ -218,7 +216,7 @@ describe('kanbanShow', () => {
     await expect(stale.tools.show(stale.s)).rejects.toThrow(/superseded/)
     const refused = await harness()
     refused.token.mockRejectedValueOnce(new Error('SCOPE_DENIED'))
-    await expect(refused.tools.show(refused.s)).rejects.toThrow(/no longer honors this Kanban card run/)
+    await expect(refused.tools.show(refused.s)).rejects.toThrow(/superseded or ended/)
     expect(refused.github.reads).toEqual([])
   })
 
@@ -293,12 +291,31 @@ describe('kanbanComment', () => {
     const h = await harness()
     await expect(h.tools.comment({ agentId: AGENT, sessionKey: 'other' }, 'hi')).rejects.toThrow(/No Kanban card run/)
     h.token.mockRejectedValueOnce(new Error('SCOPE_DENIED'))
-    await expect(h.tools.comment(h.s, 'hi')).rejects.toThrow(/no longer honors/)
+    await expect(h.tools.comment(h.s, 'hi')).rejects.toThrow(/superseded or ended/)
     expect(h.w.get(dispatch.leaseId)?.progressNotes).toBe(0)
     expect(h.github.posts).toEqual([])
     await h.w.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
     await expect(h.tools.comment(h.s, 'late')).rejects.toThrow(/already reported/)
     expect(h.github.posts).toEqual([])
+  })
+
+  it('refuses when a terminal is recorded while the progress token is being fetched', async () => {
+    const h = await harness()
+    h.token.mockImplementationOnce(async () => {
+      await h.w.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
+      return 'ghs_token'
+    })
+    await expect(h.tools.comment(h.s, 'late')).rejects.toThrow(/already reported/)
+    expect(h.github.posts).toEqual([])
+    expect(h.w.get(dispatch.leaseId)?.progressNotes).toBe(0)
+  })
+
+  it('checks the trusted agent identity as well as the session lease', async () => {
+    const h = await harness()
+    const foreign = { ...h.s, agentId: 'other-agent' }
+    await expect(h.tools.comment(foreign, 'hi')).rejects.toThrow(/No Kanban card run/)
+    await expect(h.tools.show(foreign)).rejects.toThrow(/No Kanban card run/)
+    expect(h.token).not.toHaveBeenCalled()
   })
 
   it('rejects oversize text before reserving a slot', async () => {

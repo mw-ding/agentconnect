@@ -1568,6 +1568,13 @@ describe('KanbanDispatcher — card read and progress-note grant (real Postgres)
     expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
   })
 
+  it('refuses reads and progress grants after the agent moves to another daemon', async () => {
+    const { h, d, req } = await leased()
+    await prisma.agent.update({ where: { id: A1 }, data: { daemonId: D2 } })
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+  })
+
   it('refuses a card read and a progress grant once the lease has ended, leaving the final-comment grant', async () => {
     const { h, d, req } = await leased()
     await h.dispatcher.onReport(D1, 4, h.reportFor(d))

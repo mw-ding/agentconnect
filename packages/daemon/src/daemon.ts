@@ -26568,7 +26568,7 @@ export class Daemon {
         return cp.kanbanCard(payload)
       },
       token: (agentId, repo, leaseId) =>
-        this.gitCreds.getKanbanCommentToken(agentId, repo, leaseId).then((g) => g.token),
+        this.gitCreds.getKanbanCommentToken(agentId, repo, leaseId, { revalidate: true }).then((g) => g.token),
       invalidateToken: (agentId, repo, leaseId, token) =>
         this.gitCreds.invalidateKanbanComment(agentId, repo, leaseId, token)
     }))

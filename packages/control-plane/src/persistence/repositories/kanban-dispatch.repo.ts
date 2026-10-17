@@ -652,6 +652,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       FROM "kanban_run" r
       JOIN "kanban_card" c ON c."id" = r."cardId"
       JOIN "kanban_board" b ON b."id" = c."boardId"
+      JOIN "agent" a ON a."id" = r."agentId" AND a."daemonId" = r."daemonId"
       LEFT JOIN "daemon" d ON d."id" = r."daemonId"
       WHERE r."leaseId" = ${req.leaseId}::uuid AND r."endedAt" IS NULL
     `)

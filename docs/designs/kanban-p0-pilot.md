@@ -307,6 +307,51 @@ worktree recovery policy that preserves uncommitted work before another write ru
 report receipts and abandoned reservations need retention rules that preserve
 restart deduplication. These are outside the dispatch fixes above.
 
+## M3 — Worker protocol and card tools
+
+A dispatched turn that ends without a terminal tool call gets exactly one short
+nudge in the same session and lease. The daemon waits for live background work to
+finish first and keeps heartbeating while the nudge turn runs. The nudge asks for
+exactly one of `kanbanComplete`, `kanbanRequestReview`, `kanbanBlock`, or `kanbanFail`.
+A terminal from that turn keeps its own outcome and reason. Ignoring the nudge
+reports `protocol_violation/no_terminal_call_after_nudge`; a refused or unstartable
+nudge reports `protocol_violation/nudge_unavailable`. Protocol violations consume
+the existing `protocolRetryLimit` budget. Errored, interrupted, superseded, and
+stopping turns do not get a nudge. Admission still checks paused/draining state.
+
+ACP errors retain their structured JSON-RPC code, message, data, and cause for a
+pure daemon-side classifier. Rate limits (429), network errors, overload (529),
+and server errors (5xx) report `transient` with a fixed `provider_*` reason code.
+Authentication (401/403), invalid requests (400/invalid params), and context
+overflow report counted `failed` outcomes. Unknown errors keep `failed/turn_error`.
+Neither initial-turn nor nudge-turn errors trigger another nudge. Error text stays
+on the daemon; only the reason code reaches the control plane.
+
+Consecutive provider transients derive their backoff from prior ended runs,
+without a schema change: 1, 2, 4, 8, 16, 32, then 60 minutes. The eighth consecutive
+provider transient moves the card to `triage`. These retries preserve failure and
+protocol counters. A different outcome resets the provider sequence; other
+transients retain their fixed one-minute cooldown.
+
+`kanbanShow()` and `kanbanComment({text})` resolve the worker's own card from the
+trusted session context. Neither accepts a card, agent, or lease argument, and
+both refuse after a terminal has been recorded or the lease has ended.
+`kanbanShow` obtains body-free metadata and at most 10 prior runs through the
+strict `kanban/card` RPC, fenced by the authenticated daemon/epoch, agent placement,
+open lease, card/board ids, and dispatch revision. The daemon reads the issue's
+title, body, labels, links, sub-issues, dependencies, and last 10 comments directly
+from GitHub. Text and lists are bounded; GitHub content uses the existing
+untrusted-content delimiters. An unavailable lease check fails the tool call.
+
+`kanbanComment` posts up to 4,000 characters per note, with at most 10 successful
+or in-flight notes per lease. A failed post releases its slot. It works in read
+mode too, like the final summary. Each read or progress post requests a fresh
+lease check through the daemon-owned issues token path, without falling back to a
+cached token on refusal or outage. The grant stays out of the agent environment.
+Progress markers use `ac-kanban-note:`; the final summary's `ac-kanban-lease:`
+lookup ignores them. The final summary retains its existing exactly-once outbox
+behavior. Workers still cannot mutate any `ac/*` label.
+
 ## M3 — App installation tokens and webhook delivery
 
 App mode is on only when `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`, and
@@ -345,3 +390,20 @@ minted for one run can be reused for a later run of the same mode on that
 repository until it is within 15 minutes of expiry. The daemon cache is keyed
 by the open lease and mode, so a read run does not reuse a write grant; this
 control-plane cache is not.
+
+Known gaps (M3 worker additions):
+
+- **A daemon restart does not resume a nudge.** Its spent flag and lease are in
+  memory. The durable lease reservation prevents the restarted daemon from
+  executing the same dispatch again; the existing orphan/reaper path applies.
+- **Progress notes are not durable or exactly-once.** A POST that GitHub accepts
+  before the response is lost may appear even though the tool reports failure.
+  Retrying can duplicate that progress note. This does not affect the separate
+  terminal summary marker. The per-lease cap bounds acknowledged and in-flight
+  notes, rather than ambiguous writes GitHub accepted without acknowledgement.
+- **The worker E2E uses an injected PAT and fake ACP agent.** It exercises real
+  GitHub issues, Postgres, daemon admission, nudge turns, the MCP control socket,
+  and the fenced card-read RPC. Heartbeats/reports use the same in-process
+  dispatcher seam as the existing dispatch E2E so one queue owns label writes;
+  token minting reuses the repository's PAT injection. It does not validate a
+  real App installation or a provider's live ACP error format.
