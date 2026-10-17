@@ -53,7 +53,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     return withAmbientTx(this.db, async (tx) => {
       const rows = await tx.$queryRaw<Array<{ id: string; issueNumber: number }>>(Prisma.sql`
         SELECT "id", "issueNumber" FROM "kanban_card"
-        WHERE "boardId" = ${boardId}::uuid AND NOT "promotionPending" AND NOT "needsAttention"
+        WHERE "boardId" = ${boardId}::uuid AND NOT "promotionPending" AND (NOT "needsAttention" OR "labelWritePending")
         ORDER BY "syncCheckedAt" ASC NULLS FIRST, "issueNumber" ASC
         LIMIT ${limit} FOR UPDATE SKIP LOCKED
       `)
@@ -194,11 +194,11 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
                 status: to,
                 stateRevision: { increment: 1 },
                 cooldownUntil: null,
-                blockKind: null,
-                labelWritePending: true
+                blockKind: null
               }
             : {}),
           ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
+          labelWritePending: true,
           needsAttention: true,
           attentionReason: 'label_attribution_timeout',
           syncDeferredAt: null,

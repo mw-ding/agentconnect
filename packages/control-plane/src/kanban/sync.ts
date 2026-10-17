@@ -225,7 +225,11 @@ export class KanbanSync {
     const requested = planLabelReconcile({ status: card.status, leased: card.lease !== null }, issue).requested
     // A fresh human edit while the CP's own label write is pending defers rather than being projected over and acked.
     const pending = (event: LabelEvent) =>
-      !humanDoorbell && card.labelWritePending && isHumanActor(event) && !isAppActor(event, this.deps.appSlug)
+      !humanDoorbell &&
+      !card.needsAttention &&
+      card.labelWritePending &&
+      isHumanActor(event) &&
+      !isAppActor(event, this.deps.appSlug)
     if (statusEvent?.event === 'closed' || statusEvent?.event === 'reopened') {
       if (BigInt(statusEvent.id) <= consumed) return ignore
       const verdict = await this.judgeEvent(repo, statusEvent, writers)
@@ -245,7 +249,7 @@ export class KanbanSync {
       const current = attributeLabel(events, statusLabel(card.status))
       if (current.kind !== 'add' || BigInt(current.event.id) <= consumed) return ignore
       if (pending(current.event)) return { verdict: 'pending' }
-      if (!humanDoorbell && card.labelWritePending) return ignore
+      if (!humanDoorbell && !card.needsAttention && card.labelWritePending) return ignore
       const judged = await this.judgeAdd(current, repo, writers)
       return judged.verdict === 'refuse' ? { ...judged, verdict: 'revert' } : ignore
     }
@@ -254,7 +258,7 @@ export class KanbanSync {
     if (BigInt(attribution.event.id) <= consumed) return ignore
     // A failed CP status write leaves the replaced label live; a tick projects the committed status, not that old label.
     if (pending(attribution.event)) return { verdict: 'pending' }
-    if (!humanDoorbell && card.labelWritePending) return ignore
+    if (!humanDoorbell && !card.needsAttention && card.labelWritePending) return ignore
     return this.judgeAdd(attribution, repo, writers)
   }
 
@@ -369,7 +373,8 @@ export class KanbanSync {
     if (status.verdict === 'pending') return done(await this.defer(card, repo, issue, boardId, issueNumber))
 
     // A fail-closed card is human-only: only a fresh, cleanly-attributed human writer edit moves it again.
-    if (card.needsAttention && status.verdict !== 'accept' && agentVerdict !== 'accept') return done(false)
+    if (card.needsAttention && !card.labelWritePending && status.verdict !== 'accept' && agentVerdict !== 'accept')
+      return done(false)
 
     let changed = false
     if (agentVerdict === 'accept') {
@@ -488,17 +493,27 @@ export class KanbanSync {
       refreshed.syncDeferredAt !== null &&
       this.now().getTime() - refreshed.syncDeferredAt.getTime() >= DEFERRAL_TIMEOUT_MS
     if (!overdue) return false
+    // A settled hold needs a fresh writer edit; a failed projection still retries without another timeout comment.
+    if (refreshed.needsAttention && !refreshed.labelWritePending) return false
     const failed = await this.deps.repo.failClosed(refreshed)
     if (!failed) return false
     if (failed.revoked) await this.deps.revoke(failed.revoked, refreshed.id)
-    // One comment per hold: a card already held for a human is not commented on again by a later deferral.
-    if (refreshed.needsAttention && failed.status === refreshed.status) return failed.status !== card.status
     const plan = planStatusWrite(failed.status, issue)
     if (!refreshed.needsAttention) {
       plan.comment = `AgentConnect Kanban: this card's status label could not be attributed within the retry window, so the card is held for a human at \`${statusLabel(failed.status)}\`. Remove and re-add the label to retry.`
     }
     try {
       await this.deps.store.applyPlan(repo, issueNumber, issue, plan)
+      // Clear only this projection's pending flag; no unattributed event cursor is consumed by a fail-closed write.
+      await this.deps.repo.ack(
+        {
+          ...refreshed,
+          stateRevision: refreshed.stateRevision + (failed.status !== refreshed.status ? 1n : 0n),
+          dispatchRevision: refreshed.dispatchRevision + (failed.revoked ? 1n : 0n)
+        },
+        refreshed.syncEventCursor,
+        refreshed.syncAgentCursor
+      )
     } catch (err) {
       this.deps.log.warn({ err, boardId, issueNumber }, 'kanban: fail-closed label write failed')
     }

@@ -681,12 +681,14 @@ describe('two CP replicas (stale snapshot after reassignment)', () => {
 describe('vera-r2: KanbanSync over Postgres', () => {
   const bob = { type: 'User', login: 'bob', id: 1 }
   const mallory = { type: 'User', login: 'mallory', id: 7 }
+  const app = { type: 'Bot', login: 'agentconnect[bot]' }
 
   async function pg(
-    card: { status: 'todo' | 'done' | 'review' | 'ready'; syncEventCursor: bigint; syncAgentCursor?: bigint } & Record<
-      string,
-      unknown
-    >,
+    card: {
+      status: 'todo' | 'done' | 'review' | 'ready' | 'triage'
+      syncEventCursor: bigint
+      syncAgentCursor?: bigint
+    } & Record<string, unknown>,
     labels: string[],
     events: LabelEvent[],
     now: () => Date = () => new Date()
@@ -864,6 +866,92 @@ describe('vera-r2: KanbanSync over Postgres', () => {
     })
     expect(writes.at(-1)).toMatchObject({ addLabels: ['ac/status:running'], removeLabels: ['ac/status:ready'] })
     expect(writes.at(-1)!.comment).toBeUndefined()
+  })
+
+  it('retries a failed fail-closed projection, clears pending, and later adopts a writer edit (PG)', async () => {
+    const now = new Date()
+    const f = await pg(
+      { status: 'ready', syncEventCursor: 40n, syncDeferredAt: new Date(now.getTime() - 11 * 60_000) },
+      ['ac/status:blocked'],
+      [{ id: 40, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }],
+      () => now
+    )
+    let failWrite = true
+    const sync = new KanbanSync({
+      ...f.deps,
+      store: {
+        ...f.deps.store,
+        applyPlan: async (...args) => {
+          if (failWrite) throw new Error('GitHub unavailable')
+          await f.deps.store.applyPlan(...args)
+        }
+      }
+    })
+    await sync.onCardChanged(f.board.id, 1, true)
+    expect(await f.read()).toMatchObject({ status: 'triage', needsAttention: true, labelWritePending: true })
+    expect(await f.deps.repo.list(f.board.id, 25)).toContain(1)
+    failWrite = false
+    f.state.events.push(
+      { id: 41, event: 'unlabeled', label: { name: 'ac/status:ready' }, actor: mallory },
+      { id: 42, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: mallory }
+    )
+    await sync.reconcileBoard(f.board.id)
+    expect(f.writes.at(-1)).toMatchObject({ addLabels: ['ac/status:triage'], removeLabels: ['ac/status:blocked'] })
+    expect(f.writes.at(-1)?.comment).not.toContain('held for a human')
+    expect(await f.read()).toMatchObject({ status: 'triage', needsAttention: true, labelWritePending: false })
+    expect(await f.deps.repo.list(f.board.id, 25)).not.toContain(1)
+    f.state.issue.labels = ['ac/status:ready']
+    f.state.events.push(
+      { id: 43, event: 'unlabeled', label: { name: 'ac/status:blocked' }, actor: app },
+      { id: 44, event: 'labeled', label: { name: 'ac/status:triage' }, actor: app },
+      { id: 45, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: bob },
+      { id: 46, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }
+    )
+    await sync.onCardChanged(f.board.id, 1, true)
+    expect(await f.read()).toMatchObject({
+      status: 'ready',
+      needsAttention: false,
+      labelWritePending: false,
+      syncEventCursor: 46n
+    })
+  })
+
+  it('adopts a fresh writer edit instead of projecting over it during held-card repair (PG)', async () => {
+    const f = await pg(
+      { status: 'triage', syncEventCursor: 40n, needsAttention: true, labelWritePending: true },
+      ['ac/status:ready'],
+      [
+        { id: 40, event: 'labeled', label: { name: 'ac/status:triage' }, actor: app },
+        { id: 41, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: bob },
+        { id: 42, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }
+      ]
+    )
+    await new KanbanSync(f.deps).reconcileBoard(f.board.id)
+    expect(await f.read()).toMatchObject({
+      status: 'ready',
+      needsAttention: false,
+      labelWritePending: false,
+      syncEventCursor: 42n
+    })
+    expect(f.writes.at(-1)?.removeLabels).not.toContain('ac/status:ready')
+  })
+
+  it('acknowledges a successful fail-closed projection without consuming unattributed events (PG)', async () => {
+    const now = new Date()
+    const f = await pg(
+      { status: 'ready', syncEventCursor: 40n, syncDeferredAt: new Date(now.getTime() - 11 * 60_000) },
+      ['ac/status:blocked'],
+      [{ id: 40, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }],
+      () => now
+    )
+    await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+    expect(await f.read()).toMatchObject({
+      status: 'triage',
+      needsAttention: true,
+      labelWritePending: false,
+      syncEventCursor: 40n
+    })
+    expect(f.writes.filter((p) => p.comment)).toHaveLength(1)
   })
 
   it('vera-r2: 5 the deferral bound fails closed to triage and a claim neither takes it nor clears the flag (PG)', async () => {
