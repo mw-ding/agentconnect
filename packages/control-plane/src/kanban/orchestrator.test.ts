@@ -771,8 +771,9 @@ describe('KanbanOrchestrator assign (S6)', () => {
     }
   })
 
-  it('posts the planReassign comment and mirrors a restart to ready', async () => {
-    const h = harness()
+  it('revokes a leased assignment, pokes the claim, and posts the planReassign restart comment', async () => {
+    const poke = vi.fn()
+    const h = harness({ poke })
     h.orchestrator.cardByIssueNumber.mockResolvedValue(card({ status: 'running', assigneeSlug: 'old-bot' }))
     h.store.readCard.mockResolvedValue(issue({ labels: ['ac/status:running', 'ac/agent:old-bot'] }))
     h.cards.setAssignee.mockResolvedValue({
@@ -783,6 +784,15 @@ describe('KanbanOrchestrator assign (S6)', () => {
       revokedLease: { leaseId: 'lease', runId: 'run', agentId: 'old-agent', daemonId: 'd', dispatchRevision: 3n }
     })
     await h.svc.orchestrate(ORG, AGENT, req('assign', { issueNumber: 7, assignee: 'ash' }))
+    expect(h.cards.setAssignee).toHaveBeenCalledWith(
+      expect.objectContaining({
+        onLease: 'revoke',
+        agentId: 'agent',
+        source: 'orchestrator',
+        actorAgentId: AGENT
+      })
+    )
+    expect(poke).toHaveBeenCalledWith(BOARD)
     const plan = h.store.applyPlan.mock.calls[0]![3]
     expect(plan.comment).toBe('AgentConnect Kanban: reassigned from old-bot to ash; restarting in a new session.')
     expect(plan.addLabels).toEqual(['ac/status:ready', 'ac/agent:ash'])
