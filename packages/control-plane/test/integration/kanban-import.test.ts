@@ -32,9 +32,11 @@ const unlabeled = (id: number, label: string, login: string): LabelEvent => ({
 })
 
 describe('issue import doorbells (Postgres)', () => {
+  // GitHub sends `transferred` only to the source repo; the destination's `opened` + `changes.old_issue` reaches the CP as
+  // the relay's `transferred` doorbell (github-ingress.test.ts pins that normalization).
   it.each([
     { name: 'opened', action: 'opened', extra: {} },
-    { name: 'transferred', action: 'transferred', extra: {} },
+    { name: 'a destination-side transfer', action: 'transferred', extra: {} },
     {
       name: 'labeled',
       action: 'labeled',
@@ -60,7 +62,7 @@ describe('issue import doorbells (Postgres)', () => {
       authorViaGithubApp: false
     }
     const cards = new PgKanbanCardRepo(prisma)
-    // No `transferred` event is visible, so a `transferred` doorbell must fail closed to triage (Blocker 2).
+    // The destination shows no visible `transferred` event, so its transfer doorbell must fail closed to triage.
     const events = [labeled(1, 'ac/status:ready', 'alice'), labeled(2, 'ac/agent:worker', 'alice')]
     const store = {
       readCard: async () => issue,

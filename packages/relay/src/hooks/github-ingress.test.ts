@@ -875,6 +875,20 @@ describe('github ingress', () => {
       expect(ring(labeled('bug'))).not.toHaveProperty('label')
     })
 
+    it('rings a destination transfer (opened with changes.old_issue) as transferred; a plain open stays opened', async () => {
+      const opened = (overrides: Record<string, unknown> = {}) =>
+        issuesPayload({ action: 'opened', issue: { id: 5042 }, ...overrides })
+      const moved = opened({
+        changes: { old_issue: { id: 9000, number: 7 }, old_repository: { id: 77, full_name: 'acme/old' } }
+      })
+      expect((await post('issues', moved)).statusCode).toBe(202)
+      await flush()
+      expect(h.graphDoorbells).toEqual([
+        expect.objectContaining({ action: 'transferred', ids: ['5042'], numbers: [42] })
+      ])
+      expect(githubIssueDoorbell('issues', opened() as never, 'g')).toMatchObject({ action: 'opened', numbers: [42] })
+    })
+
     it('deduplicates hook dispatch while replaying metadata doorbells for the same delivery', async () => {
       h.table.upsert(rule({}, { events: ['issues:*'] }))
       const headers = { 'x-github-delivery': 'gh-delivery-dup' }

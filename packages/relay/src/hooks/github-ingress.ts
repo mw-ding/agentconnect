@@ -86,7 +86,7 @@ export interface GithubIngressDeps {
 /** The payload slice the matcher reads: untrusted filter input; authorization is the compiled `installationIds` set. */
 interface GithubPayload {
   action?: string
-  changes?: { base?: unknown }
+  changes?: { base?: unknown; old_issue?: { id?: number; number?: number } }
   /** The label a `labeled` action just applied, or an `unlabeled` action removed. */
   label?: { name?: string }
   installation?: { id?: number }
@@ -1086,7 +1086,8 @@ export function githubIssueDoorbell(
   const installationId = githubNumericId(payload.installation?.id)
   const repoId = githubNumericId(payload.repository?.id)
   if (!installationId || !repoId) return undefined
-  const action = payload.action
+  // A transfer's destination gets `issues.opened` with `changes.old_issue` (only the source gets `transferred`): ring it as one.
+  const action = payload.action === 'opened' && payload.changes?.old_issue ? 'transferred' : payload.action
   const seen: RcGithubGraph = {
     deliveryKey,
     installationId,

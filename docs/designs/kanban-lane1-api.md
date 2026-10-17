@@ -296,7 +296,9 @@ hold:
 
 3. The **transferrer** passes the same human + live-write check. On a `transferred` action (the webhook action passed
    through `import(…, { action })`), a **visible** `transferred` event with a live human-writer actor is required; none
-   visible → triage. On any other action, a visible `transferred` event is still checked on its latest actor.
+   visible → triage. On any other action, a visible `transferred` event is still checked on its latest actor. GitHub
+   sends `issues.transferred` only to the **source** repository; the destination gets `issues.opened` with
+   `changes.old_issue`, which the relay rings as a `transferred` doorbell so the destination runs this rule.
 4. The **doorbell sender** of a `labeled` delivery (`RcGithubGraph.sender` + `label`, forwarded by the relay from the
    webhook) must own the latest visible event for that label when the label is live and managed (`ac/status:*` or
    `ac/agent:*`). If it does not, the events API has not caught up: a non-writer sender imports as triage, and a live
@@ -429,3 +431,4 @@ lanes shouldn't reuse the `20261122*` timestamps.
     `label` (≤ 100). `import()` options become `KanbanIssueDoorbell`, and `KanbanSync.onCardChanged` takes the same
     doorbell. Both require a `labeled` sender's add to be the latest visible event for the live label. The frame is
     `.strict()`, so the CP must deploy before a relay that sends the new fields.
+  - **Destination transfer**: the relay rings `issues.opened` with `changes.old_issue` as `transferred` (§4 step 3).
