@@ -354,15 +354,20 @@ M3 hardening (daemon and relay):
 - **Agent environment.** The daemon launches every agent from an explicit allowlist
   (`agentBaseEnvironment` in `runtimes/agent-env.ts`): process basics, locale, temp
   dirs, XDG roots, proxy and CA settings, toolchain homes, provider keys, and the
-  `ANTHROPIC_`, `OPENAI_`, `CLAUDE_`, `CODEX_`, and `GEMINI_` families. Runtime env,
-  per-agent env, and injected `AC_*` variables are added explicitly. `DATABASE_URL`,
-  `*PASSWORD`, `AWS_*`, App key material, and the relay token never reach an agent. The
-  e2e harness uses the same shape (`test/kanban-agent-env.ts`), and unit tests plant a
-  sentinel for each secret.
+  `LC_`, `ANTHROPIC_`, `OPENAI_`, `CLAUDE_`, `CODEX_`, `GEMINI_`, and `DEEPSEEK_`
+  families. Runtime env, per-agent env, and injected `AC_*` variables are added
+  explicitly. Non-allowlisted variables such as `DATABASE_URL`, `PGPASSWORD`,
+  `DB_PASSWORD`, `AWS_*`, App key material, and the relay token are dropped. Names
+  inside the allowlisted prefix families (an `OPENAI_DB_PASSWORD`, say) and provider
+  credential keys such as `OPENCLAW_GATEWAY_PASSWORD` still pass. The e2e harness uses
+  the same shape (`test/kanban-agent-env.ts`), and unit tests plant a sentinel for each
+  dropped secret.
 - **Webhook dedupe.** The relay claims an `X-GitHub-Delivery` id in flight and marks
   it seen only after the reply is out and no CP doorbell was dropped. A dropped
   forward or a 5xx forgets the id, so GitHub's redelivery is processed. A copy that
-  arrives while the first is in flight gets a retryable 503, not a silent 202.
+  arrives while the first is in flight gets a retryable 503, not a silent 202. A
+  caller that hangs up during the PR-feedback write never claims the id, and a claim
+  left unsettled for 5 minutes counts as abandoned, so no GUID stays wedged.
 - **Dedupe versus CP redelivery.** The CP redelivers through GitHub's API, which keeps
   the GUID and cannot carry a header. The relay therefore forgets an id when it
   reports a failure the CP redelivers for (`daemon_offline`, `rejected:draining`,

@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { GITCRED_CAPABILITY_ENV, GITCRED_SOCKET_ENV } from '../gitcred/env.js'
 import { DEFAULT_SHIM_PATHS, type ShimPaths } from './sandbox-paths.js'
 import { agentBaseEnvironment } from '../runtimes/agent-env.js'
+import { AUTO_MERGE_POLL_ENV } from '../github/auto-merge/core.js'
 
 /**
  * The `automerge` capability, served IN THE POD: one watcher process per armed pull request.
@@ -128,6 +129,8 @@ export function createAutoMergeHandler(
 
     const child = spawnChild([p.agentId, p.repoFullName, String(p.prNumber)], {
       ...agentBaseEnvironment(),
+      // The allowlist drops AC_* names; the operator's poll override still reaches the watcher.
+      ...(process.env[AUTO_MERGE_POLL_ENV] ? { [AUTO_MERGE_POLL_ENV]: process.env[AUTO_MERGE_POLL_ENV] } : {}),
       [GITCRED_CAPABILITY_ENV]: p.capability,
       [GITCRED_SOCKET_ENV]: process.env[GITCRED_SOCKET_ENV] ?? paths.tunnels.gitcred
     })

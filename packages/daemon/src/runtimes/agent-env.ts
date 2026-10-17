@@ -139,10 +139,11 @@ const BASE_ENV = new Set([
   'VOLTA_HOME',
   'PNPM_HOME',
   'BUN_INSTALL',
-  'PYENV_ROOT'
+  'PYENV_ROOT',
+  'DSH_PATH'
 ])
 /** Prefix families that configure the agent runtimes themselves (provider endpoints, keys, state roots). */
-const RUNTIME_ENV_PREFIXES = ['LC_', 'ANTHROPIC_', 'OPENAI_', 'CLAUDE_', 'CODEX_', 'GEMINI_']
+const RUNTIME_ENV_PREFIXES = ['LC_', 'ANTHROPIC_', 'OPENAI_', 'CLAUDE_', 'CODEX_', 'GEMINI_', 'DEEPSEEK_']
 
 /**
  * The ambient environment an agent process inherits from the daemon: an explicit allowlist, so a

@@ -9,14 +9,11 @@
 // takes the intent with it and the console's box reads back unchecked, with nothing persisted
 // anywhere to contradict that. It holds no policy — the daemon decided this agent may merge this
 // repository, and the token it fetches per tick is clamped CP-side.
-import { AUTO_MERGE_POLL_MS } from '../github/auto-merge/core.js'
+import { AUTO_MERGE_POLL_ENV, AUTO_MERGE_POLL_MS } from '../github/auto-merge/core.js'
 import { AutoMergeLoop } from '../github/auto-merge/loop.js'
 import { GITCRED_SOCKET_ENV } from '../gitcred/env.js'
 import { fetchGhToken } from '../gitcred/gh-token-ipc.js'
 import { SANDBOX_TUNNEL_PATHS } from './sandbox-paths.js'
-
-/** Poll cadence override, so an operator can tighten it without a new image. */
-export const AUTO_MERGE_POLL_ENV = 'AC_AUTO_MERGE_POLL_MS'
 
 async function main(): Promise<number> {
   // `<agentId> <owner/repo> <prNumber>`, positional and in that order — the shim spawns this.
