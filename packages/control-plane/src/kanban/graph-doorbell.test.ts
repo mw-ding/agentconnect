@@ -92,7 +92,8 @@ describe('KanbanGraphDoorbell', () => {
         ids: ['9001'],
         numbers: [7],
         sender: { login: 'alice', id: '12345', type: 'User' },
-        label: 'ac/status:ready'
+        label: 'ac/status:ready',
+        at: '2026-10-17T12:34:56.000Z'
       })
     )
     await h.doorbell.settle()
@@ -101,7 +102,8 @@ describe('KanbanGraphDoorbell', () => {
     expect(h.onCard).toHaveBeenCalledWith(BOARD, { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }, 7, {
       action: 'labeled',
       sender: { login: 'alice', id: 12345, type: 'User' },
-      label: 'ac/status:ready'
+      label: 'ac/status:ready',
+      at: '2026-10-17T12:34:56.000Z'
     })
     expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
   })

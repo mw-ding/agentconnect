@@ -692,7 +692,9 @@ export const RcGithubGraph = z
     numbers: z.array(z.number().int().positive()).max(4), // the same issues' numbers, when same-repo
     // Optional, so an older relay's frames still parse; the CP requires a `labeled` sender's add to be the latest visible.
     sender: RcGithubGraphSender.optional(),
-    label: z.string().min(1).max(100).optional()
+    label: z.string().min(1).max(100).optional(),
+    // The issue's `updated_at` at the label edit, so the CP can recognize a late or redelivered doorbell as superseded.
+    at: z.string().max(40).datetime().optional()
   })
   .strict()
 export type RcGithubGraph = z.infer<typeof RcGithubGraph>

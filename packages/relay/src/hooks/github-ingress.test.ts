@@ -875,6 +875,17 @@ describe('github ingress', () => {
       expect(ring(labeled('bug'))).not.toHaveProperty('label')
     })
 
+    it("forwards a label edit's issue updated_at, normalized, so the CP can spot a stale doorbell", () => {
+      const ring = (payload: Record<string, unknown>) => githubIssueDoorbell('issues', payload as never, 'g')
+      const at = (updated: unknown) => labeled('ac/status:ready', { issue: { id: 5042, updated_at: updated } })
+      expect(ring(at('2026-10-17T12:34:56Z'))).toMatchObject({ at: '2026-10-17T12:34:56.000Z' })
+      expect(ring(at('2026-10-17T14:34:56+02:00'))).toMatchObject({ at: '2026-10-17T12:34:56.000Z' })
+      // Unparseable, out-of-range, or non-label actions carry none rather than failing the frame.
+      for (const bad of ['not a date', '+275760-09-13T00:00:00Z', 12345]) expect(ring(at(bad))).not.toHaveProperty('at')
+      const closed = issuesPayload({ action: 'closed', issue: { id: 5042, updated_at: '2026-10-17T12:34:56Z' } })
+      expect(ring(closed)).not.toHaveProperty('at')
+    })
+
     it('rings a destination transfer (opened with changes.old_issue) as transferred; a plain open stays opened', async () => {
       const opened = (overrides: Record<string, unknown> = {}) =>
         issuesPayload({ action: 'opened', issue: { id: 5042 }, ...overrides })

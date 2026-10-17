@@ -53,6 +53,17 @@ export function doorbellAddVisible(events: readonly LabelEvent[], label: string,
   return (latest.actor?.login ?? '').toLowerCase() === sender.login.toLowerCase()
 }
 
+/** How far a visible event must postdate a doorbell's webhook time before that doorbell counts as stale. */
+const SUPERSEDE_MARGIN_MS = 5_000
+
+/** Whether the latest visible event for `label` is clearly newer than the doorbell's webhook time `at`, i.e. a late or redelivered doorbell. */
+export function doorbellSuperseded(events: readonly LabelEvent[], label: string, at: string | undefined): boolean {
+  const since = at === undefined ? NaN : Date.parse(at)
+  const created = latestLabelEvent(events, label)?.created_at
+  const latest = created === undefined ? NaN : Date.parse(created)
+  return Number.isFinite(since) && Number.isFinite(latest) && latest > since + SUPERSEDE_MARGIN_MS
+}
+
 /**
  * Who authorized a label currently on the issue: the actor login of the latest visible event for that label, only if it is
  * a `labeled` add by a human (isHumanActor) that is not the App (isAppActor); otherwise null (removal newer, no event = lag,

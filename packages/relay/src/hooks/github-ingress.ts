@@ -212,6 +212,7 @@ interface GithubSubject {
   merged?: boolean
   draft?: boolean
   state?: string
+  updated_at?: string
   /** Present on the `issue` object when an `issue_comment` belongs to a PR. */
   pull_request?: unknown
 }
@@ -1112,12 +1113,17 @@ export function githubIssueDoorbell(
   const login = payload.sender.login
   const sender = senderId && login && login.length <= 64 ? { login, id: senderId, type: 'User' } : undefined
   const name = labelEdit ? payload.label?.name : undefined
+  // Normalized to the 24-char ISO form the frame schema accepts; anything else is dropped rather than failing the frame.
+  const updated =
+    labelEdit && typeof payload.issue?.updated_at === 'string' ? Date.parse(payload.issue.updated_at) : NaN
+  const at = Number.isFinite(updated) ? new Date(updated).toISOString() : undefined
   return {
     ...seen,
     ids: [id],
     numbers: [number!],
     ...(sender ? { sender } : {}),
-    ...(name && name.length <= 100 ? { label: name } : {})
+    ...(name && name.length <= 100 ? { label: name } : {}),
+    ...(at?.length === 24 ? { at } : {})
   }
 }
 

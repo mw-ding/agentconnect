@@ -17,6 +17,8 @@ export interface KanbanIssueDoorbell {
   action?: string
   sender?: DoorbellSender
   label?: string
+  /** The webhook's issue `updated_at`, so a late or redelivered label doorbell is recognized as superseded. */
+  at?: string
 }
 
 export interface KanbanGraphDoorbellDeps {
@@ -147,6 +149,7 @@ function issueDoorbell(m: RcGithubGraph): KanbanIssueDoorbell {
   return {
     action: m.action,
     ...(m.sender ? { sender: { login: m.sender.login, id: Number(m.sender.id), type: m.sender.type } } : {}),
-    ...(m.label ? { label: m.label } : {})
+    ...(m.label ? { label: m.label } : {}),
+    ...(m.at ? { at: m.at } : {})
   }
 }

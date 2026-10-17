@@ -3,6 +3,7 @@ import type { LabelEvent } from './card-store.js'
 import {
   attributeLabel,
   doorbellAddVisible,
+  doorbellSuperseded,
   labelAdder,
   labelAddedByWriter,
   latestLabelEvent,
@@ -177,6 +178,25 @@ describe('doorbellAddVisible', () => {
     expect(doorbellAddVisible(add({ type: 'User', login: 'renamed', id: 7 }), 'ac/status:ready', sender)).toBe(true)
     expect(doorbellAddVisible(add({ type: 'User', login: 'mallory', id: 8 }), 'ac/status:ready', sender)).toBe(false)
     expect(doorbellAddVisible(add(mallory), 'ac/status:ready', sender)).toBe(true)
+  })
+})
+
+describe('doorbellSuperseded', () => {
+  const at = (id: number, created: string | undefined) => ({
+    ...ev(id, 'labeled', 'ac/status:ready', bob),
+    ...(created ? { created_at: created } : {})
+  })
+
+  it("is true only when the label's newest visible event is clearly later than the doorbell's time", () => {
+    const events = [at(1, '2026-10-17T00:00:00Z'), at(2, '2026-10-17T00:02:00Z')]
+    expect(doorbellSuperseded(events, 'AC/STATUS:READY', '2026-10-17T00:01:00.000Z')).toBe(true)
+    // Within the margin, at or after it, or with no time on either side, the doorbell is never treated as stale.
+    expect(doorbellSuperseded(events, 'ac/status:ready', '2026-10-17T00:01:56.000Z')).toBe(false)
+    expect(doorbellSuperseded(events, 'ac/status:ready', '2026-10-17T00:03:00.000Z')).toBe(false)
+    expect(doorbellSuperseded(events, 'ac/status:ready', undefined)).toBe(false)
+    expect(doorbellSuperseded(events, 'ac/status:ready', 'garbage')).toBe(false)
+    expect(doorbellSuperseded([at(2, undefined)], 'ac/status:ready', '2026-10-17T00:01:00.000Z')).toBe(false)
+    expect(doorbellSuperseded(events, 'ac/status:blocked', '2026-10-17T00:01:00.000Z')).toBe(false)
   })
 })
 

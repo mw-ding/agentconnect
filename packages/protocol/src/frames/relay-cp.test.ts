@@ -1160,6 +1160,10 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     ).toBe(false)
     expect(RcGithubGraph.safeParse({ ...withSender, label: '' }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...withSender, label: 'x'.repeat(101) }).success).toBe(false)
+    // Optional webhook time: an ISO datetime only, so an older relay's frame (without it) still parses.
+    expect(RcGithubGraph.safeParse({ ...withSender, at: '2026-10-17T12:34:56.000Z' }).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...withSender, at: 'yesterday' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...withSender, at: `2026-10-17T12:34:56.${'0'.repeat(40)}Z` }).success).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {
