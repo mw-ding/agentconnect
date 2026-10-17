@@ -8241,3 +8241,34 @@ export interface KanbanCardRepo {
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
 }
+
+// ── Kanban orchestrator (issue #2 M3, Lane 2b) — B2 epic budgets and card writes under the epic row lock ──
+
+/** The card being filed under an epic; `upsert` is the Lane 1 create-or-return, composed under the epic's lock. */
+export interface KanbanEpicChildInput {
+  boardId: string
+  /** The epic card's issue number on this board; undefined files a top-level card with no epic. */
+  epicIssueNumber?: number
+  upsert: KanbanCardUpsertInput
+}
+
+export type KanbanEpicChildResult =
+  | { ok: true; card: KanbanCardRow; created: boolean; matchedBy: 'created' | 'issue' | 'idempotency_key' }
+  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' }
+
+/** Adopt an existing card into an epic (link parent); B2 maxCards applies exactly as create does. */
+export interface KanbanAdoptEpicInput {
+  cardId: string
+  epicIssueNumber: number
+}
+
+export type KanbanAdoptEpicResult =
+  | { ok: true; changed: boolean; card: KanbanCardRow }
+  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' | 'card_not_found' }
+
+export interface KanbanOrchestratorRepo {
+  /** File a card as an epic child (or top-level) in one transaction: lock the epic, re-check B2, upsert, link + count. */
+  createEpicChild(input: KanbanEpicChildInput): Promise<KanbanEpicChildResult>
+  /** Link an existing card under an epic (parent): B2 check + counter, setting epicCardId when null. */
+  adoptEpic(input: KanbanAdoptEpicInput): Promise<KanbanAdoptEpicResult>
+}
