@@ -85,7 +85,7 @@ export interface LabelEvent {
   event: string
   created_at?: string
   label?: { name?: string }
-  actor?: { type?: string; login?: string } | null
+  actor?: { type?: string; login?: string; id?: number } | null
   performed_via_github_app?: unknown
 }
 
@@ -252,13 +252,24 @@ export class GithubCardStore implements CardStore {
     const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some(isStatus) && seen.some(isTargetAdd))
     if (!events) return false
     let latest: LabelEvent | undefined
-    let latestAdd: LabelEvent | undefined
+    let targetLatest: LabelEvent | undefined
     for (const event of events) {
       if (!isStatus(event)) continue
       if (!latest || event.id > latest.id) latest = event
-      if (isTargetAdd(event) && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
     }
-    return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
+    for (const event of events) {
+      if (!['labeled', 'unlabeled'].includes(event.event)) continue
+      if (event.label?.name !== target) continue
+      if (!targetLatest || event.id > targetLatest.id) targetLatest = event
+    }
+    // The add that produced the label must not be superseded by a later removal of the same label.
+    return (
+      !!latest &&
+      !!targetLatest &&
+      targetLatest.event === 'labeled' &&
+      isHumanActor(latest) &&
+      isHumanActor(targetLatest)
+    )
   }
 
   async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {
@@ -271,7 +282,7 @@ export class GithubCardStore implements CardStore {
         event: e.event,
         ...(e.created_at !== undefined ? { created_at: e.created_at } : {}),
         ...(e.label?.name !== undefined ? { label: { name: e.label.name } } : {}),
-        actor: e.actor ? { type: e.actor.type, login: e.actor.login } : null,
+        actor: e.actor ? { type: e.actor.type, login: e.actor.login, id: e.actor.id } : null,
         ...(e.performed_via_github_app ? { performed_via_github_app: true } : {})
       }))
       .sort((a, b) => a.id - b.id)

@@ -608,7 +608,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
             revokedLeaseId: open?.leaseId ?? null,
             from: current.status,
             to: updated.status,
-            source: input.source
+            source: input.source,
+            ...(input.actorLogin ? { actorLogin: input.actorLogin, actorGitHubId: input.actorGitHubId ?? null } : {})
           }
         }
       })

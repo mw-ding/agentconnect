@@ -8198,6 +8198,9 @@ export interface KanbanSetAssigneeInput {
   source: string
   actorUserId?: string | null
   actorAgentId?: string | null
+  /** Body-free GitHub attribution for label-driven reassignment: the login and numeric id of the label's actor. */
+  actorLogin?: string | null
+  actorGitHubId?: number | null
 }
 
 export type KanbanSetAssigneeResult =

@@ -142,4 +142,63 @@ describe('Kanban synchronization transactions (Postgres)', () => {
     }
     expect(seen.size).toBe(55)
   })
+
+  it('records the GitHub actor on a label-driven status audit row', async () => {
+    const f = await fixture()
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const plan = planLabelReconcile({ status: 'todo', leased: false }, { state: 'open', labels: ['ac/status:ready'] })
+    const result = await f.repo.apply(snapshot, plan, 7n, true, 0n, { login: 'bob', id: 42 })
+    expect(result?.changed).toBe(true)
+    const audit = await prisma.auditEvent.findFirst({ where: { kind: 'kanban_card_change' } })
+    expect(audit?.details).toMatchObject({ actorLogin: 'bob', actorGitHubId: 42, source: 'human_label' })
+  })
+
+  it('records the GitHub actor on a label-driven reassignment audit row', async () => {
+    const f = await fixture(true)
+    const result = await f.cards.setAssignee({
+      cardId: f.card.id,
+      agentId: NEXT,
+      onLease: 'revoke',
+      source: 'label',
+      now: new Date(),
+      actorLogin: 'bob',
+      actorGitHubId: 42
+    })
+    expect(result.ok && result.revokedLease?.leaseId).toBe(f.run?.leaseId)
+    const audits = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
+    expect(audits.some((a) => (a.details as { change?: string }).change === 'assignee')).toBe(true)
+    expect(audits.find((a) => (a.details as { change?: string }).change === 'assignee')?.details).toMatchObject({
+      change: 'assignee',
+      actorLogin: 'bob',
+      actorGitHubId: 42
+    })
+  })
+
+  it('defers an unattributed pass and fails closed to needsAttention after the bound', async () => {
+    const f = await fixture()
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const deferred = await f.repo.defer(snapshot, new Date())
+    expect(deferred).toMatchObject({ syncDeferralCount: 1 })
+    expect(deferred?.syncDeferredAt).toBeInstanceOf(Date)
+    expect(await f.repo.failClosed((await f.repo.get(f.board.id, 1))!)).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout',
+      syncDeferredAt: null,
+      syncDeferralCount: 0
+    })
+  })
+
+  it('a settled apply clears a prior deferral bound', async () => {
+    const f = await fixture()
+    let snapshot = (await f.repo.get(f.board.id, 1))!
+    await f.repo.defer(snapshot, new Date())
+    snapshot = (await f.repo.get(f.board.id, 1))!
+    const plan = planLabelReconcile({ status: 'todo', leased: false }, { state: 'open', labels: ['ac/status:ready'] })
+    expect(await f.repo.apply(snapshot, plan, 7n, true, 0n)).toBeTruthy()
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      syncDeferredAt: null,
+      syncDeferralCount: 0
+    })
+  })
 })

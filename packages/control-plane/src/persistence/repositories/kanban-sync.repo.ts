@@ -2,7 +2,7 @@
 import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import type { KanbanLeaseRef } from '../ports.js'
-import type { KanbanSyncRepo, SyncCard } from '../../kanban/sync.js'
+import type { GitHubActor, KanbanSyncRepo, SyncCard } from '../../kanban/sync.js'
 import { isKanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
 import { auditCardTransition } from '../../kanban/audit.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
@@ -25,6 +25,9 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         labelWritePending: true,
         syncEventCursor: true,
         syncAgentCursor: true,
+        syncDeferredAt: true,
+        syncDeferralCount: true,
+        needsAttention: true,
         assigneeAgent: { select: { name: true } },
         board: { select: { orgId: true, enabled: true } },
         runs: {
@@ -50,7 +53,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     return withAmbientTx(this.db, async (tx) => {
       const rows = await tx.$queryRaw<Array<{ id: string; issueNumber: number }>>(Prisma.sql`
         SELECT "id", "issueNumber" FROM "kanban_card"
-        WHERE "boardId" = ${boardId}::uuid AND NOT "promotionPending"
+        WHERE "boardId" = ${boardId}::uuid AND NOT "promotionPending" AND NOT "needsAttention"
         ORDER BY "syncCheckedAt" ASC NULLS FIRST, "issueNumber" ASC
         LIMIT ${limit} FOR UPDATE SKIP LOCKED
       `)
@@ -62,7 +65,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     })
   }
 
-  apply(card: SyncCard, plan: LabelPlan, cursor: bigint, human: boolean, agentCursor: bigint) {
+  apply(card: SyncCard, plan: LabelPlan, cursor: bigint, human: boolean, agentCursor: bigint, actor?: GitHubActor) {
     return withAmbientTx(this.db, async (tx) => {
       const [locked] = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT "id" FROM "kanban_card" WHERE "id" = ${card.id}::uuid FOR UPDATE
@@ -104,7 +107,9 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
           ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
           labelWritePending: repair || current.labelWritePending,
           syncEventCursor: cursor > current.syncEventCursor ? cursor : current.syncEventCursor,
-          syncAgentCursor: agentCursor > current.syncAgentCursor ? agentCursor : current.syncAgentCursor
+          syncAgentCursor: agentCursor > current.syncAgentCursor ? agentCursor : current.syncAgentCursor,
+          syncDeferredAt: null,
+          syncDeferralCount: 0
         }
       })
       await auditCardTransition(tx, {
@@ -112,7 +117,8 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         from: card.status,
         to: plan.status,
         source: 'human_label',
-        ...(revoked ? { leaseId: revoked.leaseId } : {})
+        ...(revoked ? { leaseId: revoked.leaseId } : {}),
+        ...(actor ? { actor } : {})
       })
       return { changed, revoked }
     })
@@ -131,7 +137,31 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         labelWritePending: false,
         githubSyncedAt: new Date(),
         syncEventCursor: cursor > card.syncEventCursor ? cursor : card.syncEventCursor,
-        syncAgentCursor: agentCursor > card.syncAgentCursor ? agentCursor : card.syncAgentCursor
+        syncAgentCursor: agentCursor > card.syncAgentCursor ? agentCursor : card.syncAgentCursor,
+        syncDeferredAt: null,
+        syncDeferralCount: 0
+      }
+    })
+    return count === 1
+  }
+
+  async defer(card: SyncCard, now: Date): Promise<SyncCard | null> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: card.id },
+      data: { syncDeferralCount: { increment: 1 }, syncDeferredAt: card.syncDeferredAt ?? now }
+    })
+    if (count !== 1) return null
+    return this.get(card.boardId, card.issueNumber)
+  }
+
+  async failClosed(card: SyncCard): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: card.id },
+      data: {
+        needsAttention: true,
+        attentionReason: 'label_attribution_timeout',
+        syncDeferredAt: null,
+        syncDeferralCount: 0
       }
     })
     return count === 1

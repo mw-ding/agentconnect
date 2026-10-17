@@ -2612,6 +2612,9 @@ model KanbanCard {
   syncEventCursor BigInt @default(0)
   syncAgentCursor BigInt @default(0)
   syncCheckedAt DateTime? @db.Timestamptz(6)
+  // Label-sync deferral: a pass that cannot attribute a live label yet is retried until this bound fails closed.
+  syncDeferredAt DateTime? @db.Timestamptz(6)
+  syncDeferralCount Int @default(0)
   githubSyncedAt      DateTime?        @db.Timestamptz(6)
   createdAt           DateTime         @default(now()) @db.Timestamptz(6)
   updatedAt           DateTime         @updatedAt @db.Timestamptz(6)

@@ -5,7 +5,14 @@ import { withAmbientTx, type PrismaLike } from '../persistence/prisma.js'
 
 export async function auditCardTransition(
   tx: Prisma.TransactionClient,
-  input: { cardId: string; from: KanbanStatus; to: KanbanStatus; source: string; leaseId?: string }
+  input: {
+    cardId: string
+    from: KanbanStatus
+    to: KanbanStatus
+    source: string
+    leaseId?: string
+    actor?: { login: string; id?: number }
+  }
 ): Promise<void> {
   if (input.from === input.to) return
   const card = await tx.kanbanCard.findUniqueOrThrow({
@@ -26,7 +33,8 @@ export async function auditCardTransition(
         to: input.to,
         source: input.source,
         stateRevision: card.stateRevision.toString(),
-        ...(input.leaseId ? { leaseId: input.leaseId } : {})
+        ...(input.leaseId ? { leaseId: input.leaseId } : {}),
+        ...(input.actor ? { actorLogin: input.actor.login, actorGitHubId: input.actor.id ?? null } : {})
       }
     }
   })
