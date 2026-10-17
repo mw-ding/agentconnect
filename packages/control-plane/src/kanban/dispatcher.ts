@@ -475,6 +475,9 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_installation_unavailable')
       return
     }
+    // Our own label write for the move that made this card claimable (running→review, review→ready) may still be in
+    // flight; reading before it lands would see the previous status and park a valid claim as a GitHub mismatch.
+    await this.statusWrites.get(lease.cardId)
     let observed: CardIssue | null
     try {
       observed = await this.deps.store.readCard(repo, lease.issueNumber)
