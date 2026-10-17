@@ -414,6 +414,51 @@ describe('Kanban worker leases', () => {
     expect(forget).toHaveBeenCalledTimes(1)
     expect(worker.get(replacement.leaseId)).toBeDefined()
   })
+
+  it('vera-r2: 8 a late revoke never forgets a same-agent replacement lease that reuses the session key', async () => {
+    const forget = vi.fn(async () => {})
+    const worker = new KanbanWorker({
+      clock: new FakeClock(),
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+      cp: () => ({
+        ready: () => false,
+        heartbeat: async () => ({ superseded: [] as string[] }),
+        report: async () => ({ leaseId: '', accepted: true })
+      }),
+      start: vi.fn(async (d: KanbanDispatch, ready: (id: string) => void) => {
+        ready('acp-1')
+        return { accepted: true as const, sessionKey: 'session-shared', done: new Promise<string>(() => {}) }
+      }),
+      nudge: vi.fn(async () => ({ accepted: false as const, reason: 'busy' as const })),
+      cancel: vi.fn(),
+      forget,
+      gate: async () => undefined,
+      probe: { turnActive: () => false, liveBackgroundTasks: () => 0 },
+      outbox: {
+        has: async () => false,
+        reserve: async () => {},
+        release: async () => {},
+        put: async () => {},
+        list: async () => [],
+        remove: async () => {},
+        recordTerminal: async () => false,
+        orphanedTerminals: async () => [],
+        settleTerminal: async () => {}
+      }
+    })
+    const replacement = {
+      ...dispatch,
+      leaseId: '55555555-5555-4555-8555-555555555555',
+      attempt: 2,
+      dispatchRevision: '4'
+    }
+    await worker.dispatch(dispatch)
+    await worker.dispatch(replacement)
+    // Same agent, same GitHub thread: the replacement reuses the session key, so forgetting it would kill the live lease.
+    await worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(forget).not.toHaveBeenCalled()
+    expect(worker.get(replacement.leaseId)).toBeDefined()
+  })
 })
 
 describe('Kanban worker protocol-violation nudge', () => {
