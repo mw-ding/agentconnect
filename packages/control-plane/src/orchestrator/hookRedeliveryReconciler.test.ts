@@ -327,11 +327,13 @@ describe('HookRedeliveryReconciler', () => {
           labeled({ id: 'l1', guid: 'g-l1' }),
           labeled({ id: 'l2', guid: 'g-l2', action: 'unlabeled' }),
           labeled({ id: 'l3', guid: 'g-l3', action: 'reopened' }),
-          labeled({ id: 'l4', guid: 'g-l4', action: 'closed' })
+          labeled({ id: 'l4', guid: 'g-l4', action: 'closed' }),
+          labeled({ id: 'l5', guid: 'g-l5', action: 'opened' }),
+          labeled({ id: 'l6', guid: 'g-l6', action: 'transferred' })
         ]
       })
       await h.reconciler.tick()
-      expect(h.redelivered).toEqual(['l1', 'l2', 'l3', 'l4'])
+      expect(h.redelivered).toEqual(['l1', 'l2', 'l3', 'l4', 'l5', 'l6'])
       expect(h.claimMock).not.toHaveBeenCalled()
     })
 
@@ -342,7 +344,6 @@ describe('HookRedeliveryReconciler', () => {
         deliveries: [
           labeled({ id: 'landed', guid: 'g-landed' }),
           labeled({ id: 'edited', guid: 'g-edited', action: 'edited' }),
-          labeled({ id: 'opened', guid: 'g-opened', action: 'opened' }),
           labeled({ id: 'foreign', guid: 'g-foreign', repository_id: 1 })
         ]
       })

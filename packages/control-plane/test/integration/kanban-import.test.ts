@@ -87,9 +87,9 @@ describe('issue import doorbells (Postgres)', () => {
       store: { readCard: async () => issue, applyPlan },
       permissions: { permission: async () => 'read' }
     })
-    await expect(importer.import(board, repo, 1)).rejects.toThrow('offline')
+    await expect(importer.import({ ...board, orgId: OrgId(board.orgId) }, repo, 1)).rejects.toThrow('offline')
     expect(await prisma.kanbanCard.count()).toBe(0)
-    await importer.import(board, repo, 1)
+    await importer.import({ ...board, orgId: OrgId(board.orgId) }, repo, 1)
     expect((await prisma.kanbanCard.findFirstOrThrow()).status).toBe('triage')
     expect(applyPlan).toHaveBeenLastCalledWith(
       repo,
