@@ -9,8 +9,10 @@ const BACKOFF_MAX_MS = 15 * 60_000
 /** Comments updated since the first attempt, five pages at most; a sixth page makes the lookup inconclusive. */
 const MARKER_PAGE_LIMIT = 5
 const MARKER_PAGE_SIZE = 100
-/** Widens the since window for clock skew between this daemon and GitHub. */
-const MARKER_SINCE_SKEW_MS = 2 * 60_000
+/** Widens the since window for skew between GitHub's own hosts; the bound itself is GitHub's clock, never this daemon's. */
+const MARKER_SINCE_MARGIN_MS = 2 * 60_000
+/** Bounds the pre-POST request that reads GitHub's clock. */
+const SERVER_TIME_TIMEOUT_MS = 5_000
 /** Undecided marker lookups (bound hit, timeout, error) before the row is parked as failed. */
 const MARKER_LOOKUP_LIMIT = 5
 /** Bounds the whole marker lookup, including every page fetch and its body. */
@@ -97,7 +99,7 @@ function readJson(res: Response, signal: AbortSignal): Promise<unknown> {
 /** The store rows the publisher drains. LocalStore implements this. */
 export interface KanbanCommentStore {
   dueKanbanComments(now: number, limit: number): Promise<KanbanCommentRow[]>
-  markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): Promise<void>
+  markKanbanCommentAttempt(leaseId: string, nextAt: number, githubAt: number | null): Promise<void>
   deferKanbanComment(leaseId: string, nextAt: number): Promise<void>
   deferKanbanCommentLookup(leaseId: string, nextAt: number): Promise<void>
   failKanbanComment(leaseId: string): Promise<void>
@@ -177,8 +179,9 @@ export class KanbanCommentPublisher {
         return
       }
     }
-    // Mark before the POST so a crash mid-request looks before it posts a second copy.
-    await this.deps.store.markKanbanCommentAttempt(leaseId, later(), this.deps.clock.now())
+    // Mark before the POST so a crash mid-request looks before it posts a second copy; the bound is GitHub's clock.
+    const serverAt = row.attempted ? null : await this.githubNow(entry, token)
+    await this.deps.store.markKanbanCommentAttempt(leaseId, later(), serverAt)
     const published = await new GithubFinalPoster(
       {
         token: async () => this.deps.token(entry),
@@ -193,6 +196,30 @@ export class KanbanCommentPublisher {
     if (!published) return
     await this.deps.store.removeKanbanComment(leaseId)
     this.deps.log.info(`kanban: posted final comment on ${entry.repoFullName}#${entry.issueNumber}`)
+  }
+
+  /** GitHub's clock from a cheap GET's Date header; null when unreadable, which makes a later lookup scan without a bound. */
+  private async githubNow(entry: KanbanTerminalEntry, token: string): Promise<number | null> {
+    const fetchImpl = this.deps.fetchImpl ?? fetch
+    const base = this.deps.baseUrl ?? 'https://api.github.com'
+    try {
+      const res = await fetchImpl(
+        `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?per_page=1`,
+        {
+          signal: AbortSignal.timeout(SERVER_TIME_TIMEOUT_MS),
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: 'application/vnd.github+json',
+            'x-github-api-version': '2022-11-28'
+          }
+        }
+      )
+      await res.body?.cancel().catch(() => undefined)
+      const at = res.ok ? Date.parse(res.headers.get('date') ?? '') : Number.NaN
+      return Number.isFinite(at) ? at : null
+    } catch {
+      return null
+    }
   }
 
   /** An undecided lookup retries with backoff, then parks the row loudly rather than looping or risking a duplicate. */
@@ -219,9 +246,10 @@ export class KanbanCommentPublisher {
     const fetchImpl = this.deps.fetchImpl ?? fetch
     const base = this.deps.baseUrl ?? 'https://api.github.com'
     const signal = AbortSignal.timeout(this.deps.markerLookupTimeoutMs ?? MARKER_LOOKUP_TIMEOUT_MS)
-    // This endpoint ignores sort/direction and lists oldest first, so since is what skips the older history.
-    const since = new Date((row.attemptedAt ?? row.recordedAt) - MARKER_SINCE_SKEW_MS).toISOString()
-    const query = new URLSearchParams({ since, per_page: String(MARKER_PAGE_SIZE) })
+    // This endpoint lists oldest first, so since skips the older history; with no GitHub-clock bound, scan from the start.
+    const query = new URLSearchParams({ per_page: String(MARKER_PAGE_SIZE) })
+    if (row.attemptedAt !== undefined)
+      query.set('since', new Date(row.attemptedAt - MARKER_SINCE_MARGIN_MS).toISOString())
     let url: string | undefined = `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?${query}`
     for (let page = 0; page < MARKER_PAGE_LIMIT && url; page++) {
       const res = await fetchImpl(url, {

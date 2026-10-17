@@ -4177,6 +4177,24 @@ describe.skipIf(pg)('the v58 → v59 kanban outbox columns', () => {
   })
 })
 
+describe.skipIf(pg)('the v59 → v60 kanban attemptedAt clearing', () => {
+  it('clears a locally-timestamped attemptedAt so the next marker lookup scans without a bound', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-kanban-v59-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec(
+      "INSERT INTO kanban_terminals (leaseId, entry, state, attempted, attemptedAt, recordedAt) VALUES ('l2', '{}', 'comment', 1, 1234, 5); PRAGMA user_version = 59"
+    )
+    old.close()
+    await (await LocalStore.open(path)).close()
+    const db = new DatabaseSync(path)
+    expect(db.prepare("SELECT attemptedAt FROM kanban_terminals WHERE leaseId = 'l2'").get()).toEqual({
+      attemptedAt: null
+    })
+    db.close()
+  })
+})
+
 // multi-repository-workspaces.md decision 20: v28 records that a session was handed an on-demand clone directory.
 describe.skipIf(pg)('the v27 → v28 on-demand clones column', () => {
   it('adds onDemandClones to a v27 store, empty on the sessions it already holds', async () => {

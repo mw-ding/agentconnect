@@ -1328,7 +1328,7 @@ export const SOURCE_CACHE_SCHEMA = `
       );
 `
 
-export const SCHEMA_VERSION = 59
+export const SCHEMA_VERSION = 60
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -2026,6 +2026,11 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean; postgres: bool
   async (db, store) => {
     for (const [column, type] of KANBAN_TERMINALS_RETRY_COLUMNS)
       await addColumn(db, store.postgres, 'kanban_terminals', column, type)
+  },
+  // v60: an attemptedAt written from local time is untrustworthy under clock skew; clearing it makes the next lookup scan without a bound.
+  async (db, store) => {
+    if (await columnExists(db, store.postgres, 'kanban_terminals', 'attemptedAt'))
+      await db.exec('UPDATE kanban_terminals SET attemptedAt = NULL')
   }
 ]
 
@@ -2691,7 +2696,7 @@ export class LocalStore {
       );
       -- One terminal tool call per lease. state 'held' until the CP answers the report, then 'comment' until the
       -- final issue comment lands; attempted marks a POST that may have landed, so a retry looks before posting.
-      -- attemptedAt is set once, before the first POST, and bounds that look with GitHub's since filter.
+      -- attemptedAt is GitHub's clock (Date header) before the first POST; it bounds that look with the since filter, never local time.
       -- lookupMisses counts looks that could not decide; at the cap the row is parked in state 'failed'.
       CREATE TABLE IF NOT EXISTS kanban_terminals (
         leaseId TEXT PRIMARY KEY,
@@ -5287,13 +5292,13 @@ export class LocalStore {
     }))
   }
 
-  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps the first attempt's time. */
-  async markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): Promise<void> {
+  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps GitHub's clock from the first attempt (null when unreadable). */
+  async markKanbanCommentAttempt(leaseId: string, nextAt: number, githubAt: number | null): Promise<void> {
     await this.db
       .prepare(
-        'UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, attemptedAt = COALESCE(attemptedAt, ?), nextAt = ? WHERE leaseId = ?'
+        'UPDATE kanban_terminals SET attempts = attempts + 1, attemptedAt = CASE WHEN attempted = 0 THEN ? ELSE attemptedAt END, attempted = 1, nextAt = ? WHERE leaseId = ?'
       )
-      .run(at, nextAt, leaseId)
+      .run(githubAt, nextAt, leaseId)
   }
 
   async deferKanbanComment(leaseId: string, nextAt: number): Promise<void> {
