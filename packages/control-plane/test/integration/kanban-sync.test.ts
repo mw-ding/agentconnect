@@ -592,7 +592,15 @@ describe('two CP replicas (stale snapshot after reassignment)', () => {
 
   it('replica B newer status wins over replica A stale snapshot', async () => {
     const f = await replicas()
-    const syncB = f.mk()
+    const syncB = f.mk({
+      store: {
+        readCard: async () => f.state.issue,
+        readLabelEvents: async () => f.state.events,
+        applyPlan: async () => {
+          throw new Error('B label write failed')
+        }
+      }
+    })
     // A's setAssignee runs B (a newer human status event) before returning, so A's later re-read sees B's commit.
     let bRan = false
     const syncA = f.mk({
@@ -609,7 +617,7 @@ describe('two CP replicas (stale snapshot after reassignment)', () => {
               { id: 30, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: bob },
               { id: 31, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: bob }
             ]
-            await syncB.onCardChanged(f.board.id, 1, true)
+            await expect(syncB.onCardChanged(f.board.id, 1, true)).rejects.toThrow('B label write failed')
           }
           return result
         }
@@ -620,8 +628,52 @@ describe('two CP replicas (stale snapshot after reassignment)', () => {
     const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
     expect(row.status).toBe('blocked')
     expect(row.syncEventCursor).toBe(31n)
+    expect(row.labelWritePending).toBe(false)
+    expect(f.writes).toHaveLength(2)
     // A's stale snapshot must not re-write the pre-reassignment status label.
     expect(f.writes.some((w) => w.removeLabels.includes('ac/status:running'))).toBe(false)
+  })
+
+  it.each([false, true])('rejects A stale apply after B commits (cursor-only=%s)', async (cursorOnly) => {
+    const f = await replicas()
+    await prisma.kanbanRun.delete({ where: { id: f.run.id } })
+    await prisma.kanbanCard.update({
+      where: { id: f.card.id },
+      data: { status: 'todo', assigneeAgentId: NEXT }
+    })
+    f.state.issue = { ...f.state.issue, labels: ['ac/status:blocked', 'ac/agent:new'] }
+    f.state.events = [
+      { id: 10, event: 'labeled', label: { name: 'ac/status:todo' }, actor: bob },
+      { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+      { id: 21, event: 'unlabeled', label: { name: 'ac/status:todo' }, actor: bob },
+      { id: 22, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: bob }
+    ]
+    const syncB = f.mk()
+    const staleRepo = new PgKanbanSyncRepo(prisma)
+    const apply = staleRepo.apply.bind(staleRepo)
+    let interleaved = false
+    staleRepo.apply = async (...args) => {
+      if (!interleaved) {
+        interleaved = true
+        const status = cursorOnly ? 'todo' : 'ready'
+        f.state.issue = { ...f.state.issue, labels: [`ac/status:${status}`, 'ac/agent:new'] }
+        f.state.events = [
+          ...f.state.events,
+          { id: 30, event: 'unlabeled', label: { name: 'ac/status:blocked' }, actor: bob },
+          { id: 31, event: 'labeled', label: { name: `ac/status:${status}` }, actor: bob }
+        ]
+        await syncB.onCardChanged(f.board.id, 1, true)
+      }
+      return apply(...args)
+    }
+    await f.mk({ repo: staleRepo }).onCardChanged(f.board.id, 1, true)
+    expect(interleaved).toBe(true)
+    expect(await f.repo.get(f.board.id, 1)).toMatchObject({
+      status: cursorOnly ? 'todo' : 'ready',
+      syncEventCursor: 31n,
+      stateRevision: cursorOnly ? 1n : 2n
+    })
+    expect(f.writes).toHaveLength(1)
   })
 })
 
