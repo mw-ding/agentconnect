@@ -1,6 +1,7 @@
 import { agentWithRuntime } from '../decisions/model-selection.js'
 import { isAppendCoordinate } from './append-coordinate.js'
-import { isCheckCoordinate, isSubsessionCoordinate } from './subsession-coordinate.js'
+import { isCheckCoordinate, isResearchCoordinate, isSubsessionCoordinate } from './subsession-coordinate.js'
+import { researchRunningLine } from '../assistant/research.js'
 import { CLAUDE_HEADLESS_DISALLOWED_TOOLS } from '../runtime-defs/claude-runtime.js'
 import { createMemoryEntryService } from '../memory/entries/factory.js'
 import { memoryActivationContext } from '../memory/entries/activation.js'
@@ -238,6 +239,13 @@ export class SessionManager {
         integrationId?: string,
         rec?: SessionRecord
       ) => MemoryScope | Promise<MemoryScope>
+      /** This conversation's own memory guidance beside the index, such as a person's directory entry in their DM; '' for none. */
+      memoryGuidanceFor?: (
+        agentId: string,
+        msg: NormalizedMessage,
+        integrationId?: string,
+        rec?: SessionRecord
+      ) => Promise<string>
       /** Fail-open recall diagnostics. Must never include query/record/plugin body text. */
       onMemoryRecallError?: (agentId: string, error: unknown) => void
       /** The agent's memory home was out of reach at session start: the session opened without standing context, and this is the warning. */
@@ -598,6 +606,7 @@ export class SessionManager {
     // home, a suspended sandbox — starts the session with no standing context and a warning; the memory tools answer
     // the same error, and the post-turn distillation waits in the capture outbox. Anything else still fails the turn.
     let memoryIndex = ''
+    let memoryGuidance = ''
     if (memoryEnabled) {
       try {
         const scope = await abortable(memScope, signal)
@@ -607,6 +616,8 @@ export class SessionManager {
         if (!(err instanceof MemoryHomeUnavailableError)) throw err
         this.deps.onMemoryHomeUnavailable?.(agentId, err)
       }
+      // A standing rule that needs no memory home; a failed lookup leaves only the common rules.
+      memoryGuidance = (await this.deps.memoryGuidanceFor?.(agentId, msg, integrationId, rec).catch(() => '')) ?? ''
     }
     // The channel's human display name, if the daemon has resolved one (Slack bulk refresh /
     // ChannelNameResolver, cached in `display_names`). Stored bare for a group/channel,
@@ -664,6 +675,7 @@ export class SessionManager {
           workspaceRoots: await this.workspaces.sessionAdditionalRoots(agent, workspaceRequest),
           onDemandClones: await this.workspaces.sessionOnDemandClones(agent, workspaceRequest),
           memoryIndex,
+          ...(memoryGuidance ? { memoryGuidance } : {}),
           usesMeta,
           // The platform's session-stable block (Linear's issue coordinates and working convention):
           // standing, so it never lands as a leading user block or a transcript row.
@@ -733,8 +745,10 @@ export class SessionManager {
           sessionKey: key
         }) ?? [],
       ...(options.additionalMcpServers !== undefined ? { additionalMcpServers: options.additionalMcpServers } : {}),
-      // A check (assistant-mode.md §5.12) runs in plan mode, whose exits need an approver nobody is.
-      ...(isCheckCoordinate(thread) ? { extraDisallowedTools: CLAUDE_HEADLESS_DISALLOWED_TOOLS } : {}),
+      // A check (assistant-mode.md §5.12) runs in plan mode, whose exits need an approver nobody is; research (§5.15) has nobody to ask either.
+      ...(isCheckCoordinate(thread) || isResearchCoordinate(thread)
+        ? { extraDisallowedTools: CLAUDE_HEADLESS_DISALLOWED_TOOLS }
+        : {}),
       // The sticky per-session effort override rides session `_meta` on new/load so the
       // `ultracode` sentinel (rejected by the `thought_level` select) takes effect. Chat
       // authority is resolved immediately before each request, then the await is fenced:
@@ -1040,10 +1054,13 @@ export class SessionManager {
       promptPrelude.push({ type: 'text', text: messages })
     }
     // Every turn of every agent is told the people's local time, current now (product-conventions.md "Local time").
-    promptPrelude.push({
-      type: 'text',
-      text: await abortable(() => this.localNow(agentId, key, msg, integrationId), signal)
-    })
+    const now = await abortable(() => this.localNow(agentId, key, msg, integrationId), signal)
+    promptPrelude.push({ type: 'text', text: now.text })
+    // While organization research runs, every place turn says so beside the time; no reply waits for it (assistant-mode.md §5.15).
+    if (!isSubsessionCoordinate(thread)) {
+      const since = await this.deps.store.assistantSubsessions.researchRunningSince(agentId).catch(() => undefined)
+      if (since !== undefined) promptPrelude.push({ type: 'text', text: researchRunningLine(since, now.zone) })
+    }
     // A trusted direct agent call is addressed to this agent regardless of names
     // or quoted mentions in its body. State that routing fact per turn so the
     // generic no-response rule cannot mistake the caller label for an addressee.
@@ -1097,13 +1114,13 @@ export class SessionManager {
     this.standingRefreshDue.delete(key)
   }
 
-  /** The local-time line, in the first zone found: the sender's, a run's schedule's, its starter's, the place's last seen, UTC. */
+  /** The local-time line and its zone, the first found: the sender's, a run's schedule's, its starter's, the place's last seen, UTC. */
   private async localNow(
     agentId: string,
     key: string,
     msg: NormalizedMessage,
     integrationId?: string
-  ): Promise<string> {
+  ): Promise<{ text: string; zone: string | undefined }> {
     const now = (this.deps.now ?? Date.now)()
     const place = { platform: msg.platform, channel: msg.channel, transportScope: msg.transportScope ?? null }
     const zones = this.deps.store.placeTimeZones
@@ -1127,7 +1144,7 @@ export class SessionManager {
       knownTimeZone(msg.scheduleTimeZone) ??
       (await startedBy()) ??
       (await zones.get(agentId, place).catch(() => undefined))
-    return renderLocalNow(now, zone)
+    return { text: renderLocalNow(now, zone), zone }
   }
 
   /** Decide whether to re-inject the compact no-response reminder on a later turn,
