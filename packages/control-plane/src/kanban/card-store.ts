@@ -67,6 +67,14 @@ export interface CardStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void>
+  /** Add `subIssueId` (a same-repo issue id) as a sub-issue of `issueNumber`. */
+  addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: number): Promise<void>
+  /** Add `issueId` (a same-repo issue id) to the issue's blocked_by dependencies. */
+  addBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void>
+  /** Remove `issueId` from the issue's blocked_by dependencies. */
+  removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void>
+  /** Close an issue as not planned (the duplicate-create and B2-trip paths); throws on any GitHub failure. */
+  closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void>
 }
 
 /** Called after a label POST returns success, before any later write in the same plan. */
@@ -308,6 +316,39 @@ export class GithubCardStore implements CardStore {
     onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
     return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
+  }
+
+  async addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/sub_issues`, 'POST', { sub_issue_id: subIssueId })
+  }
+
+  async addBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by`, 'POST', { issue_id: issueId })
+  }
+
+  async removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by/${issueId}`, 'DELETE')
+  }
+
+  async closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}`, 'PATCH', { state: 'closed', state_reason: 'not_planned' })
+  }
+
+  /** A metadata write with the CP-only card token (issues write); repo-id addressed so a rename can't misroute it. */
+  private async write(
+    repo: KanbanRepoRef,
+    path: string,
+    method: 'POST' | 'PATCH' | 'DELETE',
+    body?: unknown
+  ): Promise<void> {
+    const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'write')
+    await githubRequest<unknown>(`/repositories/${repo.repoId}${path}`, {
+      method,
+      auth: grant.token,
+      ...(body !== undefined ? { body } : {}),
+      fetchImpl: this.deps.fetchImpl,
+      baseUrl: this.deps.baseUrl
+    })
   }
 
   private async get<T>(repo: KanbanRepoRef, path: string, fetchImpl = this.deps.fetchImpl): Promise<T> {
