@@ -897,9 +897,9 @@ describe('vera-r2: KanbanSync over Postgres', () => {
       ...f.deps,
       store: {
         ...f.deps.store,
-        applyPlan: async (...args) => {
+        applyPlan: async (repo, issueNumber, issue, plan) => {
           if (failWrite) throw new Error('GitHub unavailable')
-          await f.deps.store.applyPlan(...args)
+          await f.deps.store.applyPlan(repo, issueNumber, issue, plan)
         }
       }
     })
