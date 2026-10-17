@@ -409,8 +409,14 @@ export const KanbanOrchestrateCommitCreateOk = z
 
 export const KanbanOrchestrateLinkOk = z.object({ ok: z.literal(true), op: z.literal('link') }).strict()
 
+/** `truncated`: the blocked_by list ran past one page, so only the read edges were removed and the status stays. */
 export const KanbanOrchestrateUnblockOk = z
-  .object({ ok: z.literal(true), op: z.literal('unblock'), status: z.string().min(1).max(40) })
+  .object({
+    ok: z.literal(true),
+    op: z.literal('unblock'),
+    status: z.string().min(1).max(40),
+    truncated: z.literal(true).optional()
+  })
   .strict()
 
 export const KanbanOrchestrateAssignOk = z

@@ -137,4 +137,112 @@ describe('PgKanbanOrchestratorRepo (B2 epic budgets)', () => {
     })
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: epic.card.id } })).epicCardsCreated).toBe(1)
   })
+  it('a replay on a full epic returns the existing card; only an actual create is refused and rolled back', async () => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'b2-r1', repoId: REPO_ID, repoFullName: 'acme/web', epicMaxCards: 1 }
+    })
+    const cards = new PgKanbanCardRepo(prisma)
+    const repo = new PgKanbanOrchestratorRepo(prisma)
+    const epic = await cards.upsertCard({ ...upsert(board.id, 500, 'epic-r1') })
+    const first = await repo.createEpicChild({
+      boardId: board.id,
+      epicIssueNumber: 500,
+      upsert: upsert(board.id, 501, 'r1')
+    })
+    expect(first).toMatchObject({ ok: true, created: true })
+    // The epic is now full; the same key (any issue) and the same issue (no key) both come back ok.
+    const byKey = await repo.createEpicChild({
+      boardId: board.id,
+      epicIssueNumber: 500,
+      upsert: upsert(board.id, 502, 'r1')
+    })
+    expect(byKey).toMatchObject({ ok: true, created: false, matchedBy: 'idempotency_key' })
+    const byIssue = await repo.createEpicChild({
+      boardId: board.id,
+      epicIssueNumber: 500,
+      upsert: { ...upsert(board.id, 501, 'r1'), idempotencyKey: null }
+    })
+    expect(byIssue).toMatchObject({ ok: true, created: false, matchedBy: 'issue' })
+    // A real create on the full epic rolls back to the savepoint: no card and no created-audit row survive.
+    const audits = await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })
+    const over = await repo.createEpicChild({
+      boardId: board.id,
+      epicIssueNumber: 500,
+      upsert: upsert(board.id, 503, 'r1-new')
+    })
+    expect(over).toEqual({ ok: false, reason: 'epic_budget_exhausted' })
+    expect(await prisma.kanbanCard.count({ where: { boardId: board.id, issueNumber: 503 } })).toBe(0)
+    expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(audits)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: epic.card.id } })).epicCardsCreated).toBe(1)
+    // A top-level create on the same board is unaffected by the epic's budget.
+    expect(await repo.createEpicChild({ boardId: board.id, upsert: upsert(board.id, 504, 'top-r1') })).toMatchObject({
+      ok: true,
+      created: true
+    })
+  })
+
+  it('an upsert error inside createEpicChild leaves the ambient transaction usable', async () => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'b2-err', repoId: REPO_ID, repoFullName: 'acme/web' }
+    })
+    const repo = new PgKanbanOrchestratorRepo(prisma)
+    await expect(
+      repo.createEpicChild({ boardId: board.id, upsert: { ...upsert(board.id, 1, 'err'), expectedRepoId: 1n } })
+    ).rejects.toMatchObject({ name: 'KanbanCardUpsertError', code: 'repo_mismatch' })
+    expect(await prisma.kanbanCard.count({ where: { boardId: board.id } })).toBe(0)
+  })
+
+  it('adoptEpic refuses a self-parent, a cycle, a re-parent, and a chain past the depth bound', async () => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'b2-r4', repoId: REPO_ID, repoFullName: 'acme/web', epicMaxCards: 100 }
+    })
+    const cards = new PgKanbanCardRepo(prisma)
+    const repo = new PgKanbanOrchestratorRepo(prisma)
+    const mk = async (n: number) => (await cards.upsertCard({ ...upsert(board.id, n, `r4-${n}`) })).card
+    const a = await mk(601)
+    const b = await mk(602)
+    const c = await mk(603)
+    expect(await repo.adoptEpic({ cardId: a.id, epicIssueNumber: 601 })).toEqual({ ok: false, reason: 'invalid_link' })
+    // b under a, c under b; then a under c would close a three-card cycle.
+    expect(await repo.adoptEpic({ cardId: b.id, epicIssueNumber: 601 })).toMatchObject({ ok: true, changed: true })
+    expect(await repo.adoptEpic({ cardId: c.id, epicIssueNumber: 602 })).toMatchObject({ ok: true, changed: true })
+    expect(await repo.adoptEpic({ cardId: a.id, epicIssueNumber: 603 })).toEqual({ ok: false, reason: 'invalid_link' })
+    // Re-parenting a card that already has an epic is refused, not moved.
+    const d = await mk(604)
+    expect(await repo.adoptEpic({ cardId: c.id, epicIssueNumber: 604 })).toEqual({ ok: false, reason: 'invalid_link' })
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).epicCardId).toBe(b.id)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: d.id } })).epicCardsCreated).toBe(0)
+    // A chain deeper than 32 hops is refused as if it cycled.
+    let parent = await mk(700)
+    for (let i = 1; i <= 33; i++) {
+      const next = await mk(700 + i)
+      await prisma.kanbanCard.update({ where: { id: next.id }, data: { epicCardId: parent.id } })
+      parent = next
+    }
+    const loose = await mk(800)
+    expect(await repo.adoptEpic({ cardId: loose.id, epicIssueNumber: 733 })).toEqual({
+      ok: false,
+      reason: 'invalid_link'
+    })
+    expect(await repo.adoptEpic({ cardId: loose.id, epicIssueNumber: 710 })).toMatchObject({ ok: true })
+  })
+
+  it('opposite concurrent adopts serialize on the board lock: exactly one wins, no deadlock', async () => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'b2-r4c', repoId: REPO_ID, repoFullName: 'acme/web', epicMaxCards: 100 }
+    })
+    const cards = new PgKanbanCardRepo(prisma)
+    const repo = new PgKanbanOrchestratorRepo(prisma)
+    const a = (await cards.upsertCard({ ...upsert(board.id, 901, 'c-a') })).card
+    const b = (await cards.upsertCard({ ...upsert(board.id, 902, 'c-b') })).card
+    for (let round = 0; round < 5; round++) {
+      await prisma.kanbanCard.updateMany({ where: { boardId: board.id }, data: { epicCardId: null } })
+      const results = await Promise.all([
+        repo.adoptEpic({ cardId: a.id, epicIssueNumber: 902 }),
+        repo.adoptEpic({ cardId: b.id, epicIssueNumber: 901 })
+      ])
+      expect(results.filter((r) => r.ok)).toHaveLength(1)
+      expect(results.filter((r) => !r.ok)).toEqual([{ ok: false, reason: 'invalid_link' }])
+    }
+  })
 })

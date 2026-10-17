@@ -281,7 +281,7 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
       ttlSec: 3540,
       expiresAt: '2026-07-11T01:00:00.000Z',
       repoFullName: 'acme/web',
-      access: 'read' as const
+      access: 'write' as const
     }))
     const orchestratorRepoId = vi.fn(async () => 42n)
     const deps = {
@@ -296,7 +296,7 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
       repoFullName: 'acme/web'
     })
     await handleGitCredRequest(frame, conn, deps)
-    expect(orchestratorRepoId).toHaveBeenCalledWith(AGENT_ID, 'acme/web')
+    expect(orchestratorRepoId).toHaveBeenCalledWith(AGENT_ID, PLACED_AGENT.orgId, 'acme/web')
     expect(mintForKanbanOrchestratorWrite).toHaveBeenCalledWith(
       PLACED_AGENT,
       'acme/web',
@@ -308,7 +308,7 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
     expect(conn.replyTo).toHaveBeenCalledWith(
       frame,
       'gitcred/grant',
-      expect.objectContaining({ token: 'ghs_orch', access: 'read' })
+      expect.objectContaining({ token: 'ghs_orch', access: 'write' })
     )
   })
 

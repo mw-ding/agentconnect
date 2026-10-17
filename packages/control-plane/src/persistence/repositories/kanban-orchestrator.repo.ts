@@ -49,11 +49,24 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
       if (input.epicIssueNumber !== undefined) {
         const locked = await this.lockEpic(tx, input.boardId, input.epicIssueNumber)
         if (locked === 'not_found') return { ok: false, reason: 'epic_not_found' }
-        if (exhausted(locked)) return { ok: false, reason: 'epic_budget_exhausted' }
         epic = locked
       }
-      // Composes under this tx: the outer transaction's boundary wins.
-      const result = await new PgKanbanCardRepo(tx).upsertCard(input.upsert)
+      // The budget gates only an actual create: a replay (existing key or issue) returns its card even on a full epic.
+      await tx.$executeRaw`SAVEPOINT kanban_epic_child`
+      let result: Awaited<ReturnType<PgKanbanCardRepo['upsertCard']>>
+      try {
+        // Composes under this tx: the outer transaction's boundary wins.
+        result = await new PgKanbanCardRepo(tx).upsertCard(input.upsert)
+      } catch (err) {
+        await tx.$executeRaw`ROLLBACK TO SAVEPOINT kanban_epic_child`
+        throw err
+      }
+      if (result.created && epic && exhausted(epic)) {
+        // Undo the insert and its created-audit row; nothing else in this tx has written yet.
+        await tx.$executeRaw`ROLLBACK TO SAVEPOINT kanban_epic_child`
+        return { ok: false, reason: 'epic_budget_exhausted' }
+      }
+      await tx.$executeRaw`RELEASE SAVEPOINT kanban_epic_child`
       if (result.created && epic) {
         await tx.kanbanCard.update({ where: { id: result.card.id }, data: { epicCardId: epic.id } })
         await tx.kanbanCard.update({ where: { id: epic.id }, data: { epicCardsCreated: { increment: 1 } } })
@@ -64,6 +77,12 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
 
   adoptEpic(input: KanbanAdoptEpicInput): Promise<KanbanAdoptEpicResult> {
     return withAmbientTx(this.db, async (tx) => {
+      const [board] = await tx.$queryRaw<Array<{ boardId: string }>>(Prisma.sql`
+        SELECT c."boardId" FROM "kanban_card" c WHERE c."id" = ${input.cardId}::uuid
+      `)
+      if (!board) return { ok: false, reason: 'card_not_found' }
+      // One epic re-link at a time per board: disjoint row locks alone would let two links close a long cycle.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'kanban-epic-link:' + board.boardId}))::text`
       const [card] = await tx.$queryRaw<Array<{ id: string; boardId: string; epicCardId: string | null }>>(Prisma.sql`
         SELECT c."id", c."boardId", c."epicCardId" FROM "kanban_card" c WHERE c."id" = ${input.cardId}::uuid FOR UPDATE OF c
       `)
@@ -74,6 +93,11 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
         const row = await tx.kanbanCard.findUnique({ where: { id: card.id }, select: CARD_ROW_SELECT })
         return { ok: true, changed: false, card: toCardRow(row!) }
       }
+      // Re-parenting is refused: GitHub keeps one parent per issue, and B2 counts never refund a moved child.
+      if (card.epicCardId !== null) return { ok: false, reason: 'invalid_link' }
+      if (locked.id === card.id || (await this.reachesCard(tx, locked.id, card.id))) {
+        return { ok: false, reason: 'invalid_link' }
+      }
       if (exhausted(locked)) return { ok: false, reason: 'epic_budget_exhausted' }
       const row = await tx.kanbanCard.update({
         where: { id: card.id },
@@ -83,6 +107,20 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
       await tx.kanbanCard.update({ where: { id: locked.id }, data: { epicCardsCreated: { increment: 1 } } })
       return { ok: true, changed: true, card: toCardRow(row) }
     })
+  }
+
+  /** Walks the epic chain up from `fromId`; true when it reaches `targetId` (a cycle) or runs past the depth bound. */
+  private async reachesCard(tx: Prisma.TransactionClient, fromId: string, targetId: string): Promise<boolean> {
+    let at: string | null = fromId
+    for (let depth = 0; depth < EPIC_CHAIN_MAX_DEPTH && at !== null; depth++) {
+      if (at === targetId) return true
+      const [row]: Array<{ epicCardId: string | null }> = await tx.$queryRaw<Array<{ epicCardId: string | null }>>(
+        Prisma.sql`SELECT "epicCardId" FROM "kanban_card" WHERE "id" = ${at}::uuid`
+      )
+      at = row?.epicCardId ?? null
+    }
+    // A chain deeper than the bound is refused as if it cycled; no real decomposition nests that far.
+    return at !== null
   }
 
   // The epic card's row lock is the B2 mutex: N commits at the budget boundary serialize and only the remaining room wins.
@@ -209,17 +247,12 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
     }
   }
 
-  async resolveAssignee(
-    orgId: string,
-    slug: string
-  ): Promise<{ ok: true; agentId: string } | { ok: false; reason: 'unknown_agent' | 'agent_not_assignable' }> {
+  async unassignableReason(orgId: string, slug: string): Promise<'unknown_agent' | 'agent_not_assignable'> {
     const agent = await this.db.agent.findUnique({
       where: { orgId_name: { orgId, name: slug.toLowerCase() } },
-      select: { id: true, visibility: true }
+      select: { id: true }
     })
-    if (!agent) return { ok: false, reason: 'unknown_agent' }
-    if (agent.visibility === 'restricted') return { ok: false, reason: 'agent_not_assignable' }
-    return { ok: true, agentId: agent.id }
+    return agent ? 'agent_not_assignable' : 'unknown_agent'
   }
 
   async epicBudget(
@@ -235,9 +268,16 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
     return row.epicCardsCreated >= row.epicMaxCards ? 'epic_budget_exhausted' : 'ok'
   }
 
-  async orchestratorRepoId(agentId: string, repoFullName: string): Promise<bigint | null> {
+  async orchestratorRepoId(agentId: string, orgId: string, repoFullName: string): Promise<bigint | null> {
+    // GitHub names are case-insensitive; the board must be the agent's own org's, never a same-named repo elsewhere.
     const board = await this.db.kanbanBoard.findFirst({
-      where: { orchestratorAgentId: agentId, enabled: true, repoFullName },
+      where: {
+        orchestratorAgentId: agentId,
+        orgId,
+        enabled: true,
+        repoFullName: { equals: repoFullName, mode: 'insensitive' }
+      },
+      orderBy: { createdAt: 'asc' },
       select: { repoId: true }
     })
     return board?.repoId ?? null
@@ -291,6 +331,8 @@ function toCardRow(row: {
   if (!isKanbanStatus(row.status)) throw new Error(`kanban card ${row.id} has unknown status ${row.status}`)
   return { ...row, status: row.status }
 }
+
+const EPIC_CHAIN_MAX_DEPTH = 32
 
 /** The B2 maxCards ceiling: a lifetime counter that archiving a child never refunds. */
 function exhausted(epic: EpicRow): boolean {

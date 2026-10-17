@@ -8267,12 +8267,12 @@ export interface KanbanAdoptEpicInput {
 
 export type KanbanAdoptEpicResult =
   | { ok: true; changed: boolean; card: KanbanCardRow }
-  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' | 'card_not_found' }
+  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' | 'card_not_found' | 'invalid_link' }
 
 export interface KanbanOrchestratorRepo {
-  /** File a card as an epic child (or top-level) in one transaction: lock the epic, re-check B2, upsert, link + count. */
+  /** File a card as an epic child (or top-level) in one tx: lock the epic, upsert, and only a real create is budget-gated. */
   createEpicChild(input: KanbanEpicChildInput): Promise<KanbanEpicChildResult>
-  /** Link an existing card under an epic (parent): B2 check + counter, setting epicCardId when null. */
+  /** Link an unparented card under an epic: refuses self/cycle/re-parent (`invalid_link`), then B2 check + counter. */
   adoptEpic(input: KanbanAdoptEpicInput): Promise<KanbanAdoptEpicResult>
   /** The board as this orchestrator sees it; unknown/other-org boards are indistinguishable (`board_not_found`). */
   boardForOrchestrator(
@@ -8292,15 +8292,12 @@ export interface KanbanOrchestratorRepo {
   ): Promise<{ truncated: boolean; boards: KanbanOrchestratorBoardView[] }>
   /** One card by issue number on a board, with the fields link/assign/unblock need. */
   cardByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanOrchestratorCard | null>
-  /** The assignee an `ac/agent:<slug>` names: unknown vs restricted vs an org agent id. */
-  resolveAssignee(
-    orgId: string,
-    slug: string
-  ): Promise<{ ok: true; agentId: string } | { ok: false; reason: 'unknown_agent' | 'agent_not_assignable' }>
+  /** Why `resolveAgentSlug` (the Lane 1 policy) returned null for this slug: no such agent, or a restricted one. */
+  unassignableReason(orgId: string, slug: string): Promise<'unknown_agent' | 'agent_not_assignable'>
   /** B2 pre-check for prepare: the epic's lifetime counter against the board's maxCards. */
   epicBudget(boardId: string, epicIssueNumber: number): Promise<'ok' | 'epic_not_found' | 'epic_budget_exhausted'>
-  /** The board repo this agent orchestrates on `repoFullName`; null when no enabled board matches (grant gate). */
-  orchestratorRepoId(agentId: string, repoFullName: string): Promise<bigint | null>
+  /** The board repo this agent orchestrates in its org on `repoFullName` (case-insensitive); null gates the grant. */
+  orchestratorRepoId(agentId: string, orgId: string, repoFullName: string): Promise<bigint | null>
 }
 
 /** The board facts the orchestrator service needs, after the role gate passed. */

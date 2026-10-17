@@ -303,7 +303,7 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         return
       }
       // The agent must orchestrate an enabled board on this repo; the repo id is resolved from that board, never the ask.
-      const repoId = await deps.kanbanOrchestrator.orchestratorRepoId(agentId, repoFullName)
+      const repoId = await deps.kanbanOrchestrator.orchestratorRepoId(agentId, agent.orgId, repoFullName)
       if (repoId === null) {
         conn.sendError(frame.id, 'SCOPE_DENIED', 'this agent does not orchestrate a board on that repository', false)
         return
@@ -321,7 +321,8 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         ttlSec: cred.ttlSec,
         expiresAt: cred.expiresAt,
         repoFullName: cred.repoFullName,
-        access: 'read',
+        // An issues:write token: the daemon caches it under its own orchestrator key and never serves it to git.
+        access: 'write',
         ...githubEcho(githubQualified, repoId)
       })
       return

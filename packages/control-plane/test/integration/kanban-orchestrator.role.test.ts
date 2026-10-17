@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { PgKanbanOrchestratorRepo } from '../../src/persistence/repositories/kanban-orchestrator.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
 
@@ -108,17 +109,48 @@ describe('PgKanbanOrchestratorRepo role gate (real Postgres)', () => {
     expect((await repo.orchestratorBoards(randomUUID(), undefined, undefined, 200)).boards).toEqual([])
   })
 
-  it('resolves an assignee slug into unknown_agent / agent_not_assignable / an agent id', async () => {
+  it('explains a null resolveAgentSlug as unknown_agent or agent_not_assignable', async () => {
     const repo = new PgKanbanOrchestratorRepo(prisma)
-    expect(await repo.resolveAssignee(DEFAULT_ORG_ID, 'missing')).toEqual({ ok: false, reason: 'unknown_agent' })
+    const cards = new PgKanbanCardRepo(prisma)
+    expect(await cards.resolveAgentSlug(DEFAULT_ORG_ID, 'missing')).toBeNull()
+    expect(await repo.unassignableReason(DEFAULT_ORG_ID, 'missing')).toBe('unknown_agent')
     const restricted = randomUUID()
     await seedAgent(prisma, restricted, { visibility: 'restricted', sharedWith: ['member-1'] })
-    expect(await repo.resolveAssignee(DEFAULT_ORG_ID, `agent-${restricted}`)).toEqual({
-      ok: false,
-      reason: 'agent_not_assignable'
-    })
+    expect(await cards.resolveAgentSlug(DEFAULT_ORG_ID, `agent-${restricted}`)).toBeNull()
+    expect(await repo.unassignableReason(DEFAULT_ORG_ID, `agent-${restricted}`)).toBe('agent_not_assignable')
     const ok = randomUUID()
     await seedAgent(prisma, ok, { name: 'available' })
-    expect(await repo.resolveAssignee(DEFAULT_ORG_ID, 'available')).toEqual({ ok: true, agentId: ok })
+    expect(await cards.resolveAgentSlug(DEFAULT_ORG_ID, 'Available')).toBe(ok)
+  })
+
+  it('orchestratorRepoId matches the repo case-insensitively and only within the agent org', async () => {
+    const repo = new PgKanbanOrchestratorRepo(prisma)
+    const agentId = randomUUID()
+    await seedAgent(prisma, agentId, { name: `orch-${agentId}` })
+    await prisma.kanbanBoard.create({
+      data: {
+        orgId: DEFAULT_ORG_ID,
+        name: 'grant',
+        repoId: REPO_ID + 7n,
+        repoFullName: 'Acme/Web',
+        orchestratorAgentId: agentId
+      }
+    })
+    expect(await repo.orchestratorRepoId(agentId, DEFAULT_ORG_ID, 'acme/web')).toBe(REPO_ID + 7n)
+    expect(await repo.orchestratorRepoId(agentId, DEFAULT_ORG_ID, 'ACME/WEB')).toBe(REPO_ID + 7n)
+    expect(await repo.orchestratorRepoId(agentId, DEFAULT_ORG_ID, 'acme/web2')).toBeNull()
+    // The same agent id named as orchestrator of a board in another org grants nothing for this org's agent.
+    const otherOrg = await prisma.org.create({ data: { id: 'org-g2', name: 'g2', slug: 'g2' } })
+    await prisma.kanbanBoard.create({
+      data: {
+        orgId: otherOrg.id,
+        name: 'foreign',
+        repoId: REPO_ID + 8n,
+        repoFullName: 'acme/other',
+        orchestratorAgentId: agentId
+      }
+    })
+    expect(await repo.orchestratorRepoId(agentId, DEFAULT_ORG_ID, 'acme/other')).toBeNull()
+    expect(await repo.orchestratorRepoId(agentId, otherOrg.id, 'acme/other')).toBe(REPO_ID + 8n)
   })
 })

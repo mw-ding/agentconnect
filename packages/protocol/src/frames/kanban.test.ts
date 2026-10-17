@@ -318,6 +318,9 @@ describe('kanban wire (issue #2 M2)', () => {
     )
     expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'link' }).success).toBe(true)
     expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'unblock', status: 'todo' }).success).toBe(true)
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'unblock', status: 'todo', truncated: true }).success).toBe(
+      true
+    )
     expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'assign', assigned: false }).success).toBe(true)
     expect(
       KanbanOrchestrateOk.safeParse({
