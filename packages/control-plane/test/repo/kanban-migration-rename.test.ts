@@ -8,7 +8,10 @@ const prismaDir = fileURLToPath(new URL('../../prisma/', import.meta.url))
 const script = readFileSync(`${prismaDir}upgrade/2026-10-16-kanban-migration-rename.sql`, 'utf8')
 // The DO block is the whole effect; psql's BEGIN/COMMIT wrap it in a transaction.
 const doBlock = script.slice(script.indexOf('DO $$'), script.lastIndexOf('$$;') + 2)
-const pairs = [...script.matchAll(/\('(\d{14}_kanban_\w+)', '(\d{14}_kanban_\w+)'\)/g)].map((m) => [m[1]!, m[2]!])
+const pairs = [...script.matchAll(/\('(\d{14}_kanban_\w+)', '(\d{14}_kanban_\w+)'\)/g)].map((m): [string, string] => [
+  m[1]!,
+  m[2]!
+])
 const SCHEMA = 'kanban_rename_test'
 
 /** Run the script twice against a scratch `_prisma_migrations`, then roll everything back. */
