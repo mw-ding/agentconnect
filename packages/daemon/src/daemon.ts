@@ -4375,8 +4375,8 @@ export class Daemon {
       kanbanComment: (req) =>
         this.kanbanCardTools().comment(
           this.kanbanToolSession(req),
-          // Masked like a terminal summary: the note is posted to GitHub as written.
-          maskSecretsDeep(req.text, maskableSecrets(this.agents.get(req.agentId)))
+          // The org model credential (MODEL_API_KEY / MODEL_HEADER_*) rides this mask too, so a prompt-injected agent cannot exfiltrate it through a progress note.
+          this.maskAgentSecrets(req.agentId, req.text)
         ),
       codeHostEffect: (req) => this.runCodeHostEffect(req),
       codeHostResearch: {
@@ -27136,8 +27136,8 @@ export class Daemon {
         'No Kanban card run holds this session (it was never dispatched, already ended, or was superseded), so there is no outcome to report.'
       )
     }
-    // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy.
-    const terminal = maskSecretsDeep(req.terminal, maskableSecrets(this.agents.get(req.agentId)))
+    // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy, and the org model credential rides this mask too.
+    const terminal = this.maskAgentSecrets(req.agentId, req.terminal)
     const result = await this.kanban.recordTerminal(leaseId, terminal)
     if (!result.recorded) {
       throw new Error(
