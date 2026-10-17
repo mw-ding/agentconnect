@@ -72,7 +72,7 @@ export interface KanbanSyncRepo {
     actor?: GitHubActor
   ): Promise<{ changed: boolean; revoked: KanbanLeaseRef | null } | null>
   ack(card: SyncCard, cursor: bigint, agentCursor?: bigint): Promise<boolean>
-  /** Record one deferred pass; returns the refreshed card, or null when the card vanished. */
+  /** Record one deferred pass; returns the refreshed card, or null when its snapshot is stale or the card vanished. */
   defer(card: SyncCard, now: Date): Promise<SyncCard | null>
   /** Fail a card closed: ready/running moves to triage (revoking its lease), it is flagged for a human, the bound clears. */
   failClosed(card: SyncCard): Promise<{ status: KanbanStatus; revoked: KanbanLeaseRef | null } | null>

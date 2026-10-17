@@ -147,7 +147,15 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
 
   async defer(card: SyncCard, now: Date): Promise<SyncCard | null> {
     const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: card.id },
+      where: {
+        id: card.id,
+        stateRevision: card.stateRevision,
+        dispatchRevision: card.dispatchRevision,
+        syncEventCursor: card.syncEventCursor,
+        syncAgentCursor: card.syncAgentCursor,
+        syncDeferredAt: card.syncDeferredAt,
+        promotionPending: false
+      },
       data: { syncDeferralCount: { increment: 1 }, syncDeferredAt: card.syncDeferredAt ?? now }
     })
     if (count !== 1) return null
@@ -164,6 +172,9 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
       if (
         current.stateRevision !== card.stateRevision ||
         current.dispatchRevision !== card.dispatchRevision ||
+        current.syncEventCursor !== card.syncEventCursor ||
+        current.syncAgentCursor !== card.syncAgentCursor ||
+        current.syncDeferredAt?.getTime() !== card.syncDeferredAt?.getTime() ||
         current.promotionPending ||
         !isKanbanStatus(current.status)
       )

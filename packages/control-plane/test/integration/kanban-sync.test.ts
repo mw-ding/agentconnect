@@ -198,6 +198,22 @@ describe('Kanban synchronization transactions (Postgres)', () => {
     expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(0)
   })
 
+  it('does not restart the deferral clock from a competing stale snapshot', async () => {
+    const f = await fixture()
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const first = new Date('2026-10-17T00:00:00Z')
+    await f.repo.defer(snapshot, first)
+    await f.repo.defer(snapshot, new Date(first.getTime() + 9 * 60_000))
+    expect((await f.repo.get(f.board.id, 1))!.syncDeferredAt).toEqual(first)
+  })
+
+  it('rejects a stale repeated timeout snapshot even when fail-closed does not change status', async () => {
+    const f = await fixture()
+    const snapshot = (await f.repo.defer((await f.repo.get(f.board.id, 1))!, new Date()))!
+    expect(await f.repo.failClosed(snapshot)).toEqual({ status: 'todo', revoked: null })
+    expect(await f.repo.failClosed(snapshot)).toBeNull()
+  })
+
   it('fails a leased running card closed to triage: lease ended, generation bumped, audited, a claim never takes it', async () => {
     const f = await fixture(true)
     const snapshot = (await f.repo.get(f.board.id, 1))!
@@ -953,6 +969,63 @@ describe('vera-r2: KanbanSync over Postgres', () => {
     })
     expect(f.writes.filter((p) => p.comment)).toHaveLength(1)
   })
+
+  it.each(['defer', 'failClosed'] as const)(
+    'a stale %s cannot undo another replica writer re-add (PG)',
+    async (stage) => {
+      const now = new Date()
+      const old = { id: 40, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob } as LabelEvent
+      const f = await pg(
+        { status: 'ready', syncEventCursor: 40n, syncDeferredAt: new Date(now.getTime() - 11 * 60_000) },
+        ['ac/status:blocked'],
+        [old],
+        () => now
+      )
+      const writerIssue = { ...f.state.issue, labels: ['ac/status:ready'] }
+      const writerEvents: LabelEvent[] = [
+        old,
+        { id: 41, event: 'unlabeled', label: { name: 'ac/status:ready' }, actor: bob },
+        { id: 42, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }
+      ]
+      const writer = new KanbanSync({
+        ...f.deps,
+        store: {
+          ...f.deps.store,
+          readCard: async () => writerIssue,
+          readLabelEvents: async () => writerEvents
+        }
+      })
+      const staleRepo = new PgKanbanSyncRepo(prisma)
+      let raced = false
+      const newerEdit = async () => {
+        raced = true
+        await writer.onCardChanged(f.board.id, 1, true)
+        expect(await f.read()).toMatchObject({ status: 'ready', syncEventCursor: 42n, syncDeferredAt: null })
+      }
+      if (stage === 'defer') {
+        const defer = staleRepo.defer.bind(staleRepo)
+        staleRepo.defer = async (...args) => {
+          await newerEdit()
+          return defer(...args)
+        }
+      } else {
+        const failClosed = staleRepo.failClosed.bind(staleRepo)
+        staleRepo.failClosed = async (...args) => {
+          await newerEdit()
+          return failClosed(...args)
+        }
+      }
+      await new KanbanSync({ ...f.deps, repo: staleRepo }).onCardChanged(f.board.id, 1, true)
+      expect(raced).toBe(true)
+      expect(await f.read()).toMatchObject({
+        status: 'ready',
+        syncEventCursor: 42n,
+        syncDeferredAt: null,
+        needsAttention: false
+      })
+      expect(f.writes.some((p) => p.status === 'triage')).toBe(false)
+    }
+  )
 
   it('vera-r2: 5 the deferral bound fails closed to triage and a claim neither takes it nor clears the flag (PG)', async () => {
     const start = new Date()
