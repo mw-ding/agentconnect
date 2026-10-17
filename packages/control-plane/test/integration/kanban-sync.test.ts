@@ -53,7 +53,7 @@ describe('Kanban synchronization transactions (Postgres)', () => {
     ])
     expect(results.filter(Boolean)).toHaveLength(1)
     const current = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
-    expect(current).toMatchObject({ status: 'ready', stateRevision: 2n, labelWritePending: true, syncEventCursor: 7n })
+    expect(current).toMatchObject({ status: 'ready', stateRevision: 2n, labelWritePending: false, syncEventCursor: 7n })
     expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(1)
     const next = (await f.repo.get(f.board.id, 1))!
     expect(await f.repo.ack(snapshot, 7n)).toBe(false)

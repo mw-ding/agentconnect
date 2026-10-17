@@ -152,6 +152,21 @@ it('tracks background work by the runtime id while reporting the outward session
   ])
 })
 
+it('starts a fresh runtime session for a subsequent lease under the same GitHub thread key', async () => {
+  const h = await harness()
+  await h.worker.dispatch(dispatch)
+  await vi.waitFor(async () => expect(await h.store.getSession(key())).toMatchObject({ state: 'idle' }))
+  const first = await h.store.getSession(key())
+  expect(first?.acpSessionId).toBe('acp-card')
+  await h.worker.revoke(dispatch.leaseId, dispatch.cardId)
+  h.host.newSession.mockResolvedValueOnce('acp-restarted')
+  const next = { ...dispatch, leaseId: '55555555-5555-4555-8555-555555555555', attempt: 2, dispatchRevision: '4' }
+  await h.worker.dispatch(next)
+  await vi.waitFor(async () => expect((await h.store.getSession(key()))?.acpSessionId).toBe('acp-restarted'))
+  expect(h.host.forgetSession).toHaveBeenCalledWith('acp-card')
+  expect(h.host.newSession).toHaveBeenCalledTimes(2)
+})
+
 it('uses the exact GitHub hook coordinates and preserves untrusted-content guidance', () => {
   const card = buildKanbanMessage(dispatch, 'trace')
   const hook = buildHookMessage(

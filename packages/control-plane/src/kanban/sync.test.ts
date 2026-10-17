@@ -56,7 +56,7 @@ function fixture(overrides: Partial<SyncCard> = {}) {
       applyPlan: vi.fn(async () => {}),
       managedEdits: vi.fn(async () => ({ status: event(), assignee: null, cursor: 1 }))
     },
-    permissions: { permission: vi.fn(async () => 'write') },
+    permissions: { permission: vi.fn(async () => 'write' as const) },
     repoRef: vi.fn(async () => target),
     revoke: vi.fn(async () => {}),
     promote: vi.fn(async () => {}),

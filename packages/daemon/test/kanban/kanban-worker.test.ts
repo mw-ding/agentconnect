@@ -181,6 +181,22 @@ describe('Kanban worker leases', () => {
     expect(JSON.stringify(h.cp.report.mock.calls)).not.toContain('sensitive')
   })
 
+  it('revokes only the addressed lease and leaves its replacement untouched on replay', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.worker.revoke(dispatch.leaseId, 'other-card')
+    expect(h.cancel).not.toHaveBeenCalled()
+    await h.worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(h.cancel).toHaveBeenCalledOnce()
+    expect(h.worker.get(dispatch.leaseId)).toBeUndefined()
+    const next = { ...dispatch, leaseId: '55555555-5555-4555-8555-555555555555', attempt: 2, dispatchRevision: '4' }
+    await h.worker.dispatch(next)
+    await h.worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(h.worker.get(next.leaseId)).toBeDefined()
+    expect(h.cancel).toHaveBeenCalledOnce()
+    expect(h.reports.has(dispatch.leaseId)).toBe(false)
+  })
+
   it('cancels superseded turns and stops beating or reporting them', async () => {
     const h = harness()
     await h.worker.dispatch(dispatch)

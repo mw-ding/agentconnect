@@ -173,7 +173,7 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
             { installationId: 1n, repoId: f.board.repoId, repoFullName: FULL },
             issue.number
           )
-          return edits.assignee?.label?.name
+          return edits.assignee?.actor?.login
         },
         { timeout: 30_000 }
       )

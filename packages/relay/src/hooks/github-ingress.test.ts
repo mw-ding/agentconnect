@@ -698,7 +698,7 @@ describe('github ingress', () => {
       // A seen marker names no issue, so the CP re-reads nothing but its redelivery sweep knows the GUID landed.
       const seen = { deliveryKey: 'g', installationId: String(INSTALLATION), repoId: String(REPO_ID), event: 'issues' }
       expect(ring('issues', labeled('bug'))).toEqual({ ...seen, action: 'labeled', ids: [], numbers: [] })
-      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([])
+      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([42])
       expect(
         ring('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))?.numbers
       ).toEqual([])
