@@ -18,6 +18,31 @@ export type PrismaLike = PrismaClient | Prisma.TransactionClient
 
 let singleton: PrismaClient | undefined
 
+const TIMEZONE_OPTION = /(^|\s)(-c\s*|--)timezone=\S+/gi
+
+/**
+ * Pin the Postgres session timezone to UTC in a connection URL.
+ *
+ * `@prisma/adapter-pg` mis-reads `timestamptz` values under a non-UTC session:
+ * it keeps the wall clock and labels it UTC, so `now()` and bound `Date`s drift by
+ * the session's offset. A server or role default inherited from the host TZ would
+ * silently shift lease, watch, and backoff clocks by hours. The pin goes in the
+ * URL's `options` parameter because node-pg lets URL fields override pool config.
+ * Other `options` flags are kept; any explicit timezone flag is replaced.
+ */
+export function withUtcSession(databaseUrl: string | undefined): string | undefined {
+  if (!databaseUrl) return databaseUrl
+  let url: URL
+  try {
+    url = new URL(databaseUrl)
+  } catch {
+    return databaseUrl
+  }
+  const existing = (url.searchParams.get('options') ?? '').replace(TIMEZONE_OPTION, ' ').trim()
+  url.searchParams.set('options', existing ? `${existing} -c timezone=UTC` : '-c timezone=UTC')
+  return url.toString()
+}
+
 /**
  * Build (or reuse) the process-wide PrismaClient for a given connection URL.
  *
@@ -29,7 +54,7 @@ let singleton: PrismaClient | undefined
 export function createPrisma(databaseUrl?: string, opts?: { poolMax?: number }): PrismaClient {
   if (singleton) return singleton
   const adapter = new PrismaPg({
-    connectionString: databaseUrl ?? process.env.DATABASE_URL,
+    connectionString: withUtcSession(databaseUrl ?? process.env.DATABASE_URL),
     ...(opts?.poolMax ? { max: opts.poolMax } : {})
   })
   singleton = new PrismaClient({ adapter })

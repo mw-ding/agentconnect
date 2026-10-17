@@ -8,6 +8,7 @@ import { afterAll, beforeEach, inject } from 'vitest'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import { seed } from '../prisma/seed.js'
+import { withUtcSession } from '../src/persistence/prisma.js'
 
 const poolId = Number(process.env.VITEST_POOL_ID ?? '1')
 const databaseUrls = inject('databaseUrls')
@@ -31,7 +32,7 @@ process.env.DATABASE_URL = connectionString
  * that number keeps one budget to reason about.
  */
 export const prisma = new PrismaClient({
-  adapter: new PrismaPg({ connectionString }),
+  adapter: new PrismaPg({ connectionString: withUtcSession(connectionString) }),
   transactionOptions: { timeout: 20_000, maxWait: 10_000 }
 })
 
