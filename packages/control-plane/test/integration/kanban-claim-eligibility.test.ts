@@ -137,7 +137,7 @@ describe('claim eligibility parity (real Postgres)', () => {
     const snapshots = new Map<string, ClaimEligibilityInput>()
     for (const c of Object.values(cards)) snapshots.set(c.id, await factsFor(b.id, c.id))
     const claimed = await repo.claim(b.id, { now: NOW, isDaemonLive: (id) => LIVE.has(id) })
-    const claimedIds = new Set(claimed.map((l) => l.cardId))
+    const claimedIds = new Set(claimed.leases.map((l) => l.cardId))
 
     for (const [name, c] of Object.entries(cards)) {
       const verdict = explainClaim(snapshots.get(c.id)!)
@@ -150,7 +150,7 @@ describe('claim eligibility parity (real Postgres)', () => {
     }
 
     // The board's total is one (the eligible card): nothing else was claimed.
-    expect(claimed).toHaveLength(1)
+    expect(claimed.leases).toHaveLength(1)
   })
 
   it('explains a disabled board and never claims from it', async () => {
@@ -159,7 +159,7 @@ describe('claim eligibility parity (real Postgres)', () => {
     const b = await board(100, 100, false)
     const c = await card(b.id, 1)
     const repo = new PgKanbanDispatchRepo(prisma)
-    expect(await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).toEqual([])
+    expect((await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
     expect(explainClaim(await factsFor(b.id, c.id))).toEqual({ eligible: false, gate: 'board_disabled' })
   })
 
@@ -183,7 +183,7 @@ describe('claim eligibility parity (real Postgres)', () => {
     })
     const waiting = await card(b.id, 2)
     const repo = new PgKanbanDispatchRepo(prisma)
-    expect(await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).toEqual([])
+    expect((await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
     expect(explainClaim(await factsFor(b.id, waiting.id))).toEqual({ eligible: false, gate: 'board_cap' })
   })
 
@@ -207,7 +207,7 @@ describe('claim eligibility parity (real Postgres)', () => {
     })
     const waiting = await card(b.id, 2)
     const repo = new PgKanbanDispatchRepo(prisma)
-    expect(await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).toEqual([])
+    expect((await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
     expect(explainClaim(await factsFor(b.id, waiting.id))).toEqual({ eligible: false, gate: 'agent_cap' })
   })
 })

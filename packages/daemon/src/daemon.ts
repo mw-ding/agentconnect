@@ -4378,6 +4378,9 @@ export class Daemon {
           // The org model credential (MODEL_API_KEY / MODEL_HEADER_*) rides this mask too, so a prompt-injected agent cannot exfiltrate it through a progress note.
           this.maskAgentSecrets(req.agentId, req.text)
         ),
+      kanbanLeaseRole: (req) =>
+        this.kanban?.forSession(sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope))
+          ?.role ?? 'work',
       codeHostEffect: (req) => this.runCodeHostEffect(req),
       codeHostResearch: {
         list: async (ctx) => {

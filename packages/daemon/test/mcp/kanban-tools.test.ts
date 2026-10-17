@@ -114,11 +114,33 @@ describe('kanban terminal tools', () => {
     await expect(executeTool(ctx, 'kanbanShow', {}, refusing)).rejects.toThrow(/No Kanban card run/)
   })
 
+  it('gates the verifier-only tools by the live lease role', async () => {
+    const record = vi.fn(async () => ({ recorded: true }))
+    const verify = { recordKanbanTerminal: record, kanbanLeaseRole: () => 'verify' as const } as unknown as OpsDeps
+    const work = { recordKanbanTerminal: record, kanbanLeaseRole: () => 'work' as const } as unknown as OpsDeps
+
+    await executeTool(ctx, 'kanbanRequestChanges', { reason: 'needs tests' }, verify)
+    expect(record).toHaveBeenCalledWith(
+      expect.objectContaining({ terminal: { outcome: 'changes_requested', summary: '', reason: 'needs tests' } })
+    )
+    await expect(executeTool(ctx, 'kanbanRequestChanges', { reason: 'x' }, work)).rejects.toThrow(/not_verifier/)
+    await expect(executeTool(ctx, 'kanbanRequestChanges', {}, verify)).rejects.toThrow(/reason/)
+    await expect(executeTool(ctx, 'kanbanRequestReview', { summary: 'x' }, verify)).rejects.toThrow(
+      /verifier_cannot_request_review/
+    )
+    // A worker's request-review is unchanged.
+    await executeTool(ctx, 'kanbanRequestReview', { summary: 'ready' }, work)
+    expect(record).toHaveBeenLastCalledWith(
+      expect.objectContaining({ terminal: { outcome: 'review_requested', summary: 'ready' } })
+    )
+  })
+
   it('advertises the two read/comment tools beside the terminal ones', () => {
     expect(KANBAN_TOOLS.map((t) => t.name)).toEqual(
       expect.arrayContaining([
         'kanbanComplete',
         'kanbanRequestReview',
+        'kanbanRequestChanges',
         'kanbanBlock',
         'kanbanFail',
         'kanbanShow',
