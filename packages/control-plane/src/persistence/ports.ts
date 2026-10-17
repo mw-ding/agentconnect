@@ -8021,6 +8021,9 @@ export type KanbanRunEndResult =
       plan: RunEndPlan
     }
 
+/** An ingest move's outcome: `moved` carries the card's id and post-move revision for the notification outbox. */
+export type KanbanIngestResult = { moved: false } | { moved: true; cardId: string; stateRevision: bigint }
+
 export interface KanbanLeaseBeatInput {
   leaseId: string
   cardId: string
@@ -8076,7 +8079,7 @@ export interface KanbanDispatchRepo {
   // The status a mismatch or an attention flag parked the card in; null when neither holds it.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
-  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean>
+  ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<KanbanIngestResult>
   // Push the next re-read out exponentially (a changed `observed` restarts it); counts a pending promotion's check.
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
@@ -8118,6 +8121,50 @@ export interface KanbanDispatchRepo {
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
   /** Open runs for one agent on one daemon: the repos whose daemon grants must follow the run mode. */
   openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+}
+
+// ── Kanban notifications (M4) — a body-free outbox drained to the board's anchor channel ──
+
+export interface KanbanNotificationInsert {
+  boardId: string
+  cardId: string
+  issueNumber: number
+  stateRevision: bigint
+  from: KanbanStatus
+  to: KanbanStatus
+  blockKind?: KanbanBlockKind | null
+  reasonCode?: string | null
+  tripped?: string | null
+  mention: boolean
+}
+
+export interface KanbanNotificationRow extends KanbanNotificationInsert {
+  id: string
+  createdAt: Date
+  attempts: number
+}
+
+/** The board facts the notifier needs to address one pending row's target. */
+export interface KanbanNotifyTarget {
+  orgId: OrgId
+  repoFullName: string
+  targetPlatform: string
+  targetChannel: string | null
+  targetIntegrationId: string | null
+  createdByUserId: string | null
+}
+
+export interface KanbanNotifyRepo {
+  /** Insert a notification unless one already exists for this card revision (replay-safe). */
+  enqueue(row: KanbanNotificationInsert): Promise<void>
+  /** Pending rows (unsent and next attempt due) oldest first, bounded. */
+  pending(limit: number, now: Date): Promise<KanbanNotificationRow[]>
+  markSent(id: string): Promise<void>
+  /** Retry later with exponential backoff; a row that exhausted its attempts is parked with lastError. */
+  markFailed(id: string, nextAttemptAt: Date, attempts: number, lastError: string): Promise<void>
+  giveUp(id: string, lastError: string): Promise<void>
+  /** The board's notification anchor + org/repo facts for one row; null when the board is gone. */
+  target(boardId: string): Promise<KanbanNotifyTarget | null>
 }
 
 export interface KanbanCardRecord {

@@ -2568,6 +2568,7 @@ model KanbanBoard {
   lastModifiedBy    User?        @relation("KanbanBoardModifiedBy", fields: [lastModifiedByUserId], references: [id], onDelete: SetNull)
   cards             KanbanCard[]
   commands          KanbanCommand[]
+  notifications     KanbanNotification[]
 
   @@unique([orgId, repoId]) // one board per repository per org
   @@index([repoId]) // graph doorbell lookup
@@ -2627,6 +2628,7 @@ model KanbanCard {
   assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
   runs          KanbanRun[]
   commands      KanbanCommand[]
+  notifications KanbanNotification[]
 
   @@unique([boardId, issueId])
   @@unique([boardId, issueNumber])
@@ -2687,6 +2689,33 @@ model KanbanCommand {
   @@unique([boardId, commentId])
   @@index([cardId])
   @@map("kanban_command")
+}
+
+// One body-free notification per status move (M4), drained to the board's anchor channel by the notifier.
+model KanbanNotification {
+  id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  boardId       String           @db.Uuid
+  cardId        String           @db.Uuid
+  issueNumber   Int
+  stateRevision BigInt // the card's revision after the move; the (cardId, stateRevision) key makes replays idempotent
+  fromStatus    KanbanCardStatus
+  toStatus      KanbanCardStatus
+  blockKind     KanbanBlockKind?
+  reasonCode    String?
+  tripped       String?
+  mention       Boolean          @default(false)
+  createdAt     DateTime         @default(now()) @db.Timestamptz(6)
+  sentAt        DateTime?        @db.Timestamptz(6)
+  abandonedAt   DateTime?        @db.Timestamptz(6) // set when the notifier gave up; the row is never drained again
+  attempts      Int              @default(0)
+  nextAttemptAt DateTime?        @db.Timestamptz(6)
+  lastError     String?
+
+  board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  card  KanbanCard  @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([cardId, stateRevision])
+  @@map("kanban_notification") // plus a migration-only partial index over the pending rows
 }
 
 // ───────────────────────────────────────────────────────────────────────────

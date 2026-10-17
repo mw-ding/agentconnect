@@ -1,4 +1,5 @@
 import { turnState, type DaemonRenderAction, type Pending } from '../../daemon/turn-types.js'
+import type { Logger } from '../../log.js'
 import type { NormalizedMessage } from '../../messages/normalized.js'
 import type { TurnOutputSurface } from '../turn-output.js'
 import { QQReplyId } from './connection.js'
@@ -13,7 +14,8 @@ import {
 } from './turn-output.js'
 
 export function createQQTurnOutput(
-  record: (turn: Pending, text: string) => Promise<void>
+  record: (turn: Pending, text: string) => Promise<void>,
+  log?: Pick<Logger, 'debug'>
 ): TurnOutputSurface<Pending, DaemonRenderAction, QQConverger, NormalizedMessage> {
   return {
     platform: 'qq',
@@ -26,7 +28,8 @@ export function createQQTurnOutput(
       conn: ctx.egress as QQTurnState['conn'],
       outputAbort: new AbortController(),
       channel: ctx.message.channel,
-      replyId: QQReplyId(ctx.message)
+      replyId: QQReplyId(ctx.message),
+      ...(log ? { log } : {})
     }),
     onSuppress: (turn) => {
       const state = turnState<QQTurnState>(turn)

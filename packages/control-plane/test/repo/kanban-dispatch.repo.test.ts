@@ -604,14 +604,14 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const boardId = await seedBoard()
     const c = await park(boardId, 'blocked')
     await repo().deferRecovery(c.id, NOW)
-    expect(await repo().ingestStatus(boardId, c.issueNumber, 'triage', 'ready')).toBe(false)
-    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(true)
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'triage', 'ready')).toMatchObject({ moved: false })
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toMatchObject({ moved: true })
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
       status: 'ready',
       recoveryCheckAt: null,
       recoveryChecks: 0
     })
-    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(false)
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toMatchObject({ moved: false })
   })
 
   it('restarts the backoff when the observed GitHub fingerprint changes, and on a webhook reset', async () => {
@@ -775,8 +775,8 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBe('todo')
     await repo().deferRecovery(c.id, NOW)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).promotionChecks).toBe(0)
-    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toBe(false)
-    expect(await repo().ingestStatus(boardId, c.issueNumber, 'todo', 'ready')).toBe(true)
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'blocked', 'ready')).toMatchObject({ moved: false })
+    expect(await repo().ingestStatus(boardId, c.issueNumber, 'todo', 'ready')).toMatchObject({ moved: true })
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
       status: 'ready',
       needsAttention: false,

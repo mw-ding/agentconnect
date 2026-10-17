@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Daemon } from '../src/daemon.js'
+import { agentHostKey } from '../src/acp/host-key.js'
+import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalMemoryFs } from '../src/memory/fs.js'
 import { emitWebchatUpdate, flushHeldWebchatText, type WebchatTurnOutput } from '../src/webchat/turn-output.js'
 import type { WebchatOutput, WebchatDone, RdChatEvent, RdMsgWebchat, RdWebchatPost } from '@agentconnect.md/protocol'
@@ -266,6 +268,74 @@ describe('Webchat workspace file links', () => {
 })
 
 describe('Daemon webchat: SessionUpdate → webchat/output mapping', () => {
+  it('masks split provider secrets in the held final stream, canonical post, and transcript', async () => {
+    const apiKey = 'sk-batchprobe-SECRET-value-0001'
+    const header = 'batchprobe-header-SECRET-0002'
+    const { factory, host } = streamingHost([
+      text('[details] key sk-batchprobe-'),
+      text('SECRET-value-0001 header batchprobe-'),
+      text('header-SECRET-0002')
+    ])
+    const daemon = new Daemon({ root: scaffold(), hostFactory: factory })
+    const prompt = host.prompt.getMockImplementation()!
+    host.prompt.mockImplementation(async (sid, blocks) => {
+      ;(daemon as any).modelProviderSecrets.set(
+        agentHostKey(AGENT_ID),
+        maskableSecrets({
+          runtimeOverrides: {
+            secrets: [
+              { name: 'MODEL_API_KEY', value: apiKey },
+              { name: 'MODEL_HEADER_x-workspace', value: header }
+            ]
+          }
+        })
+      )
+      return prompt(sid, blocks)
+    })
+    await daemon.start()
+    try {
+      const cp = fakeCpClient()
+      ;(daemon as any).cpClient = cp
+      const posts: RdWebchatPost[] = []
+      const turnId = '77777777-7777-4777-8777-777777777777'
+      const msgId = `webchat:${CONV}:${turnId}`
+      await (daemon as any).dispatch(
+        AGENT_ID,
+        {
+          msgId,
+          traceId: turnId,
+          source: 'user',
+          platform: 'webchat',
+          channel: CONV,
+          sender: { id: 'alice', isBot: false },
+          text: 'go',
+          mentionedBots: [],
+          isDm: true,
+          trigger: 'dm'
+        },
+        undefined,
+        { conversationId: CONV, turnId, sink: cp.sink, postSink: (post: RdWebchatPost) => posts.push(post) }
+      )
+      const streamed = cp.outputs
+        .flatMap((output) => (output.event?.kind === 'message' ? [output.event.text] : []))
+        .join('')
+      const rows = await (daemon as any).store.threadTranscript(CONV, msgId)
+      expect(posts).toHaveLength(1)
+      const stored = rows
+        .filter((row: { sender: string }) => row.sender === AGENT_ID)
+        .map((row: { text: string }) => row.text)
+        .join('')
+      for (const value of [streamed, posts[0]!.post.text, stored]) {
+        expect(value).toContain('[secret:MODEL_API_KEY]')
+        expect(value).toContain('[secret:MODEL_HEADER_x-workspace]')
+        expect(value).not.toContain(apiKey)
+        expect(value).not.toContain(header)
+      }
+    } finally {
+      await daemon.stop()
+    }
+  })
+
   it('maps message/thinking/tool chunks to webchat events with a monotonic index, then done', async () => {
     const { factory } = streamingHost([
       thought('let me think'),

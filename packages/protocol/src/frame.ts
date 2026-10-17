@@ -79,6 +79,8 @@ import {
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
   KanbanLeaseHeartbeatOk,
+  KanbanNotify,
+  KanbanNotifyOk,
   KanbanReport,
   KanbanReportOk
 } from './frames/kanban.js'
@@ -419,6 +421,8 @@ export const FRAME_SCHEMAS = {
   'kanban/report/ok': KanbanReportOk,
   'kanban/card': KanbanCardShow,
   'kanban/card/ok': KanbanCardShowOk,
+  'kanban/notify': KanbanNotify,
+  'kanban/notify/ok': KanbanNotifyOk,
   // ── integrations (platform config distribution; token-bearing — never log) ──
   'integration/upsert': IntegrationUpsert,
   'integration/remove': IntegrationRemove,
@@ -805,6 +809,8 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('kanban/report/ok', FRAME_SCHEMAS['kanban/report/ok']),
   frame('kanban/card', FRAME_SCHEMAS['kanban/card']),
   frame('kanban/card/ok', FRAME_SCHEMAS['kanban/card/ok']),
+  frame('kanban/notify', FRAME_SCHEMAS['kanban/notify']),
+  frame('kanban/notify/ok', FRAME_SCHEMAS['kanban/notify/ok']),
   frame('integration/upsert', FRAME_SCHEMAS['integration/upsert']),
   frame('integration/remove', FRAME_SCHEMAS['integration/remove']),
   frame('integration/channels', FRAME_SCHEMAS['integration/channels']),

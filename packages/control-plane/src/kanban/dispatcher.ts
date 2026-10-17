@@ -40,6 +40,7 @@ import type { RepoPermissionLookup } from '../github/repo-permission.js'
 import { authorizeHumanKanbanAction } from './human-action.js'
 import { labelAdder } from './label-attribution.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
+import type { KanbanTransition } from './notifier.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
 
@@ -68,6 +69,8 @@ export interface KanbanDispatcherDeps {
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
+  /** Enqueues a transition notification (planNotification + outbox insert); undefined when notifications are off. */
+  notify?: { enqueue(transition: KanbanTransition, stateRevision: bigint): Promise<void>; drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   tickMs?: number
   unackedGraceMs?: number
@@ -163,6 +166,7 @@ export class KanbanDispatcher {
   /** Doorbell: reconcile one board now, single-flight with one trailing rerun. */
   poke(boardId: string): void {
     if (this.stopped) return
+    void this.deps.notify?.drain().catch(() => undefined)
     if (this.running.has(boardId)) {
       this.rerun.add(boardId)
       return
@@ -182,6 +186,7 @@ export class KanbanDispatcher {
   /** One reconciler pass: reap stale leases first so their slots are claimable, then claim every board. */
   async tick(): Promise<void> {
     await this.reap()
+    await this.deps.notify?.drain().catch(() => undefined)
     for (const boardId of await this.deps.repo.listEnabledBoardIds()) {
       this.recoveryDue.add(boardId)
       this.poke(boardId)
@@ -306,7 +311,14 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
-    return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
+    const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
+    if (result.moved) {
+      await this.deps.notify?.enqueue(
+        { cardId: result.cardId, boardId, issueNumber, from, to: plan.to },
+        result.stateRevision
+      )
+    }
+    return { moved: result.moved, observed }
   }
 
   // The human who added the status label must hold live write access, as a comment command's sender must; fail closed.
@@ -501,6 +513,9 @@ export class KanbanDispatcher {
       await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_installation_unavailable')
       return
     }
+    // Our own label write for the move that made this card claimable (running→review, review→ready) may still be in
+    // flight; reading before it lands would see the previous status and park a valid claim as a GitHub mismatch.
+    await this.statusWrites.get(lease.cardId)
     let observed: CardIssue | null
     try {
       observed = await this.deps.store.readCard(repo, lease.issueNumber)

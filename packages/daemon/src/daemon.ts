@@ -1,7 +1,7 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
-import { buildKanbanMessage } from './messages/kanban-message.js'
+import { buildKanbanMessage, kanbanNotifyText } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
   MEMORY_ENTRIES_V1_FEATURE,
@@ -267,7 +267,7 @@ import {
   steeredTranscriptText
 } from './daemon/steering-admission.js'
 import { recallQueryFromBlocks } from './memory/recall.js'
-import { maskableSecrets, maskSecretsDeep } from './session/secret-mask.js'
+import { maskableSecrets, maskSecretsDeep, maskToolArgs, type SecretMaskEntry } from './session/secret-mask.js'
 import { monotonicTs } from './store/monotonic-ts.js'
 import { StoreRetentionSweeper, resolveStoreRetentionSettings } from './store/retention.js'
 import { TranscriptRecorder, type TranscriptEvent } from './session/transcript-recorder.js'
@@ -289,7 +289,7 @@ import { GitlabBroker } from './gitlab/broker.js'
 import { gitlabApiBaseUrl } from './gitlab/api-base.js'
 import { GiteaBroker } from './gitea/broker.js'
 import { giteaApiBaseUrl } from './gitea/api-base.js'
-import type { CodeHostEffectBroker, CodeHostEffectTarget } from './codehost/broker.js'
+import type { CodeHostBrokerOperation, CodeHostEffectBroker, CodeHostEffectTarget } from './codehost/broker.js'
 import { CodeHostNoteProjector } from './gitlab/note-projection.js'
 import {
   CONFIG_FILE_CONVENTIONS,
@@ -1064,6 +1064,8 @@ import type {
   TaskListReq,
   KanbanDispatch,
   KanbanDispatchRefusal,
+  KanbanNotify,
+  KanbanNotifyOk,
   McpAppRpc,
   McpAppRpcResult,
   CodeHostProvider,
@@ -1712,18 +1714,21 @@ export class Daemon {
         }
       })
       registry.register(
-        createQQTurnOutput(async (p, text) => {
-          if (p.plan.transcriptChannel && p.plan.statusThread)
-            await this.store.appendTranscript({
-              channel: p.plan.transcriptChannel,
-              thread: p.plan.statusThread,
-              admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
-              ts: monotonicTs(),
-              sender: p.plan.agentId,
-              kind: 'text',
-              text
-            })
-        })
+        createQQTurnOutput(
+          async (p, text) => {
+            if (p.plan.transcriptChannel && p.plan.statusThread)
+              await this.store.appendTranscript({
+                channel: p.plan.transcriptChannel,
+                thread: p.plan.statusThread,
+                admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
+                ts: monotonicTs(),
+                sender: p.plan.agentId,
+                kind: 'text',
+                text
+              })
+          },
+          { debug: (message) => this.log.debug(message) }
+        )
       )
       registry.register({
         platform: 'linear',
@@ -4226,6 +4231,10 @@ export class Daemon {
       // MCP Apps: a daemon-hosted UI server's tool. Resolution is by the `<server>__<tool>`
       // namespace the host minted, so nothing here can shadow a product tool.
       appTool: (ctx, name, args) => this.runAppTool(ctx, name, args),
+      // Every dispatched MCP tool's arguments are masked before any handler sees them.
+      maskAgentSecrets: (agentId, args) => this.maskAgentToolArgs(agentId, args),
+      // shareFile's user-visible display text (file name / provenance marker).
+      maskAgentText: (agentId, text) => this.maskAgentSecrets(agentId, text),
       // Peer discovery goes to the CP (the only authority for the cross-daemon
       // roster). Resolve the client lazily; fail closed when it isn't connected.
       channelAgents: async ({ currentChannel, currentThread, currentTransportScope, ...req }) => {
@@ -4368,8 +4377,20 @@ export class Daemon {
       viewSessionStatus: (req) => Promise.resolve(this.collab.viewSessionStatus(req)),
       rootPostRelation: (req) => this.collab.rootPostRelation(req),
       spawnChannelRootSession: (req) => this.collab.spawnChannelRootSession(req),
-      submitCodeReview: (req) => this.codeReviews.submit(req),
-      replyGithubReviewThreads: (req) => this.githubReviews.replyGithubReviewThreads(req),
+      // MCP args bypass the onAcpUpdate mask, so agent text is masked here before it is stored or posted.
+      submitCodeReview: (req) =>
+        this.codeReviews.submit({
+          ...req,
+          body: this.maskAgentSecrets(req.agentId, req.body),
+          ...(req.comments
+            ? { comments: req.comments.map((c) => ({ ...c, body: this.maskAgentSecrets(req.agentId, c.body) })) }
+            : {})
+        }),
+      replyGithubReviewThreads: (req) =>
+        this.githubReviews.replyGithubReviewThreads({
+          ...req,
+          replies: req.replies.map((r) => ({ ...r, body: this.maskAgentSecrets(req.agentId, r.body) }))
+        }),
       recordKanbanTerminal: (req) => this.recordKanbanTerminal(req),
       kanbanShow: (req) => this.kanbanCardTools().show(this.kanbanToolSession(req)),
       kanbanComment: (req) =>
@@ -4381,7 +4402,8 @@ export class Daemon {
       kanbanLeaseRole: (req) =>
         this.kanban?.forSession(sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope))
           ?.role ?? 'work',
-      codeHostEffect: (req) => this.runCodeHostEffect(req),
+      codeHostEffect: (req) =>
+        this.runCodeHostEffect({ ...req, operation: this.maskCodeHostOperation(req.agentId, req.operation) }),
       codeHostResearch: {
         list: async (ctx) => {
           const { repositories, partial } = await this.researchRepositories(ctx.agentId)
@@ -4529,8 +4551,11 @@ export class Daemon {
         }
         const ext = sniffed === 'image/png' ? 'png' : sniffed === 'image/jpeg' ? 'jpg' : 'webp'
         const stem = basename(rel).replace(/\.[A-Za-z0-9]+$/, '') || 'image'
+        // The outbound DISPLAY name (never the fs read) is masked: the model-chosen
+        // path can carry a secret, and the name is what the platform renders to users.
+        const name = this.maskAgentSecrets(ctx.agentId, `${stem}.${ext}`)
         const sha256 = createHash('sha256').update(bytes).digest('hex')
-        return { ok: true, bytes, name: `${stem}.${ext}`, mimeType: sniffed, sha256 }
+        return { ok: true, bytes, name, mimeType: sniffed, sha256 }
       },
       // A console turn's image is bounded by the image-processing limit, not the IM per-file cap (webchat-generated-images.md §5).
       readWorkspaceSharedImage: async (ctx, rel) => {
@@ -13834,6 +13859,25 @@ export class Daemon {
     return await broker.execute({ ...target, agentId: req.agentId, sessionKey: key }, req.operation)
   }
 
+  /** Mask the agent-authored public text of a brokered operation (body, title, description), never its ids or refs. */
+  private maskCodeHostOperation(agentId: string, op: CodeHostBrokerOperation): CodeHostBrokerOperation {
+    switch (op.kind) {
+      case 'createComment':
+      case 'updateComment':
+      case 'replyDiscussion':
+        return { ...op, body: this.maskAgentSecrets(agentId, op.body) }
+      case 'createMergeRequest':
+      case 'updateMergeRequest':
+        return {
+          ...op,
+          ...(op.title !== undefined ? { title: this.maskAgentSecrets(agentId, op.title) } : {}),
+          ...(op.description !== undefined ? { description: this.maskAgentSecrets(agentId, op.description) } : {})
+        }
+      default:
+        return op
+    }
+  }
+
   /** The hook-dispatched turn's trusted repository first (§13.1), else the agent's managed workspace repository. */
   private codeHostEffectTarget(
     agentId: string,
@@ -17120,6 +17164,10 @@ export class Daemon {
     // ONE egress lookup, so the leased client is the one the surface writes through.
     const egressConn = this.platformTurnEgress.get(msg.platform)?.(plan.integrationId)
     const run: TurnRun = { entry, key, plan, agent, replyConn, ...(egressConn ? { egressConn } : {}), evaluation }
+    // One per-turn mask snapshot, read by the webchat held-text flush and the turn final.
+    // It starts as the live entry set; buildPending re-captures it AFTER openSession so a
+    // cold session's BYOK provider secrets (recorded at host construction) are included.
+    const maskSnapshot: { entries: SecretMaskEntry[] } = { entries: this.maskEntriesFor(agentId) }
     // Startup notices and replies share the queue entry's index and terminal fence from before openSession.
     const pendingWebchat = webchat
       ? Object.assign(webchat, {
@@ -17127,6 +17175,7 @@ export class Daemon {
           replyText: '',
           replySegments: [],
           heldText: '',
+          maskText: (text: string) => this.maskAgentSecretsIn(agentId, text, maskSnapshot.entries),
           heldTextOffset: 0,
           messageId: undefined,
           messageEmitted: false
@@ -17241,7 +17290,8 @@ export class Daemon {
       sessionId,
       outwardSessionId,
       resolveFileLink,
-      webchat: pendingWebchat
+      webchat: pendingWebchat,
+      maskSnapshot
     })
     // Every turn re-stashes the stored title (fallback or runtime): the connection dedupes
     // repeats, and re-pushing heals a rename lost to a restart or an unregistered thread.
@@ -17293,6 +17343,8 @@ export class Daemon {
       if (!p.signals.runtimeReportedModel) turnModel = await this.captureTurnModel(run, host, sessionId, modelOverride)
       await this.settleUsage(p, run, sessionId)
       await this.commitWebchatReply(p, run, outcome)
+      // The assembled reply feeds memory capture, evaluation, and an inferred parent reply.
+      p.reply.text = this.maskAgentSecretsIn(p.plan.agentId, p.reply.text, p.maskEntries)
       await this.flushPlatformFinals(p, run, sessionId, currentAttributionInfo)
       await this.finalizeDelivery(p, run, { rec, sessionId, handled, outcome, memoryCaptureTarget })
     } catch (err) {
@@ -18155,6 +18207,7 @@ export class Daemon {
       outwardSessionId: string
       resolveFileLink?: WorkspaceFileLinkResolver
       webchat: Pending['webchat']
+      maskSnapshot: { entries: SecretMaskEntry[] }
     }
   ): Pending {
     const { entry, plan } = run
@@ -18167,6 +18220,10 @@ export class Daemon {
       const ordinaryHost = this.hosts.get(hostKey)
       if (ordinaryHost) entry.selectedHost = this.selectedOrdinaryTurnHost(hostKey, ordinaryHost)
     }
+    // Re-capture the snapshot now that openSession recorded the host's BYOK provider
+    // secrets — the webchat held-text flush and the final-mask paths below read this same
+    // snapshot, so a host released mid-flush still masks its BYOK entries.
+    turn.maskSnapshot.entries = this.maskEntriesFor(agentId)
     const p: Pending = {
       plan,
       entry,
@@ -18195,6 +18252,9 @@ export class Daemon {
       builtinSystemToolCallIds: new Set(),
       acpSessionId: sessionId,
       outwardSessionId,
+      // Snapshot the agent's mask entries now: a host released mid-flush drops the BYOK entries,
+      // and the final-mask paths below must still see them.
+      maskEntries: turn.maskSnapshot.entries,
       ...(turn.resolveFileLink ? { resolveFileLink: turn.resolveFileLink } : {}),
       ...(entry.selectedHost ? { selectedHost: entry.selectedHost } : {}),
       turnState: plan.turnSurface.initialTurnState({
@@ -19094,6 +19154,8 @@ export class Daemon {
   ): Promise<void> {
     if (!p.webchat) return
     const agentId = p.entry.agentId
+    // A segment concatenates chunks, so mask the assembled text before it is stored and posted.
+    const text = this.maskAgentSecretsIn(agentId, segment.text, p.maskEntries)
     const scope = hopCount !== undefined ? (p.webchatRouting ?? initialWebchatRouting(p.entry)).scope : undefined
     const replyTs = await webchatTurnOutput.appendWebchatTextRow(
       this.store,
@@ -19104,7 +19166,7 @@ export class Daemon {
         postId: segment.postId,
         sender: agentId,
         admission: { agentId, sessionKey: p.plan.sessionKey },
-        text: segment.text
+        text
       }
     )
     p.webchat.postSink?.({
@@ -19119,7 +19181,7 @@ export class Daemon {
           ...(hopCount !== undefined ? { hopCount } : {}),
           ...(scope ? { addressedAgentIds: scope } : {})
         },
-        text: segment.text,
+        text,
         at: Number(replyTs)
       },
       ...(p.webchat.initiator ? { initiator: p.webchat.initiator } : {})
@@ -19225,7 +19287,8 @@ export class Daemon {
         plan.transcriptChannel,
         plan.statusThread,
         { agentId, sessionKey: plan.sessionKey },
-        ev
+        ev,
+        p.maskEntries
       )
     // The turn is over, so nothing more will supersede a coalesced tool body: make the last
     // state of every streamed tool call durable now rather than on the buffer's own timer.
@@ -19541,6 +19604,7 @@ export class Daemon {
         {
           appendTranscript: async (row) => await this.store.appendTranscript(row),
           monotonicTs: () => monotonicTs(),
+          maskFinal: (text) => this.maskAgentSecretsIn(agentId, text, p.maskEntries),
           beginPublish: async (hasFinal) => {
             try {
               // A replay of `in_flight` suppresses another comment. If this write
@@ -21288,6 +21352,27 @@ export class Daemon {
   /** Serialize action application per session, so in-place edits never race on a remembered message ts; routed by platform. */
   private enqueueApply(p: Pending, action: DaemonRenderAction, opts: { allowWhenSuppressed?: boolean } = {}): void {
     if (p.outputSuppressed && !opts.allowWhenSuppressed) return
+    // Converger text is assembled across chunks, where the per-chunk ingress mask misses a split secret.
+    const mask = (text: string) => this.maskAgentSecretsIn(p.plan.agentId, text, p.maskEntries)
+    if ('text' in action) action = { ...action, text: mask(action.text) }
+    else if (action.kind === 'activity' && 'body' in action) action = { ...action, body: mask(action.body) }
+    else if (action.kind === 'stream-append' || action.kind === 'stream-stop') {
+      const chunks = (action.kind === 'stream-append' ? action.chunks : action.settle).map((chunk) => ({
+        ...chunk,
+        title: mask(chunk.title),
+        ...(chunk.type === 'task_update'
+          ? {
+              ...(chunk.details !== undefined ? { details: mask(chunk.details) } : {}),
+              ...(chunk.output !== undefined ? { output: mask(chunk.output) } : {})
+            }
+          : {})
+      }))
+      action = {
+        ...action,
+        ...(action.kind === 'stream-append' ? { chunks } : { settle: chunks }),
+        ...(action.progressText !== undefined ? { progressText: mask(action.progressText) } : {})
+      }
+    }
     p.signals.applyChain = p.signals.applyChain.then(() => {
       // Check again at execution time: actions queued before an interrupt must not
       // publish later after a backed-up transport queue drains.
@@ -21495,10 +21580,32 @@ export class Daemon {
    *  payload about to be rendered, streamed, or persisted (session/secret-mask.ts).
    *  No-op (same reference) for agents without maskable secrets. */
   private maskAgentSecrets<T>(agentId: string, payload: T): T {
+    return maskSecretsDeep(payload, this.maskEntriesFor(agentId))
+  }
+
+  /** Copy-on-write mask over a payload, including a per-turn snapshot (`extra`) of the
+   *  provider secrets captured before the host's process could exit. */
+  private maskAgentSecretsIn<T>(agentId: string, payload: T, extra?: SecretMaskEntry[]): T {
+    return maskSecretsDeep(payload, this.maskEntriesFor(agentId, extra))
+  }
+
+  /** Copy-on-write mask of an agent's write-only secrets over a tool call's
+   *  arguments, leaving structural routing/enum/timestamp keys untouched. */
+  private maskAgentToolArgs<T>(agentId: string, payload: T): T {
+    return maskToolArgs(payload, this.maskEntriesFor(agentId))
+  }
+
+  /** The {name,value} mask entries for an agent: its runtime-override secrets plus
+   *  the BYOK provider secrets recorded for any of its live hosts, plus `extra` — the
+   *  turn's snapshot — so a host released mid-flush still masks its BYOK entries. */
+  private maskEntriesFor(agentId: string, extra?: SecretMaskEntry[]): SecretMaskEntry[] {
     const providerSecrets = [...this.modelProviderSecrets].flatMap(([key, secrets]) =>
       hostKeyAgentId(key) === agentId ? secrets : []
     )
-    return maskSecretsDeep(payload, [...maskableSecrets(this.agents.get(agentId)), ...providerSecrets])
+    const live = [...maskableSecrets(this.agents.get(agentId)), ...providerSecrets]
+    if (!extra?.length) return live
+    const seen = new Set(live.map((e) => e.value))
+    return [...live, ...extra.filter((e) => !seen.has(e.value))]
   }
 
   /** Keep native usage and the runtime's concrete model together, including notifications after turn completion. */
@@ -21996,7 +22103,8 @@ export class Daemon {
           agentId: p.plan.agentId,
           sessionKey: p.plan.sessionKey
         },
-        ev
+        ev,
+        p.maskEntries
       )
   }
 
@@ -22007,8 +22115,13 @@ export class Daemon {
     channel: string,
     thread: string,
     admission: TranscriptAdmission,
-    ev: TranscriptEvent
+    ev: TranscriptEvent,
+    extra?: SecretMaskEntry[]
   ): Promise<void> {
+    // A reasoning row concatenates thought chunks, so mask the assembled row too.
+    ev = { ...ev, text: this.maskAgentSecretsIn(agentId, ev.text, extra) }
+    // A tool/plan row's merged body (rawInput/rawOutput/entries) can split a secret across updates.
+    if (ev.kind !== 'reasoning') ev = { ...ev, body: this.maskAgentSecretsIn(agentId, ev.body, extra) }
     if (ev.kind === 'plan') {
       await this.store.upsertPlan({
         channel,
@@ -26614,6 +26727,7 @@ export class Daemon {
       cronReportOutbox: () => this.cronReportOutbox,
       kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
       kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
+      kanbanNotify: (notify) => this.kanbanNotify(notify),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
       effectiveAgents: () => this.effectiveAgents(),
@@ -27128,6 +27242,42 @@ export class Daemon {
       invalidateToken: (agentId, repo, leaseId, token) =>
         this.gitCreds.invalidateKanbanComment(agentId, repo, leaseId, token)
     }))
+  }
+
+  /** `kanban/notify`: post one body-free transition notification through the target integration's own connection. */
+  private async kanbanNotify(notify: KanbanNotify): Promise<KanbanNotifyOk> {
+    const agentId = this.agentForIntegration(notify.target.integrationId)
+    if (!agentId || !this.servesAgent(agentId)) {
+      return { notifyId: notify.notifyId, ok: false, reason: 'integration_missing' }
+    }
+    // Dedupe by notifyId in a bounded in-memory set; a daemon restart may post a retried notification twice.
+    if (this.seenNotifyIds.has(notify.notifyId)) return { notifyId: notify.notifyId, ok: true }
+    const conn = this.replyConnFor(agentId, notify.target.integrationId)
+    if (!conn) return { notifyId: notify.notifyId, ok: false, reason: 'no_connection' }
+    const text = this.maskAgentSecrets(agentId, kanbanNotifyText(notify))
+    try {
+      await conn.postMessage(notify.target.channel, text)
+    } catch {
+      return { notifyId: notify.notifyId, ok: false, reason: 'post_failed' }
+    }
+    this.rememberNotifyId(notify.notifyId)
+    return { notifyId: notify.notifyId, ok: true }
+  }
+
+  private agentForIntegration(integrationId: string): string | undefined {
+    for (const [agentId, agent] of this.agents) {
+      if (agent.integrations.some((integration) => integration.id === integrationId)) return agentId
+    }
+    return undefined
+  }
+
+  private readonly seenNotifyIds = new Map<string, number>()
+  private rememberNotifyId(notifyId: string): void {
+    this.seenNotifyIds.set(notifyId, Date.now())
+    if (this.seenNotifyIds.size > 1000) {
+      const oldest = [...this.seenNotifyIds.entries()].sort((a, b) => a[1] - b[1])[0]
+      if (oldest) this.seenNotifyIds.delete(oldest[0])
+    }
   }
 
   /** A worker terminal tool call: the lease comes from the session's own live run, never from the model. */

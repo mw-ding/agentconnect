@@ -1,5 +1,5 @@
 // Kanban dispatch → turn (issue #2 D3/D4): keys the GitHub hook's `<prefix>#<n>` thread session; the worker reads the issue itself.
-import type { KanbanDispatch } from '@agentconnect.md/protocol'
+import type { KanbanDispatch, KanbanNotify } from '@agentconnect.md/protocol'
 import type { NormalizedMessage } from './normalized.js'
 
 /** The same coordinates a headless GitHub hook delivery on this issue uses, so both land in one session. */
@@ -74,6 +74,16 @@ export function buildKanbanMessage(d: KanbanDispatch, traceId: string, nudge = f
     trigger: 'cron',
     headless: true
   }
+}
+
+/** Assemble one notification's Slack text from metadata only: `Kanban: <repo>#<n> → <to> (detail) <url>`, with `<@Uxxxx>` when a mention resolved. */
+export function kanbanNotifyText(n: KanbanNotify): string {
+  const ref = `${n.repoFullName}#${n.issueNumber}`
+  const url = `https://github.com/${n.repoFullName}/issues/${n.issueNumber}`
+  const detail = n.blockKind ?? (n.to === 'triage' ? (n.tripped ?? n.reasonCode) : n.reasonCode)
+  const suffix = detail ? ` (${detail.replaceAll('_', ' ')})` : ''
+  const mention = n.mention ? `<@${n.mention.slackUserId}> ` : ''
+  return `${mention}Kanban: ${ref} → ${n.to}${suffix} <${url}>`
 }
 
 const AC_LABEL = /ac(?:\/|%2f)/i
