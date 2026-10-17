@@ -227,7 +227,7 @@ describe('Kanban M4 controls — skip (real Postgres)', () => {
 
     const result = await h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
     expect(result.ok).toBe(true)
-    expect(await h.card(c.id)).toMatchObject({ status: 'archived' })
+    expect(await h.card(c.id)).toMatchObject({ status: 'archived', dispatchRevision: BigInt(d.dispatchRevision) + 1n })
     // The issue closed not_planned and one body-free comment posted (after the running label write).
     expect(h.store.issues.get(c.issueNumber)).toMatchObject({ state: 'closed', stateReason: 'not_planned' })
     const skip = h.store.writes.at(-1)!
