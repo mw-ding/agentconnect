@@ -5,11 +5,9 @@ import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
-import { insertKanbanNotification } from '../../src/persistence/repositories/kanban-notify.repo.js'
-import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
+import { insertKanbanNotification, PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
-import { planRunEnd } from '../../src/kanban/run-accounting.js'
 import type {
   CardGraph,
   CardIssue,
