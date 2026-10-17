@@ -6,7 +6,7 @@ import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
-import type { KanbanBlockKind } from '../../kanban/run-accounting.js'
+import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
   KanbanClaimOpts,
@@ -441,6 +441,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             row.agentDaemonId === row.daemonId))
       if (!fenced) return { accepted: false }
 
+      // Backoff is derived from the ended runs themselves, so it needs no card column.
+      const trailingProviderTransients =
+        input.outcome === 'transient' ? await this.trailingProviderTransients(tx, row.cardId) : 0
       const plan = input.plan(
         {
           status: row.status,
@@ -456,7 +459,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           blockRecurrenceLimit: row.blockRecurrenceLimit,
           completionContract: row.completionContract,
           verifierAgentId: row.verifierAgentId
-        }
+        },
+        { trailingProviderTransients }
       )
       await tx.kanbanRun.update({
         where: { id: row.runId },
@@ -499,6 +503,22 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         }
       }
     })
+  }
+
+  /** How many of the card's latest ended runs, back to back, were provider outages (transient with a `provider_*` reason). */
+  private async trailingProviderTransients(tx: PrismaLike, cardId: string): Promise<number> {
+    const ended = await tx.kanbanRun.findMany({
+      where: { cardId, endedAt: { not: null } },
+      orderBy: { attempt: 'desc' },
+      take: PROVIDER_TRANSIENT_LIMIT,
+      select: { outcome: true, reasonCode: true }
+    })
+    let n = 0
+    for (const run of ended) {
+      if (run.outcome !== 'transient' || !run.reasonCode?.startsWith('provider_')) break
+      n += 1
+    }
+    return n
   }
 
   heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]> {

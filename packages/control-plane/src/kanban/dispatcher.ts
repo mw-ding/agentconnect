@@ -388,7 +388,9 @@ export class KanbanDispatcher {
     const end: KanbanRunEnd =
       report.outcome === 'blocked'
         ? { outcome: 'blocked', blockKind: report.blockKind ?? 'transient' }
-        : { outcome: report.outcome }
+        : report.outcome === 'transient'
+          ? { outcome: 'transient', provider: report.reasonCode?.startsWith('provider_') === true }
+          : { outcome: report.outcome }
     const result = await this.endRun(report.leaseId, end, report.reasonCode ?? null, {
       fence: {
         daemonId,
@@ -497,7 +499,7 @@ export class KanbanDispatcher {
       now,
       ...extra,
       ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
-      plan: (card, board) => planRunEnd(card, board, end, now)
+      plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx)
     })
     if (result.accepted && result.card.from !== result.card.to) {
       const repo = await this.repoRef(result.card)

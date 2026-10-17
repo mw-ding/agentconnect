@@ -16,6 +16,7 @@ import type {
   AccountingCard,
   KanbanBlockKind,
   OpenLeaseFacts,
+  RunEndContext,
   RunEndPlan
 } from '../kanban/run-accounting.js'
 import type {
@@ -7917,7 +7918,7 @@ export interface KanbanRunEndInput {
   prNumber?: number
   now: Date
   /** Pure accounting, evaluated under the row locks. */
-  plan(card: AccountingCard, board: AccountingBoard): RunEndPlan
+  plan(card: AccountingCard, board: AccountingBoard, ctx: RunEndContext): RunEndPlan
 }
 
 export type KanbanRunEndResult =

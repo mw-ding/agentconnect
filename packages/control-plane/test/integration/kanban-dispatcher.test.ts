@@ -1439,3 +1439,54 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.store.writes).toEqual([])
   })
 })
+
+describe('KanbanDispatcher — provider outage backoff (real Postgres)', () => {
+  /** Dispatch the card's next lease once its cooldown passed, then end it with `patch`. */
+  async function cycle(h: Awaited<ReturnType<typeof harness>>, cardId: string, patch: Partial<KanbanReport>) {
+    const c = await h.card(cardId)
+    if (c.cooldownUntil) h.clock.advance(c.cooldownUntil.getTime() - h.clock.now() + 1)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent.at(-1)!.d
+    expect(d.cardId).toBe(cardId)
+    expect(await h.dispatcher.onReport(D1, 4, h.reportFor(d, patch))).toMatchObject({ accepted: true })
+    await h.dispatcher.settle()
+    return h.card(cardId)
+  }
+  const outage = { outcome: 'transient', reasonCode: 'provider_rate_limited' } as const
+
+  it('doubles the cooldown for each consecutive provider outage, never counts a failure, and caps at an hour', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    const waits: number[] = []
+    for (let i = 1; i < 8; i++) {
+      const after = await cycle(h, c.id, outage)
+      expect(after).toMatchObject({ status: 'ready', consecutiveFailures: 0 })
+      waits.push(after.cooldownUntil!.getTime() - h.clock.now())
+    }
+    expect(waits).toEqual([60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000])
+  })
+
+  it('routes the card to triage on the eighth consecutive outage instead of looping forever', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    for (let i = 1; i < 8; i++) await cycle(h, c.id, outage)
+    const last = await cycle(h, c.id, outage)
+    expect(last).toMatchObject({ status: 'triage', cooldownUntil: null, consecutiveFailures: 0 })
+    expect(h.store.issues.get(c.issueNumber)?.labels).toContain('ac/status:triage')
+  })
+
+  it('restarts the backoff after a different outcome, and leaves non-provider transients on the flat cooldown', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, outage)
+    const failed = await cycle(h, c.id, { outcome: 'failed', reasonCode: 'provider_auth' })
+    expect(failed).toMatchObject({ status: 'ready', consecutiveFailures: 1 })
+    const again = await cycle(h, c.id, outage)
+    expect(again.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+    const flat = await cycle(h, c.id, { outcome: 'transient', reasonCode: 'turn_lost' })
+    expect(flat.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+    const flat2 = await cycle(h, c.id, { outcome: 'transient', reasonCode: 'turn_lost' })
+    expect(flat2.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+  })
+})

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { canTransition } from './card-state.js'
 import {
   FAILURE_COOLDOWN_MAX_MS,
+  PROVIDER_TRANSIENT_LIMIT,
   TRANSIENT_COOLDOWN_MS,
   failureCooldownMs,
   planRunEnd,
@@ -35,6 +36,7 @@ const END_CASES: KanbanRunEnd[] = [
   { outcome: 'failed' },
   { outcome: 'protocol_violation' },
   { outcome: 'transient' },
+  { outcome: 'transient', provider: true },
   { outcome: 'reclaimed' },
   { outcome: 'blocked', blockKind: 'needs_input' },
   { outcome: 'blocked', blockKind: 'capability' }
@@ -174,5 +176,46 @@ describe('staleLeaseReason — the reaper predicate', () => {
     const inFlight = { ...healthy, dispatchedAt: ago(60_000), ackedAt: null, heartbeatAt: null }
     expect(staleLeaseReason(inFlight, NOW, opts)).toBeNull()
     expect(staleLeaseReason({ ...inFlight, dispatchedAt: ago(3 * 60_000) }, NOW, opts)).toBe('dispatch_unacked')
+  })
+})
+
+describe('planRunEnd — provider outage backoff', () => {
+  const outage: KanbanRunEnd = { outcome: 'transient', provider: true }
+  const cooldown = (trailing: number) =>
+    planRunEnd(running, board, outage, NOW, { trailingProviderTransients: trailing }).cooldownUntil!.getTime() -
+    NOW.getTime()
+
+  it('doubles from one minute and caps at an hour without counting a failure', () => {
+    expect([0, 1, 2, 3, 4, 5, 6].map(cooldown)).toEqual([
+      60_000,
+      120_000,
+      240_000,
+      480_000,
+      960_000,
+      1_920_000,
+      FAILURE_COOLDOWN_MAX_MS
+    ])
+    expect(planRunEnd(running, board, outage, NOW, { trailingProviderTransients: 3 })).toMatchObject({
+      status: 'ready',
+      countsAsFailure: false,
+      consecutiveFailures: 0
+    })
+  })
+
+  it('routes to triage once the bound is reached', () => {
+    const plan = planRunEnd(running, board, outage, NOW, { trailingProviderTransients: PROVIDER_TRANSIENT_LIMIT - 1 })
+    expect(plan).toMatchObject({
+      status: 'triage',
+      tripped: 'transient_limit',
+      cooldownUntil: null,
+      countsAsFailure: false
+    })
+    expect(canTransition('running', plan.status)).toBe(true)
+  })
+
+  it('keeps the flat cooldown for an unclassified transient however many came before', () => {
+    const plan = planRunEnd(running, board, { outcome: 'transient' }, NOW, { trailingProviderTransients: 9 })
+    expect(plan).toMatchObject({ status: 'ready' })
+    expect(plan.cooldownUntil!.getTime() - NOW.getTime()).toBe(TRANSIENT_COOLDOWN_MS)
   })
 })
