@@ -22,6 +22,7 @@ export interface CardIssue extends ObservedIssue {
   issueId: bigint
   nodeId: string
   number: number
+  authorLogin?: string | null
 }
 
 export interface CardLink {
@@ -149,6 +150,7 @@ interface GhIssue {
   repository_url?: string
   repository?: { id?: number }
   pull_request?: unknown
+  user?: { login?: string } | null
 }
 
 export interface GithubCardStoreDeps {
@@ -182,7 +184,8 @@ export class GithubCardStore implements CardStore {
       number: issue.number,
       state: issue.state,
       stateReason: issue.state_reason ?? null,
-      labels
+      labels,
+      ...(issue.user !== undefined ? { authorLogin: issue.user?.login ?? null } : {})
     }
   }
 

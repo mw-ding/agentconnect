@@ -29,7 +29,7 @@ describe('live board repository coverage', () => {
   })
 
   it('uses the live repository identity through the org installation', async () => {
-    const repoRefFor = vi.fn(async () => ({ repoId: 42n, fullName: 'Acme/Web' }))
+    const repoRefFor = vi.fn(async () => ({ repoId: 42n, fullName: 'Acme/Web', private: true, defaultBranch: 'main' }))
     const liveByOrgAndAccount = vi.fn(async () => installation)
     const resolver = githubKanbanRepoResolver({ installations: { liveByOrgAndAccount }, github: { repoRefFor } })
     expect(await resolver.resolve(org, 'acme/web')).toEqual({

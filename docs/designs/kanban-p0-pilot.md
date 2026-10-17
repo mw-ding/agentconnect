@@ -345,3 +345,28 @@ minted for one run can be reused for a later run of the same mode on that
 repository until it is within 15 minutes of expiry. The daemon cache is keyed
 by the open lease and mode, so a read run does not reuse a write grant; this
 control-plane cache is not.
+
+## M1 — Board configuration and issue import
+
+Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
+under `/api/v1/orgs/:orgId/kanban/boards`; members list and read only boards
+permitted by the shared resource visibility policy. Restricted boards require a
+current member audience, with the organization Owner exception. Each create or
+update rechecks repository identity through a live installation belonging to the
+organization. Board configuration changes produce body-free audit events.
+
+An enabled board imports issues on human `opened`, `transferred`, or `labeled`
+doorbells when a live issue read carries any `ac/status:*` label. Other labels
+alone do not import. A single valid status is retained for a write-capable author;
+missing, malformed, conflicting, or `running` initial status becomes `triage`.
+The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
+unknown permission and other roles always become `triage`. The safety label write
+precedes the idempotent card upsert, so a failed write cannot leave a ready card.
+One `ac/agent:<slug>` resolves to an agent name within the board's organization;
+unknown, conflicting, or malformed assignment labels leave it unassigned.
+The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
+imports and orchestrator creates without duplicate cards or creation audits.
+
+Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
+redelivery, not by an installation-wide issue enumeration. The live tests use a
+PAT as the injected installation-token source; production uses the App token.
