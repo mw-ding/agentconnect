@@ -189,6 +189,8 @@ interface GhLinked {
 
 // Slice at a UTF-16 boundary so a surrogate pair straddling the cap is dropped whole rather than left as a lone surrogate.
 export const truncateUtf16Safe = (text: string, max: number): string => {
+  // Uncut text is returned as is, even when it ends in a lone high surrogate; only a cut can split a pair.
+  if (text.length <= max) return text
   const value = text.slice(0, max)
   const last = value.charCodeAt(value.length - 1)
   return last >= 0xd800 && last <= 0xdbff ? value.slice(0, -1) : value
