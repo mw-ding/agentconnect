@@ -5,6 +5,7 @@ import { GithubFinalPoster } from '../github/poster.js'
 import type { KanbanLease } from './kanban-worker.js'
 import { KANBAN_PROGRESS_NOTE_CAP } from './kanban-worker.js'
 
+const FENCE_SKELETON = 'untrustedexternalcontent'
 const REMOVED_LINE = '[line removed: it imitated the untrusted-content fence]'
 
 // Check each line and adjacent pair once so invisible characters and split markers cannot forge a boundary.
@@ -18,9 +19,11 @@ export function neutralizeFenceMarkers(text: string): string {
     line.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/\P{L}/gu, '')
   )
   const removed = new Set<number>()
+  const hit = skeletons.map((sk) => sk.includes(FENCE_SKELETON))
   for (let i = 0; i < skeletons.length; i++) {
-    if (skeletons[i]!.includes('untrustedexternalcontent')) removed.add(i)
-    if (i + 1 < skeletons.length && (skeletons[i]! + skeletons[i + 1]!).includes('untrustedexternalcontent')) {
+    if (hit[i]) removed.add(i)
+    // A pair counts only when the phrase spans the line break, so a marker line's honest neighbours survive.
+    else if (i + 1 < skeletons.length && !hit[i + 1] && (skeletons[i]! + skeletons[i + 1]!).includes(FENCE_SKELETON)) {
       removed.add(i)
       removed.add(i + 1)
     }
