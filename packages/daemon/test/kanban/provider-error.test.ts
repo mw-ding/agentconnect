@@ -82,7 +82,7 @@ describe('classifyProviderError', () => {
       [401, 'provider_auth'],
       [403, 'provider_auth'],
       [400, 'provider_invalid_request']
-    ].map(([code, reason]) => [
+    ].map(([code, reason]): [string, AcpConnectionClosedError, ReturnType<typeof fatal>] => [
       `structured ${code} precedes the transport marker`,
       new AcpConnectionClosedError({ status: code }),
       code === 400 || code === 401 || code === 403 ? fatal(String(reason)) : transient(String(reason))
