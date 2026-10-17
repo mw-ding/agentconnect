@@ -189,10 +189,21 @@ export class KanbanWorker {
       return
     }
     const remembered = this.sessionsByLease.get(leaseId)
-    if (remembered) {
-      await this.deps.forget(remembered.agentId, remembered.sessionKey)
-      this.sessionsByLease.delete(leaseId)
-    }
+    if (!remembered) return
+    this.sessionsByLease.delete(leaseId)
+    // A replacement admitted on the same session key owns that session now; an admission in flight may be about to.
+    await Promise.allSettled(this.admitting.values())
+    if (this.sessionOwned(remembered.agentId, remembered.sessionKey)) return
+    await this.deps.forget(remembered.agentId, remembered.sessionKey)
+  }
+
+  // A live lease, or the remembered session of a newer lease, on this agent's session key.
+  private sessionOwned(agentId: string, sessionKey: string): boolean {
+    for (const lease of this.leases.values())
+      if (lease.dispatch.agentId === agentId && lease.sessionKey === sessionKey) return true
+    for (const session of this.sessionsByLease.values())
+      if (session.agentId === agentId && session.sessionKey === sessionKey) return true
+    return false
   }
 
   private async admit(d: KanbanDispatch): Promise<KanbanDispatchOk> {
@@ -239,6 +250,9 @@ export class KanbanWorker {
       progressNotes: 0
     }
     this.leases.set(d.leaseId, lease)
+    // The session key's newest lease owns it: an older lease's late revoke must not forget the replacement's session.
+    for (const [id, session] of this.sessionsByLease)
+      if (session.agentId === d.agentId && session.sessionKey === started.sessionKey) this.sessionsByLease.delete(id)
     this.sessionsByLease.set(d.leaseId, { agentId: d.agentId, sessionKey: started.sessionKey })
     this.deps.onLeaseChanged?.(d)
     this.watchTurn(d.leaseId, started.done)
