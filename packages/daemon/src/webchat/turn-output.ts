@@ -178,7 +178,7 @@ export function flushHeldWebchatText(wc: WebchatTurnOutput, resolveFileLink?: Wo
   wc.heldTextOffset = 0
   if (!held) return
   wc.messageEmitted = true
-  for (const text of chunkText(held)) {
+  for (const text of chunkText(wc.maskText?.(held) ?? held)) {
     wc.sink.output({
       conversationId: wc.conversationId,
       turnId: wc.turnId,

@@ -47,6 +47,8 @@ import { FakeClock, WireError } from '@agentconnect.md/connection'
 import { fakeSlackAppFactory } from './fakes/slack-app.js'
 import { WAIT } from './wait-support.js'
 import { RuntimeSessionFailure } from '../src/acp/session-failure.js'
+import { agentHostKey } from '../src/acp/host-key.js'
+import { maskableSecrets } from '../src/session/secret-mask.js'
 
 // One plane per test file — the isolation Vitest's per-file module registry used to give.
 const workspaces = new WorkspaceManager()
@@ -103,6 +105,21 @@ function streamingHost() {
     return host as never
   }
   return { factory, host }
+}
+
+/** What buildAcpHost records for the agent's host launched with a BYOK provider credential. */
+function seedProviderSecrets(daemon: Daemon, apiKey: string, header: string): void {
+  ;(daemon as any).modelProviderSecrets.set(
+    agentHostKey(AGENT_ID),
+    maskableSecrets({
+      runtimeOverrides: {
+        secrets: [
+          { name: 'MODEL_API_KEY', value: apiKey },
+          { name: 'MODEL_HEADER_x-workspace', value: header }
+        ]
+      }
+    })
+  )
 }
 
 /** Capture and ACK hook/report requests the daemon emits on turn end. */
@@ -356,6 +373,7 @@ describe('Daemon rd/msg hook fires', () => {
 
   it('masks a secret split across final chunks in the stored final and the posted comment', async () => {
     const secret = 'sk-provider-api-key-value'
+    const header = 'provider-workspace-header-value'
     const chunk = (text: string) => ({
       sessionUpdate: 'agent_message_chunk',
       _meta: { codex: { phase: 'final_answer' } },
@@ -363,17 +381,19 @@ describe('Daemon rd/msg hook fires', () => {
     })
     const { factory, host } = streamingHost()
     host.prompt.mockImplementation(async (sid: string) => {
+      // Seeded at prompt time, after the launch, as buildAcpHost records a BYOK host's credentials.
+      seedProviderSecrets(daemon, secret, header)
       const onUpdate = (host as any).onUpdate as (sid: string, u: unknown) => void
       onUpdate(sid, chunk('key is sk-provider-'))
-      onUpdate(sid, chunk('api-key-value ok'))
+      onUpdate(sid, chunk('api-key-value, header provider-workspace-'))
+      onUpdate(sid, chunk('header-value ok'))
       return { stopReason: 'end_turn' }
     })
     const hostFactory = (agent: unknown, cb: (sid: string, u: unknown) => void) => {
       ;(host as any).onUpdate = cb
       return factory(agent, cb)
     }
-    const root = scaffold({ runtimeOverrides: { secrets: [{ name: 'MODEL_API_KEY', value: secret }] } })
-    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory })
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold(), hostFactory })
     await daemon.start()
     const cp = fakeCpClient()
     ;(daemon as never as { cpClient: unknown }).cpClient = cp
@@ -408,15 +428,16 @@ describe('Daemon rd/msg hook fires', () => {
     await vi.waitFor(() => expect(cp.hookReports).toHaveLength(1), WAIT)
 
     const posted = publish.mock.calls.map((c) => c[0] ?? '').join('\n')
-    expect(posted).toContain('[secret:MODEL_API_KEY]')
     const rows = (await (daemon as any).store.threadTranscript(
       transcriptChannelKey('agentconnect-md/agentconnect', 'github:123'),
       '145'
     )) as Array<{ text: string }>
     const stored = rows.map((r) => r.text).join('\n')
-    expect(stored).toContain('[secret:MODEL_API_KEY]')
     for (const text of [posted, stored]) {
+      expect(text).toContain('[secret:MODEL_API_KEY]')
+      expect(text).toContain('[secret:MODEL_HEADER_x-workspace]')
       expect(text).not.toContain(secret)
+      expect(text).not.toContain(header)
       expect(text.replace(/\s/g, '')).not.toContain('sk-provider-api-key-value')
     }
     await daemon.stop()
@@ -4383,8 +4404,301 @@ describe('Daemon rd/msg hook fires', () => {
   })
 })
 
-// webhook-triggers-and-github-events.md, "Trusted users": a relay-authored notice is a fixed-text
-// post on the thread — no model turn — and a thread is told once however many arrive.
+// MCP tool args reach the daemon over the control socket, never through the onAcpUpdate mask.
+describe('Daemon masks agent-authored MCP text before a code host sees it', () => {
+  const API_KEY = 'sk-batchprobe-SECRET-value-0001'
+  const HEADER = 'batchprobe-header-SECRET-0002'
+  const leak = `key ${API_KEY} header ${HEADER}`
+  const expectMasked = (text: string) => {
+    expect(text).toContain('[secret:MODEL_API_KEY]')
+    expect(text).toContain('[secret:MODEL_HEADER_x-workspace]')
+    expect(text).not.toContain(API_KEY)
+    expect(text).not.toContain(HEADER)
+  }
+
+  it.each([
+    { mode: 'headless', target: undefined },
+    {
+      mode: 'targeted',
+      target: { platform: 'slack' as const, channel: 'C-alerts', integrationId: 'int-a' }
+    }
+  ])(
+    'masks provider secrets in every batched review-thread reply body ($mode)',
+    async ({ target }) => {
+      const clock = new FakeClock(Date.parse('2026-08-12T00:00:00.000Z'))
+      let onUpdate!: (sid: string, update: unknown) => void
+      const published: Array<{ root?: string; body: string }> = []
+      const host = {
+        start: vi.fn(async () => {}),
+        newSession: vi.fn(async () => 'acp-review-batch-mask'),
+        modelOptions: vi.fn(() => null),
+        hasSession: vi.fn(() => true),
+        prompt: vi.fn(async (sid: string) => {
+          seedProviderSecrets(daemon, API_KEY, HEADER)
+          await (daemon as any).mcp.deps.replyGithubReviewThreads({
+            agentId: AGENT_ID,
+            platform: target?.platform ?? 'hook',
+            channel: target?.channel ?? 'acme/infra',
+            thread: target ? 'anchor-1' : '42',
+            ...(target ? {} : { transportScope: 'github:123' }),
+            replies: [
+              { threadRootCommentId: '101', body: `First: ${leak}` },
+              { threadRootCommentId: '102', body: `Second: ${leak}` }
+            ]
+          })
+          onUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Posted.' } })
+          return { stopReason: 'end_turn' }
+        }),
+        cancel: vi.fn(async () => {}),
+        stop: vi.fn(async () => {})
+      }
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold(),
+        clock,
+        hostFactory: (_agent, cb) => {
+          onUpdate = cb
+          return host as never
+        }
+      })
+      await daemon.start()
+      const cp = fakeCpClient()
+      ;(daemon as never as { cpClient: unknown }).cpClient = cp
+      if (target) {
+        ;(daemon as any).connByIntegration.set(target.integrationId, {
+          postMessage: vi.fn(async () => 'anchor-1'),
+          postContext: vi.fn(async () => {}),
+          setStatus: vi.fn(async () => {})
+        })
+      }
+      ;(daemon as any).githubReviews.makeCodeHostReply = vi.fn(
+        (_agentId: string, ref: { reviewThreadRootCommentId?: string }) => ({
+          collector: new GithubReplyCollector(),
+          poster: {
+            publish: vi.fn(async (body: string) => {
+              published.push({ root: ref.reviewThreadRootCommentId, body })
+              return { kind: 'review_comment' as const, commentId: String(9000 + published.length) }
+            })
+          }
+        })
+      )
+      const reviewComment = (deliveryKey: string, commentId: string): RdMsgHook =>
+        fire({
+          sessionKey: 'acme/infra#42',
+          ...(target ? { target } : {}),
+          msgId: `${HOOK_ID}:${deliveryKey}`,
+          deliveryKey,
+          firedAt: `2026-08-12T00:00:0${commentId === '101' ? '0' : '1'}.000Z`,
+          event: 'pull_request_review_comment:created',
+          github: {
+            repoId: '123',
+            repoFullName: 'acme/infra',
+            sourceInstallationId: '456',
+            subjectKind: 'pull_request',
+            pullNumber: 42,
+            pullRequestReviewId: '900',
+            reviewCommentId: commentId,
+            reviewThreadRootCommentId: commentId
+          },
+          context: {
+            source: 'github',
+            event: 'pull_request_review_comment',
+            action: 'created',
+            repo: 'acme/infra',
+            number: 42,
+            senderLogin: 'reviewer',
+            bodyExcerpt: `Finding ${commentId}.`,
+            truncated: false
+          }
+        })
+
+      await (daemon as any).handleRelayMsg(reviewComment('root-1', '101'), () => {})
+      await vi.waitFor(() => expect((daemon as any).activeGateEntries.size).toBe(1), WAIT)
+      await (daemon as any).handleRelayMsg(reviewComment('root-2', '102'), () => {})
+      clock.advance(5_000)
+      await vi.waitFor(() => expect(published).toHaveLength(2), WAIT)
+
+      expect(published.map(({ root }) => root)).toEqual(['101', '102'])
+      for (const { body } of published) expectMasked(body)
+      await daemon.stop()
+    },
+    15_000
+  )
+
+  it.each(['body', 'inline comments'])('masks the GitHub formal review %s in the POST', async (field) => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: streamingHost().factory
+    })
+    await daemon.start()
+    seedProviderSecrets(daemon, API_KEY, HEADER)
+    const headSha = 'a'.repeat(40)
+    const baseSha = 'b'.repeat(40)
+    const hook: Record<string, unknown> = {
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'mask',
+      firedAt: new Date().toISOString()
+    }
+    const inboxId = `${HOOK_ID}:mask`
+    const key = `hook:acme/infra:42:${AGENT_ID}`
+    await (daemon as any).store.appendInbox({
+      id: inboxId,
+      sessionKey: key,
+      agentId: AGENT_ID,
+      msg: '{}',
+      hookContext: JSON.stringify(hook),
+      loopGuardCounted: 1,
+      enqueuedAt: '1'
+    })
+    ;(daemon as any).activeGithubTurnMeta.set(key, {
+      entry: { inboxId, hookContext: hook },
+      hook,
+      snapshot: {
+        configRevision: '1',
+        dispatchRevision: '1',
+        dispatchDaemonId: '44444444-4444-4444-8444-444444444444',
+        reviewPolicy: 'full',
+        reportingMode: 'check',
+        gateMode: 'informational'
+      },
+      repoId: '123',
+      repoFullName: 'acme/infra',
+      pullNumber: 42,
+      expectedHeadSha: headSha,
+      expectedBaseSha: baseSha,
+      reportSha: headSha,
+      sessionId: 'acp-mask',
+      reviewState: 'idle'
+    })
+    ;(daemon as any).cpClient = {
+      stop: vi.fn(async () => {}),
+      authorizeGithubReview: vi.fn(async ({ attemptId }: { attemptId: string }) => ({
+        attemptId,
+        token: 'ghs_review',
+        ttlSec: 60,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        repoId: '123',
+        repoFullName: 'acme/infra',
+        pullNumber: 42,
+        expectedHeadSha: headSha,
+        expectedBaseSha: baseSha
+      })),
+      reportGithubReviewResult: vi.fn(async () => ({ accepted: true }))
+    }
+    vi.spyOn((daemon as any).githubReviews, 'githubCommentAttribution').mockResolvedValue(undefined)
+    const posts: Array<{ body: string; comments: Array<{ body: string }> }> = []
+    ;(daemon as any).githubReviews.githubReviewClient.fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname
+      if (init.method === 'POST') {
+        posts.push(JSON.parse(String(init.body)))
+        return Response.json({ id: 9001, commit_id: headSha })
+      }
+      if (path.endsWith('/reviews')) return Response.json([])
+      if (path.endsWith('/files')) {
+        return Response.json([{ filename: 'src/a.ts', patch: '@@ -1,1 +1,2 @@\n line\n+added' }])
+      }
+      return Response.json({ head: { sha: headSha }, base: { sha: baseSha }, state: 'open', merged: false })
+    })
+
+    await expect(
+      (daemon as any).mcp.deps.submitCodeReview({
+        agentId: AGENT_ID,
+        platform: 'hook',
+        channel: 'acme/infra',
+        thread: '42',
+        event: 'COMMENT',
+        verdict: 'neutral',
+        body: `Summary: ${leak}`,
+        comments: [{ path: 'src/a.ts', line: 2, side: 'RIGHT', body: `Inline: ${leak}` }]
+      })
+    ).resolves.toMatchObject({ state: 'submitted', reviewId: '9001' })
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.comments).toHaveLength(1)
+    expectMasked(field === 'body' ? posts[0]!.body : posts[0]!.comments[0]!.body)
+    await daemon.stop()
+  })
+
+  it.each(['gitlabReviews', 'giteaReviews'])(
+    'hands the %s adapter a masked review body and inline comment bodies',
+    async (adapter) => {
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold(),
+        hostFactory: streamingHost().factory
+      })
+      await daemon.start()
+      seedProviderSecrets(daemon, API_KEY, HEADER)
+      vi.spyOn((daemon as any)[adapter], 'owns').mockReturnValue(true)
+      const submit = vi.spyOn((daemon as any)[adapter], 'submit').mockResolvedValue({ state: 'submitted' })
+
+      await (daemon as any).mcp.deps.submitCodeReview({
+        agentId: AGENT_ID,
+        platform: 'hook',
+        channel: HOOK_ID,
+        thread: 'subject',
+        event: 'COMMENT',
+        verdict: 'neutral',
+        body: `Summary: ${leak}`,
+        comments: [{ path: 'src/a.ts', line: 2, side: 'RIGHT', body: `Inline: ${leak}` }]
+      })
+      const req = submit.mock.calls[0]![1] as { body: string; comments: Array<{ path: string; body: string }> }
+      expectMasked(req.body)
+      expectMasked(req.comments[0]!.body)
+      expect(req.comments[0]!.path).toBe('src/a.ts')
+      await daemon.stop()
+    }
+  )
+
+  it.each([
+    { kind: 'createComment', extra: { subject: 'merge_request', iid: 42, body: leak } },
+    { kind: 'replyDiscussion', extra: { subject: 'merge_request', iid: 42, discussionId: 'd-1', body: leak } },
+    { kind: 'updateComment', extra: { subject: 'merge_request', iid: 42, noteId: API_KEY, body: leak } },
+    {
+      kind: 'createMergeRequest',
+      extra: { sourceBranch: API_KEY, targetBranch: HEADER, title: leak, description: leak }
+    },
+    { kind: 'updateMergeRequest', extra: { iid: 42, targetBranch: HEADER, title: leak, description: leak } }
+  ])('masks $kind public text before the code-host broker posts it', async ({ kind, extra }) => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: streamingHost().factory
+    })
+    await daemon.start()
+    seedProviderSecrets(daemon, API_KEY, HEADER)
+    const key = sessionKey('hook', HOOK_ID, 'subject', AGENT_ID, `gitlab:${GITLAB_PROJECT}`)
+    ;(daemon as any).activeTurnCodeHost.set(key, {
+      agentId: AGENT_ID,
+      provider: 'gitlab',
+      repoId: GITLAB_PROJECT,
+      hookId: HOOK_ID
+    })
+    const execute = vi.spyOn((daemon as any).codeHostBrokers.get('gitlab'), 'execute').mockResolvedValue({ ok: true })
+
+    await (daemon as any).mcp.deps.codeHostEffect({
+      agentId: AGENT_ID,
+      platform: 'hook',
+      channel: HOOK_ID,
+      thread: 'subject',
+      transportScope: `gitlab:${GITLAB_PROJECT}`,
+      operation: { kind, ...extra }
+    })
+    const op = execute.mock.calls[0]![1] as { kind: string; body: string; title?: string; description?: string }
+    const { title, description } = extra as Record<string, unknown>
+    const coordinates = Object.fromEntries(
+      Object.entries(extra).filter(([key]) => !['title', 'description', 'body'].includes(key))
+    )
+    expect(op).toMatchObject({ kind, ...coordinates })
+    if (title !== undefined) expectMasked(op.title!)
+    if (description !== undefined) expectMasked(op.description!)
+    if (title === undefined) expectMasked(op.body)
+    await daemon.stop()
+  })
+})
+
+// A relay-authored trusted-user notice is fixed text, posted once per thread without a model turn.
 describe('Daemon rd/msg hook notices', () => {
   const notice = (deliveryKey: string): RdMsgHook =>
     fire({

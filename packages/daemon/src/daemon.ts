@@ -282,7 +282,7 @@ import { GitlabBroker } from './gitlab/broker.js'
 import { gitlabApiBaseUrl } from './gitlab/api-base.js'
 import { GiteaBroker } from './gitea/broker.js'
 import { giteaApiBaseUrl } from './gitea/api-base.js'
-import type { CodeHostEffectBroker, CodeHostEffectTarget } from './codehost/broker.js'
+import type { CodeHostBrokerOperation, CodeHostEffectBroker, CodeHostEffectTarget } from './codehost/broker.js'
 import { CodeHostNoteProjector } from './gitlab/note-projection.js'
 import {
   CONFIG_FILE_CONVENTIONS,
@@ -4360,10 +4360,23 @@ export class Daemon {
       viewSessionStatus: (req) => Promise.resolve(this.collab.viewSessionStatus(req)),
       rootPostRelation: (req) => this.collab.rootPostRelation(req),
       spawnChannelRootSession: (req) => this.collab.spawnChannelRootSession(req),
-      submitCodeReview: (req) => this.codeReviews.submit(req),
-      replyGithubReviewThreads: (req) => this.githubReviews.replyGithubReviewThreads(req),
+      // MCP args bypass the onAcpUpdate mask, so agent text is masked here before it is stored or posted.
+      submitCodeReview: (req) =>
+        this.codeReviews.submit({
+          ...req,
+          body: this.maskAgentSecrets(req.agentId, req.body),
+          ...(req.comments
+            ? { comments: req.comments.map((c) => ({ ...c, body: this.maskAgentSecrets(req.agentId, c.body) })) }
+            : {})
+        }),
+      replyGithubReviewThreads: (req) =>
+        this.githubReviews.replyGithubReviewThreads({
+          ...req,
+          replies: req.replies.map((r) => ({ ...r, body: this.maskAgentSecrets(req.agentId, r.body) }))
+        }),
       recordKanbanTerminal: (req) => this.recordKanbanTerminal(req),
-      codeHostEffect: (req) => this.runCodeHostEffect(req),
+      codeHostEffect: (req) =>
+        this.runCodeHostEffect({ ...req, operation: this.maskCodeHostOperation(req.agentId, req.operation) }),
       codeHostResearch: {
         list: async (ctx) => {
           const { repositories, partial } = await this.researchRepositories(ctx.agentId)
@@ -13816,6 +13829,25 @@ export class Daemon {
     return await broker.execute({ ...target, agentId: req.agentId, sessionKey: key }, req.operation)
   }
 
+  /** Mask the agent-authored public text of a brokered operation (body, title, description), never its ids or refs. */
+  private maskCodeHostOperation(agentId: string, op: CodeHostBrokerOperation): CodeHostBrokerOperation {
+    switch (op.kind) {
+      case 'createComment':
+      case 'updateComment':
+      case 'replyDiscussion':
+        return { ...op, body: this.maskAgentSecrets(agentId, op.body) }
+      case 'createMergeRequest':
+      case 'updateMergeRequest':
+        return {
+          ...op,
+          ...(op.title !== undefined ? { title: this.maskAgentSecrets(agentId, op.title) } : {}),
+          ...(op.description !== undefined ? { description: this.maskAgentSecrets(agentId, op.description) } : {})
+        }
+      default:
+        return op
+    }
+  }
+
   /** The hook-dispatched turn's trusted repository first (§13.1), else the agent's managed workspace repository. */
   private codeHostEffectTarget(
     agentId: string,
@@ -17109,6 +17141,7 @@ export class Daemon {
           replyText: '',
           replySegments: [],
           heldText: '',
+          maskText: (text: string) => this.maskAgentSecrets(agentId, text),
           heldTextOffset: 0,
           messageId: undefined,
           messageEmitted: false
@@ -17275,6 +17308,8 @@ export class Daemon {
       if (!p.signals.runtimeReportedModel) turnModel = await this.captureTurnModel(run, host, sessionId, modelOverride)
       await this.settleUsage(p, run, sessionId)
       await this.commitWebchatReply(p, run, outcome)
+      // The assembled reply feeds memory capture, evaluation, and an inferred parent reply.
+      p.reply.text = this.maskAgentSecrets(p.plan.agentId, p.reply.text)
       await this.flushPlatformFinals(p, run, sessionId, currentAttributionInfo)
       await this.finalizeDelivery(p, run, { rec, sessionId, handled, outcome, memoryCaptureTarget })
     } catch (err) {
@@ -19076,6 +19111,8 @@ export class Daemon {
   ): Promise<void> {
     if (!p.webchat) return
     const agentId = p.entry.agentId
+    // A segment concatenates chunks, so mask the assembled text before it is stored and posted.
+    const text = this.maskAgentSecrets(agentId, segment.text)
     const scope = hopCount !== undefined ? (p.webchatRouting ?? initialWebchatRouting(p.entry)).scope : undefined
     const replyTs = await webchatTurnOutput.appendWebchatTextRow(
       this.store,
@@ -19086,7 +19123,7 @@ export class Daemon {
         postId: segment.postId,
         sender: agentId,
         admission: { agentId, sessionKey: p.plan.sessionKey },
-        text: segment.text
+        text
       }
     )
     p.webchat.postSink?.({
@@ -19101,7 +19138,7 @@ export class Daemon {
           ...(hopCount !== undefined ? { hopCount } : {}),
           ...(scope ? { addressedAgentIds: scope } : {})
         },
-        text: segment.text,
+        text,
         at: Number(replyTs)
       },
       ...(p.webchat.initiator ? { initiator: p.webchat.initiator } : {})
@@ -21271,6 +21308,27 @@ export class Daemon {
   /** Serialize action application per session, so in-place edits never race on a remembered message ts; routed by platform. */
   private enqueueApply(p: Pending, action: DaemonRenderAction, opts: { allowWhenSuppressed?: boolean } = {}): void {
     if (p.outputSuppressed && !opts.allowWhenSuppressed) return
+    // Converger text is assembled across chunks, where the per-chunk ingress mask misses a split secret.
+    const mask = (text: string) => this.maskAgentSecrets(p.plan.agentId, text)
+    if ('text' in action) action = { ...action, text: mask(action.text) }
+    else if (action.kind === 'activity' && 'body' in action) action = { ...action, body: mask(action.body) }
+    else if (action.kind === 'stream-append' || action.kind === 'stream-stop') {
+      const chunks = (action.kind === 'stream-append' ? action.chunks : action.settle).map((chunk) => ({
+        ...chunk,
+        title: mask(chunk.title),
+        ...(chunk.type === 'task_update'
+          ? {
+              ...(chunk.details !== undefined ? { details: mask(chunk.details) } : {}),
+              ...(chunk.output !== undefined ? { output: mask(chunk.output) } : {})
+            }
+          : {})
+      }))
+      action = {
+        ...action,
+        ...(action.kind === 'stream-append' ? { chunks } : { settle: chunks }),
+        ...(action.progressText !== undefined ? { progressText: mask(action.progressText) } : {})
+      }
+    }
     p.signals.applyChain = p.signals.applyChain.then(() => {
       // Check again at execution time: actions queued before an interrupt must not
       // publish later after a backed-up transport queue drains.
@@ -21992,6 +22050,8 @@ export class Daemon {
     admission: TranscriptAdmission,
     ev: TranscriptEvent
   ): Promise<void> {
+    // A reasoning row concatenates thought chunks, so mask the assembled row too.
+    ev = { ...ev, text: this.maskAgentSecrets(agentId, ev.text) }
     if (ev.kind === 'plan') {
       await this.store.upsertPlan({
         channel,

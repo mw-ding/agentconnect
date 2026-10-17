@@ -701,6 +701,7 @@ export interface Pending {
     replySegments: { postId: string; text: string; committing?: Promise<void> }[]
     segmentIndex?: number
     heldText: string
+    maskText?: (text: string) => string
     heldTextOffset?: number
     messageId?: string
     messageEmitted: boolean

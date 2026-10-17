@@ -69,7 +69,7 @@ export class QQPrivateStream {
     await this.flight
     if (this.failed) throw this.failure
     if (!this.cursor.id) return this.conn.sendText(this.channel, this.replyId, text)
-    if (!text.startsWith(this.confirmed)) throw new Error('QQ final text changed an already delivered prefix')
+    // Final secret masking can rewrite a preview; QQ's replace mode accepts the full final snapshot.
     const parts = splitQQText(text)
     let first = parts.shift() ?? this.confirmed
     if (text.startsWith(this.confirmed) && first.length < this.confirmed.length) {
