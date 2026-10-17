@@ -76,6 +76,7 @@ const issue = (over: Record<string, unknown> = {}) => ({
   state_reason: null,
   labels: [{ name: statusLabel('ready') }, { name: 'bug' }],
   repository: { id: 42 },
+  repository_url: 'https://api.github.com/repos/acme/web',
   ...over
 })
 
@@ -89,7 +90,11 @@ describe('GithubCardStore reads', () => {
       number: 7,
       state: 'open',
       stateReason: null,
-      labels: ['ac/status:ready', 'bug']
+      labels: ['ac/status:ready', 'bug'],
+      authorLogin: null,
+      authorType: null,
+      authorViaGithubApp: false,
+      repositoryFullName: 'acme/web'
     })
     expect(JSON.stringify(card, (_k, v: unknown) => (typeof v === 'bigint' ? v.toString() : v))).not.toMatch(
       /SECRET|roadmap/
@@ -102,6 +107,38 @@ describe('GithubCardStore reads', () => {
     const h = harness({ 'GET /repositories/42/issues/8': () => json(issue({ number: 8, pull_request: {} })) })
     expect(await h.store.readCard(REPO, 7)).toBeNull()
     expect(await h.store.readCard(REPO, 8)).toBeNull()
+  })
+
+  it.each([{ number: 8 }, { repository: { id: 99 } }])(
+    'refuses a redirected issue outside the requested identity: %j',
+    async (over) => {
+      const h = harness({ 'GET /repositories/42/issues/7': () => json(issue(over)) })
+      expect(await h.store.readCard(REPO, 7)).toBeNull()
+    }
+  )
+
+  // Repo-id addressing survives a rename, so a new name still reads; only the importer fences on the name.
+  it.each([
+    ['https://api.github.com/repos/other/web', 'other/web'],
+    ['https://api.github.com/repos/ACME/Web', 'ACME/Web'],
+    [undefined, null]
+  ])('reports the repository name %s without refusing the read', async (url, name) => {
+    const h = harness({ 'GET /repositories/42/issues/7': () => json(issue({ repository_url: url })) })
+    expect(await h.store.readCard(REPO, 7)).toMatchObject({ repositoryFullName: name })
+  })
+
+  it.each([false, true])('projects body-free author attribution with App flag %s', async (viaApp) => {
+    const h = harness({
+      'GET /repositories/42/issues/7': () =>
+        json(
+          issue({ user: { login: 'alice', type: 'User' }, performed_via_github_app: viaApp ? { slug: 'app' } : null })
+        )
+    })
+    expect(await h.store.readCard(REPO, 7)).toMatchObject({
+      authorLogin: 'alice',
+      authorType: 'User',
+      authorViaGithubApp: viaApp
+    })
   })
 
   it('reads the parent, sub-issues, and blocked_by graph', async () => {
@@ -264,6 +301,7 @@ describe('status label attribution', () => {
     ['bot add', [ev(1, bot)], false],
     ['unknown actor', [ev(1, null)], false],
     ['user-typed bot login', [ev(1, { type: 'User', login: 'worker[bot]' })], false],
+    ['case-variant App status removal', [ev(1, human), ev(2, bot, 'AC/STATUS:blocked', { event: 'unlabeled' })], false],
     ['app on behalf of a user', [ev(1, human, 'ac/status:ready', { performed_via_github_app: { id: 1 } })], false],
     ['no history', [], false],
     ['bot re-add after human', [ev(1, human), ev(2, bot)], false],

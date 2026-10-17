@@ -5,6 +5,7 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
 import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import { isAttestedHumanAuthority } from '../../kanban/human-authority.js'
 import { hasWriteAccess } from '../../github/repo-permission.js'
 import {
   KanbanCardUpsertError,
@@ -634,7 +635,13 @@ const UNATTENDED_STATUSES: ReadonlySet<string> = new Set(['triage', 'todo'])
 
 function humanAuthorized(input: KanbanCardUpsertInput): boolean {
   const authority = input.humanAuthority
-  return input.source === 'import' && !input.actorAgentId && !!authority?.login && hasWriteAccess(authority.permission)
+  return (
+    input.source === 'import' &&
+    !input.actorAgentId &&
+    isAttestedHumanAuthority(authority) &&
+    !!authority.login &&
+    hasWriteAccess(authority.permission)
+  )
 }
 
 /** The same assignee policy for upsert and setAssignee: an agent of the org that is not restricted to an audience. */

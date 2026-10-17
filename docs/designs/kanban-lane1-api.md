@@ -1,6 +1,6 @@
 # Lane 1 frozen repo API (Kanban M1) — for Lanes 2/3/4
 
-**Version:** 1.1 (2026-10-17, PR #136 review fixes)
+**Version:** 1.2 (2026-10-17, PR #136 round-2 fixes)
 
 Introduced on branch `backend/2-kanban-m1-gaps` in commit `df86b612e`. Path keys: `cp/` = `packages/control-plane/`.
 These signatures are **frozen**. Changes after 1.0 are additive except where the change log says a field was
@@ -23,8 +23,11 @@ export interface KanbanCardRow {
 }
 
 export interface KanbanHumanAuthority {
-  login: string                        // the GitHub login whose label set the status
-  permission: RepoPermissionLevel      // its live level; must be admin | maintain | write
+  // Branded opaque value (unique-symbol brand + module-private WeakSet): a literal, spread copy, or JSON
+  // round-trip of a real one is rejected by upsertCard. Only `attestHumanAuthority` (cp/src/kanban/human-authority.ts)
+  // can mint one; the importer is the sole production caller.
+  readonly login: string              // the GitHub login whose label set the status
+  readonly permission: RepoPermissionLevel   // its live level; must be admin | maintain | write
 }
 
 export interface KanbanCardUpsertInput {
@@ -73,7 +76,9 @@ getCard(cardId: string): Promise<KanbanCardRow | null>
   `archived`) needs **all** of the following, or the upsert throws `status_not_allowed`:
   - `source === 'import'`
   - `actorAgentId` null or absent
-  - a `humanAuthority` with a non-empty login and a write-level permission (`admin`, `maintain`, `write`)
+  - a `humanAuthority` that is an **attested** value (`isAttestedHumanAuthority`) with a non-empty login and a
+    write-level permission (`admin`, `maintain`, `write`). A structurally identical literal, spread copy, or JSON
+    round-trip is not in the module-private WeakSet and fails the check, so an in-process caller cannot forge one.
 
   The created audit row records `details.humanAuthority: { login, permission }` (null when there was none). Agents
   move cards past `todo` only through the audited human-gated paths: 1b's `casStatus` / promotion flow, and
@@ -273,14 +278,24 @@ seam `{ mintKanbanCard: async () => ({ token }) }` works unchanged.
 `KanbanImporter` imports a status-labeled issue that has no card yet. Its status is **kept** only when all of these
 hold:
 
-1. The issue author has live write access (`checkWriteAccess`).
-2. Exactly one well-formed, non-`running` `ac/status:*` label is on the issue, and the latest `labeled` event for that
-   label has an actor that:
+1. The issue **author** passes the same human test as a label actor: `authorType === 'User'`, a non-empty login that
+   does not end in `[bot]`, no `performed_via_github_app`, and not the App — plus live write access (`checkWriteAccess`).
+   `readCard` projects this body-free as `CardIssue.authorType` (from `issue.user.type`), `authorLogin`, and
+   `authorViaGithubApp` (whether `performed_via_github_app` is set), so an App-filed or bot-filed issue never counts as
+   human-authored.
+2. Exactly one well-formed, non-`running` `ac/status:*` label is on the issue, and the label's **latest visible
+   `labeled`/`unlabeled` event** (case-insensitive name compare, tie-broken by event id then `created_at`) is a `labeled`
+   add whose actor:
    - passes `isHumanActor` (a `User`, not a `[bot]` login, no `performed_via_github_app`)
    - is not `isAppActor(event, appSlug)`
    - has live write access
-3. If the events contain any `transferred` event, the latest one's actor (the transferrer) passes the same human +
-   live-write check.
+
+   A visible removal of the label newer than its add, or no event for that label at all (event lag), fails closed:
+   the older add can no longer authorize a re-add that has not landed in the events API yet.
+
+3. The **transferrer** passes the same human + live-write check. On a `transferred` action (the webhook action passed
+   through `import(…, { action })`), a **visible** `transferred` event with a live human-writer actor is required; none
+   visible → triage. On any other action, a visible `transferred` event is still checked on its latest actor.
 
 Events come from `CardStore.readLabelEvents(repo, issueNumber)`. It returns body-free `LabelEvent`s (id, event,
 label name, actor type/login, an App flag), oldest first, using the existing newest-first pagination and page cap. A
@@ -293,15 +308,32 @@ auto-dispatched") and the existing store semantics: a triage card is visible on 
 plus an assignee, and a human must move it. The importer also writes the `ac/status:triage` label first, so GitHub
 agrees.
 
+- **Import signature.** `import(board, repo, issueNumber, options?: { action?: string }): Promise<boolean>`. The
+  container passes the webhook action through; callers that do not have an action may omit `options`.
+- **Label attribution helper.** The per-label rule lives once in `cp/src/kanban/label-attribution.ts` for Lane 1b to
+  reuse (it fixes the same bug in `statusSetByHuman`): `latestLabelEvent(events, label)`, `labelAdder(events, label,
+appSlug)`, and `labelAddedByWriter(events, label, appSlug, writer)`, plus `latestTransferEvent(events)`. The importer
+  calls these; it does not re-implement the rule.
+- **Status-label case.** Status labels are _detected_ case-insensitively (`isStatusLabel`, exported from
+  `card-state.ts`: `label.toLowerCase().startsWith('ac/status:')`), but only the exact canonical lowercase form
+  `ac/status:<status>` is valid. Any other case variant is malformed and forces triage. The detection helpers
+  (`parseStatusLabels`, `planStatusWrite`, `planLabelReconcile`, the dispatcher/graph-reconciler filters, and the relay
+  doorbell prefix) all use `isStatusLabel`, so a stale case variant is removed or ignored.
 - **Assignee.** The importer stores an `ac/agent:` pick only when the status was kept **and** every current
-  `ac/agent:*` label's latest `labeled` event passes the same human + live-write check. Otherwise
+  `ac/agent:*` label's latest visible `labeled`/`unlabeled` event is a `labeled` add by a live human writer. Otherwise
   `assigneeAgentId: null`.
-- **Human authority.** When the status is kept, the upsert carries `humanAuthority: { login, permission }` from the
-  status label's adder, and nothing else does.
+- **Human authority.** When the status is kept, the upsert carries the status-label adder's attested authority via
+  `attestHumanAuthority(login, level)` (`cp/src/kanban/human-authority.ts`), and nothing else does.
+- **Read-after-redirect fence.** `readCard` returns `null` when the resolved issue's `number` differs from the
+  requested one or its `repository.id` (when present) differs from the board's `repoId`. It also reports
+  `repositoryFullName` (from `repository_url`) without refusing, because reads are addressed by repo id and a renamed
+  repository must keep dispatching. The importer alone fences on the name: a name that doesn't match the board's
+  `repoFullName` (case-insensitive), or a missing one, imports nothing (warn reason `repository_mismatch`); a rename
+  imports again once board metadata is refreshed.
 - **Lookups and logs.** Permission lookups are deduplicated per login (case-insensitive) within one import. Errors are
   logged at warn level and body-free: board id, issue number, a reason (`events_unreadable` /
   `permission_lookup_failed`), the error class, and the HTTP status. Error messages are never logged.
-- **Wiring.** The container passes `appSlug: githubAppCfg?.slug` and the HTTP logger.
+- **Wiring.** The container passes `appSlug: githubAppCfg?.slug`, the HTTP logger, and the webhook `action`.
 
 ## 5. Board routes (`cp/src/http/routes/kanban.ts`)
 
@@ -359,3 +391,21 @@ lanes shouldn't reuse the `20261122*` timestamps.
   - Board routes carry stable `code`s (§5), and the plugin's owner gate is default-on with a `kanbanAccess: 'viewer'`
     opt-out.
   - Migration renamed to `20261122100000_kanban_board_card_audit`.
+- 2026-10-17 v1.2, PR #136 round-2 fixes:
+  - **Branded** `KanbanHumanAuthority` as an opaque value minted only by `attestHumanAuthority`
+    (`cp/src/kanban/human-authority.ts`, unique-symbol brand + module-private `WeakSet`). `upsertCard` accepts a status
+    past `todo` only if `isAttestedHumanAuthority(humanAuthority)`; a literal, spread copy, or JSON round-trip is
+    refused with `status_not_allowed`. Lanes 2–4 must mint via the helper, never build the struct by hand.
+  - **Per-label attribution** moved to `cp/src/kanban/label-attribution.ts` (`latestLabelEvent`, `labelAdder`,
+    `labelAddedByWriter`, `latestTransferEvent`). For each authority-bearing label the latest visible
+    `labeled`/`unlabeled` event (case-insensitive) decides: a newer removal, no event (lag), or a non-human actor
+    fails closed. Lane 1b must reuse these helpers for `statusSetByHuman`.
+  - **Transfer rule**: `import()` gains `options?: { action?: string }`; the container passes the webhook action. A
+    `transferred` action now requires a visible `transferred` event with a live human-writer actor.
+  - **Author attribution**: `CardIssue` gains `authorType` and `authorViaGithubApp` (body-free, from `readCard`); the
+    importer requires the author to pass the same human test as label actors before the permission check.
+  - **Status-label case**: detection is case-insensitive via `isStatusLabel` (exported from `card-state.ts`); only the
+    exact canonical `ac/status:<status>` spelling is valid, and any other case variant is malformed. The importer,
+    `parseStatusLabels`, and the removal filters use it.
+  - **Read-after-redirect fence**: `readCard` fails closed (`null`) on a `number` or `repository.id` mismatch and
+    exposes `CardIssue.repositoryFullName`; the importer refuses to import when that name isn't the board's repo.

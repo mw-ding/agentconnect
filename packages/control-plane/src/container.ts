@@ -1820,7 +1820,7 @@ export function buildContainer(
         onCard: async (board, repo, issueNumber, action) => {
           const imported =
             ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
-            (await kanbanImporter?.import(board, repo, issueNumber))
+            (await kanbanImporter?.import(board, repo, issueNumber, { action }))
           if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
           kanbanDispatcher?.poke(board.id)
         },

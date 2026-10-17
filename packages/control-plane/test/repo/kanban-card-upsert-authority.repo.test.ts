@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
+import { attestHumanAuthority } from '../../src/kanban/human-authority.js'
 import { cardIdempotencyKey } from '../../src/kanban/card-key.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -35,7 +36,9 @@ function input(boardId: string, n: number, extra: Partial<KanbanCardUpsertInput>
   return { boardId, expectedRepoId: 4242n, issueId: BigInt(700_000 + n), issueNumber: n, source: 'import', ...extra }
 }
 
-const writer = (permission: RepoPermissionLevel = 'write') => ({ humanAuthority: { login: 'maintainer', permission } })
+const writer = (permission: RepoPermissionLevel = 'write') => ({
+  humanAuthority: attestHumanAuthority('maintainer', permission)
+})
 const cardAudit = () => prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' }, orderBy: { id: 'asc' } })
 
 describe('upsertCard: mode and ready are never an agent’s to set', () => {
@@ -80,6 +83,29 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
     })
   })
 
+  it.each(['literal', 'spread', 'JSON'] as const)('rejects %s authority with no row, audit, or claim', async (kind) => {
+    const boardId = await seedBoard()
+    const real = attestHumanAuthority('maintainer', 'admin')
+    const forged =
+      kind === 'literal'
+        ? { login: 'nobody', permission: 'admin' }
+        : kind === 'spread'
+          ? { ...real }
+          : JSON.parse(JSON.stringify(real))
+    await expect(
+      cards.upsertCard(
+        input(boardId, 20, {
+          status: 'ready',
+          assigneeAgentId: A1,
+          humanAuthority: forged as KanbanCardUpsertInput['humanAuthority']
+        })
+      )
+    ).rejects.toMatchObject({ code: 'status_not_allowed' })
+    expect(await prisma.kanbanCard.count()).toBe(0)
+    expect(await cardAudit()).toHaveLength(0)
+    expect(await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).toEqual([])
+  })
+
   it.each(['triage', 'read', 'none'] as const)('refuses ready with a %s-level human authority', async (level) => {
     const boardId = await seedBoard()
     await expect(cards.upsertCard(input(boardId, 4, { status: 'ready', ...writer(level) }))).rejects.toMatchObject({
@@ -91,7 +117,7 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
   it.each([
     ['an agent actor', { actorAgentId: ORCH }],
     ['a non-import source', { source: 'orchestrator' }],
-    ['an empty login', { humanAuthority: { login: '', permission: 'admin' as const } }]
+    ['an empty login', { humanAuthority: attestHumanAuthority('', 'admin') }]
   ])('refuses ready with a writer authority but %s', async (_name, extra) => {
     const boardId = await seedBoard()
     await expect(
