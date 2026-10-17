@@ -132,8 +132,14 @@ export class KanbanOrchestrator {
       return refuse('commit_create', 'issue_not_from_app')
     }
     // No App slug (dev/E2E PAT seam): the author fence is skipped — the PAT mints every token, so there is no bot actor.
+    if ((req.blockedBy ?? []).includes(req.issueNumber)) return refuse('commit_create', 'invalid_link')
     const blockers = await this.resolveBlockers(req.boardId, req.blockedBy ?? [])
-    if (blockers === 'cross_repo') return refuse('commit_create', 'cross_repo')
+    if (blockers === 'card_not_found') return refuse('commit_create', 'card_not_found')
+    // GitHub's sub-issue and dependency writes take the epic's numeric issue id, so resolve it before the DB write.
+    const epicIssueId =
+      req.epicIssueNumber !== undefined
+        ? (await this.deps.orchestrator.cardByIssueNumber(req.boardId, req.epicIssueNumber))?.issueId
+        : undefined
     const assigneeAgentId = req.assignee !== undefined ? await this.assigneeId(orgId, req.assignee) : null
     if (assigneeAgentId === 'unknown_agent') return refuse('commit_create', 'unknown_agent')
     if (assigneeAgentId === 'agent_not_assignable') return refuse('commit_create', 'agent_not_assignable')
@@ -176,12 +182,13 @@ export class KanbanOrchestrator {
     try {
       await this.applyCreateLabels(repo, issue, req.status ?? 'todo', req.assignee, assigneeAgentId)
       if (req.epicIssueNumber !== undefined) {
-        await this.deps.store.addSubIssue(repo, req.epicIssueNumber, req.issueNumber).catch((err) => {
+        if (epicIssueId === undefined) throw new Error('epic card vanished after commit')
+        await this.deps.store.addSubIssue(repo, req.epicIssueNumber, issue.issueId).catch((err) => {
           if (!isDuplicate(err)) throw err
         })
       }
       for (const blocker of blockers) {
-        await this.deps.store.addBlockedBy(repo, req.issueNumber, blocker).catch((err) => {
+        await this.deps.store.addBlockedBy(repo, req.issueNumber, blocker.issueId).catch((err) => {
           if (!isDuplicate(err)) throw err
         })
       }
@@ -207,11 +214,14 @@ export class KanbanOrchestrator {
     if (!repo) return refuse('link', 'github_unavailable')
     const card = await this.deps.orchestrator.cardByIssueNumber(req.boardId, req.issueNumber)
     if (!card) return refuse('link', 'card_not_found')
-    for (const blocker of req.blockedBy ?? []) {
+    const targets: Array<{ issueNumber: number; issueId: bigint }> = []
+    for (const blocker of new Set(req.blockedBy ?? [])) {
       if (blocker === req.issueNumber) return refuse('link', 'invalid_link')
       const target = await this.deps.orchestrator.cardByIssueNumber(req.boardId, blocker)
       if (!target) return refuse('link', 'card_not_found')
+      targets.push({ issueNumber: target.issueNumber, issueId: target.issueId })
     }
+    let parentNumber: number | undefined
     if (req.parentIssueNumber !== undefined) {
       if (req.parentIssueNumber === req.issueNumber) return refuse('link', 'invalid_link')
       const parent = await this.deps.orchestrator.cardByIssueNumber(req.boardId, req.parentIssueNumber)
@@ -224,10 +234,17 @@ export class KanbanOrchestrator {
         epicIssueNumber: req.parentIssueNumber
       })
       if (!adopted.ok) return refuse('link', adopted.reason)
+      parentNumber = parent.issueNumber
     }
     try {
-      for (const blocker of req.blockedBy ?? []) {
-        await this.deps.store.addBlockedBy(repo, req.issueNumber, blocker).catch((err) => {
+      // The DB epic link alone is invisible on GitHub; mirror it as a native sub-issue.
+      if (parentNumber !== undefined) {
+        await this.deps.store.addSubIssue(repo, parentNumber, card.issueId).catch((err) => {
+          if (!isDuplicate(err)) throw err
+        })
+      }
+      for (const target of targets) {
+        await this.deps.store.addBlockedBy(repo, req.issueNumber, target.issueId).catch((err) => {
           if (!isDuplicate(err)) throw err
         })
       }
@@ -249,11 +266,18 @@ export class KanbanOrchestrator {
     const card = await this.deps.orchestrator.cardByIssueNumber(req.boardId, req.issueNumber)
     if (!card) return refuse('unblock', 'card_not_found')
     // Omitted blockers removes every blocked_by edge; named ones remove exactly those.
-    const blockers =
-      req.blockers ?? (await this.deps.store.readGraph(repo, req.issueNumber)).blockedBy.map((l) => l.number)
+    // Dependency deletes are addressed by the blocker's numeric issue id, which the live graph read supplies.
+    let edges: Array<{ issueId: bigint; number: number }>
+    try {
+      edges = (await this.deps.store.readGraph(repo, req.issueNumber)).blockedBy
+    } catch {
+      return refuse('unblock', 'github_unavailable')
+    }
+    const named = req.blockers ? new Set(req.blockers) : null
+    const blockers = named ? edges.filter((edge) => named.has(edge.number)) : edges
     try {
       for (const blocker of blockers) {
-        await this.deps.store.removeBlockedBy(repo, req.issueNumber, blocker).catch((err) => {
+        await this.deps.store.removeBlockedBy(repo, req.issueNumber, blocker.issueId).catch((err) => {
           if (!isDuplicate(err) && !(err instanceof GithubApiError && err.status === 404)) throw err
         })
       }
@@ -327,12 +351,18 @@ export class KanbanOrchestrator {
     return issue.authorType === 'Bot' && issue.authorLogin?.toLowerCase() === `${appSlug}[bot]`.toLowerCase()
   }
 
-  /** Blockers must be cards on the same board (same repo); anything else is cross-repo and refused. */
-  private async resolveBlockers(boardId: string, blockers: number[]): Promise<number[] | 'cross_repo'> {
-    for (const blocker of blockers) {
-      if (!(await this.deps.orchestrator.cardByIssueNumber(boardId, blocker))) return 'cross_repo'
+  /** Blockers must be cards on this board (same repo); their numeric issue ids feed the dependency writes. */
+  private async resolveBlockers(
+    boardId: string,
+    blockers: number[]
+  ): Promise<Array<{ issueNumber: number; issueId: bigint }> | 'card_not_found'> {
+    const resolved: Array<{ issueNumber: number; issueId: bigint }> = []
+    for (const blocker of new Set(blockers)) {
+      const card = await this.deps.orchestrator.cardByIssueNumber(boardId, blocker)
+      if (!card) return 'card_not_found'
+      resolved.push({ issueNumber: card.issueNumber, issueId: card.issueId })
     }
-    return blockers
+    return resolved
   }
 
   private async assigneeId(orgId: OrgId, slug: string): Promise<string | 'unknown_agent' | 'agent_not_assignable'> {

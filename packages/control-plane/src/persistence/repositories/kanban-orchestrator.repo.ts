@@ -169,6 +169,7 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
     const [row] = await this.db.$queryRaw<
       Array<{
         cardId: string
+        issueId: bigint
         issueNumber: number
         status: string
         assigneeAgentId: string | null
@@ -181,7 +182,7 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
         stateRevision: bigint
       }>
     >(Prisma.sql`
-      SELECT c."id" AS "cardId", c."issueNumber", c."status"::text AS "status", c."assigneeAgentId",
+      SELECT c."id" AS "cardId", c."issueId", c."issueNumber", c."status"::text AS "status", c."assigneeAgentId",
              a."name" AS "assigneeSlug", c."priority", c."blockKind"::text AS "blockKind", c."epicCardId",
              ep."issueNumber" AS "epicIssueNumber", EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL) AS "leased",
              c."stateRevision"
@@ -194,6 +195,7 @@ export class PgKanbanOrchestratorRepo implements KanbanOrchestratorRepo {
     if (!isKanbanStatus(row.status)) return null
     return {
       cardId: row.cardId,
+      issueId: row.issueId,
       issueNumber: row.issueNumber,
       status: row.status,
       assigneeAgentId: row.assigneeAgentId,

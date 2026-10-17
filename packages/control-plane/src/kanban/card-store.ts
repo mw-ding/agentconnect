@@ -67,12 +67,12 @@ export interface CardStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void>
-  /** Add `subIssueId` (a same-repo issue id) as a sub-issue of `issueNumber`. */
-  addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: number): Promise<void>
-  /** Add `issueId` (a same-repo issue id) to the issue's blocked_by dependencies. */
-  addBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void>
-  /** Remove `issueId` from the issue's blocked_by dependencies. */
-  removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void>
+  /** Add the issue with GitHub id `subIssueId` (the numeric id, NOT its number) as a sub-issue of `issueNumber`. */
+  addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void>
+  /** Add the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) to the issue's blocked_by. */
+  addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
+  /** Remove the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) from the issue's blocked_by. */
+  removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
   /** Close an issue as not planned (the duplicate-create and B2-trip paths); throws on any GitHub failure. */
   closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void>
 }
@@ -318,16 +318,18 @@ export class GithubCardStore implements CardStore {
     return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
   }
 
-  async addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: number): Promise<void> {
-    await this.write(repo, `/issues/${issueNumber}/sub_issues`, 'POST', { sub_issue_id: subIssueId })
+  async addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/sub_issues`, 'POST', { sub_issue_id: Number(subIssueId) })
   }
 
-  async addBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void> {
-    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by`, 'POST', { issue_id: issueId })
+  async addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by`, 'POST', {
+      issue_id: Number(blockerIssueId)
+    })
   }
 
-  async removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, issueId: number): Promise<void> {
-    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by/${issueId}`, 'DELETE')
+  async removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by/${blockerIssueId}`, 'DELETE')
   }
 
   async closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void> {

@@ -223,6 +223,15 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
 
   const waitFor = (fn: () => Promise<void>, timeout = 45_000) => vi.waitFor(fn, { timeout, interval: 1_000 })
 
+  const subIssueNumbers = async (n: number) =>
+    (await gh<Issue[]>('GET', `/repos/${FULL}/issues/${n}/sub_issues?per_page=100`))
+      .map((i) => i.number)
+      .sort((x, y) => x - y)
+  const blockedByNumbers = async (n: number) =>
+    (await gh<Issue[]>('GET', `/repos/${FULL}/issues/${n}/dependencies/blocked_by?per_page=100`))
+      .map((i) => i.number)
+      .sort((x, y) => x - y)
+
   it('drives the orchestrator tools end to end against real GitHub', async () => {
     await seedDaemon(prisma, daemonId, { sessionEpoch: 1n })
     await seedAgent(prisma, agentId, { daemonId, name: 'orchestrator-e2e' })
@@ -293,9 +302,13 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       })
       expect(dbCards.every((c) => c.idempotencyKey !== null && c.epicCardId === epicCard.id)).toBe(true)
       expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: epicCard.id } })).epicCardsCreated).toBe(2)
-      // mw-ding/agentconnect does not expose the sub_issues/blocked_by WRITE endpoints (they 404), so the GitHub link
-      // writes are best-effort; the card rows above carry the epic link and B1 key.
-      phase('o1 note: sub_issues/blocked_by writes 404 on this repo (known gap); links validated at the DB level')
+      // Neither create is partial: the sub-issue and blocked_by writes (addressed by numeric issue id) landed on GitHub.
+      expect(a.partial).toBeUndefined()
+      expect(b.partial).toBeUndefined()
+      await waitFor(async () => {
+        expect(await subIssueNumbers(epicIssue)).toEqual([aIssue, bIssue].sort((x, y) => x - y))
+        expect(await blockedByNumbers(bIssue)).toEqual([aIssue])
+      })
       return [epicIssue, aIssue, bIssue]
     })
 
@@ -349,16 +362,24 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       return []
     })
 
-    // o5 link/unblock: the GitHub issue-dependencies WRITE endpoint 404s on this repo, so the positive edge write is a
-    // documented gap; here we validate the refusal paths (missing card / self-link) that run entirely against the CP DB.
-    await scenario('o5 link/unblock refusal paths', async () => {
-      const link = await orch('kanbanLink', { board: boardId, issue: bIssue, blockedBy: [999999] })
-      expect(link).toMatchObject({ refused: expect.any(String) })
+    // o5 link/unblock: refusals, then a real blocked_by edge added by kanbanLink and removed by kanbanUnblock.
+    await scenario('o5 link/unblock', async () => {
+      const missing = await orch('kanbanLink', { board: boardId, issue: bIssue, blockedBy: [999999] })
+      expect(missing).toMatchObject({ refused: expect.any(String) })
       const self = await orch('kanbanLink', { board: boardId, issue: bIssue, blockedBy: [bIssue] })
       expect(self).toMatchObject({ refused: expect.stringContaining('self-link') })
-      phase(
-        'o5 note: positive blocked_by write 404s on this repo; edge add/remove is covered by the CP integration tests'
+      expect(await orch('kanbanLink', { board: boardId, issue: bIssue, blockedBy: [epicIssue] })).toEqual({
+        linked: true
+      })
+      await waitFor(async () =>
+        expect(await blockedByNumbers(bIssue)).toEqual([aIssue, epicIssue].sort((x, y) => x - y))
       )
+      expect(await orch('kanbanUnblock', { board: boardId, issue: bIssue, blockers: [epicIssue] })).toMatchObject({
+        unblocked: true
+      })
+      await waitFor(async () => expect(await blockedByNumbers(bIssue)).toEqual([aIssue]))
+      expect(await orch('kanbanUnblock', { board: boardId, issue: bIssue })).toMatchObject({ unblocked: true })
+      await waitFor(async () => expect(await blockedByNumbers(bIssue)).toEqual([]))
       return [bIssue]
     })
 

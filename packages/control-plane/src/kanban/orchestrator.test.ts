@@ -27,6 +27,7 @@ function issue(over: Partial<CardIssue> = {}): CardIssue {
 
 const card = (over: Record<string, unknown> = {}) => ({
   cardId: '33333333-3333-4333-8333-333333333333',
+  issueId: 7000n,
   issueNumber: 7,
   status: 'todo' as const,
   assigneeAgentId: null as string | null,
@@ -68,7 +69,10 @@ function harness(over: Partial<KanbanOrchestratorDeps> = {}) {
     boardForOrchestrator: anyMock(async () => ({ ok: true as const, board })),
     epicBudget: anyMock(async () => 'ok' as const),
     resolveAssignee: anyMock(async () => ({ ok: true as const, agentId: 'agent' })),
-    cardByIssueNumber: anyMock(async () => card()),
+    // Each issue number maps to a distinct GitHub id, so a test can tell an id from a number.
+    cardByIssueNumber: anyMock(async (_board: string, n: number) =>
+      card({ issueNumber: n, issueId: BigInt(n) * 1000n })
+    ),
     createEpicChild: anyMock(async (input: { upsert: { issueNumber: number } }) => ({
       ok: true as const,
       card: { ...card(), issueNumber: input.upsert.issueNumber },
@@ -273,8 +277,9 @@ describe('KanbanOrchestrator commit_create', () => {
         blockedBy: [2]
       })
     )
-    expect(h.store.addSubIssue).toHaveBeenCalledWith(REPO, 1, 7)
-    expect(h.store.addBlockedBy).toHaveBeenCalledWith(REPO, 7, 2)
+    // GitHub takes numeric issue ids here: the new issue's id (9001) under epic #1, and blocker #2's id (2000).
+    expect(h.store.addSubIssue).toHaveBeenCalledWith(REPO, 1, 9001n)
+    expect(h.store.addBlockedBy).toHaveBeenCalledWith(REPO, 7, 2000n)
     expect(h.store.applyPlan).toHaveBeenCalled()
     const plan = h.store.applyPlan.mock.calls[0]![3]
     expect(plan.addLabels).toContain('ac/status:todo')
@@ -310,6 +315,74 @@ describe('KanbanOrchestrator link/unblock/assign', () => {
     expect(out).toEqual({ ok: true, op: 'unblock', status: 'todo' })
     expect(h.cards.casStatus).toHaveBeenCalledWith('33333333-3333-4333-8333-333333333333', 1n, 'todo')
     expect(h.store.applyPlan).toHaveBeenCalled()
+  })
+
+  it('unblock deletes edges by the blocker issue id from the live graph, only the named ones', async () => {
+    const h = harness()
+    const link = (number: number) => ({
+      issueId: BigInt(number) * 1000n + 1n,
+      number,
+      repoId: 42n,
+      state: 'open' as const,
+      stateReason: null
+    })
+    h.store.readGraph.mockResolvedValue({
+      parent: null,
+      subIssues: [],
+      blockedBy: [link(3), link(4)],
+      blocking: [],
+      truncated: false
+    })
+    await h.svc.orchestrate(ORG, AGENT, req('unblock', { issueNumber: 7, blockers: [3, 99] }))
+    expect(h.store.removeBlockedBy.mock.calls).toEqual([[REPO, 7, 3001n]])
+    h.store.removeBlockedBy.mockClear()
+    await h.svc.orchestrate(ORG, AGENT, req('unblock', { issueNumber: 7 }))
+    expect(h.store.removeBlockedBy.mock.calls).toEqual([
+      [REPO, 7, 3001n],
+      [REPO, 7, 4001n]
+    ])
+  })
+
+  it('unblock refuses github_unavailable when the graph cannot be read', async () => {
+    const h = harness()
+    h.store.readGraph.mockRejectedValue(new Error('down'))
+    expect(await h.svc.orchestrate(ORG, AGENT, req('unblock', { issueNumber: 7 }))).toEqual({
+      ok: false,
+      op: 'unblock',
+      code: 'github_unavailable'
+    })
+    expect(h.store.removeBlockedBy).not.toHaveBeenCalled()
+  })
+
+  it('link mirrors a parent as a native sub-issue and adds blocked_by by issue id', async () => {
+    const h = harness()
+    h.orchestrator.cardByIssueNumber.mockImplementation(async (_board: string, n: number) =>
+      card({ cardId: `33333333-3333-4333-8333-33333333333${n}`, issueNumber: n, issueId: BigInt(n) * 1000n })
+    )
+    const out = await h.svc.orchestrate(
+      ORG,
+      AGENT,
+      req('link', { issueNumber: 7, parentIssueNumber: 1, blockedBy: [2, 2] })
+    )
+    expect(out).toEqual({ ok: true, op: 'link' })
+    expect(h.store.addSubIssue).toHaveBeenCalledWith(REPO, 1, 7000n)
+    expect(h.store.addBlockedBy.mock.calls).toEqual([[REPO, 7, 2000n]])
+  })
+
+  it('commit_create refuses a self-blocker and a blocker that is not a card', async () => {
+    const h = harness()
+    const base = { step: 's', specDigest: 'a'.repeat(64), issueNumber: 7 }
+    expect(await h.svc.orchestrate(ORG, AGENT, req('commit_create', { ...base, blockedBy: [7] }))).toEqual({
+      ok: false,
+      op: 'commit_create',
+      code: 'invalid_link'
+    })
+    h.orchestrator.cardByIssueNumber.mockResolvedValue(null)
+    expect(await h.svc.orchestrate(ORG, AGENT, req('commit_create', { ...base, blockedBy: [2] }))).toEqual({
+      ok: false,
+      op: 'commit_create',
+      code: 'card_not_found'
+    })
   })
 
   it('unblock leaves a non-blocked card alone', async () => {

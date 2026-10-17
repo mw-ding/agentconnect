@@ -70,7 +70,7 @@ two boards claiming in parallel serialize and cannot overshoot.
 - The daemon's in-memory pending map re-commits the same issue after a failed commit within a process; a daemon
   crash between the file and the commit can file a duplicate (the CP's `issue_not_from_app` / duplicate-close path
   bounds the damage).
-- The GitHub `sub_issues` and `issue-dependencies` WRITE endpoints are not exposed on every repository (404 on
-  user-owned repos); those edge writes are validated by the CP tests rather than live.
+- Sub-issue and dependency writes take GitHub's numeric issue **id**, never the issue number; the CardStore methods
+  take a `bigint` id to make that hard to get wrong. The live E2E asserts both edges on GitHub.
 - `kanbanCreate` takes a board id (uuid); an `owner/repo` alias is not yet accepted.
 - Board CRUD does not yet surface `epicMaxCards` / `epicMaxActive` in the owner routes (defaults apply).

@@ -598,25 +598,26 @@ describe('half-landed promotion attribution (events after the pre-POST cursor)',
 describe('GithubCardStore link writes', () => {
   it('adds a sub-issue with a write-scoped card token over the repo-id endpoint', async () => {
     const h = harness({ 'POST /repositories/42/issues/7/sub_issues': () => json({}, 201) })
-    await h.store.addSubIssue(REPO, 7, 42)
+    await h.store.addSubIssue(REPO, 7, 3001n)
     expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'write')
     expect(h.calls).toHaveLength(1)
     expect(h.calls[0]).toMatchObject({ method: 'POST', url: 'https://api.test/repositories/42/issues/7/sub_issues' })
-    expect(h.calls[0]!.body).toEqual({ sub_issue_id: 42 })
+    // The numeric issue id, never the issue number.
+    expect(h.calls[0]!.body).toEqual({ sub_issue_id: 3001 })
   })
 
   it('adds and removes blocked_by edges', async () => {
     const h = harness({
       'POST /repositories/42/issues/7/dependencies/blocked_by': () => json({}, 201),
-      'DELETE /repositories/42/issues/7/dependencies/blocked_by/42': () => json({})
+      'DELETE /repositories/42/issues/7/dependencies/blocked_by/3002': () => json({})
     })
-    await h.store.addBlockedBy(REPO, 7, 42)
-    await h.store.removeBlockedBy(REPO, 7, 42)
+    await h.store.addBlockedBy(REPO, 7, 3002n)
+    await h.store.removeBlockedBy(REPO, 7, 3002n)
     expect(h.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
       'POST https://api.test/repositories/42/issues/7/dependencies/blocked_by',
-      'DELETE https://api.test/repositories/42/issues/7/dependencies/blocked_by/42'
+      'DELETE https://api.test/repositories/42/issues/7/dependencies/blocked_by/3002'
     ])
-    expect(h.calls[0]!.body).toEqual({ issue_id: 42 })
+    expect(h.calls[0]!.body).toEqual({ issue_id: 3002 })
   })
 
   it('closes an issue as not planned', async () => {
@@ -628,6 +629,6 @@ describe('GithubCardStore link writes', () => {
 
   it('propagates a GitHub failure', async () => {
     const h = harness({ 'POST /repositories/42/issues/7/sub_issues': () => json({ message: 'boom' }, 500) })
-    await expect(h.store.addSubIssue(REPO, 7, 42)).rejects.toThrow()
+    await expect(h.store.addSubIssue(REPO, 7, 3001n)).rejects.toThrow()
   })
 })

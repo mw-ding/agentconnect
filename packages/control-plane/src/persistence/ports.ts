@@ -8314,6 +8314,8 @@ export interface KanbanOrchestratorBoard {
 
 export interface KanbanOrchestratorCard {
   cardId: string
+  /** The GitHub numeric issue id; sub-issue and dependency writes take this, never the number. */
+  issueId: bigint
   issueNumber: number
   status: KanbanStatus
   assigneeAgentId: string | null
