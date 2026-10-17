@@ -2,13 +2,13 @@
 import { gitRepoLabel } from '@agentconnect.md/protocol'
 import type { KanbanGrantScope } from '../persistence/ports.js'
 
-/** The repo a gitcred request is for: the named repo, else a github-mode workspace. */
+/** The repo a gitcred request is for: the named repo, else a GitHub-credentialed workspace. */
 export function kanbanRequestRepo(
   requested: string | undefined,
-  workspace: { mode?: string; gitRepo?: string } | undefined
+  workspace: { mode?: string; gitRepo?: string; credential?: { provider: string } } | undefined
 ): string | undefined {
   if (requested?.includes('/')) return requested
-  if (workspace?.mode !== 'github' || !workspace.gitRepo) return undefined
+  if (workspace?.mode !== 'git' || workspace.credential?.provider !== 'github' || !workspace.gitRepo) return undefined
   const label = gitRepoLabel(workspace.gitRepo)
   return label.includes('/') ? label : undefined
 }

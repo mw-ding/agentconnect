@@ -922,4 +922,38 @@ describe('handleGitCredRequest — Kanban run grants', () => {
     expect(mintForKanbanRun).not.toHaveBeenCalled()
     expect(mintForAgent).toHaveBeenCalled()
   })
+
+  it('echoes the numeric identity and preserves a requested read on a write run', async () => {
+    const mintForKanbanRun = vi.fn(async () => ({ ...grant, repoId: 77n }))
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      provider: 'github',
+      externalRepoId: '77',
+      repoFullName: 'acme/web',
+      requestedAccess: 'read'
+    })
+
+    await handleGitCredRequest(frame, conn, kanbanDeps([{ ...scope, mode: 'write' }], { mintForKanbanRun }))
+
+    expect(mintForKanbanRun).toHaveBeenCalledWith(PLACED_AGENT, 'acme/web', 77n, 'read', expect.any(Array))
+    expect(conn.replyTo).toHaveBeenCalledWith(
+      frame,
+      'gitcred/grant',
+      expect.objectContaining({ provider: 'github', externalRepoId: '77', access: 'read' })
+    )
+  })
+
+  it('discards a Kanban grant whose numeric identity disagrees with the request', async () => {
+    const conn = fakeConn()
+    const frame = gitcredFrame({ provider: 'github', externalRepoId: '999', repoFullName: 'acme/web' })
+
+    await handleGitCredRequest(
+      frame,
+      conn,
+      kanbanDeps([scope], { mintForKanbanRun: async () => ({ ...grant, repoId: 77n }) })
+    )
+
+    expect(conn.replyTo).not.toHaveBeenCalled()
+    expect(conn.sendError).toHaveBeenCalledWith(frame.id, 'SCOPE_DENIED', expect.stringContaining('999'), false)
+  })
 })

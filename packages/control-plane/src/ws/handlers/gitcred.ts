@@ -271,7 +271,8 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         ttlSec: cred.ttlSec,
         expiresAt: cred.expiresAt,
         repoFullName: cred.repoFullName,
-        access: 'read'
+        access: 'read',
+        ...githubEcho(githubQualified, allowed.repoId)
       })
       return
     }
@@ -339,33 +340,16 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
     // design §2) or, read-only, a PRIVATE skill source the agent enables
     // (shared-skills.md §3). GithubPoster requests take the purpose-gated path above;
     // general agent git/gh credentials stay constrained by this allowlist.
-    // An open Kanban run replaces the workspace grant for that repo, so read mode is the token itself.
-    if (kanbanScope) {
-      const cred = await deps.github.mintForKanbanRun(
-        agent,
-        repoFullName ?? kanbanScope.repoFullName,
-        kanbanScope.repoId,
-        kanbanScope.mode,
-        bucketKeys
-      )
-      conn.replyTo(frame, 'gitcred/grant', {
-        username: 'x-access-token',
-        token: cred.token,
-        ttlSec: cred.ttlSec,
-        expiresAt: cred.expiresAt,
-        repoFullName: cred.repoFullName,
-        access: cred.access
-      })
-      return
-    }
-    // `requestedAccess` is the §17.1 access floor; every pre-v2 caller leaves it absent and keeps the tier.
-    const cred = await deps.github!.mintForAgent(
-      agent,
-      [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
-      capabilities,
-      repoFullName,
-      requestedAccess
-    )
+    // A Kanban run caps the repository grant; an explicitly requested read remains read.
+    const cred = kanbanScope
+      ? await deps.github!.mintForKanbanRun(
+          agent,
+          repoFullName ?? kanbanScope.repoFullName,
+          kanbanScope.repoId,
+          requestedAccess === 'read' ? 'read' : kanbanScope.mode,
+          bucketKeys
+        )
+      : await deps.github!.mintForAgent(agent, bucketKeys, capabilities, repoFullName, requestedAccess)
     // This arm resolves the repo INSIDE the mint, so a named numeric id is verified on the way out —
     // the grant is discarded rather than served, exactly as a daemon discards a mismatched echo.
     if (githubRepoIdMismatch(externalRepoId, cred.repoId)) {
