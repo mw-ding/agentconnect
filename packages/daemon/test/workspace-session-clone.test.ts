@@ -1632,6 +1632,16 @@ describe('a Kanban write session checks out its ac/card-<n> branch', () => {
     git(cwd, ['commit', '-m', 'card progress'])
     const tip = git(cwd, ['rev-parse', 'HEAD'])
     rmSync(cwd, { recursive: true })
+    const nextPath = join(dirname(cwd), workspaces.sessionWorktreeId('kanban:new-7'))
+    const root = workspaces.primaryRoot(agent)
+    await workspaces.addRootSessionWorktree(
+      agent.id,
+      root,
+      nextPath,
+      `refs/remotes/origin/${root.branch}`,
+      undefined,
+      kanbanCardBranch(7)
+    )
     const next = await workspaces.prepareSessionWorkspace(
       agent,
       unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
