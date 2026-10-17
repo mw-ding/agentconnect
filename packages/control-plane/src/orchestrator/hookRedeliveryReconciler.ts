@@ -1,5 +1,5 @@
 /** Periodically redelivers eligible GitHub hooks missing a run or proven to fail before daemon admission. */
-import { GITHUB_GRAPH_EVENTS, GITHUB_RELEASE_RESTATED_EVENTS, KANBAN_ISSUE_ACTIONS } from '@agentconnect.md/protocol'
+import { GITHUB_RELEASE_RESTATED_EVENTS, isKanbanDoorbellDelivery } from '@agentconnect.md/protocol'
 import type { Clock, TimerHandle } from '../domain/clock.js'
 import type { HookId } from '../domain/ids.js'
 import type { GhHookDeliveryPage } from '../github/service.js'
@@ -16,10 +16,6 @@ const SUBSCRIPTION_EVENTS = new Set([
   'deployment_status',
   'release'
 ])
-/** The Kanban graph doorbell families (relay mirror); they never produce a HookRun, so landing is asked of the graph dep. */
-const GRAPH_EVENTS: ReadonlySet<string> = new Set(GITHUB_GRAPH_EVENTS)
-/** `issues` actions the relay always forwards to the Kanban doorbell, so they land there too, beside any hook match. */
-const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string | null> = new Set(KANBAN_ISSUE_ACTIONS)
 /** Redeliveries per GUID that landed no run before giving up; counted durably, so a restart cannot reset it. */
 const MAX_ATTEMPTS = 3
 /** Delay before the first sweep of a process — see {@link HookRedeliveryReconciler.start}. */
@@ -244,7 +240,8 @@ export class HookRedeliveryReconciler {
     const matchingHookIds = new Map<string, HookId[]>()
     const graphGuids = new Set<string>()
     const matching = deliveries.filter((d) => {
-      const isGraph = GRAPH_EVENTS.has(d.event) || (d.event === 'issues' && KANBAN_ISSUE_ACTION_SET.has(d.action))
+      // The relay forwards these to the Kanban doorbell (rung or seen-only) beside any hook match; landing is asked of the graph dep.
+      const isGraph = isKanbanDoorbellDelivery(d.event, d.action)
       if (!isGraph && !SUBSCRIPTION_EVENTS.has(d.event)) return false
       const at = Date.parse(d.delivered_at)
       if (Number.isNaN(at) || at < now - MAX_LOOKBACK_MS || at > newest) return false

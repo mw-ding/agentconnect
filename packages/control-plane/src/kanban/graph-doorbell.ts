@@ -1,5 +1,5 @@
 // Kanban doorbell (issue #2 spike §3): a body-free `rc/github-graph` poke makes the CP re-read a graph or card.
-import type { RcGithubGraph } from '@agentconnect.md/protocol'
+import type { KanbanDoorbellCommand, RcGithubGraph } from '@agentconnect.md/protocol'
 import type { GithubInstallationRepo, KanbanBoardRecord, KanbanBoardRepo } from '../persistence/ports.js'
 import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
 
@@ -24,6 +24,13 @@ export interface KanbanGraphDoorbellDeps {
   ) => void | Promise<void>
   /** An `issues` status change: no graph read, the card itself is re-read; a throw leaves the GUID un-landed too. */
   onCard?: (board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number, action?: string) => void | Promise<void>
+  /** A `/kanban` comment command; a throw leaves the GUID un-landed too. */
+  onCommand?: (
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    command: KanbanDoorbellCommand
+  ) => void | Promise<void>
   log: GraphDoorbellLog
 }
 
@@ -91,10 +98,15 @@ export class KanbanGraphDoorbell {
         repoFullName: board.repoFullName
       }
       for (const issueNumber of m.numbers) {
+        const command = m.command
         reads.push(
-          m.event === 'issues'
-            ? (async () => this.deps.onCard?.(board, repo, issueNumber, m.action))()
-            : this.schedule(board, repo, issueNumber)
+          m.event === 'issue_comment'
+            ? (async () => {
+                if (command) await this.deps.onCommand?.(board, repo, issueNumber, command)
+              })()
+            : m.event === 'issues'
+              ? (async () => this.deps.onCard?.(board, repo, issueNumber, m.action))()
+              : this.schedule(board, repo, issueNumber)
         )
       }
     }

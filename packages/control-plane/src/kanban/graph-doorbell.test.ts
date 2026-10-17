@@ -49,11 +49,13 @@ function make(
     readGraph?: (repo: unknown, n: number) => Promise<CardGraph>
     onGraph?: () => void | Promise<void>
     onCard?: () => void | Promise<void>
+    onCommand?: () => void | Promise<void>
   } = {}
 ) {
   const readGraph = vi.fn(opts.readGraph ?? (async () => EMPTY))
   const onGraph = vi.fn()
   const onCard = vi.fn(opts.onCard ?? (() => {}))
+  const onCommand = vi.fn(opts.onCommand ?? (() => {}))
   const log = { debug: vi.fn(), warn: vi.fn() }
   const listEnabledByRepoId = vi.fn(async () => opts.boards ?? [BOARD])
   const doorbell = new KanbanGraphDoorbell({
@@ -64,9 +66,10 @@ function make(
     store: { readGraph },
     onGraph: opts.onGraph ?? onGraph,
     onCard,
+    onCommand,
     log
   })
-  return { doorbell, readGraph, onGraph, onCard, log, listEnabledByRepoId }
+  return { doorbell, readGraph, onGraph, onCard, onCommand, log, listEnabledByRepoId }
 }
 
 describe('KanbanGraphDoorbell', () => {
@@ -96,6 +99,40 @@ describe('KanbanGraphDoorbell', () => {
       'labeled'
     )
     expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('hands a comment command to onCommand only, never to onCard or a graph read', async () => {
+    const h = make()
+    const command = { name: 'unblock' as const, commentId: '9001', sender: { login: 'alice', type: 'User' } }
+    h.doorbell.poke(poke({ event: 'issue_comment', action: 'created', ids: ['5'], numbers: [7], command }))
+    await h.doorbell.settle()
+    expect(h.readGraph).not.toHaveBeenCalled()
+    expect(h.onCard).not.toHaveBeenCalled()
+    expect(h.onCommand).toHaveBeenCalledWith(
+      BOARD,
+      { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' },
+      7,
+      command
+    )
+    expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+  })
+
+  it('lands a comment seen-only marker without any read, and leaves a failed command un-landed', async () => {
+    const seen = make()
+    seen.doorbell.poke(poke({ event: 'issue_comment', action: 'created', ids: [], numbers: [] }))
+    await seen.doorbell.settle()
+    expect(seen.listEnabledByRepoId).not.toHaveBeenCalled()
+    expect(seen.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
+
+    const failed = make({
+      onCommand: () => {
+        throw new Error('github 502')
+      }
+    })
+    const command = { name: 'ready' as const, commentId: '1', sender: { login: 'alice', type: 'User' } }
+    failed.doorbell.poke(poke({ event: 'issue_comment', action: 'created', ids: ['5'], numbers: [7], command }))
+    await failed.doorbell.settle()
+    expect(failed.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
   })
 
   it('does not land an issues poke whose card handling failed', async () => {

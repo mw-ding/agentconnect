@@ -8240,4 +8240,47 @@ export interface KanbanCardRepo {
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+  /** The ledger row of one `/kanban` comment command; null when this comment was never recorded. */
+  getCommand(boardId: string, commentId: bigint): Promise<KanbanCommandRecord | null>
+  /** Record a command; an applied one moves the unleased card by stateRevision CAS with an audit row, atomically. */
+  recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult>
+  /** The command's GitHub effect landed, so a later delivery of the same comment is a no-op. */
+  settleCommand(id: string): Promise<void>
 }
+
+/** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */
+export interface KanbanCommandRecord {
+  id: string
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  actorLogin: string
+  /** `applied`, or the refusal reason code. */
+  outcome: string
+  fromStatus: KanbanStatus
+  toStatus: KanbanStatus | null
+  settledAt: Date | null
+}
+
+export interface KanbanCommandInput {
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  /** The live-attested human; required for an applied move, absent only on a refusal. */
+  humanAuthority?: KanbanHumanAuthority
+  actorLogin: string
+  from: KanbanStatus
+  expectedStateRevision: bigint
+  /** Present for an applied move; absent records a refusal. */
+  to?: KanbanStatus
+  refusal?: string
+}
+
+export type KanbanCommandRecordResult =
+  | { kind: 'recorded'; record: KanbanCommandRecord }
+  /** This comment was already recorded (a concurrent or earlier delivery): its row, unchanged. */
+  | { kind: 'duplicate'; record: KanbanCommandRecord }
+  /** The card moved, gained a lease, or vanished since it was read; nothing was written. */
+  | { kind: 'stale' }

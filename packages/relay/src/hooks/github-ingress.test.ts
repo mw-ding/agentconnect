@@ -34,6 +34,8 @@ import {
   buildTrustedGithubMetadata,
   githubGraphDoorbell,
   githubIssueDoorbell,
+  githubCommentDoorbell,
+  parseKanbanCommand,
   GITHUB_BODY_EXCERPT_MAX,
   type GithubMatchCtx
 } from './github-ingress.js'
@@ -948,6 +950,111 @@ describe('github ingress', () => {
       await post('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))
       await flush()
       expect(h.graphDoorbells).toEqual([expect.objectContaining({ deliveryKey: 'gh-delivery-1', numbers: [] })])
+    })
+  })
+
+  describe('Kanban comment command doorbell (TRD 4.4)', () => {
+    const commented = (body: string, overrides: Record<string, unknown> = {}) =>
+      issuesPayload({
+        action: 'created',
+        issue: { id: 5042 },
+        comment: { id: 9001, body },
+        sender: { login: 'alice', id: 31, type: 'User' },
+        ...overrides
+      })
+    const seen = {
+      deliveryKey: 'g',
+      installationId: String(INSTALLATION),
+      repoId: String(REPO_ID),
+      event: 'issue_comment',
+      action: 'created',
+      ids: [],
+      numbers: []
+    }
+
+    it.each<[string, string | undefined]>([
+      ['/kanban unblock', 'unblock'],
+      ['/kanban reopen', 'reopen'],
+      ['/kanban ready', 'ready'],
+      ['/KANBAN Unblock', 'unblock'],
+      ['   /kanban unblock', 'unblock'],
+      ['/kanban unblock   ', 'unblock'],
+      ['\t/kanban\tready', 'ready'],
+      ['/kanban  ready', 'ready'],
+      ['/kanban unblock\r\nthanks!', 'unblock'],
+      ['/kanban unblock\nmore text', 'unblock'],
+      ['thanks!\n/kanban unblock', undefined],
+      ['> /kanban unblock', undefined],
+      ['/kanban unblock please', undefined],
+      ['/kanban unblocked', undefined],
+      ['/kanbanunblock', undefined],
+      ['/kanban', undefined],
+      ['/kanban merge', undefined],
+      ['kanban unblock', undefined],
+      ['`/kanban unblock`', undefined],
+      ['', undefined]
+    ])('parses %j as %s', (body, expected) => {
+      expect(parseKanbanCommand(body)).toBe(expected)
+    })
+
+    it('forwards the command, comment id, and sender, never the comment text', () => {
+      const poke = githubCommentDoorbell('issue_comment', commented('/kanban unblock\nsecret plan'), 'g')
+      expect(poke).toEqual({
+        ...seen,
+        ids: ['5042'],
+        numbers: [42],
+        command: { name: 'unblock', commentId: '9001', sender: { login: 'alice', id: '31', type: 'User' } }
+      })
+      expect(JSON.stringify(poke)).not.toMatch(/secret plan|db down|primary is unreachable/)
+    })
+
+    it('sends a seen marker for non-commands, PR comments, bots, and unprovable ids', () => {
+      const ring = (payload: Record<string, unknown>) => githubCommentDoorbell('issue_comment', payload as never, 'g')
+      expect(ring(commented('lgtm'))).toEqual(seen)
+      expect(ring(commented('lgtm\n/kanban unblock'))).toEqual(seen)
+      // A comment on a pull request's conversation is never a card command.
+      expect(ring(commented('/kanban unblock', { issue: { id: 5042, pull_request: { url: 'x' } } }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { sender: { login: 'evil[bot]', type: 'User' } }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { sender: { login: 'acme', type: 'Organization' } }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { sender: undefined }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { comment: { body: '/kanban unblock' } }))).toEqual(seen)
+      expect(ring(commented('/kanban unblock', { issue: { id: undefined } }))).toEqual(seen)
+      // A sender id is optional on the frame.
+      expect(ring(commented('/kanban ready', { sender: { login: 'alice', type: 'User' } }))?.command).toEqual({
+        name: 'ready',
+        commentId: '9001',
+        sender: { login: 'alice', type: 'User' }
+      })
+    })
+
+    it('ignores edits and deletions and other events entirely', () => {
+      const ring = (event: string, payload: Record<string, unknown>) =>
+        githubCommentDoorbell(event, payload as never, 'g')
+      expect(ring('issue_comment', commented('/kanban unblock', { action: 'edited' }))).toBeUndefined()
+      expect(ring('issue_comment', commented('/kanban unblock', { action: 'deleted' }))).toBeUndefined()
+      expect(ring('issues', commented('/kanban unblock'))).toBeUndefined()
+      expect(ring('issue_comment', commented('/kanban unblock', { installation: undefined }))).toBeUndefined()
+    })
+
+    it('rings the doorbell over HTTP without any hook rule, and replays it for a duplicate delivery', async () => {
+      const headers = { 'x-github-delivery': 'gh-comment-1' }
+      expect((await post('issue_comment', commented('/kanban reopen'), { headers })).statusCode).toBe(202)
+      expect((await post('issue_comment', commented('/kanban reopen'), { headers })).statusCode).toBe(202)
+      await flush()
+      expect(h.graphDoorbells).toHaveLength(2)
+      expect(h.graphDoorbells[0]).toMatchObject({ deliveryKey: 'gh-comment-1', command: { name: 'reopen' } })
+      expect(h.graphDoorbells[1]).toEqual(h.graphDoorbells[0])
+      expect(h.sent).toHaveLength(0)
+    })
+
+    it('still matches an issue_comment hook for the same delivery', async () => {
+      h.table.upsert(rule({}, { events: ['issue_comment:created'] }))
+      await post('issue_comment', commented('/kanban unblock'))
+      await flush()
+      expect(h.graphDoorbells).toEqual([
+        expect.objectContaining({ command: expect.objectContaining({ name: 'unblock' }) })
+      ])
     })
   })
 

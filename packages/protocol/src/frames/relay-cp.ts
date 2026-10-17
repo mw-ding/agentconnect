@@ -667,11 +667,39 @@ export type RcCodeHostDelivery = z.infer<typeof RcCodeHostDelivery>
 // R→C EVT (fire-and-forget) — Kanban doorbell (issue #2 spike §3): a verified graph or card-status delivery, ids only
 export const GITHUB_GRAPH_EVENTS = ['sub_issues', 'issue_dependencies'] as const
 /** `issues` rings for a human status relabel or close/reopen; other such deliveries send empty `numbers`, landing only. */
-export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues'] as const
+export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues', 'issue_comment'] as const
 /** The `issues` actions the relay always forwards (rung or seen-only), so the CP's redelivery sweep can re-ask lost ones. */
 export const KANBAN_ISSUE_ACTIONS = ['opened', 'transferred', 'labeled', 'unlabeled', 'closed', 'reopened'] as const
+/** Comment commands ring only on a new comment; edits never re-run one. */
+export const KANBAN_COMMENT_ACTIONS = ['created'] as const
+/** `/kanban <command>` on the first line of a new issue comment (TRD 4.4). */
+export const KANBAN_COMMENT_COMMANDS = ['unblock', 'reopen', 'ready'] as const
+export const KanbanCommentCommand = z.enum(KANBAN_COMMENT_COMMANDS)
+export type KanbanCommentCommand = z.infer<typeof KanbanCommentCommand>
+/** Event:action pairs the relay always forwards to the Kanban doorbell, so the CP's redelivery sweep may re-ask them. */
+export function isKanbanDoorbellDelivery(event: string, action: string | null | undefined): boolean {
+  if ((GITHUB_GRAPH_EVENTS as readonly string[]).includes(event)) return true
+  const actions: readonly string[] =
+    event === 'issues' ? KANBAN_ISSUE_ACTIONS : event === 'issue_comment' ? KANBAN_COMMENT_ACTIONS : []
+  return !!action && actions.includes(action)
+}
 export const GithubGraphEvent = z.enum(KANBAN_DOORBELL_EVENTS)
 export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
+/** A parsed comment command: the command, the comment's id, and the sender's identity; never the comment text. */
+export const KanbanDoorbellCommand = z
+  .object({
+    name: KanbanCommentCommand,
+    commentId: GithubNumericId,
+    sender: z
+      .object({
+        login: z.string().min(1).max(64),
+        id: GithubNumericId.optional(),
+        type: z.string().min(1).max(32) // User|Bot|Organization — the CP re-checks it, never trusts the relay alone
+      })
+      .strict()
+  })
+  .strict()
+export type KanbanDoorbellCommand = z.infer<typeof KanbanDoorbellCommand>
 export const RcGithubGraph = z
   .object({
     deliveryKey: z.string().min(1).max(200), // X-GitHub-Delivery GUID — the redelivery landed marker
@@ -680,7 +708,8 @@ export const RcGithubGraph = z
     event: GithubGraphEvent,
     action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|labeled|… — observational only
     ids: z.array(GithubNumericId).max(4), // issue ids named by the payload (parent/sub, blocked/blocking)
-    numbers: z.array(z.number().int().positive()).max(4) // the same issues' numbers, when same-repo
+    numbers: z.array(z.number().int().positive()).max(4), // the same issues' numbers, when same-repo
+    command: KanbanDoorbellCommand.optional() // `issue_comment` only; absent on a seen-only marker
   })
   .strict()
 export type RcGithubGraph = z.infer<typeof RcGithubGraph>

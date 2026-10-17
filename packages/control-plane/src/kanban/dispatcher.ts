@@ -34,6 +34,9 @@ import {
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planGraphPromotion } from './graph-reconciler.js'
+import type { RepoPermissionLookup } from '../github/repo-permission.js'
+import { authorizeHumanKanbanAction } from './human-action.js'
+import { labelAdder } from './label-attribution.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
@@ -50,7 +53,12 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionVerdict'>
+  store: Pick<
+    CardStore,
+    'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionVerdict' | 'readLabelEvents'
+  >
+  /** Live write check for the human whose status label un-parks a card (the comment-command gate); the container always wires it. */
+  humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -271,7 +279,30 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
+    if (!(await this.labelWriterAuthorized(repo, issueNumber, plan.to))) {
+      this.deps.log.info(
+        { boardId, issueNumber, from, to: plan.to },
+        'kanban: recovery ignored a non-writer status label'
+      )
+      return { moved: false, observed }
+    }
     return { moved: await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to), observed }
+  }
+
+  // The human who added the status label must hold live write access, as a comment command's sender must; fail closed.
+  private async labelWriterAuthorized(repo: KanbanRepoRef, issueNumber: number, to: KanbanStatus): Promise<boolean> {
+    const authz = this.deps.humanAuthz
+    if (!authz) return true
+    const login = labelAdder(await this.deps.store.readLabelEvents(repo, issueNumber), statusLabel(to), authz.appSlug)
+    if (!login) return false
+    const verdict = await authorizeHumanKanbanAction({
+      repo,
+      actor: { login, type: 'User' },
+      appSlug: authz.appSlug,
+      permissions: authz.permissions
+    })
+    if (!verdict.ok && verdict.reason === 'lookup_failed') throw verdict.error
+    return verdict.ok
   }
 
   // A failed promotion is adopted on proof, cleared once no ready label landed by its watch's end, else retried or escalated.

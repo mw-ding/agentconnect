@@ -54,6 +54,9 @@ class FakeStore {
   }
   /** Issues whose event window cannot be read in full (for example 1,000+ events since the cursor). */
   readonly unreadable = new Set<number>()
+  async readLabelEvents(_repo: KanbanRepoRef, n: number): Promise<LabelEvent[]> {
+    return [...(this.events.get(n) ?? [])]
+  }
   async lastEventId(_repo: KanbanRepoRef, n: number): Promise<number> {
     return (this.events.get(n) ?? []).reduce((max, event) => Math.max(max, event.id), 0)
   }

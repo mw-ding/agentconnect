@@ -24,7 +24,7 @@ interface GithubCall {
 }
 
 // A ready-labelled issue whose latest status edit is a human's.
-function fakeGithub(publicKeyPem: string) {
+function fakeGithub(publicKeyPem: string, labeler = HUMAN) {
   const calls: GithubCall[] = []
   const fetch = async (url: string, init?: RequestInit): Promise<Response> => {
     const { pathname } = new URL(url)
@@ -38,6 +38,12 @@ function fakeGithub(publicKeyPem: string) {
     if (method === 'POST' && pathname === `/app/installations/${INSTALLATION_ID}/access_tokens`) {
       call.jwtValid = verifyRs256(auth.replace(/^Bearer /, ''), publicKeyPem)
       return json(201, { token: 'ghs_test_installation', expires_at: new Date(Date.now() + 3_600_000).toISOString() })
+    }
+    // The label's human adder must hold live write access to un-park the card; `mallory` only reads.
+    const permission = pathname.match(new RegExp(`^/repositories/${REPO_ID}/collaborators/([^/]+)/permission$`))
+    if (permission) {
+      const level = ({ alice: 'write', mallory: 'read' } as Record<string, string>)[permission[1]!]
+      return level ? json(200, { permission: level }) : json(404, { message: 'Not Found' })
     }
     const base = `/repositories/${REPO_ID}/issues/${ISSUE.number}`
     if (pathname === base) {
@@ -55,8 +61,8 @@ function fakeGithub(publicKeyPem: string) {
     if (pathname === `${base}/events`) {
       return json(200, [
         { id: 1, event: 'labeled', label: { name: 'ac/status:triage' }, actor: HUMAN },
-        { id: 2, event: 'labeled', label: { name: 'ac/status:ready' }, actor: HUMAN },
-        { id: 3, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: HUMAN }
+        { id: 2, event: 'labeled', label: { name: 'ac/status:ready' }, actor: labeler },
+        { id: 3, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: labeler }
       ])
     }
     if (pathname.startsWith(`${base}/`)) return pathname.endsWith('/parent') ? json(404, {}) : json(200, [])
@@ -94,9 +100,9 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot() {
+async function boot(labeler = HUMAN) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string)
+  const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, labeler)
   await prisma.githubInstallation.create({
     data: {
       orgId: DEFAULT_ORG_ID,
@@ -190,6 +196,22 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     expect(mint?.jwtValid).toBe(true)
     expect(mint?.body).toEqual({ repository_ids: [REPO_ID], permissions: { metadata: 'read', issues: 'read' } })
     expect(github.calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/issues/${ISSUE.number}/events`)
+  })
+
+  it('a human relabel by a non-writer leaves the parked card where it is (live write check, TRD 4.5)', async () => {
+    const mallory = { type: 'User', login: 'mallory' }
+    const { github, card, link } = await boot(mallory)
+    await postGithubWebhook(link.webhookUrl, {
+      secret: WEBHOOK_SECRET,
+      event: 'issues',
+      payload: issuesLabeled(mallory)
+    })
+    await until(
+      async () => github.calls.map((c) => c.path),
+      (paths) => paths.some((p) => p.endsWith('/collaborators/mallory/permission'))
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('triage')
   })
 
   it('forwards the same GUID after a dropped CP emit and persists the redelivered doorbell', async () => {

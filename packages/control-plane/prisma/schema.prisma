@@ -2560,6 +2560,7 @@ model KanbanBoard {
   createdBy         User?        @relation("KanbanBoardCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   lastModifiedBy    User?        @relation("KanbanBoardModifiedBy", fields: [lastModifiedByUserId], references: [id], onDelete: SetNull)
   cards             KanbanCard[]
+  commands          KanbanCommand[]
 
   @@unique([orgId, repoId]) // one board per repository per org
   @@index([repoId]) // graph doorbell lookup
@@ -2615,6 +2616,7 @@ model KanbanCard {
   board         KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
   runs          KanbanRun[]
+  commands      KanbanCommand[]
 
   @@unique([boardId, issueId])
   @@unique([boardId, issueNumber])
@@ -2650,6 +2652,30 @@ model KanbanRun {
 
   @@unique([cardId, attempt])
   @@map("kanban_run")
+}
+
+// One `/kanban` comment command per GitHub comment id (TRD 4.4): a replayed or redelivered doorbell applies it at most once.
+model KanbanCommand {
+  id         String            @id @default(uuid()) @db.Uuid
+  boardId    String            @db.Uuid
+  cardId     String            @db.Uuid
+  commentId  BigInt // GitHub numeric comment id — the idempotency key
+  command    String // unblock | reopen | ready
+  actorLogin String
+  // applied, or the refusal reason code (wrong_status | leased | illegal | no_write); body-free.
+  outcome    String
+  fromStatus KanbanCardStatus
+  toStatus   KanbanCardStatus?
+  // The GitHub effect (label/reopen write or the one refusal comment) landed; null re-runs it on the next delivery.
+  settledAt  DateTime?         @db.Timestamptz(6)
+  createdAt  DateTime          @default(now()) @db.Timestamptz(6)
+
+  board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  card  KanbanCard  @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([boardId, commentId])
+  @@index([cardId])
+  @@map("kanban_command")
 }
 
 // ───────────────────────────────────────────────────────────────────────────

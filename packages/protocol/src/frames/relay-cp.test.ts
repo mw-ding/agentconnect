@@ -20,6 +20,8 @@ import {
   RcRunReport,
   RcGithubInstallation,
   RcGithubGraph,
+  isKanbanDoorbellDelivery,
+  KANBAN_ISSUE_ACTIONS,
   RcGithubRerequest,
   RcGithubRerequestResult,
   RcBotRevoked,
@@ -1137,9 +1139,48 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(RcGithubGraph.safeParse({ ...poke, event: 'issues', action: 'labeled', ids: [], numbers: [] }).success).toBe(
       true
     )
-    expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'pull_request_review' }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, ids: ['1', '2', '3', '4', '5'] }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, repoId: 'acme/web' }).success).toBe(false)
+  })
+
+  it('rc/github-graph carries a parsed comment command, never the comment text', () => {
+    const poke = {
+      deliveryKey: 'guid-c',
+      installationId: '1234567',
+      repoId: '42',
+      event: 'issue_comment',
+      action: 'created',
+      ids: ['17'],
+      numbers: [7],
+      command: { name: 'unblock', commentId: '9001', sender: { login: 'alice', id: '5', type: 'User' } }
+    }
+    const r = decodeRelayCpFrame(envelope('rc/github-graph', poke))
+    expect(r.ok).toBe(true)
+    if (!r.ok || r.frame.type !== 'rc/github-graph') throw new Error('narrow')
+    expect(r.frame.payload).toEqual(poke)
+    // A seen-only marker for a non-command comment carries no command.
+    expect(RcGithubGraph.safeParse({ ...poke, ids: [], numbers: [], command: undefined }).success).toBe(true)
+    const bad = (command: Record<string, unknown>) => RcGithubGraph.safeParse({ ...poke, command }).success
+    expect(bad({ ...poke.command, body: '/kanban unblock please' })).toBe(false)
+    expect(bad({ ...poke.command, name: 'merge' })).toBe(false)
+    expect(bad({ ...poke.command, commentId: 'abc' })).toBe(false)
+    expect(bad({ ...poke.command, sender: { ...poke.command.sender, name: 'Alice Smith' } })).toBe(false)
+    expect(bad({ ...poke.command, sender: { ...poke.command.sender, login: 'x'.repeat(65) } })).toBe(false)
+    expect(bad({ ...poke.command, sender: { login: 'alice' } })).toBe(false)
+    expect(bad({ name: 'ready', commentId: '1', sender: { login: 'bob', type: 'User' } })).toBe(true)
+  })
+
+  it('isKanbanDoorbellDelivery names exactly the forwarded event:action pairs', () => {
+    expect(isKanbanDoorbellDelivery('sub_issues', 'sub_issue_added')).toBe(true)
+    expect(isKanbanDoorbellDelivery('issue_dependencies', null)).toBe(true)
+    for (const action of KANBAN_ISSUE_ACTIONS) expect(isKanbanDoorbellDelivery('issues', action)).toBe(true)
+    expect(isKanbanDoorbellDelivery('issues', 'edited')).toBe(false)
+    expect(isKanbanDoorbellDelivery('issue_comment', 'created')).toBe(true)
+    expect(isKanbanDoorbellDelivery('issue_comment', 'edited')).toBe(false)
+    expect(isKanbanDoorbellDelivery('issue_comment', null)).toBe(false)
+    expect(isKanbanDoorbellDelivery('push', null)).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {

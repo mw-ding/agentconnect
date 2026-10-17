@@ -21,6 +21,9 @@ import {
   type KanbanCardRow,
   type KanbanCardUpsertInput,
   type KanbanCardUpsertResult,
+  type KanbanCommandInput,
+  type KanbanCommandRecord,
+  type KanbanCommandRecordResult,
   type KanbanLeaseRef,
   type KanbanModeAdminRepo,
   type KanbanSetAssigneeInput,
@@ -70,6 +73,37 @@ const BOARD_VIEW_SELECT = {
   lastModifiedAt: true,
   createdAt: true
 } as const
+
+const COMMAND_SELECT = {
+  id: true,
+  boardId: true,
+  cardId: true,
+  commentId: true,
+  command: true,
+  actorLogin: true,
+  outcome: true,
+  fromStatus: true,
+  toStatus: true,
+  settledAt: true
+} as const
+
+/** Thrown inside the command transaction so a lost CAS also rolls back its ledger row. */
+const STALE_COMMAND = new Error('kanban command: card changed since it was read')
+
+function toCommandRecord(row: {
+  id: string
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  actorLogin: string
+  outcome: string
+  fromStatus: string
+  toStatus: string | null
+  settledAt: Date | null
+}): KanbanCommandRecord {
+  return { ...row, fromStatus: row.fromStatus as KanbanStatus, toStatus: row.toStatus as KanbanStatus | null }
+}
 
 const isUniqueViolation = (err: unknown) => err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002'
 
@@ -395,6 +429,109 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       }
     })
     return count === 1
+  }
+
+  async getCommand(boardId: string, commentId: bigint): Promise<KanbanCommandRecord | null> {
+    const row = await this.db.kanbanCommand.findUnique({
+      where: { boardId_commentId: { boardId, commentId } },
+      select: COMMAND_SELECT
+    })
+    return row ? toCommandRecord(row) : null
+  }
+
+  async recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult> {
+    const applied = input.to !== undefined
+    // A move needs the live-attested writer, never a login string; a refusal records who asked and why.
+    if (
+      applied &&
+      !(isAttestedHumanAuthority(input.humanAuthority) && hasWriteAccess(input.humanAuthority.permission))
+    ) {
+      throw new Error('kanban command: an applied move requires an attested human writer')
+    }
+    try {
+      return await withAmbientTx(this.db, async (tx) => {
+        const [row] = await tx.kanbanCommand.createManyAndReturn({
+          data: [
+            {
+              id: randomUUID(),
+              boardId: input.boardId,
+              cardId: input.cardId,
+              commentId: input.commentId,
+              command: input.command,
+              actorLogin: input.actorLogin,
+              outcome: applied ? 'applied' : (input.refusal ?? 'refused'),
+              fromStatus: input.from,
+              toStatus: input.to ?? null
+            }
+          ],
+          skipDuplicates: true,
+          select: COMMAND_SELECT
+        })
+        if (!row) {
+          const existing = await tx.kanbanCommand.findUniqueOrThrow({
+            where: { boardId_commentId: { boardId: input.boardId, commentId: input.commentId } },
+            select: COMMAND_SELECT
+          })
+          return { kind: 'duplicate', record: toCommandRecord(existing) } as const
+        }
+        if (!applied) return { kind: 'recorded', record: toCommandRecord(row) } as const
+        // The CAS refuses a card that moved or was leased since the read; the throw rolls the ledger row back too.
+        const { count } = await tx.kanbanCard.updateMany({
+          where: {
+            id: input.cardId,
+            boardId: input.boardId,
+            stateRevision: input.expectedStateRevision,
+            status: input.from,
+            runs: { none: { endedAt: null } }
+          },
+          data: {
+            status: input.to!,
+            stateRevision: { increment: 1 },
+            cooldownUntil: null,
+            blockKind: null,
+            recoveryCheckAt: null,
+            recoveryChecks: 0,
+            recoveryObserved: null,
+            ...PROMOTION_CLEARED,
+            // A reopened card starts a new piece of work; the old PR must not complete it.
+            ...(input.from === 'done' ? { linkedPrNumber: null } : {})
+          }
+        })
+        if (count !== 1) throw STALE_COMMAND
+        const board = await tx.kanbanBoard.findUniqueOrThrow({ where: { id: input.boardId }, select: { orgId: true } })
+        const card = await tx.kanbanCard.findUniqueOrThrow({
+          where: { id: input.cardId },
+          select: { issueNumber: true }
+        })
+        await tx.auditEvent.create({
+          data: {
+            kind: 'kanban_card_change',
+            orgId: board.orgId,
+            message: `kanban card ${input.cardId} status changed by comment command`,
+            details: {
+              boardId: input.boardId,
+              cardId: input.cardId,
+              issueNumber: card.issueNumber,
+              change: 'status',
+              from: input.from,
+              to: input.to!,
+              command: input.command,
+              commentId: input.commentId.toString(),
+              humanAuthority: { login: input.humanAuthority!.login, permission: input.humanAuthority!.permission },
+              source: 'comment_command'
+            }
+          }
+        })
+        return { kind: 'recorded', record: toCommandRecord(row) } as const
+      })
+    } catch (err) {
+      if (err === STALE_COMMAND) return { kind: 'stale' }
+      throw err
+    }
+  }
+
+  async settleCommand(id: string): Promise<void> {
+    await this.db.kanbanCommand.updateMany({ where: { id, settledAt: null }, data: { settledAt: new Date() } })
   }
 
   async upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult> {
