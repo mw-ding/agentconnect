@@ -4127,6 +4127,56 @@ describe.skipIf(pg)('the v26 → v27 router targets column', () => {
   })
 })
 
+describe.skipIf(pg)('the v58 → v59 kanban outbox columns', () => {
+  const RETRY_COLUMNS = ['attempts', 'attempted', 'attemptedAt', 'lookupMisses', 'nextAt']
+  const columnsOf = (path: string): string[] => {
+    const db = new DatabaseSync(path)
+    const names = (db.prepare('PRAGMA table_info(kanban_terminals)').all() as { name: string }[]).map((c) => c.name)
+    db.close()
+    return names
+  }
+
+  it('creates the retry columns on a fresh store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-kanban-fresh-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    expect(columnsOf(path)).toEqual(expect.arrayContaining(RETRY_COLUMNS))
+  })
+
+  it('adds the retry columns to a legacy-shape table at v58 and keeps its rows', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-kanban-legacy-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec(`DROP TABLE kanban_terminals;
+      CREATE TABLE kanban_terminals (leaseId TEXT PRIMARY KEY, entry TEXT NOT NULL, state TEXT NOT NULL, recordedAt INTEGER NOT NULL);
+      INSERT INTO kanban_terminals VALUES ('l1', '{}', 'comment', 5);
+      PRAGMA user_version = 58`)
+    old.close()
+    expect(columnsOf(path)).not.toContain('attemptedAt')
+
+    await (await LocalStore.open(path)).close()
+    expect(columnsOf(path)).toEqual(expect.arrayContaining(RETRY_COLUMNS))
+    const check = new DatabaseSync(path)
+    expect(
+      check
+        .prepare('SELECT leaseId, attempts, attempted, attemptedAt, lookupMisses, nextAt FROM kanban_terminals')
+        .all()
+    ).toEqual([
+      expect.objectContaining({
+        leaseId: 'l1',
+        attempts: 0,
+        attempted: 0,
+        attemptedAt: null,
+        lookupMisses: 0,
+        nextAt: 0
+      })
+    ])
+    expect((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    check.close()
+    // A migrated store reopens without another step.
+    await (await LocalStore.open(path)).close()
+  })
+})
+
 // multi-repository-workspaces.md decision 20: v28 records that a session was handed an on-demand clone directory.
 describe.skipIf(pg)('the v27 → v28 on-demand clones column', () => {
   it('adds onDemandClones to a v27 store, empty on the sessions it already holds', async () => {

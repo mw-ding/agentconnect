@@ -1328,7 +1328,7 @@ export const SOURCE_CACHE_SCHEMA = `
       );
 `
 
-export const SCHEMA_VERSION = 58
+export const SCHEMA_VERSION = 59
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -2021,8 +2021,22 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean; postgres: bool
       externalResourceKey = (SELECT externalResourceKey FROM audience a WHERE a.key = sessions.key),
       externalResourceKind = 'conversation', sourceBindingKind = 'external'
       WHERE externalProvider IS NULL AND key IN (SELECT key FROM audience)`)
+  },
+  // v59: kanban_terminals shipped without its retry columns at an earlier head, which the CREATE block cannot widen.
+  async (db, store) => {
+    for (const [column, type] of KANBAN_TERMINALS_RETRY_COLUMNS)
+      await addColumn(db, store.postgres, 'kanban_terminals', column, type)
   }
 ]
+
+/** The comment outbox's retry columns, as v59 adds them where an older kanban_terminals lacks them. */
+const KANBAN_TERMINALS_RETRY_COLUMNS = [
+  ['attempts', 'INTEGER NOT NULL DEFAULT 0'],
+  ['attempted', 'INTEGER NOT NULL DEFAULT 0'],
+  ['attemptedAt', 'INTEGER'],
+  ['lookupMisses', 'INTEGER NOT NULL DEFAULT 0'],
+  ['nextAt', 'INTEGER NOT NULL DEFAULT 0']
+] as const
 
 /** Add a column a table lacks, on either dialect; a table that does not exist yet gets it from the CREATE block. */
 async function addColumn(db: StoreTx, postgres: boolean, table: string, column: string, type: string): Promise<void> {
