@@ -11,14 +11,13 @@ import { Daemon } from '../src/daemon.js'
 import { executeTool, type SessionContext } from '../src/mcp/ops.js'
 import { agentHostKey } from '../src/acp/host-key.js'
 import { maskableSecrets, secretPlaceholder } from '../src/session/secret-mask.js'
-import { CODE_HOST_PROVIDERS } from '@agentconnect.md/protocol'
 import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS } from '../src/mcp/tools.js'
 import type { CodeHostBrokerOperation } from '../src/codehost/broker.js'
 import { GithubReplyCollector } from '../src/github/poster.js'
-import { finalizeGithubTurn } from '../src/platforms/github/turn-output.js'
-import { emitWebchatUpdate, flushHeldWebchatText } from '../src/webchat/turn-output.js'
+import { emitWebchatUpdate } from '../src/webchat/turn-output.js'
 import { sessionKey, transcriptChannelKey } from '../src/store/local-store.js'
 import { fakeSlackAppFactory } from './fakes/slack-app.js'
+import { WAIT } from './wait-support.js'
 
 const AGENT = 'bot-a'
 const API_KEY = 'sk-coverageprobe-SECRET-value-0001'
@@ -124,30 +123,73 @@ describe('turn-output surface registry coverage', () => {
 })
 
 describe('webchat outbound coverage', () => {
-  it('masks a held suffix before the final stream flush', () => {
-    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold() })
+  it('masks a held suffix through the daemon-wired maskText after the host releases its BYOK secrets', async () => {
+    let onUpdate!: (sid: string, u: unknown) => void
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: (_agent, cb) => {
+        onUpdate = cb
+        return {
+          start: vi.fn(async () => {}),
+          newSession: vi.fn(async () => 'acp-wc-1'),
+          modelOptions: vi.fn(() => null),
+          hasSession: vi.fn(() => true),
+          prompt: vi.fn(async (sid: string) => {
+            const half = Math.ceil(API_KEY.length / 2)
+            onUpdate(sid, chunk(`[details] ${API_KEY.slice(0, half)}`))
+            onUpdate(sid, chunk(`${API_KEY.slice(half)} ${HEADER}`))
+            // The host released its BYOK provider secrets before the final held-text flush.
+            ;(daemon as any).modelProviderSecrets.delete(agentHostKey(AGENT))
+            return { stopReason: 'end_turn' }
+          }),
+          cancel: vi.fn(async () => {}),
+          forgetSession: vi.fn(),
+          stop: vi.fn(async () => {})
+        } as never
+      }
+    })
+    await daemon.start()
     seedProviderSecrets(daemon)
-    const output = vi.fn()
-    const wc = {
-      conversationId: 'conv-1',
-      turnId: 'turn-1',
-      sink: { output, done: vi.fn() },
-      index: 0,
-      replyText: '',
-      replySegments: [],
-      heldText: '',
-      messageEmitted: false,
-      maskText: (text: string) => (daemon as any).maskAgentSecrets(AGENT, text)
+    const outputs: Array<{ event: { kind: string; text?: string } }> = []
+    const sink = { output: (o: { event: { kind: string; text?: string } }) => outputs.push(o), done: vi.fn() }
+    ;(daemon as any).cpClient = {
+      organizationScope: () => 'connection' as const,
+      stop: vi.fn(async () => {}),
+      emitUsageReport: vi.fn(),
+      emitSessionActivity: vi.fn(),
+      emitEventSession: vi.fn(),
+      emitHookReport: vi.fn(async () => 'acknowledged' as const)
     }
-    const half = Math.ceil(API_KEY.length / 2)
-    for (const text of ['[details] ', API_KEY.slice(0, half), API_KEY.slice(half), ` ${HEADER}`])
-      emitWebchatUpdate(wc, chunk(text))
-    flushHeldWebchatText(wc)
-    const text = output.mock.calls.map(([event]) => event.event.text).join('')
+    const conv = '88888888-8888-4888-8888-888888888888'
+    const turnId = '55555555-5555-4555-8555-555555555555'
+    await (daemon as any).dispatch(
+      AGENT,
+      {
+        msgId: `webchat:${conv}:${turnId}`,
+        traceId: turnId,
+        source: 'user' as const,
+        platform: 'webchat' as const,
+        channel: conv,
+        thread: conv,
+        sender: { id: 'alice', isBot: false },
+        text: 'go',
+        mentionedBots: [] as string[],
+        isDm: true,
+        trigger: 'dm' as const
+      },
+      undefined,
+      { conversationId: conv, turnId, sink }
+    )
+    const text = outputs
+      .filter((o) => o.event?.kind === 'message')
+      .map((o) => o.event.text ?? '')
+      .join('')
     expect(text).toContain(KEY_PH)
     expect(text).toContain(HEADER_PH)
     expect(text).not.toContain(API_KEY)
     expect(text).not.toContain(HEADER)
+    await daemon.stop()
   })
 
   it('masks the committed segment row and its canonical post', async () => {
@@ -187,47 +229,98 @@ describe('webchat outbound coverage', () => {
 })
 
 describe('code-host turn-final coverage', () => {
-  it('masks the final answer through finalizeGithubTurn/maskFinal for every provider', async () => {
-    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold() })
-    seedProviderSecrets(daemon)
-    // The provider registry the turn-final is selected from; a new host forces this snapshot update.
-    expect([...CODE_HOST_PROVIDERS]).toEqual(['github', 'gitlab', 'gitea'])
-    for (const provider of CODE_HOST_PROVIDERS) {
-      const collector = new GithubReplyCollector()
-      const half = Math.ceil(API_KEY.length / 2)
-      for (const text of [API_KEY.slice(0, half), `${API_KEY.slice(half)} ${HEADER}`]) collector.onUpdate(chunk(text))
-      const publish = vi.fn(async (_text?: string) => ({ kind: 'review_comment' as const, commentId: '1' }))
-      const state = { poster: { publish }, collector, deferredFinalTranscript: false }
-      const turn = {
-        plan: {
-          statusThread: 'T1',
-          sessionThread: 'T1',
-          sessionKey: `hook:${provider}:1:${AGENT}`,
-          transcriptChannel: 'C1',
-          agentId: AGENT,
-          platform: 'hook'
-        }
+  it('masks the final answer through the daemon-wired maskFinal after the host releases its BYOK secrets', async () => {
+    let onUpdate!: (sid: string, u: unknown) => void
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: (_agent, cb) => {
+        onUpdate = cb
+        return {
+          start: vi.fn(async () => {}),
+          newSession: vi.fn(async () => 'acp-hook-1'),
+          modelOptions: vi.fn(() => null),
+          hasSession: vi.fn(() => true),
+          prompt: vi.fn(async (sid: string) => {
+            const half = Math.ceil(API_KEY.length / 2)
+            onUpdate(sid, {
+              sessionUpdate: 'agent_message_chunk',
+              _meta: { codex: { phase: 'final_answer' } },
+              content: { type: 'text', text: API_KEY.slice(0, half) }
+            })
+            onUpdate(sid, {
+              sessionUpdate: 'agent_message_chunk',
+              _meta: { codex: { phase: 'final_answer' } },
+              content: { type: 'text', text: `${API_KEY.slice(half)} ${HEADER}` }
+            })
+            // The host released its BYOK provider secrets before the final mask.
+            ;(daemon as any).modelProviderSecrets.delete(agentHostKey(AGENT))
+            return { stopReason: 'end_turn' }
+          }),
+          cancel: vi.fn(async () => {}),
+          forgetSession: vi.fn(),
+          stop: vi.fn(async () => {})
+        } as never
       }
-      await finalizeGithubTurn(
-        {
-          appendTranscript: vi.fn(async () => {}),
-          monotonicTs: () => '1',
-          maskFinal: (text: string) => (daemon as any).maskAgentSecrets(AGENT, text),
-          beginPublish: vi.fn(async () => true),
-          endPublish: vi.fn(async () => {}),
-          warn: vi.fn()
-        },
-        turn,
-        state,
-        { suppressed: false, atEnd: true, formalReviewOwnsResponse: false }
-      )
-      expect(publish, provider).toHaveBeenCalledTimes(1)
-      const posted = String(publish.mock.calls[0]![0])
-      expect(posted, provider).toContain(KEY_PH)
-      expect(posted, provider).toContain(HEADER_PH)
-      expect(posted, provider).not.toContain(API_KEY)
-      expect(posted, provider).not.toContain(HEADER)
+    })
+    await daemon.start()
+    seedProviderSecrets(daemon)
+    const cp = {
+      hookReports: [] as unknown[],
+      sessionEvents: [] as unknown[],
+      organizationScope: () => 'connection' as const,
+      stop: vi.fn(async () => {}),
+      emitEventSession: vi.fn((e: unknown) => (cp.sessionEvents as unknown[]).push(e)),
+      emitHookReport: vi.fn(async (r: unknown) => {
+        cp.hookReports.push(r)
+        return 'acknowledged' as const
+      }),
+      emitUsageReport: vi.fn(),
+      emitSessionActivity: vi.fn()
     }
+    ;(daemon as any).cpClient = cp
+    const publish = vi.fn(async (_text?: string) => ({ kind: 'review_comment' as const, commentId: '1' }))
+    ;(daemon as any).githubReviews.makeCodeHostReply = vi.fn(() => ({
+      poster: { publish },
+      collector: new GithubReplyCollector()
+    }))
+    const hookId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    await (daemon as any).handleRelayMsg(
+      {
+        source: 'hook',
+        agentId: AGENT,
+        sessionKey: 'agentconnect-md/agentconnect#145',
+        msgId: `${hookId}:d-1`,
+        hookId,
+        deliveryKey: 'd-1',
+        firedAt: new Date().toISOString(),
+        github: {
+          repoId: '123',
+          repoFullName: 'agentconnect-md/agentconnect',
+          sourceInstallationId: '456',
+          subjectKind: 'pull_request',
+          pullNumber: 145
+        },
+        context: {
+          source: 'github',
+          event: 'pull_request',
+          action: 'opened',
+          repo: 'agentconnect-md/agentconnect',
+          number: 145,
+          title: 'leak check',
+          truncated: false
+        }
+      },
+      () => {}
+    )
+    await vi.waitFor(() => expect(cp.hookReports).toHaveLength(1), WAIT)
+    expect(publish).toHaveBeenCalledTimes(1)
+    const posted = String(publish.mock.calls[0]![0])
+    expect(posted).toContain(KEY_PH)
+    expect(posted).toContain(HEADER_PH)
+    expect(posted).not.toContain(API_KEY)
+    expect(posted).not.toContain(HEADER)
+    await daemon.stop()
   })
 })
 
@@ -343,11 +436,14 @@ describe('code-host broker and review outbound coverage', () => {
         comments: [{ path: 'a.ts', body: `see ${HEADER}`, line: 1, side: 'RIGHT' }]
       })
       expect(submit).toHaveBeenCalledTimes(1)
-      const req = submit.mock.calls[0]![0] as { body: string; comments: Array<{ body: string }> }
+      const req = submit.mock.calls[0]![0] as { body: string; comments: Array<{ path: string; body: string }> }
       expect(req.body).toContain(KEY_PH)
       expect(req.body).not.toContain(API_KEY)
       expect(req.comments[0]!.body).toContain(HEADER_PH)
       expect(req.comments[0]!.body).not.toContain(HEADER)
+      // The comment path is the API diff-path anchor (must match the diff exactly), never
+      // rendered as visible text — it is deliberately left unmasked while the body is masked.
+      expect(req.comments[0]!.path).toBe('a.ts')
     } finally {
       await close()
     }

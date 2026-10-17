@@ -13,6 +13,7 @@ import {
 import {
   isToolArgPassthroughKey,
   maskableSecrets,
+  maskSecretsInText,
   maskToolArgs,
   secretPlaceholder
 } from '../src/session/secret-mask.js'
@@ -39,6 +40,9 @@ const ENTRIES = maskableSecrets({
 
 /** The same mask the daemon wires into OpsDeps: `maskToolArgs` over the seeded entries. */
 const mask = (args: Record<string, unknown>): Record<string, unknown> => maskToolArgs(args, ENTRIES)
+
+/** The same string mask the daemon wires for `maskAgentText` (shareFile display text). */
+const maskText = (text: string): string => maskSecretsInText(text, ENTRIES)
 
 describe('maskToolArgs', () => {
   it('masks free-text values and leaves structural keys untouched', () => {
@@ -86,9 +90,6 @@ describe('maskToolArgs', () => {
       'toolCallId',
       'planId',
       'path',
-      'url',
-      'href',
-      'link',
       'postAt',
       'dueAt',
       'dueDate',
@@ -104,6 +105,10 @@ describe('maskToolArgs', () => {
       'team'
     ])
       expect(out[key], key).toBe(API_KEY)
+    // URL keys are free text and are masked even when they equal a secret.
+    expect(out.url).toBe(KEY_PH)
+    expect(out.href).toBe(KEY_PH)
+    expect(out.link).toBe(KEY_PH)
     // Free text is masked.
     expect(out.message).toBe(`leak ${KEY_PH} end`)
     expect(out.title).toBe(`t ${KEY_PH}`)
@@ -133,7 +138,7 @@ describe('maskToolArgs', () => {
   })
 
   it('passes every registered structural key through untouched', () => {
-    // The suffix families every schema relies on for ids, URLs and instants.
+    // The suffix families every schema relies on for ids and instants.
     for (const key of [
       'itemId',
       'columnId',
@@ -143,8 +148,6 @@ describe('maskToolArgs', () => {
       'listId',
       'sessionId',
       'taskId',
-      'avatarUrl',
-      'workspaceUrl',
       'postAt',
       'dueAt',
       'firedAt',
@@ -152,6 +155,9 @@ describe('maskToolArgs', () => {
       'planId'
     ])
       expect(isToolArgPassthroughKey(key), key).toBe(true)
+    // URL keys are NOT pass-through — a URL is free text that can carry a secret.
+    for (const key of ['url', 'href', 'link', 'avatarUrl', 'workspaceUrl'])
+      expect(isToolArgPassthroughKey(key), key).toBe(false)
     // Free-text keys are never pass-through.
     for (const key of [
       'message',
@@ -242,6 +248,7 @@ function makeDeps(over: Partial<OpsDeps> = {}): OpsDeps {
       getDisplayNames: async () => new Map()
     },
     maskAgentSecrets: (_agentId, args) => mask(args),
+    maskAgentText: (_agentId, text) => maskText(text),
     ...over
   }
 }
@@ -272,6 +279,41 @@ describe('executeTool masks every tool', () => {
       deps
     )
     expect(gw.postMessage).toHaveBeenCalledWith('C1', `leak ${KEY_PH} end`, undefined, expect.anything())
+  })
+
+  it('sendMessage rejects a toUser that smuggles a secret into the mention body', async () => {
+    const gw = fakeGateway()
+    const deps = makeDeps({ gatewayFor: () => gw })
+    await expect(
+      executeTool(
+        ctx,
+        'sendMessage',
+        { action: 'postMessage', channel: 'C1', toUser: [`U1> <${API_KEY}> <@U1`], message: 'hi' },
+        deps
+      )
+    ).rejects.toThrow(/toUser/)
+    expect(gw.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('sendMessage masks a bare secret-shaped toUser and rejects it (fail closed)', async () => {
+    const gw = fakeGateway()
+    const deps = makeDeps({ gatewayFor: () => gw })
+    await expect(
+      executeTool(ctx, 'sendMessage', { action: 'postMessage', channel: 'C1', toUser: API_KEY, message: 'hi' }, deps)
+    ).rejects.toThrow(/toUser/)
+    expect(gw.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('sendMessage still posts a legit toUser array channel-root mention', async () => {
+    const gw = fakeGateway()
+    const deps = makeDeps({ gatewayFor: () => gw })
+    await executeTool(
+      ctx,
+      'sendMessage',
+      { action: 'postMessage', channel: 'C1', toUser: ['U1', 'U2'], message: 'hi' },
+      deps
+    )
+    expect(gw.postMessage).toHaveBeenCalledWith('C1', '<@U1> <@U2> hi', undefined, expect.anything())
   })
 
   it('sendMessage file caption (uploadFile)', async () => {
@@ -324,6 +366,43 @@ describe('executeTool masks every tool', () => {
     )
   })
 
+  it('shareFile masks a secret in the upload display name and provenance marker', async () => {
+    const shared: Array<{ text: string }> = []
+    const gw = fakeGateway({
+      uploadFile: vi.fn(async (_c: string, file: { name: string }, comment: string) => ({
+        ok: true as const,
+        messageId: 'ts-1'
+      }))
+    })
+    const deps = makeDeps({
+      gatewayFor: () => gw,
+      shareTarget: () => ({ ok: true, platform: 'slack', integrationId: 'int-1', channel: 'C1' }),
+      readWorkspaceImage: async () => ({
+        ok: true,
+        bytes: Buffer.from('x'),
+        name: `${API_KEY}.png`,
+        mimeType: 'image/png',
+        sha256: 'a'.repeat(64)
+      }),
+      recordShare: async (_ctx, row: { text: string }) => {
+        shared.push(row)
+      },
+      now: () => 1000
+    })
+    await executeTool(ctx, 'shareFile', { path: `${API_KEY}.png`, caption: 'see' }, deps)
+    // The DISPLAY name is masked; the raw path was still used for the read (stubbed above).
+    expect(gw.uploadFile).toHaveBeenCalledWith(
+      'C1',
+      expect.objectContaining({ name: `${KEY_PH}.png` }),
+      expect.anything(),
+      expect.anything(),
+      expect.anything()
+    )
+    // The provenance marker text is masked too.
+    expect(shared[0]!.text).toContain(KEY_PH)
+    expect(shared[0]!.text).not.toContain(API_KEY)
+  })
+
   it('scheduleMessage', async () => {
     const gw = fakeGateway({
       scheduleMessage: vi.fn(async (channel: string, _text: string, postAt: number) => ({ id: 'q1', channel, postAt }))
@@ -359,7 +438,7 @@ describe('executeTool masks every tool', () => {
     ])
   })
 
-  it('addBookmark masks the title and leaves the link untouched', async () => {
+  it('addBookmark masks a secret in the link and the title', async () => {
     const gw = fakeGateway({
       addBookmark: vi.fn(async (_c: string, spec: { title: string }) => ({ id: 'b1', title: spec.title }))
     })
@@ -367,13 +446,48 @@ describe('executeTool masks every tool', () => {
     await executeTool(
       ctx,
       'addBookmark',
-      { channel: 'C1', title: `runbook ${API_KEY}`, link: 'https://docs.example.test/x' },
+      { channel: 'C1', title: `runbook ${API_KEY}`, link: `https://docs.example.test/x?key=${HEADER}` },
       deps
     )
     expect(gw.addBookmark).toHaveBeenCalledWith('C1', {
       title: `runbook ${KEY_PH}`,
-      link: 'https://docs.example.test/x'
+      link: `https://docs.example.test/x?key=${HEADER_PH}`
     })
+  })
+
+  it('addBookmark leaves a non-secret link and icon fields unchanged', async () => {
+    const gw = fakeGateway({
+      addBookmark: vi.fn(async (_c: string, spec: { title: string }) => ({ id: 'b1', title: spec.title }))
+    })
+    const deps = makeDeps({ gatewayFor: () => gw })
+    await executeTool(
+      ctx,
+      'addBookmark',
+      { channel: 'C1', title: 'runbook', link: 'https://docs.example.test/x', emoji: ':book:' },
+      deps
+    )
+    expect(gw.addBookmark).toHaveBeenCalledWith('C1', {
+      title: 'runbook',
+      link: 'https://docs.example.test/x',
+      emoji: ':book:'
+    })
+  })
+
+  it('addListItem masks a secret in a nested link field value', async () => {
+    const gw = fakeGateway({ addListItem: vi.fn(async () => ({ id: 'row-1', fields: {} })) })
+    const deps = makeDeps({ gatewayFor: () => gw })
+    await executeTool(
+      ctx,
+      'addListItem',
+      {
+        listId: 'L1',
+        fields: [{ columnId: 'c1', type: 'link', value: { type: 'link', url: `https://x.test/?k=${API_KEY}` } }]
+      },
+      deps
+    )
+    expect(gw.addListItem).toHaveBeenCalledWith('L1', [
+      { columnId: 'c1', type: 'link', value: { type: 'link', url: `https://x.test/?k=${KEY_PH}` } }
+    ])
   })
 
   it.each(['addListItem', 'updateListItem'] as const)('%s masks list field values', async (name) => {
@@ -520,14 +634,14 @@ describe('executeTool masks Linear session tools', () => {
 })
 
 describe('guard: structural fields pass through while text fields are masked', () => {
-  it('addBookmark keeps a secret-shaped link untouched while masking the title', async () => {
+  it('addBookmark masks a secret-shaped link instead of leaving it untouched', async () => {
     const gw = fakeGateway({
       addBookmark: vi.fn(async (_c: string, spec: { title: string }) => ({ id: 'b1', title: spec.title }))
     })
     const deps = makeDeps({ gatewayFor: () => gw })
     await executeTool(ctx, 'addBookmark', { channel: 'C1', title: `leak ${API_KEY}`, link: API_KEY }, deps)
-    // The link (a URL) equals the secret and passes through; the title is masked.
-    expect(gw.addBookmark).toHaveBeenCalledWith('C1', { title: `leak ${KEY_PH}`, link: API_KEY })
+    // The link equals the secret and is masked (URL keys are no longer pass-through); the title too.
+    expect(gw.addBookmark).toHaveBeenCalledWith('C1', { title: `leak ${KEY_PH}`, link: KEY_PH })
   })
 })
 

@@ -210,4 +210,46 @@ describe('MCP tool masking through the real daemon wiring', () => {
       await h.close()
     }
   })
+
+  it('masks a secret in the shareFile upload display name at the readWorkspaceImage source', async () => {
+    const root = scaffold()
+    const ws = join(root, 'agents', AGENT, 'workspace')
+    mkdirSync(ws, { recursive: true })
+    writeFileSync(
+      join(ws, `${API_KEY}.png`),
+      Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('data')])
+    )
+    const daemon: Daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root })
+    try {
+      await daemon.start()
+      ;(daemon as any).modelProviderSecrets.set(
+        agentHostKey(AGENT),
+        maskableSecrets({
+          runtimeOverrides: {
+            secrets: [
+              { name: 'MODEL_API_KEY', value: API_KEY },
+              { name: 'MODEL_HEADER_x-workspace', value: HEADER }
+            ]
+          }
+        })
+      )
+      const ctx: SessionContext = {
+        agentId: AGENT,
+        platform: 'slack',
+        integrationId: INT,
+        isDm: false,
+        channel: 'C1',
+        thread: 'T1',
+        deliveryThread: 'T1',
+        tools: []
+      }
+      const read = await (daemon as any).mcp.deps.readWorkspaceImage(ctx, `${API_KEY}.png`)
+      expect(read.ok).toBe(true)
+      expect(read.name).toBe(`${KEY_PH}.png`)
+      expect(read.name).not.toContain(API_KEY)
+    } finally {
+      await daemon.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

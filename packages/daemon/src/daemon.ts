@@ -4223,6 +4223,8 @@ export class Daemon {
       appTool: (ctx, name, args) => this.runAppTool(ctx, name, args),
       // Every dispatched MCP tool's arguments are masked before any handler sees them.
       maskAgentSecrets: (agentId, args) => this.maskAgentToolArgs(agentId, args),
+      // shareFile's user-visible display text (file name / provenance marker).
+      maskAgentText: (agentId, text) => this.maskAgentSecrets(agentId, text),
       // Peer discovery goes to the CP (the only authority for the cross-daemon
       // roster). Resolve the client lazily; fail closed when it isn't connected.
       channelAgents: async ({ currentChannel, currentThread, currentTransportScope, ...req }) => {
@@ -4529,8 +4531,11 @@ export class Daemon {
         }
         const ext = sniffed === 'image/png' ? 'png' : sniffed === 'image/jpeg' ? 'jpg' : 'webp'
         const stem = basename(rel).replace(/\.[A-Za-z0-9]+$/, '') || 'image'
+        // The outbound DISPLAY name (never the fs read) is masked: the model-chosen
+        // path can carry a secret, and the name is what the platform renders to users.
+        const name = this.maskAgentSecrets(ctx.agentId, `${stem}.${ext}`)
         const sha256 = createHash('sha256').update(bytes).digest('hex')
-        return { ok: true, bytes, name: `${stem}.${ext}`, mimeType: sniffed, sha256 }
+        return { ok: true, bytes, name, mimeType: sniffed, sha256 }
       },
       // A console turn's image is bounded by the image-processing limit, not the IM per-file cap (webchat-generated-images.md §5).
       readWorkspaceSharedImage: async (ctx, rel) => {
@@ -17139,6 +17144,9 @@ export class Daemon {
     // ONE egress lookup, so the leased client is the one the surface writes through.
     const egressConn = this.platformTurnEgress.get(msg.platform)?.(plan.integrationId)
     const run: TurnRun = { entry, key, plan, agent, replyConn, ...(egressConn ? { egressConn } : {}), evaluation }
+    // Snapshot the mask entries once, before the host can exit and drop its BYOK
+    // provider secrets — the webchat held-text flush and the turn final both use it.
+    const maskEntries = this.maskEntriesFor(agentId)
     // Startup notices and replies share the queue entry's index and terminal fence from before openSession.
     const pendingWebchat = webchat
       ? Object.assign(webchat, {
@@ -17146,7 +17154,7 @@ export class Daemon {
           replyText: '',
           replySegments: [],
           heldText: '',
-          maskText: (text: string) => this.maskAgentSecrets(agentId, text),
+          maskText: (text: string) => this.maskAgentSecretsIn(agentId, text, maskEntries),
           heldTextOffset: 0,
           messageId: undefined,
           messageEmitted: false
@@ -17261,7 +17269,8 @@ export class Daemon {
       sessionId,
       outwardSessionId,
       resolveFileLink,
-      webchat: pendingWebchat
+      webchat: pendingWebchat,
+      maskEntries
     })
     // Every turn re-stashes the stored title (fallback or runtime): the connection dedupes
     // repeats, and re-pushing heals a rename lost to a restart or an unregistered thread.
@@ -18177,6 +18186,7 @@ export class Daemon {
       outwardSessionId: string
       resolveFileLink?: WorkspaceFileLinkResolver
       webchat: Pending['webchat']
+      maskEntries: SecretMaskEntry[]
     }
   ): Pending {
     const { entry, plan } = run
@@ -18219,7 +18229,7 @@ export class Daemon {
       outwardSessionId,
       // Snapshot the agent's mask entries now: a host released mid-flush drops the BYOK entries,
       // and the final-mask paths below must still see them.
-      maskEntries: this.maskEntriesFor(agentId),
+      maskEntries: turn.maskEntries,
       ...(turn.resolveFileLink ? { resolveFileLink: turn.resolveFileLink } : {}),
       ...(entry.selectedHost ? { selectedHost: entry.selectedHost } : {}),
       turnState: plan.turnSurface.initialTurnState({

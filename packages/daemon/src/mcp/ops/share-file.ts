@@ -68,6 +68,11 @@ export type SharedImageReadResult =
   | { ok: false; reason: 'sandboxed' | 'not-found' | 'escape' | 'too-large'; detail?: string }
 
 export interface ShareFileDeps extends GatewayDeps {
+  /** Mask one agent's write-only secrets out of a USER-VISIBLE string (a file
+   *  display name or provenance marker), never the fs/API path used to read the
+   *  file. Wired to the daemon's per-agent mask; optional so the pure handler
+   *  stays daemon-free in tests. */
+  maskAgentText?: (agentId: string, text: string) => string
   /** The active turn's webchat publisher (webchat-generated-images.md §4); `unsupported` when its console cannot show cards. */
   webchatImagePublisherFor?: (
     ctx: SessionContext
@@ -103,6 +108,12 @@ export interface ShareFileDeps extends GatewayDeps {
  *  bare Telegram `@username` — the tool description says so instead of promising it away. */
 export function escapeCaptionMentions(caption: string): string {
   return caption.replace(/<(?=[@#!]|at[\s>])/gi, '<\u200b').replace(/@(everyone|here)\b/gi, '@\u200b$1')
+}
+
+/** Mask USER-VISIBLE file text (a display name or provenance marker), never the
+ *  fs/API path the file was read from. No-op without the daemon mask. */
+function maskAgentText(deps: ShareFileDeps, ctx: SessionContext, text: string): string {
+  return deps.maskAgentText?.(ctx.agentId, text) ?? text
 }
 
 const READ_REFUSALS: Record<Exclude<ShareReadResult, { ok: true }>['reason'], (path: string, d?: string) => string> = {
@@ -173,7 +184,7 @@ export async function shareFile(
       const read = await deps.readWorkspaceSharedImage(ctx, path)
       if (!read.ok) throw new Error(READ_REFUSALS[read.reason](path, read.detail))
       const receipt = await publishWebchat({
-        path,
+        path: maskAgentText(deps, ctx, path),
         ...(caption ? { caption: escapeCaptionMentions(caption) } : {}),
         bytes: read.bytes,
         sha256: read.sha256
@@ -215,7 +226,7 @@ export async function shareFile(
     ? await uploader(read, escaped)
     : await gw!.uploadFile!(
         target.channel,
-        { bytes: read.bytes, name: read.name, mimeType: read.mimeType },
+        { bytes: read.bytes, name: maskAgentText(deps, ctx, read.name), mimeType: read.mimeType },
         escaped,
         {
           ...(target.thread !== undefined ? { thread: target.thread } : {}),
@@ -236,7 +247,7 @@ export async function shareFile(
 
   // Provenance (docs §4): the model-chosen path plus what was ACTUALLY published — sniffed
   // type, size, digest — and the bytes for console replay when they fit the transcript cap.
-  const marker = `[shared: ${path} (${read.mimeType}, ${read.bytes.byteLength} bytes, sha256:${read.sha256.slice(0, 16)})]`
+  const marker = `[shared: ${maskAgentText(deps, ctx, path)} (${read.mimeType}, ${read.bytes.byteLength} bytes, sha256:${read.sha256.slice(0, 16)})]`
   const ts = outcome.messageId ?? `local-${deps.now()}`
   // The image is already in the conversation past this point, so a store failure must NOT
   // read as a failed share — a thrown error here would invite the double-posting retry the
