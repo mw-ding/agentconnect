@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { KanbanOrchestrate } from '@agentconnect.md/protocol'
 import { cardIdempotencyKey } from './card-key.js'
 import { KanbanOrchestrator, type KanbanOrchestratorDeps } from './orchestrator.js'
-import type { CardStore, KanbanRepoRef, CardIssue } from './card-store.js'
+import type { KanbanRepoRef, CardIssue } from './card-store.js'
 import type { OrgId } from '../domain/ids.js'
 
 const ORG = 'org' as OrgId

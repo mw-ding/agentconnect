@@ -166,10 +166,12 @@ import {
   ASSISTANT_SUBSESSION_HANDLERS,
   type AssistantSubsessionDeps
 } from './ops/assistant-subsessions.js'
-import { KANBAN_ARG_SCHEMAS, KANBAN_HANDLERS, type KanbanDeps } from './ops/kanban.js'
 import {
+  KANBAN_ARG_SCHEMAS,
+  KANBAN_HANDLERS,
   KANBAN_ORCHESTRATOR_ARG_SCHEMAS,
   KANBAN_ORCHESTRATOR_HANDLERS,
+  type KanbanDeps,
   type KanbanOrchestratorToolDeps
 } from './ops/kanban.js'
 
