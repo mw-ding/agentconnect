@@ -8159,6 +8159,8 @@ export interface KanbanCardUpsertInput {
   /** The agent that filed it, when an orchestrator did. */
   actorAgentId?: string | null
   humanAuthority?: KanbanHumanAuthority | null
+  /** Create-only: the newest status event an import honored, so label sync never re-reads it as a new human request. */
+  syncEventCursor?: bigint
 }
 
 export interface KanbanCardUpsertResult {

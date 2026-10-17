@@ -74,6 +74,14 @@ export interface CardStore {
   ): Promise<void>
 }
 
+/** The issue's event history runs past the page bound, so nothing on it can be attributed; sync defers, then fails closed. */
+export class KanbanEventHistoryBoundError extends Error {
+  constructor() {
+    super('kanban: issue events run past the page bound')
+    this.name = 'KanbanEventHistoryBoundError'
+  }
+}
+
 /** Called after a label POST returns success, before any later write in the same plan. */
 export type LabelWriteObserver = (label: string) => void | Promise<void>
 
@@ -282,7 +290,7 @@ export class GithubCardStore implements CardStore {
 
   async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {
     const events = await this.recentEvents(repo, issueNumber, () => false)
-    if (!events) throw new Error('kanban: issue events run past the page bound')
+    if (!events) throw new KanbanEventHistoryBoundError()
     // Keep attribution fields only: a `renamed` event would otherwise carry the issue title.
     return events
       .map((e) => ({

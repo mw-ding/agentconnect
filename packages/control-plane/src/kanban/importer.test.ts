@@ -458,15 +458,50 @@ describe('Kanban import labeled-doorbell sender', () => {
 // with the remove and the re-add both invisible, the visible history still credits the writer's old add.
 describe('vera-r2: sender-less labeled doorbell', () => {
   const levels: Levels = { alice: 'write', bob: 'write', mallory: 'triage' }
-  it('vera-r2: 3 imports a live managed label named by a sender-less labeled doorbell as triage, never ready', async () => {
+  it.each([
+    ['neither sender nor label', { action: 'labeled' }],
+    ['a live status label but no sender', { action: 'labeled', label: 'ac/status:ready' }],
+    ['a live agent label but no sender', { action: 'labeled', label: 'ac/agent:worker' }]
+  ])('vera-r2: 3 imports a labeled doorbell naming %s as unassigned triage, never ready', async (_name, doorbell) => {
     const h = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, [
       ...labeled('ac/status:ready', 'bob'),
       ...labeled('ac/agent:worker', 'bob')
     ])
-    const imported = await h.importer.import(board, repo, 1, { action: 'labeled' }).catch(() => false)
-    if (imported) expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
-    expect(h.cards.upsertCard.mock.calls.some(([input]) => (input as { status?: string }).status === 'ready')).toBe(
-      false
-    )
+    expect(await h.importer.import(board, repo, 1, doorbell)).toBe(true)
+    expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+    expect(upserted(h)).not.toHaveProperty('humanAuthority')
+  })
+
+  it('keeps importing ready for a sender-less doorbell whose label is not a live managed one, or a non-label action', async () => {
+    for (const doorbell of [
+      { action: 'labeled', label: 'bug' },
+      { action: 'labeled', label: 'ac/status:blocked' },
+      { action: 'opened' }
+    ]) {
+      const h = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, [
+        ...labeled('ac/status:ready', 'bob'),
+        ...labeled('ac/agent:worker', 'bob')
+      ])
+      expect(await h.importer.import(board, repo, 1, doorbell)).toBe(true)
+      expect(upserted(h)).toMatchObject({ status: 'ready', assigneeAgentId: 'agent' })
+    }
+  })
+})
+
+// The status edits an import honors are consumed, so the first CP transition's projection never treats them as new.
+describe('Kanban import sync cursor', () => {
+  it('records the newest status event it attributed, and none for a triage import', async () => {
+    const events = [...labeled('ac/status:todo', 'bob'), ...labeled('ac/status:ready', 'bob')]
+    const kept = harness(issue(['ac/status:ready']), { alice: 'write', bob: 'write' }, [
+      { id: events[0]!.id, event: 'labeled', label: { name: 'ac/status:todo' }, actor: user('bob') },
+      { id: events[0]!.id + 1, event: 'unlabeled', label: { name: 'ac/status:todo' }, actor: user('bob') },
+      { ...events[1]!, id: events[0]!.id + 2 }
+    ])
+    expect(await kept.importer.import(board, repo, 1)).toBe(true)
+    expect(upserted(kept)).toMatchObject({ status: 'ready', syncEventCursor: BigInt(events[0]!.id + 2) })
+    const triage = harness(issue(['ac/status:ready']), { alice: 'write', bob: 'triage' })
+    expect(await triage.importer.import(board, repo, 1)).toBe(true)
+    expect(upserted(triage)).toMatchObject({ status: 'triage' })
+    expect(upserted(triage)).not.toHaveProperty('syncEventCursor')
   })
 })

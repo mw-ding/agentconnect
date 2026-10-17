@@ -3,7 +3,7 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import type { KanbanLeaseRef } from '../ports.js'
 import type { GitHubActor, KanbanSyncRepo, SyncCard } from '../../kanban/sync.js'
-import { isKanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
+import { isKanbanStatus, type KanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
 import { auditCardTransition } from '../../kanban/audit.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
 
@@ -154,16 +154,65 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     return this.get(card.boardId, card.issueNumber)
   }
 
-  async failClosed(card: SyncCard): Promise<boolean> {
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: card.id },
-      data: {
-        needsAttention: true,
-        attentionReason: 'label_attribution_timeout',
-        syncDeferredAt: null,
-        syncDeferralCount: 0
+  failClosed(card: SyncCard): Promise<{ status: KanbanStatus; revoked: KanbanLeaseRef | null } | null> {
+    return withAmbientTx(this.db, async (tx) => {
+      const [locked] = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT "id" FROM "kanban_card" WHERE "id" = ${card.id}::uuid FOR UPDATE
+      `)
+      if (!locked) return null
+      const current = await tx.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
+      if (
+        current.stateRevision !== card.stateRevision ||
+        current.dispatchRevision !== card.dispatchRevision ||
+        current.promotionPending ||
+        !isKanbanStatus(current.status)
+      )
+        return null
+      // Only a dispatchable card moves: triage is never claimed, and every other status already needs a human to run.
+      const from = current.status
+      const to: KanbanStatus = from === 'ready' || from === 'running' ? 'triage' : from
+      const run = to !== from ? await tx.kanbanRun.findFirst({ where: { cardId: card.id, endedAt: null } }) : null
+      let revoked: KanbanLeaseRef | null = null
+      if (run) {
+        await tx.kanbanRun.update({
+          where: { id: run.id },
+          data: { endedAt: new Date(), outcome: 'reclaimed', reasonCode: 'label_attribution_timeout' }
+        })
+        revoked = {
+          runId: run.id,
+          leaseId: run.leaseId,
+          agentId: run.agentId,
+          daemonId: run.daemonId,
+          dispatchRevision: run.dispatchRevision
+        }
       }
+      await tx.kanbanCard.update({
+        where: { id: card.id },
+        data: {
+          ...(to !== from
+            ? {
+                status: to,
+                stateRevision: { increment: 1 },
+                cooldownUntil: null,
+                blockKind: null,
+                labelWritePending: true
+              }
+            : {}),
+          ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
+          needsAttention: true,
+          attentionReason: 'label_attribution_timeout',
+          syncDeferredAt: null,
+          syncDeferralCount: 0
+        }
+      })
+      await auditCardTransition(tx, {
+        cardId: card.id,
+        from,
+        to,
+        source: 'label_attribution_timeout',
+        ...(revoked ? { leaseId: revoked.leaseId } : {})
+      })
+      return { status: to, revoked }
     })
-    return count === 1
   }
 }

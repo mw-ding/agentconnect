@@ -466,6 +466,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
               status,
               assigneeAgentId: input.assigneeAgentId ?? null,
               priority: input.priority ?? 0,
+              syncEventCursor: input.syncEventCursor ?? 0n,
               // Never from the input, even a cast one: only setCardMode (audited, revisioned) sets an override.
               mode: null
             }

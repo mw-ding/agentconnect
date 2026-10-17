@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { KanbanSync, type SyncCard, type KanbanSyncDeps } from './sync.js'
 import { KANBAN_STATUSES, canTransition, LEASED_HUMAN_STATUSES, planLabelReconcile } from './card-state.js'
-import type { CardIssue, LabelEvent } from './card-store.js'
+import { KanbanEventHistoryBoundError, type CardIssue, type LabelEvent } from './card-store.js'
 import type { RepoPermissionLevel } from '../github/repo-permission.js'
 
 const target = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
@@ -79,8 +79,10 @@ function fixture(overrides: Partial<SyncCard> = {}) {
         return { ...card }
       }),
       failClosed: vi.fn(async (_c) => {
-        card = { ...card, needsAttention: true }
-        return true
+        const status = card.status === 'ready' || card.status === 'running' ? 'triage' : card.status
+        const revoked = status !== card.status ? card.lease : null
+        card = { ...card, status, needsAttention: true, syncDeferredAt: null, syncDeferralCount: 0, lease: null }
+        return { status, revoked }
       })
     },
     cards: {
@@ -661,6 +663,46 @@ describe('vera-r2: attribution holes', () => {
     await f.sync.onCardChanged('board', 1, true)
     expect(f.card().status).not.toBe('ready')
     expect(lookedUp(f, 'mallory')).toBe(true)
+    // Mallory's label is refused on its own add: reverted with the refusal comment, and the audit names her.
+    expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'mallory', id: 7 })
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      removeLabels: ['ac/status:ready'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+  })
+
+  it("vera-r2: 1a a writer's reopen adopts a writer's own live status label", async () => {
+    const f = fixture({ status: 'done', syncEventCursor: 100n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready']
+    f.events.splice(
+      0,
+      f.events.length,
+      stateEvent(99, 'closed', bob),
+      labelEvent(100, 'labeled', 'ac/status:done', bob),
+      labelEvent(101, 'unlabeled', 'ac/status:done', bob),
+      labelEvent(102, 'labeled', 'ac/status:ready', bob),
+      stateEvent(103, 'reopened', bob)
+    )
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card()).toMatchObject({ status: 'ready', syncEventCursor: 103n })
+  })
+
+  it("vera-r2: 1a a writer's reopen never adopts a live label a non-writer added before the cursor", async () => {
+    const f = fixture({ status: 'done', syncEventCursor: 100n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:ready', 'ac/agent:x']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(98, 'labeled', 'ac/status:ready', mallory),
+      labelEvent(99, 'labeled', 'ac/agent:x', bob),
+      stateEvent(103, 'reopened', bob)
+    )
+    // The reopen judges the label it would adopt even below the cursor: mallory's add is refused, not adopted on bob's reopen.
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('done')
+    expect(lookedUp(f, 'mallory')).toBe(true)
   })
 
   it('vera-r2: 1b the re-read after a reassignment re-judges a status swap made meanwhile', async () => {
@@ -749,22 +791,53 @@ describe('vera-r2: attribution holes', () => {
     const f = fixture({ status: 'running', syncEventCursor: 104n, lease })
     vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
     f.issue.labels = ['ac/status:running']
+    const at = (minute: number) => `2026-10-17T00:0${minute}:00Z`
     f.events.splice(
       0,
       f.events.length,
-      labelEvent(100, 'labeled', 'ac/status:running', bob),
-      labelEvent(101, 'unlabeled', 'ac/status:running', mallory),
-      labelEvent(102, 'labeled', 'ac/status:running', mallory),
-      labelEvent(103, 'unlabeled', 'ac/status:running', bob),
-      labelEvent(104, 'labeled', 'ac/status:running', bob)
+      { ...labelEvent(100, 'labeled', 'ac/status:running', bob), created_at: at(0) },
+      { ...labelEvent(101, 'unlabeled', 'ac/status:running', mallory), created_at: at(1) },
+      { ...labelEvent(102, 'labeled', 'ac/status:running', mallory), created_at: at(1) },
+      { ...labelEvent(103, 'unlabeled', 'ac/status:running', bob), created_at: at(2) },
+      { ...labelEvent(104, 'labeled', 'ac/status:running', bob), created_at: at(2) }
     )
+    // Mallory's doorbell, late or redelivered, carries her edit's time; bob's re-add is visibly newer.
     await f.sync.onCardChanged('board', 1, true, {
       action: 'labeled',
       sender: { login: 'mallory', id: 7, type: 'User' },
-      label: 'ac/status:running'
+      label: 'ac/status:running',
+      at: '2026-10-17T00:01:00.000Z'
     })
     expect(f.card().status).toBe('running')
     expect(f.deps.revoke).not.toHaveBeenCalled()
+  })
+
+  it('vera-r2: 4 a non-writer doorbell newer than every visible event is still refused', async () => {
+    const f = fixture({ status: 'running', syncEventCursor: 104n, lease })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:running']
+    f.events.splice(
+      0,
+      f.events.length,
+      { ...labelEvent(102, 'labeled', 'ac/status:running', mallory), created_at: '2026-10-17T00:01:00Z' },
+      { ...labelEvent(103, 'unlabeled', 'ac/status:running', bob), created_at: '2026-10-17T00:02:00Z' },
+      { ...labelEvent(104, 'labeled', 'ac/status:running', bob), created_at: '2026-10-17T00:02:00Z' }
+    )
+    // Mallory's invisible remove+re-add after bob's: her older visible add must not make this doorbell look stale.
+    for (const stamp of ['2026-10-17T00:03:00.000Z', '2026-10-17T00:02:04.000Z', undefined]) {
+      const g = fixture({ status: 'running', syncEventCursor: 104n, lease })
+      vi.mocked(g.deps.permissions.permission).mockImplementation(permissions)
+      g.issue.labels = f.issue.labels
+      g.events.splice(0, g.events.length, ...f.events)
+      await g.sync.onCardChanged('board', 1, true, {
+        action: 'labeled',
+        sender: { login: 'mallory', id: 7, type: 'User' },
+        label: 'ac/status:running',
+        ...(stamp ? { at: stamp } : {})
+      })
+      expect(g.card().status).toBe('triage')
+      expect(g.deps.revoke).toHaveBeenCalledWith(expect.objectContaining({ leaseId: 'lease' }), 'card')
+    }
   })
 
   it('vera-r2: 5 the deferral bound fails closed to triage, not the kept dispatchable status', async () => {
@@ -776,7 +849,13 @@ describe('vera-r2: attribution holes', () => {
     f.events.splice(0, f.events.length, labelEvent(40, 'labeled', 'ac/status:ready', bob))
     await f.sync.onCardChanged('board', 1, true)
     expect(f.deps.repo.failClosed).toHaveBeenCalled()
-    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({ status: 'triage' })
+    expect(f.card()).toMatchObject({ status: 'triage', needsAttention: true })
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      status: 'triage',
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:blocked'],
+      comment: expect.stringContaining('held for a human at `ac/status:triage`')
+    })
   })
 
   it('vera-r2: 6 the fail-closed comment is posted once, not again on later doorbells', async () => {
@@ -784,9 +863,9 @@ describe('vera-r2: attribution holes', () => {
     let now = new Date(start.getTime() + 11 * 60_000)
     const f = fixture({ status: 'blocked', syncEventCursor: 40n, syncDeferredAt: start, syncDeferralCount: 3 })
     f.deps.now = () => now
-    vi.mocked(f.deps.repo.failClosed).mockImplementation(async () => {
+    vi.mocked(f.deps.repo.failClosed).mockImplementation(async (c) => {
       Object.assign(f.card(), { needsAttention: true, syncDeferredAt: null, syncDeferralCount: 0 })
-      return true
+      return { status: c.status, revoked: null }
     })
     vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
     f.issue.labels = ['ac/status:todo']
@@ -805,11 +884,12 @@ describe('vera-r2: attribution holes', () => {
     let now = start
     const f = fixture({ status: 'ready', syncEventCursor: 40n })
     f.deps.now = () => now
-    vi.mocked(f.deps.store.readLabelEvents).mockRejectedValue(new Error('kanban: issue events run past the page bound'))
+    vi.mocked(f.deps.store.readLabelEvents).mockRejectedValue(new KanbanEventHistoryBoundError())
     await f.sync.onCardChanged('board', 1, true).catch(() => {})
     expect(f.deps.repo.defer).toHaveBeenCalled()
     now = new Date(start.getTime() + 11 * 60_000)
     await f.sync.onCardChanged('board', 1, true).catch(() => {})
     expect(f.deps.repo.failClosed).toHaveBeenCalled()
+    expect(f.card()).toMatchObject({ status: 'triage', needsAttention: true })
   })
 })

@@ -15,6 +15,7 @@ import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import {
   isAppActor,
   isHumanActor,
+  latestManagedEdits,
   type CardIssue,
   type CardStore,
   type KanbanRepoRef,
@@ -95,6 +96,8 @@ export class KanbanImporter {
       status,
       assigneeAgentId,
       source: 'import',
+      // The status edits this import honored are consumed, so sync never re-reads them as a new human request.
+      ...(authority ? { syncEventCursor: BigInt(latestManagedEdits(authority.events).status?.id ?? 0) } : {}),
       ...(kept ? { humanAuthority: authority.human } : {})
     })
     return true
@@ -170,11 +173,18 @@ export class KanbanImporter {
     writer: (login: string | null | undefined) => Promise<WriteCheck>
   ): Promise<boolean> {
     const { sender, label } = doorbell
-    if (doorbell.action !== 'labeled' || !sender || !label) return true
+    if (doorbell.action !== 'labeled') return true
     const key = `${board.id}#${issueNumber}`
+    // A relay that has not rolled yet names no label or sender: the edit it rang for cannot be placed, so it fails closed.
+    if (!label) return false
     const managed = isStatusLabel(label) || label.toLowerCase().startsWith(AGENT_LABEL_PREFIX)
     const live = issue.labels.some((name) => name.toLowerCase() === label.toLowerCase())
-    if (!managed || !live || doorbellAddVisible(events, label, sender)) {
+    if (!managed || !live) {
+      this.lagging.delete(key)
+      return true
+    }
+    if (!sender) return false
+    if (doorbellAddVisible(events, label, sender)) {
       this.lagging.delete(key)
       return true
     }

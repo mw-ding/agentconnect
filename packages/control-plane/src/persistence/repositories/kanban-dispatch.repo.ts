@@ -156,6 +156,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               : Prisma.empty
           }
           AND NOT c."promotionPending"
+          AND NOT c."needsAttention"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
         ORDER BY c."priority" DESC, c."createdAt" ASC, c."id" ASC

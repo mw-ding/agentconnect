@@ -257,7 +257,8 @@ describe('issue import doorbells (Postgres)', () => {
           login === 'tim' ? 'triage' : 'write'
       }
     })
-    expect(await importer.import({ ...board, orgId: OrgId(board.orgId) }, repo, 1, { action: 'labeled' })).toBe(true)
+    // An opening doorbell: a sender-less `labeled` one now fails closed on its own (vera-r2 3 below).
+    expect(await importer.import({ ...board, orgId: OrgId(board.orgId) }, repo, 1, { action: 'opened' })).toBe(true)
     expect(await prisma.kanbanCard.findMany({ where: { boardId: board.id } })).toEqual([
       expect.objectContaining({ status, assigneeAgentId: assigned ? agent : null, mode: null })
     ])

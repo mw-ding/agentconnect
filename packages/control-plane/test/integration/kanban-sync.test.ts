@@ -4,6 +4,8 @@ import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync
 import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanSync } from '../../src/kanban/sync.js'
+import { KanbanImporter } from '../../src/kanban/importer.js'
+import { OrgId } from '../../src/domain/ids.js'
 import { planLabelReconcile, planStatusWrite, type LabelPlan } from '../../src/kanban/card-state.js'
 import type { CardIssue, LabelEvent } from '../../src/kanban/card-store.js'
 import { prisma } from '../setup.db.js'
@@ -183,13 +185,66 @@ describe('Kanban synchronization transactions (Postgres)', () => {
     const deferred = await f.repo.defer(snapshot, new Date())
     expect(deferred).toMatchObject({ syncDeferralCount: 1 })
     expect(deferred?.syncDeferredAt).toBeInstanceOf(Date)
-    expect(await f.repo.failClosed((await f.repo.get(f.board.id, 1))!)).toBe(true)
+    // A non-dispatchable card keeps its status: it is only flagged, so nothing moves and nothing is audited.
+    expect(await f.repo.failClosed((await f.repo.get(f.board.id, 1))!)).toEqual({ status: 'todo', revoked: null })
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      status: 'todo',
+      stateRevision: f.card.stateRevision,
       needsAttention: true,
       attentionReason: 'label_attribution_timeout',
       syncDeferredAt: null,
       syncDeferralCount: 0
     })
+    expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(0)
+  })
+
+  it('fails a leased running card closed to triage: lease ended, generation bumped, audited, a claim never takes it', async () => {
+    const f = await fixture(true)
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    await f.repo.defer(snapshot, new Date())
+    const failed = await f.repo.failClosed((await f.repo.get(f.board.id, 1))!)
+    expect(failed).toEqual({ status: 'triage', revoked: expect.objectContaining({ leaseId: f.run!.leaseId }) })
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      status: 'triage',
+      stateRevision: f.card.stateRevision + 1n,
+      dispatchRevision: f.card.dispatchRevision + 1n,
+      labelWritePending: true,
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout'
+    })
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: f.run!.id } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'label_attribution_timeout',
+      endedAt: expect.any(Date)
+    })
+    const [audit] = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
+    expect(audit!.details).toMatchObject({
+      from: 'running',
+      to: 'triage',
+      source: 'label_attribution_timeout',
+      leaseId: f.run!.leaseId
+    })
+    // A stale snapshot (the generation moved) does not fail the card closed twice.
+    expect(await f.repo.failClosed(snapshot)).toBeNull()
+  })
+
+  it('a claim neither takes nor clears a needsAttention card, even one left ready', async () => {
+    const f = await fixture()
+    await prisma.kanbanCard.update({
+      where: { id: f.card.id },
+      data: { status: 'ready', needsAttention: true, attentionReason: 'label_attribution_timeout' }
+    })
+    const claim = () =>
+      new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+    expect(await claim()).toHaveLength(0)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      status: 'ready',
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout'
+    })
+    // The same card without the flag is claimable, so the flag alone is what holds it.
+    await prisma.kanbanCard.update({ where: { id: f.card.id }, data: { needsAttention: false } })
+    expect(await claim()).toHaveLength(1)
   })
 
   it('a settled apply clears a prior deferral bound', async () => {
@@ -690,6 +745,73 @@ describe('vera-r2: KanbanSync over Postgres', () => {
     expect(f.writes.some((w) => w.removeLabels.includes('ac/status:ready'))).toBe(false)
     await sync.onCardChanged(f.board.id, 1, true)
     expect((await f.read()).status).toBe('ready')
+  })
+
+  it("an imported writer's ready is consumed: claim, then projectStatus projects running without deferring (PG)", async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON, name: 'worker' })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'import', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const state = {
+      issue: {
+        issueId: 1n,
+        nodeId: 'I_1',
+        number: 1,
+        state: 'open',
+        labels: ['ac/status:ready', 'ac/agent:worker'],
+        authorLogin: 'bob',
+        authorType: 'User',
+        authorViaGithubApp: false
+      } as CardIssue,
+      events: [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob },
+        { id: 11, event: 'labeled', label: { name: 'ac/agent:worker' }, actor: bob }
+      ] as LabelEvent[]
+    }
+    const writes: LabelPlan[] = []
+    const store = {
+      readCard: async () => state.issue,
+      readLabelEvents: async () => [...state.events],
+      applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+        writes.push(plan)
+      }
+    }
+    const permissions = { permission: async () => 'write' as const }
+    const ref = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
+    const importer = new KanbanImporter({
+      cards: new PgKanbanCardRepo(prisma),
+      store,
+      permissions,
+      appSlug: 'agentconnect'
+    })
+    expect(await importer.import({ ...board, orgId: OrgId(board.orgId) }, ref, 1, { action: 'opened' })).toBe(true)
+    expect(await prisma.kanbanCard.findFirstOrThrow({ where: { boardId: board.id } })).toMatchObject({
+      status: 'ready',
+      syncEventCursor: 10n
+    })
+    const leases = await new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    expect(leases).toHaveLength(1)
+    const sync = new KanbanSync({
+      repo: new PgKanbanSyncRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      store,
+      permissions,
+      appSlug: 'agentconnect',
+      repoRef: async () => ref,
+      revoke: async () => {},
+      promote: async () => {},
+      log: { warn: () => {} }
+    })
+    await sync.projectStatus(board.id, 1, 'running')
+    expect(await prisma.kanbanCard.findFirstOrThrow({ where: { boardId: board.id } })).toMatchObject({
+      status: 'running',
+      labelWritePending: false,
+      syncDeferredAt: null,
+      syncDeferralCount: 0
+    })
+    expect(writes.at(-1)).toMatchObject({ addLabels: ['ac/status:running'], removeLabels: ['ac/status:ready'] })
+    expect(writes.at(-1)!.comment).toBeUndefined()
   })
 
   it('vera-r2: 5 the deferral bound fails closed to triage and a claim neither takes it nor clears the flag (PG)', async () => {
