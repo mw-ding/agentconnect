@@ -1069,7 +1069,7 @@ export function githubGraphDoorbell(
 const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string> = new Set(KANBAN_ISSUE_ACTIONS)
 const KANBAN_STATUS_LABEL_PREFIX = 'ac/status:'
 
-// Issue creation and transfer also ring so a status-labeled issue can be imported without waiting for another edit.
+/** Reduce human creation, transfer, status relabel, or close/reopen to a body-free Kanban doorbell. */
 export function githubIssueDoorbell(
   event: string,
   payload: GithubPayload,

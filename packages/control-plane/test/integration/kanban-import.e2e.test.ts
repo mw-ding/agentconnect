@@ -3,7 +3,7 @@ import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanImporter } from '../../src/kanban/importer.js'
 import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
-import { GithubRepoPermission } from '../../src/github/repo-permission.js'
+import { GithubRepoPermission, hasWriteAccess } from '../../src/github/repo-permission.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/index.js'
 import { prisma } from '../setup.db.js'
 import {
@@ -43,7 +43,7 @@ describe.skipIf(!enabled)('Kanban import E2E (live GitHub)', () => {
       const store = new GithubCardStore({ tokens })
       const live = new GithubRepoPermission({ tokens, ttlMs: 0 })
       expect(await live.permission(repoRef, 'mw-ding')).toBe('admin')
-      if (level === 'read') expect(await live.permission(repoRef, 'octocat')).toBe('none')
+      if (level === 'read') expect(hasWriteAccess(await live.permission(repoRef, 'octocat'))).toBe(false)
       const permission = vi.fn((r: typeof repoRef, login: string) =>
         level === 'read' ? Promise.resolve('read' as const) : live.permission(r, login)
       )

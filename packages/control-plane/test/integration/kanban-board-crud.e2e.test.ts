@@ -23,7 +23,15 @@ describe.skipIf(!enabled)('Kanban board CRUD E2E (live GitHub)', () => {
   it('creates, lists, reads, updates and deletes an authorized live-repository board', async () => {
     const started = Date.now()
     const issue = await createIssue(issues, 'board CRUD', [])
-    await prisma.githubInstallation.create({ data: { orgId: DEFAULT_ORG_ID, installationId: 1n, accountLogin: 'mw-ding', accountType: 'User', repositorySelection: 'selected' } })
+    await prisma.githubInstallation.create({
+      data: {
+        orgId: DEFAULT_ORG_ID,
+        installationId: 1n,
+        accountLogin: 'mw-ding',
+        accountType: 'User',
+        repositorySelection: 'selected'
+      }
+    })
     const { app, close } = buildHttpApp(
       prisma,
       { OIDC_ISSUER: oidc.issuer, OIDC_AUDIENCE: oidc.audience },
@@ -32,11 +40,21 @@ describe.skipIf(!enabled)('Kanban board CRUD E2E (live GitHub)', () => {
       {
         kanbanRepoResolver: githubKanbanRepoResolver({
           installations: new PgGithubInstallationRepo(prisma),
-          github: { repoRefFor: async (_ins, owner, name) => {
-            const repo = await gh<{ id: number; full_name: string; private: boolean; default_branch: string }>('GET', `/repos/${owner}/${name}`)
-            expect(BigInt(repo.id)).toBe(REPO_ID)
-            return { repoId: BigInt(repo.id), fullName: repo.full_name, private: repo.private, defaultBranch: repo.default_branch }
-          } }
+          github: {
+            repoRefFor: async (_ins, owner, name) => {
+              const repo = await gh<{ id: number; full_name: string; private: boolean; default_branch: string }>(
+                'GET',
+                `/repos/${owner}/${name}`
+              )
+              expect(BigInt(repo.id)).toBe(REPO_ID)
+              return {
+                repoId: BigInt(repo.id),
+                fullName: repo.full_name,
+                private: repo.private,
+                defaultBranch: repo.default_branch
+              }
+            }
+          }
         })
       }
     )
