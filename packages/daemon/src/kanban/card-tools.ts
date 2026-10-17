@@ -44,15 +44,24 @@ const SMALL_CAP_RE = new RegExp(`[${Object.keys(SMALL_CAP_FOLDS).join('')}]`, 'g
 
 // Detection-only normalization: the result feeds the sliding match below, while the returned lines stay the originals.
 function lineSkeleton(line: string): string {
-  return line
-    .replace(/\p{M}{31,}/gu, (run) => Array.from(run).slice(0, COMBINING_MARK_RUN_MAX).join(''))
-    .normalize('NFKC')
-    .replace(/[\p{Default_Ignorable_Code_Point}\u115F\u1160\u3164\uFFA0]/gu, '')
-    .normalize('NFKD')
-    .replace(/\p{M}/gu, '')
-    .replace(SMALL_CAP_RE, (c) => SMALL_CAP_FOLDS[c]!)
-    .toLowerCase()
-    .replace(/\P{L}/gu, '')
+  return (
+    line
+      // Halfwidth voiced/semi-voiced marks NFKC into combining U+3099/U+309A, so fold them first to join the run the cap collapses.
+      .replace(/\uFF9E/g, '\u3099')
+      .replace(/\uFF9F/g, '\u309A')
+      // Default-ignorable and filler chars are transparent to canonical reordering, so strip them before the cap or they would split a run it must see.
+      .replace(/[\p{Default_Ignorable_Code_Point}\u115F\u1160\u3164\uFFA0]/gu, '')
+      .replace(/\p{M}{31,}/gu, (run) => Array.from(run).slice(0, COMBINING_MARK_RUN_MAX).join(''))
+      .normalize('NFKC')
+      .replace(/[\p{Default_Ignorable_Code_Point}\u115F\u1160\u3164\uFFA0]/gu, '')
+      // Re-cap in case NFKC recombined into a fresh long run before NFKD reorders it.
+      .replace(/\p{M}{31,}/gu, (run) => Array.from(run).slice(0, COMBINING_MARK_RUN_MAX).join(''))
+      .normalize('NFKD')
+      .replace(/\p{M}/gu, '')
+      .replace(SMALL_CAP_RE, (c) => SMALL_CAP_FOLDS[c]!)
+      .toLowerCase()
+      .replace(/\P{L}/gu, '')
+  )
 }
 
 // First line whose range ends after `start`, by binary search over cumulative offsets.
@@ -92,7 +101,17 @@ export function neutralizeFenceMarkers(text: string): string {
       start = joined.indexOf(needle, start + 1)
     }
   }
-  return rawLines.map((line, i) => (removed.has(i) ? REMOVED_LINE : line)).join('\n')
+  // Collapse each run of consecutive removed lines to one placeholder so a marker split over many lines cannot inflate the block.
+  const out: string[] = []
+  for (let i = 0; i < rawLines.length; i++) {
+    if (!removed.has(i)) {
+      out.push(rawLines[i]!)
+      continue
+    }
+    out.push(REMOVED_LINE)
+    while (i + 1 < rawLines.length && removed.has(i + 1)) i++
+  }
+  return out.join('\n')
 }
 
 /** Last comments shown; older history stays on the issue. */
@@ -168,14 +187,23 @@ interface GhLinked {
   repository_url?: string
 }
 
+// Slice at a UTF-16 boundary so a surrogate pair straddling the cap is dropped whole rather than left as a lone surrogate.
+export const truncateUtf16Safe = (text: string, max: number): string => {
+  const value = text.slice(0, max)
+  const last = value.charCodeAt(value.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? value.slice(0, -1) : value
+}
+
 const cut = (text: string | null | undefined, max: number): string => {
-  const value = (text ?? '').slice(0, max).trim()
+  const value = truncateUtf16Safe(text ?? '', max).trim()
   return (text?.length ?? 0) > max ? `${value}… [truncated]` : value
 }
 
 // Truncate the whole neutralized block before the fences are added, so the closing END line is always present and last.
 const capContent = (content: string): string =>
-  content.length > KANBAN_SHOW_CONTENT_MAX ? `${content.slice(0, KANBAN_SHOW_CONTENT_MAX)}… [truncated]` : content
+  content.length > KANBAN_SHOW_CONTENT_MAX
+    ? `${truncateUtf16Safe(content, KANBAN_SHOW_CONTENT_MAX)}… [truncated]`
+    : content
 
 export class KanbanCardTools {
   constructor(private readonly deps: KanbanCardToolsDeps) {}
