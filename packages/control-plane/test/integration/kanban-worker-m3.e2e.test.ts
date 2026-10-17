@@ -494,7 +494,12 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
         expect(seen.show!.result.github).toContain('----- BEGIN UNTRUSTED EXTERNAL CONTENT')
         expect(seen.show!.result.github).toContain(`title: [kanban-e2e] m3 c show-comment ${started}`)
         // The END marker in the title is escaped and does not close the fence early.
-        expect(seen.show!.result.github).toContain(`\\${UNTRUSTED_CONTENT_END}`)
+        expect(seen.show!.result.github).toContain(
+          `title: [kanban-e2e] m3 c show-comment ${started} [escaped END-UNTRUSTED-EXTERNAL-CONTENT marker]`
+        )
+        expect(
+          (seen.show!.result.github as string).match(/(BEGIN|END)\s+UNTRUSTED\s+EXTERNAL\s+CONTENT/gi)
+        ).toHaveLength(2)
         expect(
           (seen.show!.result.github as string).split('\n').filter((line) => line === UNTRUSTED_CONTENT_END)
         ).toHaveLength(1)

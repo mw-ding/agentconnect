@@ -27136,7 +27136,7 @@ export class Daemon {
         'No Kanban card run holds this session (it was never dispatched, already ended, or was superseded), so there is no outcome to report.'
       )
     }
-    // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy, and the org model credential rides this mask too.
+    // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy.
     const terminal = this.maskAgentSecrets(req.agentId, req.terminal)
     const result = await this.kanban.recordTerminal(leaseId, terminal)
     if (!result.recorded) {

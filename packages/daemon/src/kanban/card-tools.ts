@@ -5,16 +5,24 @@ import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END } from '../messages/hook
 import type { KanbanLease } from './kanban-worker.js'
 import { KANBAN_PROGRESS_NOTE_CAP } from './kanban-worker.js'
 
-// The fence markers' case/whitespace/dash-tolerant core, matched anywhere: the delimiters are long fixed strings a hostile field can reproduce with different casing or padding.
-const FENCE_MARKER = /-{3,}\s*(BEGIN|END)\s+UNTRUSTED\s+EXTERNAL\s+CONTENT/gi
+// The fence phrase matched anywhere, with any dash run (ASCII or Unicode Pd) or none in front: a hostile field
+// need not copy the exact delimiter for a model to read it as the end of the fence.
+const FENCE_MARKER =
+  /(?:[-\p{Pd}]+[\s\p{Pd}]*)?\b(BEGIN|END)\s+UNTRUSTED\s+EXTERNAL\s+CONTENT\b(?:[\s\p{Pd}]*[-\p{Pd}]+)?/giu
 
-/** Strip zero-width and other invisible format characters that would let a clean-looking marker ride through. */
+/** Zero-width and other invisible format characters, which would let a clean-looking marker ride through. */
 const FORMAT_CHARS = /\p{Cf}/gu
 
-// Defang BEGIN/END anywhere in the text: hook-message's neutralizeDelimiters only covers line starts, but kanbanShow prefixes fields (title:, - repo#n, labels:) so a marker can sit mid-line, and a zero-width or U+2028 split hides one from trimStart. Strip Cf, fold \r/U+2028/U+2029 to \n, then escape every marker so only the daemon's own fence remains.
-function neutralizeFenceMarkers(text: string): string {
-  const normalized = text.replace(/\r\n?|\u2028|\u2029/g, '\n').replace(FORMAT_CHARS, '')
-  return normalized.replace(FENCE_MARKER, (match) => `\\${match}`)
+// hook-message's neutralizeDelimiters only covers line starts, but kanbanShow prefixes fields (title:, - repo#n,
+// labels:), so a marker can sit mid-line, and a zero-width or U+2028 split hides one from trimStart. Strip Cf, fold
+// \r/U+2028/U+2029 to \n, then rewrite every marker so the phrase itself no longer appears and only the daemon's
+// own fence remains.
+export function neutralizeFenceMarkers(text: string): string {
+  const normalized = text.replace(FORMAT_CHARS, '').replace(/\r\n?|\u2028|\u2029/g, '\n')
+  return normalized.replace(
+    FENCE_MARKER,
+    (_m, kind: string) => `[escaped ${kind.toUpperCase()}-UNTRUSTED-EXTERNAL-CONTENT marker]`
+  )
 }
 
 /** Last comments shown; older history stays on the issue. */
