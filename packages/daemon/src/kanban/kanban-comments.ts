@@ -117,6 +117,8 @@ export interface KanbanCommentPublisherDeps {
   baseUrl?: string
   /** Marker lookup deadline. Covers the fetches and their bodies; a timeout defers that comment. */
   markerLookupTimeoutMs?: number
+  /** Deadline for the pre-POST read of GitHub's clock; a timeout posts with no bound. */
+  serverTimeTimeoutMs?: number
 }
 
 /** Drains accepted summaries. A failed post leaves the card move in place; the lease marker is the durable idempotency key. */
@@ -206,7 +208,7 @@ export class KanbanCommentPublisher {
       const res = await fetchImpl(
         `${base}/repos/${entry.repoFullName}/issues/${entry.issueNumber}/comments?per_page=1`,
         {
-          signal: AbortSignal.timeout(SERVER_TIME_TIMEOUT_MS),
+          signal: AbortSignal.timeout(this.deps.serverTimeTimeoutMs ?? SERVER_TIME_TIMEOUT_MS),
           headers: {
             authorization: `Bearer ${token}`,
             accept: 'application/vnd.github+json',

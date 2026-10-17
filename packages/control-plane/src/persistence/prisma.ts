@@ -55,6 +55,7 @@ export function withUtcSession(databaseUrl: string | undefined): string | undefi
     }
     const flag = decodeQueryComponent(eq === -1 ? '' : pair.slice(eq + 1))
       .replace(TIMEZONE_OPTION, ' ')
+      .replace(/\s+/g, ' ')
       .trim()
     if (flag) flags.push(flag)
   }

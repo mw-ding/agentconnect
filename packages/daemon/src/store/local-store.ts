@@ -229,7 +229,7 @@ export interface KanbanCommentRow {
   attempts: number
   /** A POST may already have landed, so the publisher must look for it before posting again. */
   attempted: boolean
-  /** Daemon clock just before the first POST; the marker search reads only comments updated since then. */
+  /** GitHub's clock at the first POST attempt, absent when unreadable; the marker search reads only comments updated since then. */
   attemptedAt?: number
   /** Marker lookups that could not decide; the publisher parks the row as failed once these hit its cap. */
   lookupMisses: number
