@@ -27287,6 +27287,9 @@ export class Daemon {
       body: JSON.stringify({ title, body }),
       signal: AbortSignal.timeout(30_000)
     })
+    if (res.status === 401 || res.status === 403) {
+      this.gitCreds.invalidateKanbanOrchestrator(agentId, repoFullName, grant.token)
+    }
     if (!res.ok) {
       await res.body?.cancel().catch(() => undefined)
       throw new Error(`GitHub issue create failed (${res.status})`)

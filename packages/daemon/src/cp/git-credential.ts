@@ -428,16 +428,28 @@ export class GitCredentialCache {
   }
 
   /** The orchestrator's issues-only token for filing a card on its board repo; the CP gates on the board role. */
-  getKanbanOrchestratorToken(agentId: string, repo: string): Promise<Entry> {
+  async getKanbanOrchestratorToken(agentId: string, repo: string): Promise<Entry> {
     const key = KANBAN_ORCH_KEY(agentId, repo)
-    return this.getKeyed(key, agentId, {
+    const forceRefresh = this.refreshKanban.has(key)
+    const entry = await this.getKeyed(key, agentId, {
       agentId,
       reason: 'helper' as const,
       capabilities: ['issues' as const],
       repoFullName: repo,
       purpose: 'kanban_orchestrator_write' as const,
-      ...this.githubProvider()
+      ...this.githubProvider(),
+      ...(forceRefresh ? { forceRefresh: true } : {})
     })
+    if (forceRefresh) this.refreshKanban.delete(key)
+    return entry
+  }
+
+  // Only evict the rejected grant; a concurrent mint may already have replaced it.
+  invalidateKanbanOrchestrator(agentId: string, repo: string, presentedToken: string): void {
+    const key = KANBAN_ORCH_KEY(agentId, repo)
+    if (this.entries.get(key)?.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshKanban.add(key)
   }
 
   /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */

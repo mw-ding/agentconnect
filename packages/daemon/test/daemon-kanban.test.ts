@@ -678,3 +678,33 @@ for (const platform of ['slack', 'webchat', 'cli', 'hook']) {
     expect(result).toEqual({ refused: 'this agent is not the orchestrator of that board' })
   })
 }
+
+it.each([401, 403, 422, 500])('invalidates an orchestrator issue token only on auth rejection (%s)', async (status) => {
+  const h = await harness()
+  const creds = (h.daemon as any).gitCreds
+  const request = vi.spyOn(creds.deps, 'request').mockImplementation(async () => ({
+    username: 'x-access-token',
+    token: `ghs_${request.mock.calls.length}`,
+    ttlSec: 3540,
+    expiresAt: '2099-01-01T00:00:00Z',
+    repoFullName: 'acme/web',
+    access: 'write'
+  }))
+  const invalidate = vi.spyOn(creds, 'invalidateKanbanOrchestrator')
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(new Response('', { status }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+  try {
+    await expect((h.daemon as any).fileKanbanIssue(AGENT, 'acme/web', 'title', 'body')).rejects.toThrow(`(${status})`)
+    await expect((h.daemon as any).fileKanbanIssue(AGENT, 'acme/web', 'title', 'body')).resolves.toBe(42)
+    const authRejected = status === 401 || status === 403
+    expect(invalidate).toHaveBeenCalledTimes(authRejected ? 1 : 0)
+    expect(request).toHaveBeenCalledTimes(authRejected ? 2 : 1)
+    if (authRejected) expect(request.mock.calls[1]![0]).toMatchObject({ forceRefresh: true })
+    const second = fetchSpy.mock.calls[1]![1]!.headers as Record<string, string>
+    expect(second.authorization).toBe(authRejected ? 'Bearer ghs_2' : 'Bearer ghs_1')
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
