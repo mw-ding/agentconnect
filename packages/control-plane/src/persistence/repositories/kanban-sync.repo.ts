@@ -37,7 +37,13 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     if (!row || !row.board.enabled || !isKanbanStatus(row.status)) return null
     const { board, runs, assigneeAgent, ...card } = row
     const run = runs[0]
-    return { ...card, status: row.status, orgId: board.orgId, assigneeName: assigneeAgent?.name ?? null, lease: run ? { ...run, runId: run.id } : null }
+    return {
+      ...card,
+      status: row.status,
+      orgId: board.orgId,
+      assigneeName: assigneeAgent?.name ?? null,
+      lease: run ? { ...run, runId: run.id } : null
+    }
   }
 
   list(boardId: string, limit: number): Promise<number[]> {
