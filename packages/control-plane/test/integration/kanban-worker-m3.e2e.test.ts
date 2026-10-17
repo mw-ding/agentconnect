@@ -1,5 +1,6 @@
 // Live GitHub + Postgres + a real daemon linked over the CP WebSocket; a fake ACP agent drives the daemon's real MCP control socket.
 import { randomBytes, randomUUID } from 'node:crypto'
+import type { KanbanReport } from '@agentconnect.md/protocol'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
@@ -371,6 +372,14 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
       isDaemonLive: (id) => id === daemonId,
       clock: systemClock,
       log: { debug: () => {}, info: () => {}, warn: (_o: unknown, m?: string) => phase(`WARN ${m ?? ''}`) }
+    })
+    // Match the existing dispatch harness: one dispatcher serializes both admission and report label writes.
+    ;(worker as any).deps.cp = () => ({
+      ready: () => true,
+      heartbeat: async (payload: { leases: Parameters<KanbanDispatcher['onHeartbeat']>[2] }) => ({
+        superseded: await dispatcher!.onHeartbeat(daemonId, epoch, payload.leases)
+      }),
+      report: (report: KanbanReport) => dispatcher!.onReport(daemonId, epoch, report)
     })
     // No GitHub App here: the CP-side lease check still runs in-process, and the PAT stands in for the minted token.
     ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
