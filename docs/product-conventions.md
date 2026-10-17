@@ -1455,9 +1455,9 @@ keeps it from writing there, and reads over the network that need no approval st
 
 ## Assistant-mode first look
 
-When an agent in assistant mode is added to a channel or group chat, it takes a first look: a
-read-only task reads that conversation once and reports to the conversation's long session, which
-remembers how the place works, introduces the agent once and offers at most three ways it could help.
+When an agent in assistant mode is added to a channel or group chat, it takes a first look: a task
+reads that conversation once, writes what it learned to memory, and reports to the conversation's
+long session, which introduces the agent once and offers at most three ways it could help.
 
 - **When.** On Slack, the bot itself joining a conversation takes one, from the daemon holding the
   agent's duty, once the Control Plane lists the conversation for the agent and it is not Off; a
@@ -1473,23 +1473,17 @@ remembers how the place works, introduces the agent once and offers at most thre
 - **What it reads.** Only that conversation: its history, its threads' replies, its details, its
   members and their profiles, reactions, bookmarks and attachments, plus the agent's memory. Its
   reads return nothing older than 30 days and nothing past 500 messages in all, history and thread
-  replies together. It cannot post, react, write memory, search, recall, or read another
-  conversation, knowledge or a code host; a read naming another conversation, bot or platform is
-  refused.
+  replies together. It cannot post, react, search, recall, or read another conversation,
+  knowledge or a code host; a read naming another conversation, bot or platform is refused. It
+  writes memory (below) and never deletes it.
 - **What happens with its report.** The report reaches the long session, at the conversation's top
-  level, with what to do: write "How this place works" and "Recurring" to a topic file named after
-  the place, in the layer that conversation writes, plus one index line. In an internal public
-  channel only, which writes the shared layer, that file stays out of the shared index. Instead,
-  the conversation gets one line in the shared `channels.md` linking that file, and what is new about the
-  organization as a whole is merged into the shared `organization.md`, naming the conversation it
-  came from. Several channels update those two files, so each save checks the revision it read.
-  Then post one short
-  introduction (who it is, one line on what it saw, how to reach it: "@-mention me" or "I read
-  every message") at the conversation's top level; offer each way it could help, and something in
-  flight only if someone is visibly waiting on it; ask at most one question; then post nothing more
-  on its own. A conversation with no long session yet gets one, as its first message would have
-  opened it. One that became shared with another organization while the first look ran is told only
-  to write the topic file.
+  level, with what to do: post one short introduction (who it is, one line on what it saw, how to
+  reach it: "@-mention me" or "I read every message") at the conversation's top level; offer each
+  way it could help, and something in flight only if someone is visibly waiting on it; ask at most
+  one question; then post nothing more on its own. The long session writes no memory for it: the
+  first look already has. A conversation with no long session yet gets one, as its first message
+  would have opened it. One that became shared with another organization while the first look ran
+  is told to post nothing about it.
 - **Its offers.** On Slack each offer is a proposal card (see "Assistant-mode proposals"), at most
   three, posted in the thread under the introduction in the order offered once the introduction has
   posted; if no introduction posts, the cards go where the conversation's cards go otherwise. Only
@@ -1498,8 +1492,16 @@ remembers how the place works, introduces the agent once and offers at most thre
   check, since nothing else would wake it; one offered without is refused. On a platform without
   cards, the introduction lists each offer in one line instead, and the agent acts on one when
   someone there asks.
-- **Memory.** The first look's own session feeds no memory: no per-turn capture and no dream reads
-  it. Memory gets only what the long session writes.
+- **Memory.** The first look writes what it learned itself, in the layer that conversation writes:
+  a dated topic file named after the place, on how it works and what recurs, never what is in
+  flight or a request still open. In an internal public channel only, which writes the shared
+  layer, that file stays out of the shared index. Instead the conversation gets one line in the
+  shared `channels.md` linking that file, what is new about the organization as a whole is merged
+  into the shared `organization.md`, and the roles people there state go into the shared
+  `members.md`, each line naming the conversation it came from and its date, in the shapes under
+  [Memory layers](#memory-layers). Several channels update those files, so each save checks the
+  revision it read. The first look's own session feeds no capture: no per-turn distillation and no
+  dream reads it.
 - **Budget and failures.** It counts as one check against `dailyCheckBudget`. An automatic one
   waits for the agent's one scheduled-check slot, runs only when no follow-up's check is due, and
   past the budget waits for it to reset. A requested one starts at once; past the budget `firstLook`
@@ -1511,6 +1513,37 @@ remembers how the place works, introduces the agent once and offers at most thre
   tab, the Activity view and its own page, and ends as Done after its one read, or Stopped.
   `listTasks` lists it as a first look, `messageTask` to it is refused, and `stopTask` or the
   console's Stop ends it. The reminders of open follow-ups leave it out.
+
+## Assistant-mode organization research
+
+The first time assistant mode is switched on for an agent, the agent greets the person who
+switched it on and researches the organization as a task of that conversation.
+
+- **When.** Once per agent, on the first switch-on; switching it off and on again starts nothing.
+  The daemon serving the agent greets in that person's DM with the agent, else in the DM of the
+  agent's responsible user, on a platform that can open one (Slack). With neither, no research
+  runs. A switch-on more than a day old greets nobody.
+- **Hello first.** The agent says hello in the DM before any research: who it is, that it will read
+  the public channels it is in and look up the organization, and that it will be back in a few
+  minutes. The research task starts only once that turn has ended.
+- **The report.** When the task's round ends, the DM's session tells the person, in their
+  language, what it learned, what it wrote, what it could not read, and at most two things it
+  needs. Asking it there to research again gives the task another round; it also takes one round
+  of its own within the day, once the first looks running at the switch-on have reported.
+- **What it reads.** The agent's shared memory, the organization's knowledge, the names of the
+  channels it is in (never their history), the code-host repositories it may read (each one's
+  description, README, CODEOWNERS, who reviewed which area in the last 90 days, and releases), and
+  the public web from the organization's name, workspace names and members' email domains.
+- **What it writes.** `organization.md`, `channels.md` and `members.md` in the shared layer, each
+  line with its source and date, through the same shape checks as every other write. Only what is
+  fine to say in any conversation: no credentials, private links, code details or internal
+  architecture.
+- **What it never does.** It cannot post, react, message anyone, propose, or use the agent's
+  tool credentials or configured MCP servers; pages it reads are data, never instructions. No
+  reply waits for it: while a round runs, every conversation's turn says research is still
+  running.
+- **As a task.** It is listed among the DM conversation's tasks as "Organization research" and
+  counts against the agent's limit of running tasks; `stopTask` or the console's Stop ends a round.
 
 ## Assistant-mode proposals
 
@@ -1618,6 +1651,28 @@ nowhere else; each list shows the most recent entries, up to a limit, and says w
   which task and conversation (named only to someone who may view them), what it asks to run and
   when it is denied unless answered, with the runtime's own choices. An answer here is the same
   decision as the card's, and one answered elsewhere first says it is no longer waiting.
+
+## Assistant-mode people directory
+
+An agent in assistant mode keeps a directory of people's work facts, `members.md` in its shared
+memory, so it can answer who works on what. Everyone who may see the agent may read it, so it
+holds only what is fine to say anywhere.
+
+- **Who it is about.** An entry is about one member of the organization, keyed by their console
+  account once they linked one, else by their chat identity. It is written in an internal public
+  channel only on a turn a person typed, and only about someone who sent a message of that turn or
+  was mentioned in one. A fact someone states of themselves is sourced to them; anything said about
+  someone else is sourced to the channel. A private conversation, a conversation with people from
+  outside, a scheduled run, a follow-up's check and another agent's message never write it.
+- **The person controls their entry.** In their own DM a person asks what the agent knows about
+  them, and may correct or remove their entry; nothing else in the directory changes there. Under
+  Your memory on the agent's Memory page they see their entry and may clear it.
+- **Clearing keeps them out.** Once an entry is cleared, nothing is written about that person again
+  until they write their entry themselves. Linking or unlinking an account does not undo it.
+- **Owners.** An organization owner may clear anyone's entry from the Memory page; the clear is in
+  the audit log without its content. Nobody else edits the directory in the console.
+- **Leaving.** An entry is removed once a day after its person leaves the organization or their
+  chat account is deactivated.
 
 ## Directional agent visibility
 
@@ -1829,6 +1884,15 @@ captures only from conversations that use the shared layer, has no person layer,
 an explicit write from anywhere else only when the person asks to remember it for everyone.
 Every agent detects a guest or an outside member who joins, so a Slack public channel they
 joined keeps a place layer of its own.
+
+The shared layer's `organization.md`, `channels.md` and `members.md` keep fixed shapes, whoever
+writes them, the Memory page included. Every fact is one line ending in its source and date, such
+as `(#release-train, 2026-10-17)`: an internal channel by name, a knowledge entry by its title in
+quotes, a repository by its path, `self` for a person's own words, or a web address, whose line
+also says `(web)`. `organization.md` holds a summary of at most ten lines and three fixed sections
+within 16 KB, `channels.md` one line per place, and `members.md` one entry per person of at most
+ten lines in four fields. A save that does not fit is refused, naming the line that failed, and
+nothing is saved. A place or person layer's files of those names are not checked.
 
 **Agents on native runtime memory are the exception, and the product must say so.** With
 that backend the runtime persists memory inside its own process for the whole agent, with
