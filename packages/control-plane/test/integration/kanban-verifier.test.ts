@@ -5,17 +5,19 @@ import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
+import { insertKanbanNotification } from '../../src/persistence/repositories/kanban-notify.repo.js'
+import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { planRunEnd } from '../../src/kanban/run-accounting.js'
 import type {
+  CardGraph,
   CardIssue,
   KanbanRepoRef,
   LabelEvent,
-  LabelPlan,
   LabelWriteObserver
 } from '../../src/kanban/card-store.js'
-import type { ObservedIssue } from '../../src/kanban/card-state.js'
+import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { OrgId } from '../../src/domain/ids.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -50,6 +52,15 @@ class FakeStore {
   }
   async readLabelEvents(): Promise<LabelEvent[]> {
     return []
+  }
+  async readGraph(): Promise<CardGraph> {
+    return { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
+  }
+  async statusSetByHuman(): Promise<boolean> {
+    return true
+  }
+  async promotionVerdict(): Promise<'inconclusive'> {
+    return 'inconclusive'
   }
 }
 
@@ -248,5 +259,92 @@ describe('Kanban verifier routing (real Postgres)', () => {
     })
     await h.dispatcher.settle()
     expect(await h.card(c.id)).toMatchObject({ status: 'done', reviewRounds: 0, verifiedAt: null })
+  })
+})
+
+describe('Kanban transition outbox (real Postgres)', () => {
+  const rows = (cardId: string) =>
+    prisma.kanbanNotification.findMany({ where: { cardId }, orderBy: { stateRevision: 'asc' } })
+
+  it('commits one notification with the status change and not a second on a replayed report', async () => {
+    const h = await harness()
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { targetChannel: 'C0ANCHOR' } })
+    const c = await h.reviewCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const verify = h.sent[0]!.d
+    const report = h.reportFor(verify, { outcome: 'changes_requested', reasonCode: 'agent_changes' })
+    await h.dispatcher.onReport(D2, 2, report)
+    await h.dispatcher.settle()
+    await h.dispatcher.onReport(D2, 2, report)
+    await h.dispatcher.settle()
+    const sentRows = await rows(c.id)
+    expect(sentRows).toHaveLength(1)
+    expect(sentRows[0]).toMatchObject({
+      issueNumber: c.issueNumber,
+      fromStatus: 'review',
+      toStatus: 'ready',
+      mention: false,
+      sentAt: null,
+      attempts: 0
+    })
+  })
+
+  it('records no row on a headless board', async () => {
+    const h = await harness()
+    const c = await h.reviewCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    await h.dispatcher.onReport(D2, 2, h.reportFor(h.sent[0]!.d))
+    await h.dispatcher.settle()
+    expect(await rows(c.id)).toEqual([])
+  })
+
+  it('rolls the row back with its transaction and ignores a duplicate (cardId, stateRevision)', async () => {
+    const h = await harness()
+    const c = await h.reviewCard()
+    const insert = (db: Parameters<typeof insertKanbanNotification>[0]) =>
+      insertKanbanNotification(db, {
+        boardId: h.board.id,
+        cardId: c.id,
+        issueNumber: c.issueNumber,
+        stateRevision: 5n,
+        from: 'running',
+        to: 'blocked',
+        blockKind: 'needs_input',
+        mention: true
+      })
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await insert(tx)
+        throw new Error('boom')
+      })
+    ).rejects.toThrow('boom')
+    expect(await rows(c.id)).toEqual([])
+    await insert(prisma)
+    await insert(prisma)
+    expect(await rows(c.id)).toHaveLength(1)
+  })
+
+  it('never drains a row the notifier gave up on', async () => {
+    const h = await harness()
+    const c = await h.reviewCard()
+    const notify = new PgKanbanNotifyRepo(prisma)
+    await notify.enqueue({
+      boardId: h.board.id,
+      cardId: c.id,
+      issueNumber: c.issueNumber,
+      stateRevision: 9n,
+      from: 'running',
+      to: 'done',
+      mention: false
+    })
+    const [pending] = await notify.pending(10, new Date(T0))
+    expect(pending).toMatchObject({ from: 'running', to: 'done', attempts: 0 })
+    await notify.markFailed(pending!.id, new Date(T0 + 60_000), 1, 'delivery_failed')
+    expect(await notify.pending(10, new Date(T0))).toEqual([])
+    expect(await notify.pending(10, new Date(T0 + 60_000))).toHaveLength(1)
+    await notify.giveUp(pending!.id, 'delivery_failed')
+    expect(await notify.pending(10, new Date(T0 + 3_600_000))).toEqual([])
   })
 })

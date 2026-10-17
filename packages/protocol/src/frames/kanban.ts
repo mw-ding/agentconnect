@@ -219,3 +219,45 @@ export const KanbanCardShowOk = z.discriminatedUnion('accepted', [
   z.object({ leaseId: z.string().uuid(), accepted: z.literal(false), reason: z.enum(['superseded']) }).strict()
 ])
 export type KanbanCardShowOk = z.infer<typeof KanbanCardShowOk>
+
+/** A short, body-free status or trip reason for a notification's `from`/`to`/`tripped` fields. */
+const KanbanNotifyCode = z
+  .string()
+  .min(1)
+  .max(40)
+  .regex(/^[a-z0-9_:-]+$/)
+
+/** `kanban/notify` (C→D REQ → `kanban/notify/ok`) — a body-free transition notification to post in the board's anchor channel. */
+export const KanbanNotify = z
+  .object({
+    notifyId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    cardId: z.string().uuid(),
+    repoFullName: z
+      .string()
+      .min(3)
+      .max(200)
+      .regex(/^[\w.-]+\/[\w.-]+$/),
+    issueNumber: z.number().int().positive(),
+    from: KanbanNotifyCode,
+    to: KanbanNotifyCode,
+    blockKind: KanbanBlockKind.optional(),
+    reasonCode: KanbanReasonCode.optional(),
+    tripped: KanbanNotifyCode.optional(),
+    /** Present only when the board owner's Slack user id resolved; never a GitHub login. */
+    mention: z.object({ slackUserId: z.string().min(1).max(40) }).optional(),
+    target: z
+      .object({
+        platform: z.string().min(1).max(20),
+        channel: z.string().min(1).max(200),
+        integrationId: z.string().uuid()
+      })
+      .strict()
+  })
+  .strict()
+export type KanbanNotify = z.infer<typeof KanbanNotify>
+
+export const KanbanNotifyOk = z
+  .object({ notifyId: z.string().uuid(), ok: z.boolean(), reason: z.string().max(100).optional() })
+  .strict()
+export type KanbanNotifyOk = z.infer<typeof KanbanNotifyOk>

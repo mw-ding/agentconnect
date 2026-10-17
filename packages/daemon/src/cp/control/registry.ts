@@ -47,7 +47,7 @@ import {
 } from './dream.js'
 import { dutyGrant, dutyRenewed, dutyRevoke, type DutyControlDeps } from './duty.js'
 import { executorPrepare, executorRelease, type ExecutorControlDeps } from './executor.js'
-import { kanbanDispatch, type KanbanControlDeps } from './kanban.js'
+import { kanbanDispatch, kanbanNotify, type KanbanControlDeps } from './kanban.js'
 import { integrationForget, integrationLeave, integrationRemove, integrationUpsert } from './integration.js'
 import { mcpServerRemove, mcpServerUpsert } from './mcpserver.js'
 import {
@@ -157,6 +157,7 @@ export const CONTROL_HANDLERS: Map<string, ControlHandler<ControlDeps>> = new Ma
   ['cron/remove', cronRemove],
   ['cron/run', cronRun],
   ['kanban/dispatch', kanbanDispatch],
+  ['kanban/notify', kanbanNotify],
   ['session/visibility', sessionVisibility],
   ['session/visibility/snapshot', sessionVisibilitySnapshot],
   ['route/assign', routeAssign],

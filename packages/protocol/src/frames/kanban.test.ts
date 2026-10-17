@@ -12,6 +12,8 @@ import {
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
+  KanbanNotify,
+  KanbanNotifyOk,
   KanbanReasonCode,
   KanbanReport,
   KanbanReportOk,
@@ -202,5 +204,41 @@ describe('kanban wire (issue #2 M2)', () => {
         card: { ...card, runs: [{ ...run, summary: 'x' }] }
       }).success
     ).toBe(false)
+  })
+})
+
+describe('kanban/notify', () => {
+  const base = {
+    notifyId: '66666666-6666-4666-8666-666666666666',
+    boardId: BOARD,
+    cardId: CARD,
+    repoFullName: 'acme/web',
+    issueNumber: 7,
+    from: 'running',
+    to: 'blocked',
+    target: { platform: 'slack', channel: 'C0ANCHOR', integrationId: AGENT }
+  }
+
+  it('parses with and without the optional detail and mention', () => {
+    expect(KanbanNotify.parse(base)).toEqual(base)
+    const full = {
+      ...base,
+      blockKind: 'needs_input',
+      reasonCode: 'x_y',
+      tripped: 'review_round_limit',
+      mention: { slackUserId: 'U1' }
+    }
+    expect(KanbanNotify.parse(full)).toEqual(full)
+  })
+
+  it('rejects unknown keys so a body can never ride the frame', () => {
+    expect(() => KanbanNotify.parse({ ...base, title: 'secret' })).toThrow()
+    expect(() => KanbanNotify.parse({ ...base, target: { ...base.target, text: 'hi' } })).toThrow()
+  })
+
+  it('round-trips both frames through the envelope registry', () => {
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/notify', base))).ok).toBe(true)
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/notify', { ...base, title: 'x' }))).ok).toBe(false)
+    expect(KanbanNotifyOk.parse({ notifyId: base.notifyId, ok: false, reason: 'post_failed' }).ok).toBe(false)
   })
 })

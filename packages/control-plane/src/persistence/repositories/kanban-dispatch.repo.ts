@@ -5,7 +5,9 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
+import { planNotification } from '../../kanban/notifier.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
+import { insertKanbanNotification } from './kanban-notify.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
@@ -16,6 +18,7 @@ import type {
   KanbanClaimedLease,
   KanbanDispatchRepo,
   KanbanGrantScope,
+  KanbanIngestResult,
   KanbanLeaseBeatInput,
   KanbanOpenLease,
   KanbanRecoveryDue,
@@ -92,6 +95,7 @@ interface RunEndRow {
   endedAt: Date | null
   status: KanbanStatus
   cardRevision: bigint
+  stateRevision: bigint
   consecutiveFailures: number
   protocolViolations: number
   blockRecurrence: number
@@ -104,6 +108,7 @@ interface RunEndRow {
   orgId: string
   repoId: bigint
   repoFullName: string
+  targetChannel: string | null
   failureLimit: number
   protocolRetryLimit: number
   blockRecurrenceLimit: number
@@ -320,10 +325,15 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return card?.status ?? null
   }
 
-  async ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<boolean> {
+  async ingestStatus(
+    boardId: string,
+    issueNumber: number,
+    from: KanbanStatus,
+    to: KanbanStatus
+  ): Promise<KanbanIngestResult> {
     return this.inTransaction(async (tx) => {
-      const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus }>>(Prisma.sql`
-        SELECT c."id", c."status" FROM "kanban_card" c
+      const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus; stateRevision: bigint }>>(Prisma.sql`
+        SELECT c."id", c."status", c."stateRevision" FROM "kanban_card" c
         LEFT JOIN LATERAL (
           SELECT "reasonCode", "endedAt" FROM "kanban_run"
           WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
@@ -331,7 +341,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         WHERE c."boardId" = ${boardId}::uuid AND c."issueNumber" = ${issueNumber} AND ${PARKED}
         FOR UPDATE OF c
       `)
-      if (!card || card.status !== from) return false
+      if (!card || card.status !== from) return { moved: false }
       await tx.kanbanCard.update({
         where: { id: card.id },
         data: {
@@ -342,7 +352,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           ...RECOVERY_RESET
         }
       })
-      return true
+      return { moved: true, cardId: card.id, stateRevision: card.stateRevision + 1n }
     })
   }
 
@@ -443,12 +453,12 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       const [row] = await tx.$queryRaw<RunEndRow[]>(Prisma.sql`
         SELECT r."id" AS "runId", r."cardId", r."attempt", r."agentId", r."daemonId", r."role",
                r."dispatchRevision" AS "runRevision", r."endedAt",
-               c."status", c."dispatchRevision" AS "cardRevision", c."consecutiveFailures", c."protocolViolations",
+               c."status", c."dispatchRevision" AS "cardRevision", c."stateRevision", c."consecutiveFailures", c."protocolViolations",
                c."blockRecurrence", c."reviewRounds", c."verifiedAt", c."cooldownUntil", c."blockKind", c."boardId",
                c."issueNumber", c."assigneeAgentId",
                r."dispatchedAt", r."ackedAt", r."heartbeatAt", r."daemonEpoch",
                d."sessionEpoch" AS "currentDaemonEpoch", a."id" AS "agentRowId", a."daemonId" AS "agentDaemonId", b."staleLeaseSec",
-               b."orgId", b."repoId", b."repoFullName", b."failureLimit", b."protocolRetryLimit",
+               b."orgId", b."repoId", b."repoFullName", b."targetChannel", b."failureLimit", b."protocolRetryLimit",
                b."blockRecurrenceLimit", b."completionContract", b."verifierAgentId"
         FROM "kanban_run" r
         JOIN "kanban_card" c ON c."id" = r."cardId"
@@ -544,6 +554,34 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           stateRevision: { increment: 1 }
         }
       })
+      // A transition notification rides the same write; the (cardId, stateRevision) key makes a replay a no-op.
+      const decision = planNotification(
+        {
+          cardId: row.cardId,
+          boardId: row.boardId,
+          issueNumber: row.issueNumber,
+          from: row.status,
+          to: plan.status,
+          blockKind: plan.blockKind ?? undefined,
+          reasonCode: input.reasonCode ?? undefined,
+          tripped: plan.tripped,
+          role: row.role
+        },
+        { targetChannel: row.targetChannel }
+      )
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          boardId: row.boardId,
+          cardId: row.cardId,
+          issueNumber: row.issueNumber,
+          stateRevision: row.stateRevision + 1n,
+          from: row.status,
+          to: plan.status,
+          blockKind: plan.blockKind,
+          reasonCode: input.reasonCode,
+          tripped: plan.tripped,
+          mention: decision.mention
+        })
       return {
         accepted: true,
         plan,
