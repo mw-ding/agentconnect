@@ -169,6 +169,22 @@ export class InstallationTokenService {
     )
   }
 
+  // Daemon Kanban orchestrator token: issues write on the board repo, for the issue the orchestrator's daemon files.
+  async mintKanbanOrchestratorWrite(
+    installationId: bigint,
+    repoFullName: string,
+    repoId: bigint
+  ): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(
+      installationId,
+      repoFullName,
+      { issues: 'write' },
+      repoId,
+      false,
+      'kanban_orchestrator_write'
+    )
+  }
+
   // CP-only Kanban card token (issue #2): issues on one repo id. Reads use read; label writes use write.
   async mintKanbanCard(
     installationId: bigint,
@@ -218,7 +234,7 @@ export class InstallationTokenService {
     levels: InternalPermissionLevels,
     repoId?: bigint,
     forceRefresh = false,
-    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run'
+    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_orchestrator_write' | 'kanban_run'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =

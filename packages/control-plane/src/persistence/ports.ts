@@ -47,6 +47,7 @@ import type {
   OrganizationSuggestionInfo,
   KanbanCardShowOk,
   KanbanReport,
+  KanbanOrchestrateCard,
   CodeHostReviewLeasePhase,
   CodeHostReviewOpKind,
   CodeHostReviewOpMethod,
@@ -8273,4 +8274,60 @@ export interface KanbanOrchestratorRepo {
   createEpicChild(input: KanbanEpicChildInput): Promise<KanbanEpicChildResult>
   /** Link an existing card under an epic (parent): B2 check + counter, setting epicCardId when null. */
   adoptEpic(input: KanbanAdoptEpicInput): Promise<KanbanAdoptEpicResult>
+  /** The board as this orchestrator sees it; unknown/other-org boards are indistinguishable (`board_not_found`). */
+  boardForOrchestrator(
+    agentId: string,
+    orgId: string,
+    boardId: string
+  ): Promise<
+    | { ok: true; board: KanbanOrchestratorBoard }
+    | { ok: false; reason: 'board_not_found' | 'board_disabled' | 'not_orchestrator' }
+  >
+  /** Boards this agent orchestrates (optionally one id) with their cards, bounded by `limit`. */
+  orchestratorBoards(
+    agentId: string,
+    boardId: string | undefined,
+    status: string | undefined,
+    limit: number
+  ): Promise<{ truncated: boolean; boards: KanbanOrchestratorBoardView[] }>
+  /** One card by issue number on a board, with the fields link/assign/unblock need. */
+  cardByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanOrchestratorCard | null>
+  /** The assignee an `ac/agent:<slug>` names: unknown vs restricted vs an org agent id. */
+  resolveAssignee(
+    orgId: string,
+    slug: string
+  ): Promise<{ ok: true; agentId: string } | { ok: false; reason: 'unknown_agent' | 'agent_not_assignable' }>
+  /** B2 pre-check for prepare: the epic's lifetime counter against the board's maxCards. */
+  epicBudget(boardId: string, epicIssueNumber: number): Promise<'ok' | 'epic_not_found' | 'epic_budget_exhausted'>
+  /** The board repo this agent orchestrates on `repoFullName`; null when no enabled board matches (grant gate). */
+  orchestratorRepoId(agentId: string, repoFullName: string): Promise<bigint | null>
+}
+
+/** The board facts the orchestrator service needs, after the role gate passed. */
+export interface KanbanOrchestratorBoard {
+  id: string
+  orgId: OrgId
+  repoId: bigint
+  repoFullName: string
+  epicMaxCards: number
+}
+
+export interface KanbanOrchestratorCard {
+  cardId: string
+  issueNumber: number
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  assigneeSlug: string | null
+  priority: number
+  blockKind: KanbanBlockKind | null
+  epicCardId: string | null
+  epicIssueNumber: number | null
+  leased: boolean
+  stateRevision: bigint
+}
+
+export interface KanbanOrchestratorBoardView {
+  boardId: string
+  repoFullName: string
+  cards: KanbanOrchestrateCard[]
 }

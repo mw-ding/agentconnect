@@ -1,7 +1,10 @@
 // Kanban GitHub tokens: App installation tokens when configured, otherwise a dev/test injected PAT (issue #2 M3).
 import type { InstallationTokenService, MintedGitCred } from '../github/installation-token.service.js'
 
-export type KanbanTokenMinter = Pick<InstallationTokenService, 'mintKanbanCard' | 'mintKanbanRun'>
+export type KanbanTokenMinter = Pick<
+  InstallationTokenService,
+  'mintKanbanCard' | 'mintKanbanRun' | 'mintKanbanOrchestratorWrite'
+>
 
 /** App tokens when the GitHub App is configured; otherwise a dev/test injected PAT, with one warning. */
 export function kanbanTokenSource(opts: {
@@ -24,6 +27,7 @@ export function kanbanTokenSource(opts: {
   })
   return {
     mintKanbanCard: async (_installationId, repoFullName, _repoId, access) => grant(repoFullName, access),
-    mintKanbanRun: async (_installationId, repoFullName, _repoId, mode) => grant(repoFullName, mode)
+    mintKanbanRun: async (_installationId, repoFullName, _repoId, mode) => grant(repoFullName, mode),
+    mintKanbanOrchestratorWrite: async (_installationId, repoFullName, _repoId) => grant(repoFullName, 'write')
   }
 }
