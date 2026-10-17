@@ -85,6 +85,19 @@ function end(
 
 const repo = () => new PgKanbanDispatchRepo(prisma)
 
+describe('PgKanbanDispatchRepo.openGrantScopes (real Postgres)', () => {
+  it('returns the board repo of an open run and drops it when the run ends', async () => {
+    const boardId = await seedBoard()
+    const card = await seedCard(boardId)
+    await prisma.kanbanCard.update({ where: { id: card.id }, data: { mode: 'write' } })
+    const [lease] = await repo().claim(boardId, live)
+    expect(await repo().openGrantScopes(A1, D1)).toEqual([{ repoId: REPO_ID, repoFullName: 'acme/web', mode: 'write' }])
+    expect(await repo().openGrantScopes(A1, D2)).toEqual([])
+    await prisma.kanbanRun.update({ where: { leaseId: lease!.leaseId }, data: { endedAt: NOW } })
+    expect(await repo().openGrantScopes(A1, D1)).toEqual([])
+  })
+})
+
 describe('PgKanbanDispatchRepo.claim — priority, age, and gates (real Postgres)', () => {
   it('claims ready cards by priority then age and leases each to its agent', async () => {
     const boardId = await seedBoard()

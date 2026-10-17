@@ -3214,6 +3214,11 @@ export class Daemon {
     // cache. The request fn resolves this.cpClient lazily (it connects later);
     // until the WS is READY a pull just fails fast and the prefetch retries at
     // first session. Everything written to disk here is secret-free.
+    const workspaceRepoOf = (agentId: string): string | undefined => {
+      const ws = this.agents.get(agentId)?.workspace
+      if (ws?.mode !== 'git-repo' || !ws.gitRepo) return undefined
+      return gitRepoLabel(ws.gitRepo) ?? undefined
+    }
     this.gitCreds = new GitCredentialCache({
       request: (payload) => {
         const client = this.cpClient
@@ -3222,6 +3227,8 @@ export class Daemon {
       },
       log: { warn: (m: string) => this.log.warn(m) },
       actionsSupported: () => this.cpClient?.supportsServerFeature?.('gitcred-actions-v1') ?? false,
+      kanbanRuns: () => this.kanban?.credentialScopes() ?? [],
+      workspaceRepoOf,
       providerV2Supported: () => this.cpClient?.supportsServerFeature?.('gitcred-provider-v2') ?? false,
       githubV2Supported: () => this.cpClient?.supportsServerFeature?.(GITCRED_GITHUB_V2_FEATURE) ?? false,
       gitlabEffectSupported: () => this.cpClient?.supportsServerFeature?.(GITLAB_EFFECT_V1_FEATURE) ?? false,
@@ -26501,7 +26508,8 @@ export class Daemon {
         liveBackgroundTasks: (agentId, sessionId, sessionKey) =>
           this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, sessionKey), sessionId) ? 0 : 1
       },
-      comments: this.kanbanComments()
+      comments: this.kanbanComments(),
+      onLeaseChanged: (dispatch) => this.gitCreds.dropAgentRepo(dispatch.agentId, dispatch.repoFullName)
     }))
   }
 

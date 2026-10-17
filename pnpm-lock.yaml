@@ -256,6 +256,9 @@ importers:
       prisma:
         specifier: ^7.9.0
         version: 7.10.0(@types/node@24.19.1)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(better-sqlite3@11.10.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(typescript@6.0.3)
+      smee-client:
+        specifier: ^5.0.0
+        version: 5.0.0
       testcontainers:
         specifier: ^12.2.0
         version: 12.2.0(supports-color@7.2.0)
@@ -2032,6 +2035,7 @@ packages:
 
   '@modelcontextprotocol/server-filesystem@2026.8.31':
     resolution: {integrity: sha512-kKaFkyAh6oipvc9+EAbJ552JafnMnOq5nzmzWkp1jJdBhTAAGpmIpWihUG1+rfNhmEFM98gUZDdCHCDD4v6a7Q==}
+    deprecated: 'Date-based versions are no longer published. This package has resumed semantic versioning at 1.0.0: install the latest version.'
     hasBin: true
 
   '@modelcontextprotocol/server@2.3.1':
@@ -5642,6 +5646,10 @@ packages:
     resolution: {integrity: sha512-CRT1WTyuQoD771GW56XEZFQ/ZoSfWid1alKGDYMmkt2yl8UXrVR4pspqWNEcqKvVIzg6PAltWjxcSSPrboA4iA==}
     engines: {node: '>=18.0.0'}
 
+  eventsource@4.1.1:
+    resolution: {integrity: sha512-D6bTRWh6KahHTK/m4WnjPQyEinNPf9eFLEZSEoj7d6fTibspnAVYfzHvirL7u/aoX5d9YYfIkBVAhmigUELk9w==}
+    engines: {node: '>=20.0.0'}
+
   execa@10.0.1:
     resolution: {integrity: sha512-ge98qjkRK4IB7tL7Ju/6qmm5LHoH1eEMt5FNZrz3f4UIYhF28lggX20z3FaX1sgc67msLEn0N0BscOs29iuwyw==}
     engines: {node: '>=22'}
@@ -8445,6 +8453,11 @@ packages:
     resolution: {integrity: sha512-94hK0Hh8rPqQl2xXc3HsaBoOXKV20MToPkcXvwbISWLEs+64sBq5kFgn2kJDHb1Pry9yrP0dxrCI9RRci7RXKg==}
     engines: {node: '>= 6.0.0', npm: '>= 3.0.0'}
 
+  smee-client@5.0.0:
+    resolution: {integrity: sha512-OYL8xPr1Tc0iqGohTGqHO/qEvUrPktK0a2Qcb0Uuj+j4KLnH5bsOhOlmpnmdh4zgzL3OwTfodcmkg5fVgiMUHw==}
+    engines: {node: ^20.18 || >= 22}
+    hasBin: true
+
   smol-toml@1.9.0:
     resolution: {integrity: sha512-hpd+HLON7HdZXqYchMM/+LaTTbdK0AU3NngIJ4KVyWbY9bfQqdL9cD+4yf6dUoU2Ap4VsU0JkQi6FxAI1B2mXQ==}
     engines: {node: '>= 18'}
@@ -10182,7 +10195,7 @@ snapshots:
       discord-api-types: 0.38.54
       magic-bytes.js: 1.13.1
       tslib: 2.8.1
-      undici: 6.28.1
+      undici: 6.29.0
 
   '@discordjs/util@1.2.0':
     dependencies:
@@ -14326,6 +14339,10 @@ snapshots:
     dependencies:
       eventsource-parser: 3.1.1
 
+  eventsource@4.1.1:
+    dependencies:
+      eventsource-parser: 3.1.1
+
   execa@10.0.1:
     dependencies:
       '@sindresorhus/merge-streams': 4.0.0
@@ -17703,6 +17720,11 @@ snapshots:
       unicode-emoji-modifier-base: 1.0.0
 
   smart-buffer@4.2.0: {}
+
+  smee-client@5.0.0:
+    dependencies:
+      eventsource: 4.1.1
+      undici: 7.30.0
 
   smol-toml@1.9.0: {}
 

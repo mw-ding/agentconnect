@@ -102,6 +102,8 @@ export interface KanbanWorkerDeps {
   probe: KanbanLivenessProbe
   comments?: KanbanFinalComments
   heartbeatMs?: number
+  /** A lease was admitted or dropped. The git-credential cache drops that repo's grants. */
+  onLeaseChanged?(dispatch: KanbanDispatch): void
 }
 
 export const KANBAN_HEARTBEAT_MS = 60_000
@@ -176,7 +178,11 @@ export class KanbanWorker {
       return { leaseId: d.leaseId, accepted: false, reason: started.reason }
     }
     // The CP mints a new lease for a card only after ending the old one, so an older local lease is already superseded.
-    for (const [id, lease] of this.leases) if (lease.dispatch.cardId === d.cardId) this.leases.delete(id)
+    for (const [id, lease] of this.leases) {
+      if (lease.dispatch.cardId !== d.cardId) continue
+      this.leases.delete(id)
+      this.deps.onLeaseChanged?.(lease.dispatch)
+    }
     const lease: KanbanLease = {
       dispatch: d,
       sessionKey: started.sessionKey,
@@ -184,6 +190,7 @@ export class KanbanWorker {
       turnSettled: false
     }
     this.leases.set(d.leaseId, lease)
+    this.deps.onLeaseChanged?.(d)
     started.done.then(
       (sessionId) => this.settleTurn(d.leaseId, sessionId ?? undefined),
       (err: unknown) => this.settleTurn(d.leaseId, undefined, err instanceof Error ? err.message : String(err))
@@ -194,6 +201,21 @@ export class KanbanWorker {
   forSession(sessionKey: string): KanbanDispatch | undefined {
     for (const lease of this.leases.values()) if (lease.sessionKey === sessionKey) return lease.dispatch
     return undefined
+  }
+
+  /** Open runs, so the git-credential cache can key a helper grant by lease and mode. */
+  credentialScopes(): Array<{
+    agentId: string
+    repoFullName: string
+    leaseId: string
+    mode: 'read' | 'write'
+  }> {
+    return [...this.leases.values()].map((lease) => ({
+      agentId: lease.dispatch.agentId,
+      repoFullName: lease.dispatch.repoFullName,
+      leaseId: lease.dispatch.leaseId,
+      mode: lease.dispatch.mode
+    }))
   }
 
   /** The live lease a session's terminal tool binds to; the agent never names it. */
@@ -270,6 +292,7 @@ export class KanbanWorker {
               if (lease) {
                 this.leases.delete(id)
                 this.deps.cancel(lease)
+                this.deps.onLeaseChanged?.(lease.dispatch)
                 this.deps.log.info(`kanban: lease ${id} superseded by the control plane`)
               }
             }
@@ -366,6 +389,7 @@ export class KanbanWorker {
     const report = this.buildReport(leaseId, lease)
     await this.deps.outbox.put(report, this.deps.clock.now())
     this.leases.delete(leaseId)
+    this.deps.onLeaseChanged?.(lease.dispatch)
     this.deps.log.info(`kanban: lease ${leaseId} ended (${report.outcome})`)
   }
 

@@ -80,6 +80,7 @@ import { githubHookRunSubject } from './github/hook-run-subject.js'
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
+import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
@@ -396,6 +397,8 @@ export interface ContainerOpts {
   gitlabFetch?: GitlabFetchLike
   /** Gitea HTTP edge stub for tests (mirrors gitlabFetch). */
   giteaFetch?: GiteaFetchLike
+  /** Dev/test only. PAT for Kanban GitHub calls when the App is not configured; not a production setting. */
+  kanbanAccessToken?: string
   /** Slack Web API fetch override for Session membership checks. */
   slackFetch?: FetchLike
   /** Feishu/Lark Open Platform fetch override for Session membership checks. */
@@ -1746,8 +1749,19 @@ export function buildContainer(
       })
     : undefined
 
-  const kanbanCardStore = github
-    ? new GithubCardStore({ tokens: github.tokens, appSlug: githubAppCfg?.slug })
+  const kanbanTokens = kanbanTokenSource({
+    app: github?.tokens,
+    injectedToken: opts.kanbanAccessToken,
+    // `http` is assigned further down, so the boot-time warning is deferred past its initialisation.
+    log: { warn: (message) => queueMicrotask(() => http.log.warn(message)) }
+  })
+  const kanbanCardStore = kanbanTokens
+    ? new GithubCardStore({
+        tokens: kanbanTokens,
+        appSlug: githubAppCfg?.slug,
+        // The same GitHub transport as the token mint, so an injected fetch covers card reads and label writes too.
+        ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+      })
     : undefined
 
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
@@ -2744,6 +2758,9 @@ export function buildContainer(
     ...(codeHostNoteProjection ? { codeHostNoteProjection } : {}),
     giteaStatusProjection,
     ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
+    kanbanGrants: {
+      openScopes: (agentId, daemonId) => repos.kanbanDispatch.openGrantScopes(agentId, daemonId)
+    },
     relayRoster: () => relayRoster.entries(),
     clock,
     config: {

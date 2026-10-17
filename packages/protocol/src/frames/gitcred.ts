@@ -38,9 +38,9 @@ export type GitCommitIdentity = z.infer<typeof GitCommitIdentity>
  * `actions` buys GitHub Actions inspection/execution. Every
  * General agent credentials mint every capability admitted by the repo's
  * `gitAccess` / authorization tier — a read-only agent gets read-only
- * issues/PR scopes and no Actions capability.
- * The one exception is purpose=github_hook_reply: a daemon-owned writer whose
- * token never enters the agent environment and is gated by an enabled hook.
+ * issues/PR scopes and no Actions capability. Two daemon-owned writers never
+ * enter the agent environment: purpose=github_hook_reply (an enabled hook)
+ * and purpose=kanban_card_write (an accepted Kanban lease, issues write only).
  */
 export const GitCredCapability = z.enum(['contents', 'issues', 'pull_requests', 'actions'])
 export type GitCredCapability = z.infer<typeof GitCredCapability>

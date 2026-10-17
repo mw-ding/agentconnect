@@ -7953,6 +7953,13 @@ export interface KanbanRecoveryDue {
   recoveryCheckAt: Date | null
 }
 
+/** One open Kanban run's board repo, used to clamp that daemon's git credential grant. */
+export interface KanbanGrantScope {
+  repoId: bigint
+  repoFullName: string
+  mode: 'read' | 'write'
+}
+
 export interface KanbanDispatchRepo {
   /** Enabled boards, for the periodic reconciler tick. */
   listEnabledBoardIds(): Promise<string[]>
@@ -7996,6 +8003,8 @@ export interface KanbanDispatchRepo {
   heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]>
   /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
+  /** Open runs for one agent on one daemon: the repos whose daemon grants must follow the run mode. */
+  openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
 }
 
 export interface KanbanCardRecord {

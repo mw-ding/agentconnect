@@ -14,6 +14,8 @@
  * advertises support) are distinct tokens with
  * separate lifecycles, and every non-workspace repo is its own token (single
  * repo scope). `repo` absent ⇒ the agent's workspace repo, the pre-#457 keys.
+ * An open Kanban run on that repo adds `(leaseId, mode)` so a write grant is
+ * not served to a later read run.
  *
  * Threshold nesting: entries are handed out only while >10min remain (the CP
  * serves grants with ≥15min, so a fresh grant always clears this). Per-key
@@ -112,6 +114,14 @@ interface Entry {
   expiresAtMono: number
 }
 
+/** One open Kanban run. Any read run on the repo wins, matching the CP grant clamp. */
+export interface KanbanCredentialRun {
+  agentId: string
+  repoFullName: string
+  leaseId: string
+  mode: 'read' | 'write'
+}
+
 export interface GitCredentialCacheDeps {
   /** D→C `gitcred/request` — throws WireError-shaped errors (`code`, `retryable`). */
   request: (payload: {
@@ -153,6 +163,10 @@ export interface GitCredentialCacheDeps {
   giteaHostFor?: (agentId: string) => string | undefined
   /** Monotonic ms; injectable for tests. */
   monoNow?: () => number
+  /** Open Kanban runs. While one matches the requested repo, the cache key includes its lease and mode. */
+  kanbanRuns?: () => readonly KanbanCredentialRun[]
+  /** Workspace owner/repo, so a repo-less helper request still sees a Kanban run on that repo. */
+  workspaceRepoOf?: (agentId: string) => string | undefined
 }
 
 /** The instance axis of each spec-hosted provider: which dep names the spec's host, and the value an absent one means. */
@@ -214,7 +228,7 @@ export class GitCredentialCache {
     }
     const withActions = plane === 'gh' && this.deps.actionsSupported?.() === true
     const cachePlane = withActions ? 'gh-actions' : plane
-    return this.getKeyed(keyOf(agentId, cachePlane, opts.repo, opts.provider), agentId, {
+    return this.getKeyed(this.cacheKey(agentId, cachePlane, opts.repo, opts.provider), agentId, {
       agentId,
       reason,
       ...(plane === 'gh' && opts.provider === undefined
@@ -464,11 +478,21 @@ export class GitCredentialCache {
   ): void {
     const plane = opts.plane ?? 'git'
     const cachePlane = plane === 'gh' && this.deps.actionsSupported?.() === true ? 'gh-actions' : plane
-    const key = keyOf(agentId, cachePlane, opts.repo, opts.provider)
+    const key = this.cacheKey(agentId, cachePlane, opts.repo, opts.provider)
     const entry = this.entries.get(key)
     if (!entry) return
     if (presentedPassword !== undefined && entry.token !== presentedPassword) return
     this.entries.delete(key)
+  }
+
+  /** Drop git/gh grants for one repo when a Kanban lease is admitted or ended. */
+  dropAgentRepo(agentId: string, repoFullName: string): void {
+    const repo = repoFullName.toLowerCase()
+    const includeWorkspace = this.deps.workspaceRepoOf?.(agentId)?.toLowerCase() === repo
+    const marker = `\u0000${agentId}\u0000`
+    for (const key of [...this.entries.keys()]) {
+      if (this.isAgentRepoToken(key, marker, repo, includeWorkspace)) this.entries.delete(key)
+    }
   }
 
   /** agent/remove: drop the orphaned bearer tokens with the agent dir. */
@@ -564,6 +588,41 @@ export class GitCredentialCache {
     }
     this.entries.set(key, entry)
     return entry
+  }
+
+  /** Lease and mode of the Kanban run that must clamp this agent+repo, if any. Read wins over write. */
+  private activeKanban(
+    agentId: string,
+    repo: string | undefined
+  ): { leaseId: string; mode: 'read' | 'write' } | undefined {
+    const runs = this.deps.kanbanRuns?.()
+    if (!runs || runs.length === 0) return undefined
+    const named = (repo ?? this.deps.workspaceRepoOf?.(agentId))?.toLowerCase()
+    if (!named) return undefined
+    const matches = runs.filter((run) => run.agentId === agentId && run.repoFullName.toLowerCase() === named)
+    if (matches.length === 0) return undefined
+    const read = matches.find((run) => run.mode === 'read')
+    const chosen = read ?? matches[0]!
+    return { leaseId: chosen.leaseId, mode: read ? 'read' : 'write' }
+  }
+
+  private cacheKey(
+    agentId: string,
+    plane: CachePlane,
+    repo: string | undefined,
+    provider?: QualifiedCodeHostProvider
+  ): string {
+    const base = keyOf(agentId, plane, repo, provider)
+    if (provider !== undefined) return base
+    const scope = this.activeKanban(agentId, repo)
+    return scope ? `${base}\u0000${scope.leaseId}\u0000${scope.mode}` : base
+  }
+
+  private isAgentRepoToken(key: string, marker: string, repo: string, includeWorkspace: boolean): boolean {
+    if (!key.includes(marker)) return false
+    const [plane, , repoField = ''] = key.split('\u0000')
+    if (plane !== 'git' && plane !== 'gh' && plane !== 'gh-actions') return false
+    return repoField === repo || (includeWorkspace && repoField === '')
   }
 
   /** A replicated spec change may re-enable a previously denied agent. */

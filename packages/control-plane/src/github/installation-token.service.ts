@@ -152,7 +152,7 @@ export class InstallationTokenService {
     return this.mintPermissionLevels(installationId, repoFullName, { checks: 'read', pull_requests: 'read' }, repoId)
   }
 
-  // Daemon Kanban summary token (issue #2 D3): issues write on one repo, cached apart from the CP's own card token.
+  // Daemon Kanban summary token: issues write on one repo id, cached apart from the CP card token.
   async mintKanbanComment(
     installationId: bigint,
     repoFullName: string,
@@ -169,14 +169,36 @@ export class InstallationTokenService {
     )
   }
 
-  // CP-only Kanban card token (issue #2 D3): issues on one repo id, cached apart from any daemon grant of the same shape.
+  // CP-only Kanban card token (issue #2): issues on one repo id. Reads use read; label writes use write.
   async mintKanbanCard(
     installationId: bigint,
     repoFullName: string,
     repoId: bigint,
-    access: GitAccess
+    access: GitAccess,
+    forceRefresh = false
   ): Promise<MintedGitCred> {
-    return this.mintPermissionLevels(installationId, repoFullName, { issues: access }, repoId, false, 'kanban_card')
+    return this.mintPermissionLevels(
+      installationId,
+      repoFullName,
+      { issues: access },
+      repoId,
+      forceRefresh,
+      'kanban_card'
+    )
+  }
+
+  // Daemon grant for one Kanban run: read clamps contents/issues/PRs to read; write follows contents with workflows.
+  async mintKanbanRun(
+    installationId: bigint,
+    repoFullName: string,
+    repoId: bigint,
+    mode: GitAccess
+  ): Promise<MintedGitCred> {
+    const levels: InternalPermissionLevels =
+      mode === 'write'
+        ? { contents: 'write', issues: 'write', pull_requests: 'write' }
+        : { contents: 'read', issues: 'read', pull_requests: 'read' }
+    return this.mintPermissionLevels(installationId, repoFullName, levels, repoId, false, 'kanban_run')
   }
 
   /** Drop every cached/in-flight token for one installation after a permission,
@@ -196,7 +218,7 @@ export class InstallationTokenService {
     levels: InternalPermissionLevels,
     repoId?: bigint,
     forceRefresh = false,
-    purpose?: 'kanban_card' | 'kanban_card_write'
+    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =

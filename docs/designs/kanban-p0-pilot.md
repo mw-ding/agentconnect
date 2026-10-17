@@ -306,3 +306,42 @@ budget; superseding a local lease needs cancellation completion, reporting, and 
 worktree recovery policy that preserves uncommitted work before another write run;
 report receipts and abandoned reservations need retention rules that preserve
 restart deduplication. These are outside the dispatch fixes above.
+
+## M3 — App installation tokens and webhook delivery
+
+App mode is on only when `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`, and
+`GITHUB_APP_SLUG` are all set (a partial set fails boot). `GITHUB_APP_CLIENT_ID`,
+when set, is the App JWT issuer. Install that App on the board repository
+(`mw-ding/agentconnect` for this pilot) and grant:
+
+- Issues: read and write
+- Contents: read and write
+- Pull requests: read and write
+- Metadata: read
+
+While a run is open, the daemon's git credential for that repository is an
+installation token scoped with `repository_ids` to the board. Read mode is
+`contents`, `issues`, and `pull_requests` at read (plus `metadata: read`), so the
+token itself cannot write. Write mode is those three at write; `workflows: write`
+follows contents write. Card reads use `issues: read`. Label writes and the
+daemon-owned final poster use `issues: write` and never enter the agent
+environment. If the App is not configured, the card store and poster keep the
+injected PAT (`kanbanAccessToken`) and log that they are doing so. That option
+is dev/test only; a production board uses the App installation token.
+
+Webhook delivery: point the App's webhook at the relay's `POST /webhooks/github`.
+The relay checks `X-Hub-Signature-256` with `GITHUB_APP_WEBHOOK_SECRET`, replaced
+outright by the control plane's deployment secret `github.webhookSecret` once a
+snapshot arrives. Subscribe to `issues`, `issue_comment`, `label`, and, when the
+App can, `sub_issues` and `issue_dependencies` (both ride the Issues permission).
+Status moves arrive as `issues` actions `labeled`, `unlabeled`, `closed`, and
+`reopened`. A verified delivery becomes a body-free Kanban doorbell on the
+relay-to-control-plane WebSocket; a bad signature is 401 and puts nothing on the
+wire.
+
+Known gap: the control plane's installation-token cache for a Kanban run is
+keyed by installation, repository, and permission levels, not by lease. A grant
+minted for one run can be reused for a later run of the same mode on that
+repository until it is within 15 minutes of expiry. The daemon cache is keyed
+by the open lease and mode, so a read run does not reuse a write grant; this
+control-plane cache is not.

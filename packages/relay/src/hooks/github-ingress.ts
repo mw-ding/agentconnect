@@ -33,6 +33,7 @@ import { createCodeHostRouter } from './code-host-routing.js'
 import { hookSnapshotForDelivery } from './hook-snapshot.js'
 import { verifySha256Header } from './signature.js'
 import { labelFilterAdmits } from './label-filter.js'
+import { GithubDeliveryDedup } from './github-delivery-dedup.js'
 import type { Logger } from '../log.js'
 
 /** Raw-body cap for the GitHub endpoint (design: 1 MiB — GitHub's own payload cap). */
@@ -1099,7 +1100,8 @@ export function githubIssueDoorbell(
 }
 
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
-  // Own plugin scope, so the raw-body parser the signature needs does not leak onto other JSON routes.
+  const deliveries = new GithubDeliveryDedup(deps.clock)
+  // Own plugin scope so the raw-body parser does not leak onto the relay's other JSON surfaces.
   void app.register(async (scope) => {
     scope.addContentTypeParser(
       'application/json',
@@ -1119,13 +1121,13 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       const event = headerString(req.headers['x-github-event']) ?? ''
       if (event === 'ping') return reply.code(204).send()
 
-      const deliveryKey = headerString(req.headers['x-github-delivery'])?.slice(0, 200) ?? randomUUID()
+      const deliveryHeader = headerString(req.headers['x-github-delivery'])?.slice(0, 200)
+      const deliveryKey = deliveryHeader ?? randomUUID()
 
       let payload: GithubPayload
       try {
         payload = JSON.parse(raw.toString('utf8')) as GithubPayload
       } catch {
-        // Cannot happen from GitHub (it signed valid JSON) — defensive only.
         return reply.code(400).send({ error: 'Bad Request', statusCode: 400 })
       }
 
@@ -1137,6 +1139,11 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       } catch {
         deps.log.warn(`github ingress: PR feedback persistence unavailable ${deliveryKey}`)
         return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
+      }
+
+      if (deliveries.seenDelivery(deliveryHeader)) {
+        deps.log.info(`github ingress: duplicate delivery ${deliveryKey}`)
+        return reply.code(202).send({ deliveryKey })
       }
 
       if (event === 'check_run' && payload.action === 'rerequested') {

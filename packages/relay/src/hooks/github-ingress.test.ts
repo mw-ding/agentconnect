@@ -368,15 +368,20 @@ const sign = (payload: string, secret = SECRET) =>
 
 describe('github ingress', () => {
   let h: Harness
+  let deliverySeq = 0
 
   beforeEach(() => {
     h = makeHarness()
+    deliverySeq = 0
   })
   afterEach(async () => {
     await h.app.close()
   })
 
   const post = (event: string, body: unknown, opts: { headers?: Record<string, string>; secret?: string } = {}) => {
+    deliverySeq += 1
+    const deliveryId =
+      opts.headers?.['x-github-delivery'] ?? (deliverySeq === 1 ? 'gh-delivery-1' : `gh-delivery-${deliverySeq}`)
     const payload = JSON.stringify(body)
     return h.app.inject({
       method: 'POST',
@@ -385,7 +390,7 @@ describe('github ingress', () => {
         'content-type': 'application/json',
         'x-hub-signature-256': sign(payload, opts.secret ?? SECRET),
         'x-github-event': event,
-        'x-github-delivery': 'gh-delivery-1',
+        'x-github-delivery': deliveryId,
         ...(opts.headers ?? {})
       },
       payload
@@ -639,6 +644,19 @@ describe('github ingress', () => {
         }
       ])
       expect(JSON.stringify(h.graphDoorbells)).not.toMatch(/db down|primary is unreachable/)
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it('forwards one delivery once when GitHub retries the same X-GitHub-Delivery', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-dup' }
+      const first = await post('issues', labeled('ac/status:ready'), { headers })
+      const second = await post('issues', labeled('ac/status:ready'), { headers })
+      expect(first.statusCode).toBe(202)
+      expect(second.statusCode).toBe(202)
+      expect(second.json()).toEqual({ deliveryKey: 'gh-delivery-dup' })
+      await flush()
+      expect(h.graphDoorbells).toHaveLength(1)
       expect(h.sent).toHaveLength(1)
     })
 

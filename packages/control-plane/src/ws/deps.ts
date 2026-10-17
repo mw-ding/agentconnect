@@ -34,7 +34,8 @@ import type {
   AgentMemoryHistoryRepo,
   ProviderKeyStore,
   DecisionRepo,
-  AgentSkillSourceStatusRepo
+  AgentSkillSourceStatusRepo,
+  KanbanGrantScope
 } from '../persistence/ports.js'
 import type { AgentMemoryStoreService } from '../agent-memory/store.service.js'
 import type { UsageWriter } from '../usage/writer.js'
@@ -231,6 +232,10 @@ export interface DaemonWsDeps {
   giteaStatusProjection?: GiteaStatusCoordinator
   /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
   kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport' | 'commentGrant'>
+  /** Open Kanban runs used to clamp gitcred grants to the run mode. Absent ⇒ no clamp. */
+  kanbanGrants?: {
+    openScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+  }
   /** The current relay roster, injected into `register/ok.relays` so a (re)connecting
    *  daemon converges to the relays it should dial (shared-bot-relay.md §5). */
   relayRoster: () => Promise<RelayRosterEntry[]>

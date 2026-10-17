@@ -1003,6 +1003,67 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     expect(calls()).toBe(3)
   })
 
+  it('mints Kanban run and poster tokens with a valid App JWT, then refreshes after the fresh window', async () => {
+    const clock = new FakeClock(1_700_000_000_000)
+    const bodies: unknown[] = []
+    const auths: string[] = []
+    const urls: string[] = []
+    let calls = 0
+    const fetchImpl = async (url: string, init?: RequestInit) => {
+      calls += 1
+      urls.push(url)
+      auths.push(new Headers(init?.headers).get('authorization') ?? '')
+      bodies.push(JSON.parse(String(init?.body)))
+      return new Response(
+        JSON.stringify({ token: `ghs_${calls}`, expires_at: new Date(clock.now() + 3_600_000).toISOString() }),
+        { status: 201, headers: { 'content-type': 'application/json' } }
+      )
+    }
+    const svc = new InstallationTokenService(cfg(), clock, fetchImpl)
+
+    const read = await svc.mintKanbanRun(IID, 'acme/tools', 777n, 'read')
+    expect(read.access).toBe('read')
+    expect(urls[0]).toBe('https://api.github.com/app/installations/42/access_tokens')
+    expect(bodies[0]).toEqual({
+      repository_ids: [777],
+      permissions: { metadata: 'read', contents: 'read', issues: 'read', pull_requests: 'read' }
+    })
+    const verified = await jwtVerify(auths[0]!.replace(/^Bearer /, ''), publicKey, { issuer: '2345678' })
+    expect(verified.protectedHeader.alg).toBe('RS256')
+    expect(verified.payload.iss).toBe('2345678')
+
+    await svc.mintKanbanRun(IID, 'acme/tools', 777n, 'read')
+    expect(calls).toBe(1)
+
+    const write = await svc.mintKanbanRun(IID, 'acme/tools', 777n, 'write')
+    expect(write.access).toBe('write')
+    expect(bodies[1]).toEqual({
+      repository_ids: [777],
+      permissions: {
+        metadata: 'read',
+        contents: 'write',
+        issues: 'write',
+        pull_requests: 'write',
+        workflows: 'write'
+      }
+    })
+
+    // The CP card writer is issues:write only, and does not share the run grant's cache entry.
+    const poster = await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'write')
+    expect(poster.token).not.toBe(write.token)
+    expect(bodies[2]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+
+    // The daemon summary token is the same issues:write shape, scoped by repo id, and cached apart from the CP card token.
+    const comment = await svc.mintKanbanComment(IID, 'acme/tools', 777n, false)
+    expect(comment.token).not.toBe(poster.token)
+    expect(bodies[3]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'write' } })
+
+    clock.advance(46 * 60 * 1000)
+    const refreshed = await svc.mintKanbanRun(IID, 'acme/tools', 777n, 'read')
+    expect(refreshed.token).not.toBe(read.token)
+    expect(calls).toBe(5)
+  })
+
   it('installation invalidation prevents an older in-flight mint from repopulating the cache', async () => {
     const clock = new FakeClock(1_700_000_000_000)
     let resolveFirst!: (response: Response) => void
