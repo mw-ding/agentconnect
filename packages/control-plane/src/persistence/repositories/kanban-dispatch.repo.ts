@@ -130,6 +130,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
       // The per-daemon cap spans boards, so its count must be serialized against other boards claiming in parallel.
       // Advisory xact locks for every daemon this board could claim, in one sorted order, keep those claims deadlock-free.
+      const lockedDaemons = new Set<string>()
       if (opts.maxPerDaemon !== undefined) {
         const daemons = await tx.$queryRaw<Array<{ daemonId: string }>>(Prisma.sql`
           SELECT DISTINCT a."daemonId" FROM "kanban_card" c
@@ -138,6 +139,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         `)
         for (const id of daemons.map((d) => d.daemonId).sort()) {
           await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'kanban-daemon-cap:' + id}))::text`
+          lockedDaemons.add(id)
         }
       }
 
@@ -210,8 +212,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if (!opts.isDaemonLive(card.daemonId)) continue
           // B2 maxActive: a child waits while its epic already has enough open runs.
           if (card.epicCardId !== null && (await epicActive(card.epicCardId)) >= board.epicMaxActive) continue
-          // Per-daemon cap across all boards: skip a card whose daemon already holds the cap.
-          if (opts.maxPerDaemon !== undefined && (await daemonActive(card.daemonId)) >= opts.maxPerDaemon) continue
+          // Per-daemon cap across all boards: an agent moved to an unlocked daemon since the lock pass waits a tick.
+          if (opts.maxPerDaemon !== undefined) {
+            if (!lockedDaemons.has(card.daemonId)) continue
+            if ((await daemonActive(card.daemonId)) >= opts.maxPerDaemon) continue
+          }
 
           const [next] = await tx.$queryRaw<{ attempt: number }[]>(Prisma.sql`
           SELECT COALESCE(MAX("attempt"), 0)::int + 1 AS "attempt" FROM "kanban_run" WHERE "cardId" = ${card.id}::uuid

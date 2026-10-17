@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import type { Prisma } from '../../src/generated/prisma/client.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
@@ -147,5 +148,74 @@ describe('PgKanbanDispatchRepo claim caps (real Postgres)', () => {
     // With no cap, a board with room claims freely.
     const uncapped = await repo.claim(boardA.id, { now: new Date(), isDaemonLive: () => true })
     expect(uncapped).toEqual([]) // its only card is already running
+  })
+  it('per-daemon cap skips a candidate whose agent moved to a daemon the claim did not lock', async () => {
+    const locked = randomUUID()
+    const moved = randomUUID()
+    await seedDaemon(prisma, locked, { sessionEpoch: 1n })
+    await seedDaemon(prisma, moved, { sessionEpoch: 1n })
+    const stays = randomUUID()
+    const mover = randomUUID()
+    await seedAgent(prisma, stays, { daemonId: locked })
+    await seedAgent(prisma, mover, { daemonId: locked })
+    const board = await prisma.kanbanBoard.create({
+      data: {
+        orgId: DEFAULT_ORG_ID,
+        name: 'caps-moved',
+        repoId: REPO_ID + 4n,
+        repoFullName: 'acme/moved',
+        maxInProgress: 10,
+        maxInProgressPerAgent: 10
+      }
+    })
+    const mk = (issueNumber: number, agentId: string, priority: number) =>
+      prisma.kanbanCard.create({
+        data: {
+          boardId: board.id,
+          issueId: BigInt(9_900 + issueNumber),
+          issueNumber,
+          status: 'ready',
+          priority,
+          assigneeAgentId: agentId
+        }
+      })
+    const kept = await mk(1, stays, 2)
+    const skipped = await mk(2, mover, 1)
+    // Between the advisory-lock pass and the candidate scan, the second agent moves to a daemon nobody locked.
+    const leases = await prisma.$transaction(async (tx) => {
+      let moveDone = false
+      // Hiding $transaction makes the repo run on this client instead of opening its own transaction.
+      const spy = new Proxy(tx, {
+        has: (target, prop) => prop !== '$transaction' && Reflect.has(target, prop),
+        get(target, prop, receiver) {
+          if (prop !== '$queryRaw') return Reflect.get(target, prop, receiver)
+          return async (...args: unknown[]) => {
+            const first = args[0] as { sql?: string } | TemplateStringsArray
+            const text =
+              'sql' in first && typeof first.sql === 'string' ? first.sql : [...(first as string[])].join('?')
+            if (!moveDone && text.includes('"sessionEpoch"') && text.includes('SKIP LOCKED')) {
+              moveDone = true
+              await prisma.agent.update({ where: { id: mover }, data: { daemonId: moved } })
+            }
+            return (target.$queryRaw as (...a: unknown[]) => Promise<unknown>)(...args)
+          }
+        }
+      }) as Prisma.TransactionClient
+      return new PgKanbanDispatchRepo(spy).claim(board.id, {
+        now: new Date(),
+        isDaemonLive: () => true,
+        maxPerDaemon: 8
+      })
+    })
+    expect(leases.map((l) => l.cardId)).toEqual([kept.id])
+    expect(await prisma.kanbanRun.count({ where: { daemonId: moved, endedAt: null } })).toBe(0)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: skipped.id } })).status).toBe('ready')
+    // The next claim locks the new daemon and admits the card.
+    const next = await new PgKanbanDispatchRepo(prisma).claim(board.id, {
+      now: new Date(),
+      isDaemonLive: () => true,
+      maxPerDaemon: 8
+    })
+    expect(next.map((l) => l.cardId)).toEqual([skipped.id])
   })
 })
