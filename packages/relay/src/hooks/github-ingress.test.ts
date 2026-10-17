@@ -518,6 +518,17 @@ describe('github ingress', () => {
       )
       expect(res.statusCode).toBe(503)
     })
+
+    it('persists feedback when the same delivery retries after a 503', async () => {
+      const payload = pullPayload({ action: 'created', comment: { body: 'please change this' } })
+      const options = { headers: { 'x-github-delivery': 'feedback-retry' } }
+      h.feedbackError = true
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(503)
+
+      h.feedbackError = false
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(202)
+      expect(h.feedback).toHaveLength(1)
+    })
   })
 
   describe('installation doorbell (decision 11)', () => {

@@ -923,19 +923,19 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
 
   async function replayReady(issueNumber: number): Promise<string> {
     const delivery = await labeledDelivery(issueNumber)
+    const originalGuid = delivery.guid ?? String(delivery.id)
+    let guid = originalGuid
     let installationId = delivery.payload.installation?.id
     if (!installationId) {
-      // A repository webhook (no GitHub App here) carries no installation block, and the relay routes
-      // Kanban doorbells by installation. Stamp the fixture installation the board uses, which is exactly
-      // the block an App delivery would carry, and say so.
+      // A stamped repository-webhook fixture is a new delivery, distinct from the original smee delivery.
       installationId = Number(ref.installationId)
       delivery.payload = { ...delivery.payload, installation: { id: installationId } }
+      guid = `${originalGuid}-kanban-e2e`
       console.log(
-        `KANBAN_E2E INJECTED installation.id=${installationId} into real delivery ${delivery.guid ?? delivery.id}: repo webhooks carry no installation without a GitHub App`
+        `KANBAN_E2E INJECTED installation.id=${installationId} from real delivery ${originalGuid} as ${guid}: repo webhooks carry no installation without a GitHub App`
       )
     }
     await ensureInstallation(BigInt(installationId))
-    const guid = delivery.guid ?? String(delivery.id)
     const sent = await postGithubWebhook(link!.webhookUrl, {
       secret: webhookSecret,
       event: 'issues',
