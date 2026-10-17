@@ -1439,3 +1439,208 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.store.writes).toEqual([])
   })
 })
+
+describe('KanbanDispatcher — provider outage backoff (real Postgres)', () => {
+  /** Dispatch the card's next lease once its cooldown passed, then end it with `patch`. */
+  async function cycle(h: Awaited<ReturnType<typeof harness>>, cardId: string, patch: Partial<KanbanReport>) {
+    const c = await h.card(cardId)
+    if (c.cooldownUntil) h.clock.advance(c.cooldownUntil.getTime() - h.clock.now() + 1)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent.at(-1)!.d
+    expect(d.cardId).toBe(cardId)
+    expect(await h.dispatcher.onReport(D1, 4, h.reportFor(d, patch))).toMatchObject({ accepted: true })
+    await h.dispatcher.settle()
+    return h.card(cardId)
+  }
+  const outage = { outcome: 'transient', reasonCode: 'provider_rate_limited' } as const
+
+  it('doubles the cooldown for each consecutive provider outage, never counts a failure, and caps at an hour', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    const waits: number[] = []
+    for (let i = 1; i < 8; i++) {
+      const after = await cycle(h, c.id, outage)
+      expect(after).toMatchObject({ status: 'ready', consecutiveFailures: 0 })
+      waits.push(after.cooldownUntil!.getTime() - h.clock.now())
+    }
+    expect(waits).toEqual([60_000, 120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000])
+  })
+
+  it('routes the card to triage on the eighth consecutive outage instead of looping forever', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    for (let i = 1; i < 8; i++) await cycle(h, c.id, outage)
+    const last = await cycle(h, c.id, outage)
+    expect(last).toMatchObject({ status: 'triage', cooldownUntil: null, consecutiveFailures: 0 })
+    expect(h.store.issues.get(c.issueNumber)?.labels).toContain('ac/status:triage')
+  })
+
+  it('skips nudge and paused-dispatch deferrals in the provider streak', async () => {
+    const h = await harness({
+      reply: (d) =>
+        d.attempt === 4
+          ? { leaseId: d.leaseId, accepted: false, reason: 'paused' }
+          : { leaseId: d.leaseId, accepted: true }
+    })
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, { outcome: 'transient', reasonCode: 'nudge_deferred' })
+    const second = await cycle(h, c.id, outage)
+    expect(second.cooldownUntil!.getTime() - h.clock.now()).toBe(120_000)
+    h.clock.advance(second.cooldownUntil!.getTime() - h.clock.now() + 1)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(await h.run(h.sent.at(-1)!.d.leaseId)).toMatchObject({
+      outcome: 'transient',
+      reasonCode: 'dispatch_refused:paused'
+    })
+    const third = await cycle(h, c.id, outage)
+    expect(third.cooldownUntil!.getTime() - h.clock.now()).toBe(240_000)
+    expect(third).toMatchObject({ status: 'ready', consecutiveFailures: 0 })
+  })
+
+  it('scans past deferrals before applying the provider history limit', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    for (let i = 0; i < 10; i++) await cycle(h, c.id, { outcome: 'transient', reasonCode: 'nudge_deferred' })
+    const second = await cycle(h, c.id, outage)
+    expect(second.cooldownUntil!.getTime() - h.clock.now()).toBe(120_000)
+  })
+
+  it.each([
+    { outcome: 'failed', reasonCode: 'provider_auth' },
+    { outcome: 'transient', reasonCode: 'turn_lost' },
+    { outcome: 'transient', reasonCode: 'dispatchxrefused:paused' },
+    { outcome: 'transient' },
+    { outcome: 'failed', reasonCode: 'nudge_deferred' },
+    { outcome: 'failed', reasonCode: 'dispatch_refused:write_needs_worktree' }
+  ] as const)('resets the provider streak after $outcome/$reasonCode', async (other) => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, other)
+    const next = await cycle(h, c.id, outage)
+    expect(next.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+  })
+
+  it('restarts the backoff after a different outcome, and leaves non-provider transients on the flat cooldown', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, outage)
+    const failed = await cycle(h, c.id, { outcome: 'failed', reasonCode: 'provider_auth' })
+    expect(failed).toMatchObject({ status: 'ready', consecutiveFailures: 1 })
+    const again = await cycle(h, c.id, outage)
+    expect(again.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+    const flat = await cycle(h, c.id, { outcome: 'transient', reasonCode: 'turn_lost' })
+    expect(flat.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+    const flat2 = await cycle(h, c.id, { outcome: 'transient', reasonCode: 'turn_lost' })
+    expect(flat2.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+  })
+})
+
+describe('KanbanDispatcher — card read and progress-note grant (real Postgres)', () => {
+  async function leased() {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    const req = { boardId: d.boardId, cardId: d.cardId, leaseId: d.leaseId, dispatchRevision: d.dispatchRevision }
+    return { h, c, d, req }
+  }
+  const superseded = (leaseId: string) => ({ leaseId, accepted: false, reason: 'superseded' })
+
+  it('returns body-free card metadata and prior runs to the daemon that holds the open lease', async () => {
+    const { h, c, d, req } = await leased()
+    // A first attempt that ended transient, then the open one.
+    await h.dispatcher.onReport(D1, 4, h.reportFor(d, { outcome: 'transient', reasonCode: 'provider_rate_limited' }))
+    await h.dispatcher.settle()
+    h.clock.advance(61_000)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const second = h.sent[1]!.d
+    const reply = await h.dispatcher.onCardShow(D1, 4, {
+      ...req,
+      leaseId: second.leaseId,
+      dispatchRevision: second.dispatchRevision
+    })
+    expect(reply).toMatchObject({
+      leaseId: second.leaseId,
+      accepted: true,
+      card: {
+        status: 'running',
+        attempt: 2,
+        mode: 'read',
+        blockKind: null,
+        consecutiveFailures: 0,
+        runs: [{ attempt: 1, outcome: 'transient', reasonCode: 'provider_rate_limited' }]
+      }
+    })
+    expect(Object.keys((reply as { card: object }).card).sort()).toEqual(
+      [
+        'attempt',
+        'blockKind',
+        'blockRecurrence',
+        'consecutiveFailures',
+        'linkedPrNumber',
+        'mode',
+        'priority',
+        'protocolViolations',
+        'runs',
+        'status'
+      ].sort()
+    )
+    expect(c.id).toBe(req.cardId)
+  })
+
+  it.each([
+    ['another daemon', (r: Record<string, string>) => ({ daemon: D2, epoch: 1, req: r })],
+    ['a stale daemon epoch', (r: Record<string, string>) => ({ daemon: D1, epoch: 3, req: r })],
+    [
+      'a stale dispatch revision',
+      (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, dispatchRevision: '99' } })
+    ],
+    ['another card', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, cardId: D2 } })],
+    ['another board', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, boardId: D2 } })],
+    ['an unknown lease', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, leaseId: D2 } })]
+  ])('refuses a card read from %s', async (_name, mutate) => {
+    const { h, req } = await leased()
+    const { daemon, epoch, req: mutated } = mutate(req)
+    const bad = mutated as typeof req
+    expect(await h.dispatcher.onCardShow(daemon, epoch, bad)).toEqual(superseded(bad.leaseId))
+  })
+
+  it('refuses a card read and a progress grant once the card was reassigned', async () => {
+    const { h, d, req } = await leased()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+    await prisma.kanbanCard.update({ where: { id: d.cardId }, data: { dispatchRevision: { increment: 1 } } })
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+  })
+
+  it('refuses reads and progress grants after the agent moves to another daemon', async () => {
+    const { h, d, req } = await leased()
+    await prisma.agent.update({ where: { id: A1 }, data: { daemonId: D2 } })
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+  })
+
+  it('refuses a card read and a progress grant once the lease has ended, leaving the final-comment grant', async () => {
+    const { h, d, req } = await leased()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(d))
+    await h.dispatcher.settle()
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+  })
+
+  it('grants a progress note only to the holder daemon, agent, epoch, and board repo', async () => {
+    const { h, d } = await leased()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+    expect(await h.dispatcher.liveCommentGrant(D2, 1, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 5, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, D2, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/other')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, D2, 'acme/web')).toBeNull()
+  })
+})

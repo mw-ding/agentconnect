@@ -12,12 +12,93 @@ import {
   turnFailureCode,
   turnFailureReason
 } from '../src/acp/acp-host.js'
+import { AcpConnectionClosedError } from '../src/acp/transport-error.js'
+import { classifyProviderError } from '../src/kanban/provider-error.js'
 import { RuntimeSessionFailure, sessionFailureFromMeta } from '../src/acp/session-failure.js'
 import { CODEX_MCP_STARTUP_GRACE_MS } from '../src/runtimes/codex-config.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const fakeAgent = join(here, 'fixtures', 'fake-acp-agent.mjs')
 describe('AcpHost (against a fake ACP agent)', () => {
+  it('marks an agent process exiting during a prompt as a transport failure', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_EXIT_DURING_PROMPT: '1' } }
+    )
+    await host.start()
+    try {
+      const sid = await host.newSession('/tmp')
+      const err = await host.prompt(sid, [{ type: 'text', text: 'go' }]).catch((error: unknown) => error)
+      expect(err).toBeInstanceOf(AcpConnectionClosedError)
+      expect(err).toMatchObject({ code: 'ACP_CONNECTION_CLOSED', cause: expect.any(Error) })
+      expect(classifyProviderError(err)).toEqual({ kind: 'fatal', reasonCode: 'agent_crashed' })
+    } finally {
+      await host.stop()
+    }
+  })
+
+  it('marks a reset on the agent stream without treating provider errors as transport failures', async () => {
+    const reset = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' })
+    let incoming: ReadableStreamDefaultController<Uint8Array>
+    let prompts = 0
+    const host = new AcpHost(
+      { command: 'fake', args: [], env: [] },
+      {
+        onUpdate: () => {},
+        driver: {
+          launch: async () => ({
+            fromAgent: new ReadableStream<Uint8Array>({
+              start: (controller) => {
+                incoming = controller
+              }
+            }),
+            toAgent: new WritableStream<Uint8Array>({
+              write: (chunk) => {
+                const req = JSON.parse(new TextDecoder().decode(chunk)) as { id: number; method: string }
+                let result: unknown = { protocolVersion: 1 }
+                if (req.method === 'session/new') result = { sessionId: 'test' }
+                if (req.method === 'session/prompt') {
+                  if (prompts++ === 0) {
+                    incoming.enqueue(
+                      new TextEncoder().encode(
+                        JSON.stringify({
+                          jsonrpc: '2.0',
+                          id: req.id,
+                          error: { code: 429, message: 'process exited with code 1' }
+                        }) + '\n'
+                      )
+                    )
+                    return
+                  }
+                  incoming.error(reset)
+                  return
+                }
+                incoming.enqueue(
+                  new TextEncoder().encode(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n')
+                )
+              }
+            }),
+            onExit: () => {},
+            stop: async () => {}
+          })
+        }
+      }
+    )
+    await host.start()
+    try {
+      const sid = await host.newSession('/tmp')
+      const provider = await host.prompt(sid, []).catch((err: unknown) => err)
+      expect(provider).not.toBeInstanceOf(AcpConnectionClosedError)
+      expect(classifyProviderError(provider)).toEqual({ kind: 'transient', reasonCode: 'provider_rate_limited' })
+      const transport = await host.prompt(sid, []).catch((err: unknown) => err)
+      expect(transport).toBeInstanceOf(AcpConnectionClosedError)
+      expect(transport).toMatchObject({ cause: reset })
+      expect(classifyProviderError(transport)).toEqual({ kind: 'fatal', reasonCode: 'agent_crashed' })
+    } finally {
+      await host.stop()
+    }
+  })
+
   it.each([
     { capabilities: ['customInstructions'], native: true },
     { capabilities: ['sessionFailure'], native: false },

@@ -14,6 +14,32 @@ export const KanbanReasonCode = z
   .regex(/^[a-z0-9_:-]+$/)
 export type KanbanReasonCode = z.infer<typeof KanbanReasonCode>
 
+/** Provider failures the daemon classifies from a turn's ACP error: transient ones report `transient`, fatal ones `failed`. */
+export const KANBAN_PROVIDER_TRANSIENT_REASON_CODES = [
+  'provider_rate_limited',
+  'provider_network',
+  'provider_overloaded',
+  'provider_server_error'
+] as const
+export const KANBAN_PROVIDER_FATAL_REASON_CODES = [
+  'provider_auth',
+  'provider_invalid_request',
+  'provider_context_overflow',
+  'agent_crashed'
+] as const
+export const KANBAN_PROVIDER_REASON_CODES = [
+  ...KANBAN_PROVIDER_TRANSIENT_REASON_CODES,
+  ...KANBAN_PROVIDER_FATAL_REASON_CODES
+] as const
+export type KanbanProviderReasonCode = (typeof KANBAN_PROVIDER_REASON_CODES)[number]
+
+/** Protocol-violation reasons: the dispatched turn ended without a terminal call, and the one nudge did not fix it. */
+export const KANBAN_REASON_NO_TERMINAL_CALL = 'no_terminal_call'
+export const KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE = 'no_terminal_call_after_nudge'
+export const KANBAN_REASON_NUDGE_UNAVAILABLE = 'nudge_unavailable'
+/** A nudge was refused because the agent is paused or the daemon is draining: not the card's fault, so it reports transient instead of a protocol violation. */
+export const KANBAN_REASON_NUDGE_DEFERRED = 'nudge_deferred'
+
 /** The run's mode, chosen from CP configuration (never a label); a write run needs its own session worktree. */
 export const KanbanRunMode = z.enum(['read', 'write'])
 export type KanbanRunMode = z.infer<typeof KanbanRunMode>
@@ -131,3 +157,57 @@ export const KanbanReportOk = z
   })
   .strict()
 export type KanbanReportOk = z.infer<typeof KanbanReportOk>
+
+/** Longest progress note a worker may post to its card's issue. */
+export const KANBAN_COMMENT_MAX_CHARS = 4_000
+
+/** Prior runs are bounded so a long-lived card cannot grow the reply. */
+export const KANBAN_CARD_SHOW_MAX_RUNS = 10
+
+/** `kanban/card` (D→C REQ → `kanban/card/ok`) — the worker's own leased card; ids and the lease fence only, never a title or body. */
+export const KanbanCardShow = z
+  .object({
+    boardId: z.string().uuid(),
+    cardId: z.string().uuid(),
+    leaseId: z.string().uuid(),
+    dispatchRevision: KanbanRevision
+  })
+  .strict()
+export type KanbanCardShow = z.infer<typeof KanbanCardShow>
+
+export const KanbanCardRun = z
+  .object({
+    attempt: z.number().int().positive(),
+    outcome: z.string().min(1).max(40).nullable(),
+    reasonCode: KanbanReasonCode.nullable(),
+    dispatchedAt: z.string().max(40),
+    endedAt: z.string().max(40).nullable()
+  })
+  .strict()
+export type KanbanCardRun = z.infer<typeof KanbanCardRun>
+
+/** Body-free card metadata; a superseded or unknown lease is answered as data (`accepted:false`). */
+export const KanbanCardShowOk = z.discriminatedUnion('accepted', [
+  z
+    .object({
+      leaseId: z.string().uuid(),
+      accepted: z.literal(true),
+      card: z
+        .object({
+          status: z.string().min(1).max(40),
+          priority: z.number().int(),
+          attempt: z.number().int().positive(),
+          mode: KanbanRunMode,
+          blockKind: KanbanBlockKind.nullable(),
+          consecutiveFailures: z.number().int().nonnegative(),
+          protocolViolations: z.number().int().nonnegative(),
+          blockRecurrence: z.number().int().nonnegative(),
+          linkedPrNumber: z.number().int().positive().nullable(),
+          runs: z.array(KanbanCardRun).max(KANBAN_CARD_SHOW_MAX_RUNS)
+        })
+        .strict()
+    })
+    .strict(),
+  z.object({ leaseId: z.string().uuid(), accepted: z.literal(false), reason: z.enum(['superseded']) }).strict()
+])
+export type KanbanCardShowOk = z.infer<typeof KanbanCardShowOk>

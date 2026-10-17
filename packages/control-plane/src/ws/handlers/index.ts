@@ -58,7 +58,7 @@ import { handleHookStart } from './hook-start.js'
 import { handleHookPreparing } from './hook-preparing.js'
 import { handleApprovalRoute } from './approval-route.js'
 import { handleReadAccess } from './read-access.js'
-import { handleKanbanLeaseHeartbeat, handleKanbanReport } from './kanban.js'
+import { handleKanbanCard, handleKanbanLeaseHeartbeat, handleKanbanReport } from './kanban.js'
 import { handleGithubReviewAuthorize } from './github-review-authorize.js'
 import { handleSharedImageGet, handleSharedImagePut } from './shared-image.js'
 import { handleTransferGet, handleTransferSettle, handleTransferSign } from './file-transfer.js'
@@ -130,6 +130,7 @@ export class FrameRouter {
       'codehost/review-result': handleCodeHostReviewResult,
       'kanban/lease-heartbeat': handleKanbanLeaseHeartbeat,
       'kanban/report': handleKanbanReport,
+      'kanban/card': handleKanbanCard,
       'channel/agents': handleChannelAgents,
       'session/child-status': handleChildSessionStatus,
       'event/session': handleEventSession,

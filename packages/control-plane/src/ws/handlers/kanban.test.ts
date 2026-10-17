@@ -2,13 +2,13 @@ import { describe, expect, it, vi } from 'vitest'
 import type { AnyFrame } from '@agentconnect.md/protocol'
 import type { DaemonConnection } from '../connection.js'
 import type { DaemonWsDeps } from '../deps.js'
-import { handleKanbanLeaseHeartbeat, handleKanbanReport } from './kanban.js'
+import { handleKanbanCard, handleKanbanLeaseHeartbeat, handleKanbanReport } from './kanban.js'
 
 const DAEMON_ID = 'd1d1d1d1-dddd-4ddd-8ddd-dddddddddddd'
 const LEASE = '44444444-4444-4444-8444-444444444444'
 const CARD = '22222222-2222-4222-8222-222222222222'
 
-const frame = (type: 'kanban/lease-heartbeat' | 'kanban/report', payload: unknown): AnyFrame =>
+const frame = (type: 'kanban/lease-heartbeat' | 'kanban/report' | 'kanban/card', payload: unknown): AnyFrame =>
   ({ v: 1, id: crypto.randomUUID(), ts: '2026-10-15T12:00:00.000Z', type, payload }) as AnyFrame
 
 const beat = { leases: [{ leaseId: LEASE, cardId: CARD, dispatchRevision: '3', liveness: 'background' }] }
@@ -65,5 +65,25 @@ describe('kanban WS handlers', () => {
     await handleKanbanReport(frame('kanban/report', report), c, { kanbanDispatcher: { onReport } } as never)
     expect(c.sendError).toHaveBeenLastCalledWith(expect.any(String), 'INTERNAL', expect.any(String), true)
     expect(c.replyTo).not.toHaveBeenCalled()
+  })
+
+  it('fences a card read with the authenticated daemon and epoch, never the payload', async () => {
+    const req = { boardId: report.boardId, cardId: CARD, leaseId: LEASE, dispatchRevision: '3' }
+    const onCardShow = vi.fn().mockResolvedValue({ leaseId: LEASE, accepted: false, reason: 'superseded' })
+    const c = conn()
+    const f = frame('kanban/card', req)
+    await handleKanbanCard(f, c, { kanbanDispatcher: { onCardShow } } as unknown as DaemonWsDeps)
+    expect(onCardShow).toHaveBeenCalledWith(DAEMON_ID, 9, req)
+    expect(c.replyTo).toHaveBeenCalledWith(f, 'kanban/card/ok', {
+      leaseId: LEASE,
+      accepted: false,
+      reason: 'superseded'
+    })
+
+    await handleKanbanCard(frame('kanban/card', req), c, {} as DaemonWsDeps)
+    expect(c.sendError).toHaveBeenLastCalledWith(expect.any(String), 'SCOPE_DENIED', expect.any(String), false)
+    const failing = vi.fn().mockRejectedValue(new Error('db down'))
+    await handleKanbanCard(frame('kanban/card', req), c, { kanbanDispatcher: { onCardShow: failing } } as never)
+    expect(c.sendError).toHaveBeenLastCalledWith(expect.any(String), 'INTERNAL', expect.any(String), true)
   })
 })

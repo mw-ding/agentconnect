@@ -231,7 +231,10 @@ export interface DaemonWsDeps {
   /** gitea-integration.md §10.4: the Control-Plane-written commit-status projection's lifecycle edges. */
   giteaStatusProjection?: GiteaStatusCoordinator
   /** Kanban lease heartbeats and run reports (issue #2 M2); absent ⇒ both answer SCOPE_DENIED. */
-  kanbanDispatcher?: Pick<KanbanDispatcher, 'onHeartbeat' | 'onReport' | 'commentGrant'>
+  kanbanDispatcher?: Pick<
+    KanbanDispatcher,
+    'onHeartbeat' | 'onReport' | 'commentGrant' | 'liveCommentGrant' | 'onCardShow'
+  >
   /** Open Kanban runs used to clamp gitcred grants to the run mode. Absent ⇒ no clamp. */
   kanbanGrants?: {
     openScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
