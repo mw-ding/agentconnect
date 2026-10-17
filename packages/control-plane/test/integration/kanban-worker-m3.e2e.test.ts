@@ -491,18 +491,14 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
         expect(promptTexts).toHaveLength(1)
         expect(seen.show?.ok, seen.show?.error).toBe(true)
         expect(seen.show!.result.controlPlane).toMatchObject({ status: 'running', attempt: 1, mode: 'read', runs: [] })
-        expect(seen.show!.result.github).toContain('----- BEGIN UNTRUSTED EXTERNAL CONTENT')
-        expect(seen.show!.result.github).toContain(`title: [kanban-e2e] m3 c show-comment ${started}`)
-        // The END marker in the title is escaped and does not close the fence early.
-        expect(seen.show!.result.github).toContain(
-          `title: [kanban-e2e] m3 c show-comment ${started} [escaped END-UNTRUSTED-EXTERNAL-CONTENT marker]`
-        )
+        const shownLines = (seen.show!.result.github as string).split('\n')
+        const nonce = /^----- BEGIN UNTRUSTED EXTERNAL CONTENT ([a-f0-9]{16}) /.exec(shownLines[0]!)?.[1]
+        expect(nonce).toBeDefined()
+        expect(shownLines.at(-1)).toBe(`----- END UNTRUSTED EXTERNAL CONTENT ${nonce} -----`)
+        expect(shownLines[1]).toBe('[line removed: it imitated the untrusted-content fence]')
         expect(
           (seen.show!.result.github as string).match(/(BEGIN|END)\s+UNTRUSTED\s+EXTERNAL\s+CONTENT/gi)
         ).toHaveLength(2)
-        expect(
-          (seen.show!.result.github as string).split('\n').filter((line) => line === UNTRUSTED_CONTENT_END)
-        ).toHaveLength(1)
         expect(seen.show!.result.github).toContain('Scratch issue for the opt-in Kanban M3 live check')
         expect(seen.show!.result.github).toContain('labels: ')
         expect(seen.note?.ok, seen.note?.error).toBe(true)

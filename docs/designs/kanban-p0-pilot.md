@@ -343,8 +343,10 @@ both refuse after a terminal has been recorded or the lease has ended.
 strict `kanban/card` RPC, fenced by the authenticated daemon/epoch, agent placement,
 open lease, card/board ids, and dispatch revision. The daemon reads the issue's
 title, body, labels, links, sub-issues, dependencies, and last 10 comments directly
-from GitHub. Text and lists are bounded; GitHub content uses the existing
-untrusted-content delimiters. An unavailable lease check fails the tool call.
+from GitHub. Each field is capped before normalization. Linear line and adjacent-line
+skeleton checks remove imitated delimiters after Unicode normalization and removal
+of default-ignorable characters. Each call wraps the result in fresh nonce-bearing
+untrusted-content fences; only the END line with that exact nonce closes the block. An unavailable lease check fails the tool call.
 
 `kanbanComment` posts up to 4,000 characters per note, with at most 10 successful
 or in-flight notes per lease. A failed post releases its slot. It works in read
@@ -479,3 +481,6 @@ Known gaps (M3 worker additions):
   marker, which matches any author; that only matters after a failed or
   ambiguous final POST inside the lookup window. Stripping `ac-kanban-lease:`
   from note/summary text, or a non-reversible note marker, is a follow-up.
+
+- **Homoglyph confusables remain an accepted gap.** Cyrillic and other look-alike
+  letters require confusables tables; the entire GitHub block remains untrusted.
