@@ -259,6 +259,8 @@ interface Harness {
   /** The routing host's answer to a host copy; the default selects every candidate as Otherwise. */
   routeAck: (msg: RdMsgHook) => RdAck | Promise<RdAck>
   offline: boolean
+  /** The CP link is down: the doorbell emits report a drop. */
+  cpDown: boolean
   cleanupSupported: boolean
   noticeSupported: boolean
   routingSupported: boolean
@@ -293,6 +295,7 @@ function makeHarness(authzCapacity = 20): Harness {
     rerequestResult: { allowed: false },
     ack: { msgId: 'x', accepted: true },
     offline: false,
+    cpDown: false,
     noticeSupported: true,
     routingSupported: true,
     routeAck: (msg) => ({
@@ -332,13 +335,19 @@ function makeHarness(authzCapacity = 20): Harness {
       }
     }),
     report: (r) => h.reports.push(r),
-    doorbell: (p) => h.doorbells.push(p),
+    doorbell: (p) => {
+      h.doorbells.push(p)
+      return !h.cpDown
+    },
     reportPullRequestFeedback: async (signal) => {
       if (h.feedbackError) throw new Error('CP unavailable')
       h.feedback.push(signal)
       return true
     },
-    graphDoorbell: (p) => h.graphDoorbells.push(p),
+    graphDoorbell: (p) => {
+      h.graphDoorbells.push(p)
+      return !h.cpDown
+    },
     authorizeComment: async (request) => {
       h.authzRequests.push(request)
       return typeof h.authzResult === 'function' ? h.authzResult(request) : h.authzResult!
@@ -669,6 +678,55 @@ describe('github ingress', () => {
       await flush()
       expect(h.graphDoorbells).toHaveLength(2)
       expect(h.graphDoorbells[1]).toEqual(h.graphDoorbells[0])
+      expect(h.sent).toHaveLength(1)
+    })
+
+    it("leaves a delivery unmarked when the CP doorbell is dropped, so GitHub's redelivery is processed", async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-cp-down' }
+      h.cpDown = true
+      expect((await post('issues', labeled('ac/status:ready'), { headers })).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+
+      h.cpDown = false
+      expect((await post('issues', labeled('ac/status:ready'), { headers })).statusCode).toBe(202)
+      await flush()
+      // Processed afresh (not replayed as a duplicate): the hook is dispatched again and the doorbell rings once more.
+      expect(h.sent).toHaveLength(2)
+      expect(h.graphDoorbells).toHaveLength(2)
+
+      // Now forwarded successfully, a third copy is a duplicate.
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.sent).toHaveLength(2)
+    })
+
+    it('forgets a delivery whose hook failed before daemon admission, so the CP redelivery of the same GUID runs', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-draining' }
+      h.ack = { msgId: 'x', accepted: false, reason: 'draining' }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.reports).toEqual([expect.objectContaining({ status: 'failed', reason: 'rejected:draining' })])
+      expect(h.sent).toHaveLength(1)
+
+      // The CP's redelivery keeps the same X-GitHub-Delivery and lands inside the TTL.
+      h.ack = { msgId: 'x', accepted: true }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      expect(h.sent).toHaveLength(2)
+      expect(h.reports.at(-1)).toMatchObject({ status: 'accepted' })
+    })
+
+    it('keeps deduping a delivery whose hook failure is not retryable', async () => {
+      h.table.upsert(rule({}, { events: ['issues:*'] }))
+      const headers = { 'x-github-delivery': 'gh-delivery-rejected' }
+      h.ack = { msgId: 'x', accepted: false, reason: 'agent_busy' }
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
+      await post('issues', labeled('ac/status:ready'), { headers })
+      await flush()
       expect(h.sent).toHaveLength(1)
     })
 
