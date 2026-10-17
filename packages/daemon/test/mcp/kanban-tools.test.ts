@@ -8,6 +8,7 @@ const ctx: SessionContext = {
   isDm: false,
   channel: 'github:123',
   thread: '42',
+  deliveryThread: '42',
   transportScope: 'github:123',
   tools: KANBAN_TOOLS,
   integrations: []

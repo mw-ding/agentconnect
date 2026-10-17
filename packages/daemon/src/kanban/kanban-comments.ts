@@ -94,14 +94,14 @@ function readJson(res: Response, signal: AbortSignal): Promise<unknown> {
   })
 }
 
-/** The sqlite rows the publisher drains. LocalStore implements this. */
+/** The store rows the publisher drains. LocalStore implements this. */
 export interface KanbanCommentStore {
-  dueKanbanComments(now: number, limit: number): KanbanCommentRow[]
-  markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): void
-  deferKanbanComment(leaseId: string, nextAt: number): void
-  deferKanbanCommentLookup(leaseId: string, nextAt: number): void
-  failKanbanComment(leaseId: string): void
-  removeKanbanComment(leaseId: string): void
+  dueKanbanComments(now: number, limit: number): Promise<KanbanCommentRow[]>
+  markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): Promise<void>
+  deferKanbanComment(leaseId: string, nextAt: number): Promise<void>
+  deferKanbanCommentLookup(leaseId: string, nextAt: number): Promise<void>
+  failKanbanComment(leaseId: string): Promise<void>
+  removeKanbanComment(leaseId: string): Promise<void>
 }
 
 export interface KanbanCommentPublisherDeps {
@@ -133,7 +133,7 @@ export class KanbanCommentPublisher {
   private async pass(): Promise<void> {
     let due: KanbanCommentRow[]
     try {
-      due = this.deps.store.dueKanbanComments(this.deps.clock.now(), BATCH)
+      due = await this.deps.store.dueKanbanComments(this.deps.clock.now(), BATCH)
     } catch (err) {
       this.deps.log.warn(`kanban: comment outbox read failed (${String(err)})`)
       return
@@ -156,7 +156,7 @@ export class KanbanCommentPublisher {
       token = await this.deps.token(entry)
     } catch (err) {
       this.deps.log.warn(`kanban: comment token unavailable for ${leaseId} (${String(err)})`)
-      this.deps.store.deferKanbanComment(leaseId, later())
+      await this.deps.store.deferKanbanComment(leaseId, later())
       return
     }
     if (row.attempted) {
@@ -164,21 +164,21 @@ export class KanbanCommentPublisher {
       try {
         lookup = await this.findMarker(row, token)
       } catch (err) {
-        this.lookupMissed(row, later(), `failed (${String(err)})`)
+        await this.lookupMissed(row, later(), `failed (${String(err)})`)
         return
       }
       if (lookup === 'found') {
-        this.deps.store.removeKanbanComment(leaseId)
+        await this.deps.store.removeKanbanComment(leaseId)
         this.deps.log.info(`kanban: final comment already on ${entry.repoFullName}#${entry.issueNumber}`)
         return
       }
       if (lookup === 'inconclusive') {
-        this.lookupMissed(row, later(), 'hit the page bound')
+        await this.lookupMissed(row, later(), 'hit the page bound')
         return
       }
     }
     // Mark before the POST so a crash mid-request looks before it posts a second copy.
-    this.deps.store.markKanbanCommentAttempt(leaseId, later(), this.deps.clock.now())
+    await this.deps.store.markKanbanCommentAttempt(leaseId, later(), this.deps.clock.now())
     const published = await new GithubFinalPoster(
       {
         token: async () => this.deps.token(entry),
@@ -191,17 +191,17 @@ export class KanbanCommentPublisher {
       entry.issueNumber
     ).publish(kanbanFinalCommentBody(entry))
     if (!published) return
-    this.deps.store.removeKanbanComment(leaseId)
+    await this.deps.store.removeKanbanComment(leaseId)
     this.deps.log.info(`kanban: posted final comment on ${entry.repoFullName}#${entry.issueNumber}`)
   }
 
   /** An undecided lookup retries with backoff, then parks the row loudly rather than looping or risking a duplicate. */
-  private lookupMissed(row: KanbanCommentRow, nextAt: number, why: string): void {
+  private async lookupMissed(row: KanbanCommentRow, nextAt: number, why: string): Promise<void> {
     const leaseId = row.entry.report.leaseId
     const issue = `${row.entry.repoFullName}#${row.entry.issueNumber}`
     const misses = row.lookupMisses + 1
     if (misses >= MARKER_LOOKUP_LIMIT) {
-      this.deps.store.failKanbanComment(leaseId)
+      await this.deps.store.failKanbanComment(leaseId)
       this.deps.log.error(
         `kanban: final comment for lease ${leaseId} on ${issue} needs attention; marker lookup ${why}, ${misses} undecided lookups, not posting`
       )
@@ -210,7 +210,7 @@ export class KanbanCommentPublisher {
     this.deps.log.warn(
       `kanban: comment lookup ${why} for lease ${leaseId} on ${issue} (${misses}/${MARKER_LOOKUP_LIMIT})`
     )
-    this.deps.store.deferKanbanCommentLookup(leaseId, nextAt)
+    await this.deps.store.deferKanbanCommentLookup(leaseId, nextAt)
   }
 
   private async findMarker(row: KanbanCommentRow, token: string): Promise<MarkerLookup> {

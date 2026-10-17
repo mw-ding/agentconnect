@@ -280,7 +280,7 @@ it('masks a secret in the stored terminal and in the GitHub comment body', async
       posted.push(String(init?.body ?? ''))
       return Promise.resolve(new Response(JSON.stringify({ id: 99 }), { status: 201 }))
     }
-    return realFetch(input as RequestInfo, init)
+    return realFetch(input as Parameters<typeof fetch>[0], init)
   })
   let release!: () => void
   const held = new Promise<void>((resolve) => {
@@ -291,10 +291,10 @@ it('masks a secret in the stored terminal and in the GitHub comment body', async
     return { stopReason: 'end_turn' }
   })
   try {
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     await vi.waitFor(() => expect(h.host.prompt).toHaveBeenCalledOnce())
     const card = buildKanbanMessage(dispatch, 'trace')
-    ;(h.daemon as any).recordKanbanTerminal({
+    await (h.daemon as any).recordKanbanTerminal({
       agentId: AGENT,
       platform: card.platform,
       channel: card.channel,
@@ -308,7 +308,7 @@ it('masks a secret in the stored terminal and in the GitHub comment body', async
         reason: `blocked on ${secret}`
       }
     })
-    const row = (h.store as any).db.prepare('SELECT entry FROM kanban_terminals').get() as { entry: string }
+    const row = (await (h.store as any).db.prepare('SELECT entry FROM kanban_terminals').get()) as { entry: string }
     expect(row.entry).toContain('[secret:GH_TOKEN]')
     expect(row.entry).not.toContain(secret)
     const stored = JSON.parse(row.entry) as { summary: string; reason: string }
@@ -324,10 +324,10 @@ it('masks a secret in the stored terminal and in the GitHub comment body', async
   }
 })
 
-it('records one terminal per lease and queues its comment only after the report is accepted', () => {
+it('records one terminal per lease and queues its comment only after the report is accepted', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ac-kanban-terminal-'))
   roots.push(root)
-  const store = new LocalStore(join(root, 'store.db'))
+  const store = await LocalStore.open(join(root, 'store.db'))
   const report: KanbanReport = {
     boardId: dispatch.boardId,
     cardId: dispatch.cardId,
@@ -346,30 +346,30 @@ it('records one terminal per lease and queues its comment only after the report 
     summary: 'need a schema decision',
     reason: 'which database?'
   }
-  expect(store.recordKanbanTerminal(entry, 1)).toBe(true)
-  expect(store.recordKanbanTerminal({ ...entry, summary: 'second' }, 2)).toBe(false)
-  store.reserveKanbanLease(dispatch.leaseId, 1)
-  expect(store.orphanedKanbanTerminals().map((row) => row.summary)).toEqual(['need a schema decision'])
-  store.putKanbanReport(report, 3)
-  expect(store.orphanedKanbanTerminals()).toEqual([])
-  store.settleKanbanTerminal(dispatch.leaseId, false)
-  expect(store.dueKanbanComments(10, 10)).toEqual([])
-  expect(store.recordKanbanTerminal(entry, 4)).toBe(true)
-  store.settleKanbanTerminal(dispatch.leaseId, true)
-  expect(store.dueKanbanComments(0, 10)).toMatchObject([{ attempted: false, entry: { summary: entry.summary } }])
-  store.markKanbanCommentAttempt(dispatch.leaseId, 100, 40)
-  store.markKanbanCommentAttempt(dispatch.leaseId, 100, 60)
-  expect(store.dueKanbanComments(50, 10)).toEqual([])
-  expect(store.dueKanbanComments(100, 10)[0]).toMatchObject({ attempted: true, attempts: 2, attemptedAt: 40 })
-  store.deferKanbanCommentLookup(dispatch.leaseId, 100)
-  expect(store.dueKanbanComments(100, 10)[0]).toMatchObject({ lookupMisses: 1 })
-  store.close()
-  const reopened = new LocalStore(join(root, 'store.db'))
-  expect(reopened.dueKanbanComments(100, 10)[0]?.entry.reason).toBe('which database?')
-  reopened.failKanbanComment(dispatch.leaseId)
-  expect(reopened.dueKanbanComments(100, 10)).toEqual([])
-  expect((reopened as any).db.prepare('SELECT state FROM kanban_terminals').get()).toEqual({ state: 'failed' })
-  reopened.close()
+  expect(await store.recordKanbanTerminal(entry, 1)).toBe(true)
+  expect(await store.recordKanbanTerminal({ ...entry, summary: 'second' }, 2)).toBe(false)
+  await store.reserveKanbanLease(dispatch.leaseId, 1)
+  expect((await store.orphanedKanbanTerminals()).map((row) => row.summary)).toEqual(['need a schema decision'])
+  await store.putKanbanReport(report, 3)
+  expect(await store.orphanedKanbanTerminals()).toEqual([])
+  await store.settleKanbanTerminal(dispatch.leaseId, false)
+  expect(await store.dueKanbanComments(10, 10)).toEqual([])
+  expect(await store.recordKanbanTerminal(entry, 4)).toBe(true)
+  await store.settleKanbanTerminal(dispatch.leaseId, true)
+  expect(await store.dueKanbanComments(0, 10)).toMatchObject([{ attempted: false, entry: { summary: entry.summary } }])
+  await store.markKanbanCommentAttempt(dispatch.leaseId, 100, 40)
+  await store.markKanbanCommentAttempt(dispatch.leaseId, 100, 60)
+  expect(await store.dueKanbanComments(50, 10)).toEqual([])
+  expect((await store.dueKanbanComments(100, 10))[0]).toMatchObject({ attempted: true, attempts: 2, attemptedAt: 40 })
+  await store.deferKanbanCommentLookup(dispatch.leaseId, 100)
+  expect((await store.dueKanbanComments(100, 10))[0]).toMatchObject({ lookupMisses: 1 })
+  await store.close()
+  const reopened = await LocalStore.open(join(root, 'store.db'))
+  expect((await reopened.dueKanbanComments(100, 10))[0]?.entry.reason).toBe('which database?')
+  await reopened.failKanbanComment(dispatch.leaseId)
+  expect(await reopened.dueKanbanComments(100, 10)).toEqual([])
+  expect(await (reopened as any).db.prepare('SELECT state FROM kanban_terminals').get()).toEqual({ state: 'failed' })
+  await reopened.close()
 })
 
 it.each(['ac/status:ready', 'ac/mode:write', 'ac/agent:worker', 'ac/future:grant'])(

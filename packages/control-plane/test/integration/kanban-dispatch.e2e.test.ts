@@ -552,7 +552,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
           outcome,
           issue: created.number
         })
-        expect(worker.recordTerminal(d.leaseId, { outcome, summary }).recorded).toBe(true)
+        expect((await worker.recordTerminal(d.leaseId, { outcome, summary })).recorded).toBe(true)
       } else {
         expect(live.terminal).toMatchObject({ outcome, summary: expect.stringContaining('KANBAN_E2E_TERMINAL') })
         phase('e: model called the terminal tool', { outcome, issue: created.number, tool: toolName })

@@ -62,16 +62,16 @@ function harness() {
       remove: async (id) => {
         reports.set(id, null)
       },
-      recordTerminal: (entry) => {
+      recordTerminal: async (entry) => {
         if (terminals.has(entry.report.leaseId)) return false
         terminals.set(entry.report.leaseId, { entry, state: 'held' })
         return true
       },
-      orphanedTerminals: () =>
+      orphanedTerminals: async () =>
         [...terminals.values()]
           .filter((t) => t.state === 'held' && reports.get(t.entry.report.leaseId) === null)
           .map((t) => t.entry),
-      settleTerminal: (id, accepted) => {
+      settleTerminal: async (id, accepted) => {
         const t = terminals.get(id)
         if (t?.state !== 'held') return
         if (accepted) t.state = 'comment'
@@ -136,8 +136,10 @@ describe('Kanban worker leases', () => {
     const h = harness()
     await h.worker.dispatch(dispatch)
     h.state.tasks = 1
-    expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' }).recorded).toBe(true)
-    expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'failed', summary: 'no' })).toEqual({
+    expect((await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })).recorded).toBe(
+      true
+    )
+    expect(await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'failed', summary: 'no' })).toEqual({
       recorded: false,
       reason: 'already_reported'
     })
@@ -193,11 +195,11 @@ describe('Kanban worker leases', () => {
   it('binds a terminal to the session lease exactly once and keeps its free text off the report', async () => {
     const h = harness()
     h.worker.start()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     expect(h.worker.leaseForSession('session-42')).toBe(dispatch.leaseId)
     expect(h.worker.leaseForSession('other-session')).toBeUndefined()
     expect(
-      h.worker.recordTerminal(dispatch.leaseId, {
+      await h.worker.recordTerminal(dispatch.leaseId, {
         outcome: 'blocked',
         blockKind: 'needs_input',
         reasonCode: 'agent_blocked',
@@ -215,7 +217,7 @@ describe('Kanban worker leases', () => {
       blockKind: 'needs_input',
       reasonCode: 'agent_blocked'
     })
-    expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'again' })).toEqual({
+    expect(await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'again' })).toEqual({
       recorded: false,
       reason: 'already_reported'
     })
@@ -228,43 +230,46 @@ describe('Kanban worker leases', () => {
     expect(h.comments.drain).toHaveBeenCalled()
     // The lease ended with the report: a late call has nothing to bind to.
     expect(h.worker.leaseForSession('session-42')).toBeUndefined()
-    expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'failed', summary: 'late' })).toEqual({
+    expect(await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'failed', summary: 'late' })).toEqual({
       recorded: false,
       reason: 'no_lease'
     })
   })
 
-  it('refuses a terminal the durable store already holds, and one it cannot persist', () => {
+  it('refuses a terminal the durable store already holds, and one it cannot persist', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
+    await h.worker.dispatch(dispatch)
     h.terminals.set(dispatch.leaseId, {
       state: 'held',
       entry: { report: {} as KanbanReport, repoFullName: 'acme/web', issueNumber: 42, summary: 'x' }
     })
-    expect(h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' })).toEqual({
+    expect(await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' })).toEqual({
       recorded: false,
       reason: 'already_reported'
     })
     const other = harness()
-    other.worker.dispatch(dispatch)
-    const outbox = (other.worker as unknown as { deps: { outbox: { recordTerminal: () => boolean } } }).deps.outbox
-    outbox.recordTerminal = () => {
+    await other.worker.dispatch(dispatch)
+    const outbox = (other.worker as unknown as { deps: { outbox: { recordTerminal: () => Promise<boolean> } } }).deps
+      .outbox
+    outbox.recordTerminal = async () => {
       throw new Error('disk full')
     }
-    expect(other.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' })).toEqual({
+    expect(await other.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' })).toEqual({
       recorded: false,
       reason: 'durability'
     })
     // A refused persist leaves the run free to report again.
-    outbox.recordTerminal = () => true
-    expect(other.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' }).recorded).toBe(true)
+    outbox.recordTerminal = async () => true
+    expect((await other.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'y' })).recorded).toBe(
+      true
+    )
   })
 
   it('drops the comment of a superseded or dead-lettered report', async () => {
     const h = harness()
     h.worker.start()
-    h.worker.dispatch(dispatch)
-    h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
+    await h.worker.dispatch(dispatch)
+    await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
     h.cp.report.mockResolvedValueOnce({ leaseId: dispatch.leaseId, accepted: false })
     await h.settle()
     expect(h.terminals.has(dispatch.leaseId)).toBe(false)
@@ -273,8 +278,8 @@ describe('Kanban worker leases', () => {
     h.worker.stop()
 
     const g = harness()
-    g.worker.dispatch(dispatch)
-    g.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
+    await g.worker.dispatch(dispatch)
+    await g.worker.recordTerminal(dispatch.leaseId, { outcome: 'completed', summary: 'done' })
     g.cp.report.mockRejectedValueOnce(new WireError('BAD_REQUEST', 'schema', false))
     await g.settle()
     expect(g.terminals.has(dispatch.leaseId)).toBe(false)
@@ -283,15 +288,17 @@ describe('Kanban worker leases', () => {
 
   it('requeues a terminal recorded before a restart and lets the lease fence decide', async () => {
     const h = harness()
-    h.worker.dispatch(dispatch)
-    h.worker.recordTerminal(dispatch.leaseId, { outcome: 'review_requested', summary: 'ready', prNumber: 7 })
+    await h.worker.dispatch(dispatch)
+    await h.worker.recordTerminal(dispatch.leaseId, { outcome: 'review_requested', summary: 'ready', prNumber: 7 })
     const held = h.terminals.get(dispatch.leaseId)!
     // A fresh process: the reservation and the recorded terminal survived, the in-memory lease did not.
     const r = harness()
     r.reports.set(dispatch.leaseId, null)
     r.terminals.set(dispatch.leaseId, held)
     r.worker.start()
-    expect(r.reports.get(dispatch.leaseId)).toMatchObject({ outcome: 'review_requested', prNumber: 7 })
+    await vi.waitFor(() =>
+      expect(r.reports.get(dispatch.leaseId)).toMatchObject({ outcome: 'review_requested', prNumber: 7 })
+    )
     await r.worker.flush()
     expect(r.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'review_requested' }))
     expect(r.terminals.get(dispatch.leaseId)?.state).toBe('comment')
