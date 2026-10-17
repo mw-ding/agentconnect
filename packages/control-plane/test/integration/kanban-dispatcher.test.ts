@@ -1475,6 +1475,55 @@ describe('KanbanDispatcher — provider outage backoff (real Postgres)', () => {
     expect(h.store.issues.get(c.issueNumber)?.labels).toContain('ac/status:triage')
   })
 
+  it('skips nudge and paused-dispatch deferrals in the provider streak', async () => {
+    const h = await harness({
+      reply: (d) =>
+        d.attempt === 4
+          ? { leaseId: d.leaseId, accepted: false, reason: 'paused' }
+          : { leaseId: d.leaseId, accepted: true }
+    })
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, { outcome: 'transient', reasonCode: 'nudge_deferred' })
+    const second = await cycle(h, c.id, outage)
+    expect(second.cooldownUntil!.getTime() - h.clock.now()).toBe(120_000)
+    h.clock.advance(second.cooldownUntil!.getTime() - h.clock.now() + 1)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(await h.run(h.sent.at(-1)!.d.leaseId)).toMatchObject({
+      outcome: 'transient',
+      reasonCode: 'dispatch_refused:paused'
+    })
+    const third = await cycle(h, c.id, outage)
+    expect(third.cooldownUntil!.getTime() - h.clock.now()).toBe(240_000)
+    expect(third).toMatchObject({ status: 'ready', consecutiveFailures: 0 })
+  })
+
+  it('scans past deferrals before applying the provider history limit', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    for (let i = 0; i < 10; i++) await cycle(h, c.id, { outcome: 'transient', reasonCode: 'nudge_deferred' })
+    const second = await cycle(h, c.id, outage)
+    expect(second.cooldownUntil!.getTime() - h.clock.now()).toBe(120_000)
+  })
+
+  it.each([
+    { outcome: 'failed', reasonCode: 'provider_auth' },
+    { outcome: 'transient', reasonCode: 'turn_lost' },
+    { outcome: 'transient', reasonCode: 'dispatchxrefused:paused' },
+    { outcome: 'transient' },
+    { outcome: 'failed', reasonCode: 'nudge_deferred' },
+    { outcome: 'failed', reasonCode: 'dispatch_refused:write_needs_worktree' }
+  ] as const)('resets the provider streak after $outcome/$reasonCode', async (other) => {
+    const h = await harness()
+    const c = await h.addCard()
+    await cycle(h, c.id, outage)
+    await cycle(h, c.id, other)
+    const next = await cycle(h, c.id, outage)
+    expect(next.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
+  })
+
   it('restarts the backoff after a different outcome, and leaves non-provider transients on the flat cooldown', async () => {
     const h = await harness()
     const c = await h.addCard()

@@ -337,8 +337,9 @@ on the daemon; only the reason code reaches the control plane.
 Consecutive provider transients derive their backoff from prior ended runs,
 without a schema change: 1, 2, 4, 8, 16, 32, then 60 minutes. The eighth consecutive
 provider transient moves the card to `triage`. These retries preserve failure and
-protocol counters. A different outcome resets the provider sequence; other
-transients retain their fixed one-minute cooldown.
+protocol counters. Transient `nudge_deferred` and `dispatch_refused:*` runs are
+skipped without counting or resetting the provider sequence; any other outcome
+resets it. Non-provider transients retain their fixed one-minute cooldown.
 
 `kanbanShow()` and `kanbanComment({text})` resolve the worker's own card from the
 trusted session context. Neither accepts a card, agent, or lease argument, and

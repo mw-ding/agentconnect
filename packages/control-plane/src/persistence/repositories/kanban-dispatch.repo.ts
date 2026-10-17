@@ -507,10 +507,25 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     })
   }
 
-  /** How many of the card's latest ended runs, back to back, were provider outages (transient with a `provider_*` reason). */
+  // Admission deferrals carry no provider evidence; exclude them before limiting the outage history.
   private async trailingProviderTransients(tx: PrismaLike, cardId: string): Promise<number> {
     const ended = await tx.kanbanRun.findMany({
-      where: { cardId, endedAt: { not: null } },
+      where: {
+        cardId,
+        endedAt: { not: null },
+        OR: [
+          { outcome: null },
+          { outcome: { not: 'transient' } },
+          { reasonCode: null },
+          {
+            AND: [
+              { reasonCode: { not: 'nudge_deferred' } },
+              // Prisma uses LIKE here, so the underscore must match literally.
+              { NOT: { reasonCode: { startsWith: 'dispatch\\_refused:' } } }
+            ]
+          }
+        ]
+      },
       orderBy: { attempt: 'desc' },
       take: PROVIDER_TRANSIENT_LIMIT,
       select: { outcome: true, reasonCode: true }
