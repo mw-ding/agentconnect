@@ -573,8 +573,18 @@ Known gaps update (M1 label sync attribution): an edit is adopted only when the
 visible issue events attribute the live label to a human writer; when the events
 API lags the live labels, the pass is deferred and neither adopts, reverts, nor
 advances the cursor. A deferred card is retried on later passes and fails closed
-to `needsAttention` 10 minutes after its first deferral, reverting the live
-status label to the committed status with a comment.
+10 minutes after its first deferral: a `ready` or `running` card moves to `triage`,
+revoking any active lease; other statuses remain unchanged. The card is flagged
+with `needsAttention`, its status label is projected with one timeout comment,
+and a claim neither takes the card nor clears the flag. Failed label writes
+remain eligible for repair; only a cleanly attributed human writer edit releases
+the hold.
+
+Roll out the CP before the relay: the strict doorbell schema on an older CP
+rejects the new fields. During the CP-before-relay window, a `labeled` doorbell
+without a sender or label imports as unassigned `triage` (fail closed). The
+relay's optional `at` timestamp lets sync ignore a superseded doorbell and judge
+the newer visible label event through the normal attribution path.
 An agent using a writer's own host `gh` credentials is indistinguishable from
 that human (the shared-GitHub-login limit): label attribution trusts the events
 API's actor, which reports the credential's login, not the process behind it.
