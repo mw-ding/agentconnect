@@ -22,6 +22,7 @@ import type { GithubTurnState } from '../platforms/github/turn-output.js'
 import type { ModelProviderTarget } from '../runtimes/model-provider-config.js'
 import type { TranscriptRecorder } from '../session/transcript-recorder.js'
 import type { TerminalOutputFolder } from '../session/terminal-output-folder.js'
+import type { SecretMaskEntry } from '../session/secret-mask.js'
 import type { OutputConverger, SlackAction } from '../slack/render.js'
 import type { TelegramAction, TelegramConverger } from '../telegram/render.js'
 import type { DiscordAction, DiscordConverger } from '../discord/render.js'
@@ -701,6 +702,7 @@ export interface Pending {
     replySegments: { postId: string; text: string; committing?: Promise<void> }[]
     segmentIndex?: number
     heldText: string
+    maskText?: (text: string) => string
     heldTextOffset?: number
     messageId?: string
     messageEmitted: boolean
@@ -708,6 +710,9 @@ export interface Pending {
   /** Agent questions this turn has already told the channel it could not render (#1794), so a
    *  runtime re-raising the same unrenderable ask posts one notice rather than one per attempt. */
   declinedElicitNotices?: Set<string>
+  /** Snapshot of the agent's mask entries (incl. BYOK provider secrets) captured when the turn
+   *  started, so a final flush after the host's process exits still masks them. */
+  maskEntries?: SecretMaskEntry[]
 }
 
 /** Visible Slack thread messages that establish a new chronological boundary. Any live
