@@ -8,6 +8,7 @@ import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
+import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
 import { KanbanControls } from '../../src/kanban/controls.js'
 import type { CardGraph, CardIssue, KanbanRepoRef, LabelWriteObserver } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
@@ -28,6 +29,9 @@ class FakeStore {
   }
   async readGraph(_repo: KanbanRepoRef, _n: number): Promise<CardGraph> {
     return { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
+  }
+  async lastEventId(): Promise<number> {
+    return 0
   }
   async statusSetByHuman(_repo: KanbanRepoRef, _n: number, _status: never): Promise<boolean> {
     return true
@@ -178,6 +182,23 @@ describe('Kanban M4 controls — pause/resume gate (real Postgres)', () => {
     expect(h.sent[0]?.d.cardId).toBe(ready.id)
   })
 
+  it('accepts an open lease report and heartbeat while paused', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const d = h.sent[0]!.d
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    expect(
+      await h.dispatcher.onHeartbeat(D1, 4, [
+        { leaseId: d.leaseId, cardId: d.cardId, dispatchRevision: d.dispatchRevision, liveness: 'turn' }
+      ])
+    ).toEqual([])
+    expect(await h.dispatcher.onReport(D1, 4, h.reportFor(d))).toMatchObject({ accepted: true })
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('done')
+  })
+
   it('the reaper still reclaims a stale lease on a paused board', async () => {
     const h = await harness()
     const c = await h.addCard()
@@ -218,6 +239,43 @@ describe('Kanban M4 controls — skip (real Postgres)', () => {
     expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
     expect((await h.card(c.id)).status).toBe('archived')
     expect(await prisma.auditEvent.count({ where: { kind: 'card_skipped' } })).toBe(1)
+  })
+
+  it('does not promote a dependent when its blocker was skipped as not_planned', async () => {
+    const h = await harness()
+    const blocker = await h.addCard()
+    const dependent = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: dependent.id }, data: { status: 'todo' } })
+    await h.controls.skip(DEFAULT_ORG_ID, h.board.id, blocker.id, DEFAULT_OWNER_ID)
+    const reconciler = new KanbanGraphReconciler({
+      cards: new PgKanbanCardRepo(prisma),
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() }
+    })
+    const observed = h.store.issues.get(blocker.issueNumber)!
+    await reconciler.apply(
+      { ...h.board, synthesizerAgentId: null, orgId: OrgId(DEFAULT_ORG_ID) },
+      { installationId: 77n, repoId: REPO_ID, repoFullName: h.board.repoFullName },
+      dependent.issueNumber,
+      {
+        parent: null,
+        subIssues: [],
+        blocking: [],
+        truncated: false,
+        blockedBy: [
+          {
+            issueId: blocker.issueId,
+            number: blocker.issueNumber,
+            repoId: REPO_ID,
+            state: observed.state,
+            stateReason: observed.stateReason
+          }
+        ]
+      }
+    )
+    expect((await h.card(dependent.id)).status).toBe('todo')
+    expect(h.store.writes.filter((w) => w.status === 'ready')).toEqual([])
   })
 
   it('refuses a card not on the board and a transition that is not allowed', async () => {
@@ -274,12 +332,49 @@ describe('Kanban M4 controls — restart (real Postgres)', () => {
     expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
   })
 
-  it('reopens a done card through the archived/triage-ready route', async () => {
+  it('allows an explicit reset of an already-ready card', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: { consecutiveFailures: 2, cooldownUntil: new Date(T0 + 60_000) }
+    })
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', consecutiveFailures: 0, cooldownUntil: null })
+  })
+
+  it('bumps the running lease fence, refuses late reports, and creates a fresh attempt', async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const d = h.sent[0]!.d
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).dispatchRevision).toBe(BigInt(d.dispatchRevision) + 1n)
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId: d.leaseId } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'restarted',
+      endedAt: expect.any(Date)
+    })
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
+    expect((await h.card(c.id)).status).toBe('ready')
+    await h.controls.resume(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent.at(-1)!.d).toMatchObject({ cardId: c.id, attempt: d.attempt + 1 })
+    expect(h.sent.at(-1)!.d.leaseId).not.toBe(d.leaseId)
+  })
+
+  it.each(['done', 'archived'] as const)('reopens a %s card', async (status) => {
     const h = await harness()
     const c = await h.addCard(['ac/status:done'], 'running')
-    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'archived' } })
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status } })
     h.store.issues.get(c.issueNumber)!.state = 'closed'
-    h.store.issues.get(c.issueNumber)!.stateReason = 'not_planned'
+    h.store.issues.get(c.issueNumber)!.stateReason = status === 'done' ? 'completed' : 'not_planned'
     const result = await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
     expect(result.ok).toBe(true)
     expect((await h.card(c.id)).status).toBe('ready')

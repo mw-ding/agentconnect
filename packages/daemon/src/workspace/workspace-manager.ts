@@ -2396,20 +2396,33 @@ export class WorkspaceManager {
         .raw(['show-ref', '--verify', `refs/heads/${branch}`])
         .then(() => true)
         .catch(() => false)
-      // --no-track: the start point is a remote-tracking ref, so git's own `branch.autoSetupMerge`
-      // would otherwise make `origin/<base>` this branch's upstream (see the generated-branch path).
+      // Only a removed daemon session can release a card branch; an existing worktree may still be live.
+      if (exists) {
+        const listing = await git().raw(['worktree', 'list', '--porcelain', '-z'])
+        for (const record of listing.split('\0\0')) {
+          const fields = record.split('\0')
+          if (!fields.includes(`branch refs/heads/${branch}`)) continue
+          const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
+          if (!path || path === cwd) continue
+          const managed = dirname(path) === dirname(cwd) && /^[a-f0-9]{24}$/.test(basename(path))
+          if (
+            !managed ||
+            (await this.fsFor(agentId).stat(path)) !== 'missing' ||
+            fields.some((field) => field.startsWith('locked'))
+          ) {
+            throw new Error(`card branch ${branch} is already checked out in another worktree`)
+          }
+          await git().raw(['worktree', 'prune', '--expire', 'now'])
+        }
+      }
+      // No upstream: pushing the card must not target the repository's default branch.
       await git().raw(
-        exists
-          ? ['worktree', 'add', '--no-track', cwd, branch]
-          : ['worktree', 'add', '-b', branch, '--no-track', cwd, target]
+        exists ? ['worktree', 'add', cwd, branch] : ['worktree', 'add', '-b', branch, '--no-track', cwd, target]
       )
       return
     }
     const name = await this.drawSessionBranch(git(), initiatedBy)
-    // --no-track: the start point is a remote-tracking ref, so git's own `branch.autoSetupMerge`
-    // would otherwise make `origin/<base>` this branch's upstream. That upstream is what the console's
-    // push authorizes against — it would turn the push button into a remote-branch creator — and it
-    // leaves a plain `git push` failing under push.default=simple on the name mismatch.
+    // No upstream: the console's push authorization must never treat the base branch as the session's target.
     await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
   }
 

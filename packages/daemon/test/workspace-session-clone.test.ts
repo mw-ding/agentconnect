@@ -1622,6 +1622,48 @@ describe('the confined tier issues only Git the sandbox admits (k8s-daemon-pool.
 
 // A Kanban write session (issue #2 B3) checks out its own `ac/card-<n>` branch on the worktree tier.
 describe('a Kanban write session checks out its ac/card-<n> branch', () => {
+  it('releases a removed session registration and resumes the existing card branch', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const old = unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+    const cwd = await workspaces.prepareSessionWorkspace(agent, old)
+    writeFileSync(join(cwd, 'saved.md'), 'saved work\n')
+    git(cwd, ['add', 'saved.md'])
+    git(cwd, ['commit', '-m', 'card progress'])
+    const tip = git(cwd, ['rev-parse', 'HEAD'])
+    rmSync(cwd, { recursive: true })
+    const next = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+    )
+    expect(git(next, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(next, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(readFileSync(join(next, 'saved.md'), 'utf8')).toBe('saved work\n')
+  })
+
+  it('refuses an existing worktree without stealing its branch or touching another card', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd7 = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:live-7', branch: kanbanCardBranch(7) })
+    )
+    const cwd8 = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:live-8', branch: kanbanCardBranch(8) })
+    )
+    writeFileSync(join(cwd7, 'wip.md'), 'live work\n')
+    await expect(
+      workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:other-7', branch: kanbanCardBranch(7) })
+      )
+    ).rejects.toThrow('already checked out in another worktree')
+    expect(readFileSync(join(cwd7, 'wip.md'), 'utf8')).toBe('live work\n')
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd8, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-8')
+  })
+
   it('creates the branch on first use, reuses it on a later attempt, and gives two cards two branches', async () => {
     const agent = agentFixture()
     const { primary } = serveAll(agent)

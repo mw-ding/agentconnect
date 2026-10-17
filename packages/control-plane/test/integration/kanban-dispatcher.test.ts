@@ -809,7 +809,14 @@ async function graphHarness() {
   const h = await harness()
   const { graphs, store } = h
   const log = { debug: vi.fn(), warn: vi.fn() }
-  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log, clock: h.clock })
+  const reconciler = new KanbanGraphReconciler({
+    agentSlug: async (orgId, id) =>
+      (await prisma.agent.findFirst({ where: { orgId, id }, select: { name: true } }))?.name ?? null,
+    cards: new PgKanbanCardRepo(prisma),
+    store,
+    log,
+    clock: h.clock
+  })
   const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
   const poke = vi.spyOn(h.dispatcher, 'poke')
   const bell = new KanbanGraphDoorbell({

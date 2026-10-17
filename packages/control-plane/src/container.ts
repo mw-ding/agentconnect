@@ -1831,7 +1831,12 @@ export function buildContainer(
     warn: (o: unknown, m?: string) => http.log.warn(o, m)
   }
   const kanbanGraphReconciler = kanbanCardStore
-    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    ? new KanbanGraphReconciler({
+        cards: repos.kanbanCard,
+        store: kanbanCardStore,
+        agentSlug: async (orgId, id) => (await repos.agent.get(OrgId(orgId), AgentId(id)))?.name ?? null,
+        log: kanbanGraphLog
+      })
     : undefined
 
   // Human controls (issue #2 B5): the DB writes live in the repos; this wraps the GitHub close/reopen + comment.

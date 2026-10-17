@@ -162,7 +162,12 @@ function make(
       }
     )
   }
-  const reconciler = new KanbanGraphReconciler({ cards, store, log: { debug: vi.fn() } })
+  const reconciler = new KanbanGraphReconciler({
+    agentSlug: async () => 'synthesizer',
+    cards,
+    store,
+    log: { debug: vi.fn() }
+  })
   return { reconciler, cards, store, labels, db }
 }
 
@@ -387,9 +392,10 @@ describe('KanbanGraphReconciler', () => {
     const h = make({ 7: { status: 'todo', labels: todoLabels } })
     await h.reconciler.apply(board, REPO, 7, graph({ subIssues: [link(2, 'closed', 'completed')] }))
     expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
+    expect(h.labels.get(7)).toContain('ac/agent:synthesizer')
     expect(h.cards.beginPromotion).not.toHaveBeenCalled()
     expect(h.db.get(7)!.status).toBe('ready')
-    expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+    expect(h.labels.get(7)).toEqual(['ac/agent:synthesizer', 'ac/status:ready'])
   })
 
   it('re-evaluates the parent epic when a sub-issue closes', async () => {
@@ -402,5 +408,6 @@ describe('KanbanGraphReconciler', () => {
     expect(h.store.readGraph).toHaveBeenCalledWith(REPO, 7)
     expect(h.db.get(7)!.status).toBe('ready')
     expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
+    expect(h.labels.get(7)).toContain('ac/agent:synthesizer')
   })
 })

@@ -729,7 +729,9 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
       if (!isKanbanStatus(row.status)) return { ok: false, reason: 'illegal_transition' }
       // Restart routes archived→triage→ready (the table's two-hop path) in one write; everything else honors the table directly.
       const legal =
-        to === 'ready' ? canTransition(row.status, to) || row.status === 'archived' : canTransition(row.status, to)
+        to === 'ready'
+          ? canTransition(row.status, to) || row.status === 'archived' || row.status === 'ready'
+          : canTransition(row.status, to)
       if (!legal) return { ok: false, reason: 'illegal_transition' }
       const [open] = await tx.$queryRaw<KanbanLeaseRef[]>(Prisma.sql`
         SELECT "leaseId", "id" AS "runId", "agentId", "daemonId", "dispatchRevision" FROM "kanban_run"

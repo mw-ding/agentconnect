@@ -266,6 +266,8 @@ describe.skipIf(!enabled)('kanban M4 controls e2e (live GitHub)', () => {
       await gh('PATCH', `/repos/${FULL}/issues/${sub2.number}`, { state: 'closed', state_reason: 'completed' })
 
       const reconciler = new KanbanGraphReconciler({
+        agentSlug: async (orgId, id) =>
+          (await prisma.agent.findFirst({ where: { orgId, id }, select: { name: true } }))?.name ?? null,
         cards: new PgKanbanCardRepo(prisma),
         store,
         log: { debug: vi.fn() }

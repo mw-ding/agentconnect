@@ -1,4 +1,5 @@
 // Kanban graph reconciler (issue #2 M1): promotes todo cards whose blockers all completed, then writes the status label.
+import { AGENT_LABEL_PREFIX, agentLabel } from './agent-label.js'
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
 import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
@@ -19,6 +20,7 @@ export interface KanbanGraphReconcilerDeps {
     | 'revertPromotion'
   >
   store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>
+  agentSlug(orgId: string, agentId: string): Promise<string | null>
   log: GraphReconcilerLog
   /** Defaults to the wall clock; stamps when the promotion intent opened, for the recovery age cap. */
   clock?: { now(): number }
@@ -33,7 +35,7 @@ export function planGraphPromotion(cardStatus: KanbanStatus, graph: CardGraph): 
   return done ? 'promote' : 'none'
 }
 
-/** Pure: a todo epic (an issue with sub-issues) whose sub-issues are ALL closed as completed is synthesized; a not_planned or open sub-issue, a truncated read, or no synthesizer leaves it alone. */
+// Synthesis needs a configured agent, a todo epic, and an untruncated graph of completed sub-issues.
 export function planSynthesis(
   epic: { status: KanbanStatus },
   graph: CardGraph,
@@ -88,6 +90,8 @@ export class KanbanGraphReconciler {
     // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
     if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
     // Only events after this cursor can be our write; it is read last so the window opens just before the POST.
+    const slug = synthesis === 'promote' ? await this.deps.agentSlug(board.orgId, board.synthesizerAgentId!) : null
+    if (synthesis === 'promote' && !slug) return
     const cursor = await this.deps.store.lastEventId(repo, issueNumber)
     const startedAt = new Date(this.deps.clock?.now() ?? Date.now())
     const began =
@@ -106,10 +110,17 @@ export class KanbanGraphReconciler {
     }
     const revision = card.stateRevision + 1n
     try {
-      await this.writeReadyLabels(repo, issueNumber, false, observed, async (label) => {
-        // Only an acknowledged POST lets recovery treat an App ready-add in the window as ours.
-        if (label === statusLabel('ready')) await this.deps.cards.notePromotionPosted(card.id)
-      })
+      await this.writeReadyLabels(
+        repo,
+        issueNumber,
+        false,
+        observed,
+        async (label) => {
+          // Only an acknowledged POST lets recovery treat an App ready-add in the window as ours.
+          if (label === statusLabel('ready')) await this.deps.cards.notePromotionPosted(card.id)
+        },
+        slug
+      )
       if (!(await this.deps.cards.clearPromotionIntent(card.id))) {
         this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: promotion intent clear lost')
       }
@@ -127,18 +138,24 @@ export class KanbanGraphReconciler {
     issueNumber: number,
     residueOnly: boolean,
     observed: CardIssue,
-    onLabelAdded?: LabelWriteObserver
+    onLabelAdded?: LabelWriteObserver,
+    assigneeSlug?: string | null
   ): Promise<void> {
     const keep = statusLabel('ready')
     const stale = observed.labels.filter((l) => isStatusLabel(l) && l !== keep)
     const hasKeep = observed.labels.includes(keep)
     // Only todo+ready can be promotion residue; preserve other conflicts for dispatcher mismatch recovery.
     if (residueOnly && (!hasKeep || stale.length !== 1 || stale[0] !== statusLabel('todo'))) return
+    const assignee = assigneeSlug ? agentLabel(assigneeSlug) : null
+    if (assignee)
+      stale.push(
+        ...observed.labels.filter((label) => label.toLowerCase().startsWith(AGENT_LABEL_PREFIX) && label !== assignee)
+      )
     const plan: LabelPlan = {
       outcome: 'accepted',
       status: 'ready',
       releaseLease: false,
-      addLabels: hasKeep ? [] : [keep],
+      addLabels: [...(assignee && !observed.labels.includes(assignee) ? [assignee] : []), ...(hasKeep ? [] : [keep])],
       removeLabels: stale
     }
     await this.deps.store.applyPlan(repo, issueNumber, observed, plan, onLabelAdded)
