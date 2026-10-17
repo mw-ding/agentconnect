@@ -166,19 +166,8 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
     await gh('PUT', `/repos/${FULL}/issues/${issue.number}/labels`, {
       labels: ['ac/status:running', 'ac/agent:lane1-next']
     })
-    await expect
-      .poll(
-        async () => {
-          const edits = await f.store.managedEdits(
-            { installationId: 1n, repoId: f.board.repoId, repoFullName: FULL },
-            issue.number
-          )
-          return edits.assignee?.actor?.login
-        },
-        { timeout: 30_000 }
-      )
-      .toBe('ac/agent:lane1-next')
     await f.ring(issue.number)
+    await expect.poll(async () => (await f.cards.getCard(card.id))?.assigneeAgentId, { timeout: 30_000 }).toBe(NEXT)
     expect(await f.cards.getCard(card.id)).toMatchObject({
       assigneeAgentId: NEXT,
       status: 'ready',
