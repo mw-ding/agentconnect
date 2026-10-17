@@ -513,6 +513,7 @@ it('masks title and body through the real orchestrator create path before the is
   const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
     const url = String(input instanceof Request ? input.url : input)
     const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
+    if (method === 'GET' && url.includes('/issues?state=all')) return Promise.resolve(new Response('[]'))
     if (method === 'POST' && url.endsWith('/issues')) {
       posted.push(String(init?.body ?? ''))
       return Promise.resolve(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
@@ -704,6 +705,34 @@ it.each([401, 403, 422, 500])('invalidates an orchestrator issue token only on a
     if (authRejected) expect(request.mock.calls[1]![0]).toMatchObject({ forceRefresh: true })
     const second = fetchSpy.mock.calls[1]![1]!.headers as Record<string, string>
     expect(second.authorization).toBe(authRejected ? 'Bearer ghs_2' : 'Bearer ghs_1')
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
+it.each(['open', 'closed'])('finds a %s crash orphan past the first page without using search', async (state) => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const marker = '<!-- agentconnect:kanban-card-key:' + 'a'.repeat(64) + ' -->'
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify(Array.from({ length: 100 }, (_, n) => ({ number: n + 1, body: '' }))))
+    )
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          { number: 101, body: marker, pull_request: {} },
+          { number: 102, body: `spec\n\n${marker}`, state }
+        ])
+      )
+    )
+  try {
+    await expect((h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker)).resolves.toBe(102)
+    expect(fetchSpy.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.github.com/repos/acme/web/issues?state=all&per_page=100&page=1',
+      'https://api.github.com/repos/acme/web/issues?state=all&per_page=100&page=2'
+    ])
   } finally {
     fetchSpy.mockRestore()
   }

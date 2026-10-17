@@ -27260,6 +27260,7 @@ export class Daemon {
         return cp.kanbanOrchestrate(payload)
       },
       repoFullNameFor: (agentId, board) => this.kanbanBoardRepo(agentId, board),
+      findIssue: (agentId, repoFullName, marker) => this.findKanbanIssue(agentId, repoFullName, marker),
       fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body)
     }))
   }
@@ -27271,6 +27272,35 @@ export class Daemon {
     const reply = await cp.kanbanOrchestrate({ op: 'list', agentId, boardId: board })
     if (!reply.ok) return null
     return (reply as Extract<typeof reply, { op: 'list' }>).boards[0]?.repoFullName ?? null
+  }
+
+  // Listing avoids GitHub search-index lag in the crash-before-commit window; failures must not fall through to POST.
+  private async findKanbanIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null> {
+    const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
+    for (let page = 1; ; page++) {
+      const res = await fetch(
+        `https://api.github.com/repos/${repoFullName}/issues?state=all&per_page=100&page=${page}`,
+        {
+          headers: {
+            authorization: `Bearer ${grant.token}`,
+            accept: 'application/vnd.github+json',
+            'x-github-api-version': '2022-11-28'
+          },
+          signal: AbortSignal.timeout(30_000)
+        }
+      )
+      if (res.status === 401 || res.status === 403) {
+        this.gitCreds.invalidateKanbanOrchestrator(agentId, repoFullName, grant.token)
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => undefined)
+        throw new Error(`GitHub issue lookup failed (${res.status})`)
+      }
+      const issues = (await res.json()) as Array<{ number: number; body: string | null; pull_request?: unknown }>
+      const found = issues.find((issue) => !issue.pull_request && issue.body?.includes(marker))
+      if (found) return found.number
+      if (issues.length < 100) return null
+    }
   }
 
   /** Files the issue body with the orchestrator's issues-only token; the CP writes only metadata. */

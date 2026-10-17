@@ -153,10 +153,9 @@ export class KanbanOrchestrator {
     if (!board.ok) return refuse('commit_create', board.reason)
     const repo = await this.repoRef(board.board)
     if (!repo) return refuse('commit_create', 'github_unavailable')
-    // The issue must be real, open, and filed by the App bot (when an App slug is configured).
+    // A crash orphan may already be closed; keep its state and the App author fence when adopting it.
     const issue = await this.deps.store.readCard(repo, req.issueNumber)
     if (!issue) return refuse('commit_create', 'issue_not_found')
-    if (issue.state !== 'open') return refuse('commit_create', 'issue_not_found')
     if (this.deps.appSlug && !this.authoredByApp(issue, this.deps.appSlug)) {
       return refuse('commit_create', 'issue_not_from_app')
     }

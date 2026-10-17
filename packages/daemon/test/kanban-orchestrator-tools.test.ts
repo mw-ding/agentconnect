@@ -1,6 +1,11 @@
 // Failed commits retain the filed issue for a bounded, caller-scoped retry.
 import { describe, expect, it, vi } from 'vitest'
-import type { KanbanOrchestrate, KanbanOrchestrateOk } from '@agentconnect.md/protocol'
+import {
+  kanbanCardKeyMarker,
+  kanbanOrchestrateCardKey,
+  type KanbanOrchestrate,
+  type KanbanOrchestrateOk
+} from '@agentconnect.md/protocol'
 import { KanbanOrchestratorTools, orchestratorSpecDigest } from '../src/kanban/orchestrator-tools.js'
 
 const AGENT = '11111111-1111-4111-8111-111111111111'
@@ -15,7 +20,8 @@ function tools(orchestrate: (p: KanbanOrchestrate) => Promise<KanbanOrchestrateO
   const svc = new KanbanOrchestratorTools({
     orchestrate: vi.fn(orchestrate),
     repoFullNameFor,
-    fileIssue
+    fileIssue,
+    findIssue: async () => null
   })
   return { svc, fileIssue, repoFullNameFor }
 }
@@ -142,6 +148,7 @@ describe('pending creates', () => {
       },
       repoFullNameFor: async () => 'acme/web',
       fileIssue,
+      findIssue: async () => null,
       now: () => now
     })
     const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY }
@@ -202,5 +209,54 @@ describe('pending creates', () => {
     expect((h.svc as any).pending.size).toBe(1)
     await h.svc.create(h.req)
     expect(h.fileIssue).toHaveBeenCalledTimes(3)
+  })
+})
+
+describe('durable crash recovery', () => {
+  it.each([true, false])('adopts a marker match (%s) or files a marked issue before committing', async (found) => {
+    const orchestrate = vi.fn(async (p: KanbanOrchestrate): Promise<KanbanOrchestrateOk> =>
+      p.op === 'prepare_create'
+        ? { ok: true, op: p.op, verdict: 'proceed' }
+        : { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+    )
+    const findIssue = vi.fn(async () => (found ? 42 : null))
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate,
+      findIssue,
+      fileIssue,
+      repoFullNameFor: async () => 'acme/web'
+    })
+    await expect(
+      svc.create({ agentId: AGENT, board: BOARD, title: TITLE, body: BODY, epic: 1, step: STEP })
+    ).resolves.toMatchObject({ created: true, issueNumber: 42 })
+    const marker = kanbanCardKeyMarker(
+      kanbanOrchestrateCardKey({
+        boardId: BOARD,
+        epicIssueNumber: 1,
+        step: STEP,
+        specDigest: orchestratorSpecDigest(TITLE, BODY)
+      })
+    )
+    expect(findIssue).toHaveBeenCalledWith(AGENT, 'acme/web', marker)
+    expect(fileIssue).toHaveBeenCalledTimes(found ? 0 : 1)
+    if (!found) expect(fileIssue).toHaveBeenCalledWith(AGENT, 'acme/web', TITLE, `${BODY}\n\n${marker}`)
+    expect(orchestrate.mock.calls[1]![0]).toMatchObject({ op: 'commit_create', issueNumber: 42 })
+  })
+
+  it('never files when the durable lookup fails', async () => {
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: async () => ({ ok: true, op: 'prepare_create', verdict: 'proceed' }),
+      repoFullNameFor: async () => 'acme/web',
+      fileIssue,
+      findIssue: async () => {
+        throw new Error('GitHub unavailable')
+      }
+    })
+    await expect(svc.create({ agentId: AGENT, board: BOARD, title: TITLE, body: BODY })).rejects.toThrow(
+      'GitHub unavailable'
+    )
+    expect(fileIssue).not.toHaveBeenCalled()
   })
 })

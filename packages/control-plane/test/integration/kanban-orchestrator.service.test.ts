@@ -1,5 +1,4 @@
-// Orchestrator service over real Postgres (issue #2 M3): B1 replays on a full epic, the B2 boundary under concurrent
-// commits, epic-to-triage, and the close rule, with GitHub replaced by a recording fake store.
+// Real Postgres verifies orchestrator idempotency, budgets, and adoption with a recording GitHub store.
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import { kanbanOrchestrateCardKey, type KanbanOrchestrate } from '@agentconnect.md/protocol'
@@ -11,6 +10,7 @@ import { PgKanbanOrchestratorRepo } from '../../src/persistence/repositories/kan
 import type { CardIssue } from '../../src/kanban/card-store.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
+import { KanbanOrchestratorTools } from '../../../daemon/src/kanban/orchestrator-tools.js'
 
 const ORG = OrgId(DEFAULT_ORG_ID)
 const REPO_ID = 990010n
@@ -165,3 +165,51 @@ describe('KanbanOrchestrator over real Postgres', () => {
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.epic.id } })).epicCardsCreated).toBe(3)
   })
 })
+
+it.each(['open', 'closed'] as const)(
+  'recovers a %s crash-before-commit issue with one POST and one card',
+  async (state) => {
+    const h = await setup(1)
+    const issues: Array<{ number: number; body: string }> = []
+    const fileIssue = vi.fn(async (_agent: string, _repo: string, _title: string, body: string) => {
+      issues.push({ number: 10 + issues.length, body })
+      return issues.at(-1)!.number
+    })
+    const findIssue = vi.fn(
+      async (_agent: string, _repo: string, marker: string) =>
+        issues.find((i) => i.body.includes(marker))?.number ?? null
+    )
+    let crash = true
+    const deps = {
+      orchestrate: async (p: KanbanOrchestrate) => {
+        if (p.op === 'commit_create' && crash) throw new Error('process died before commit')
+        return h.svc.orchestrate(ORG, h.agentId, p)
+      },
+      repoFullNameFor: async () => 'acme/web',
+      findIssue,
+      fileIssue
+    }
+    const req = { agentId: h.agentId, board: h.board.id, epic: 1, step: 'crash', title: 'scratch', body: 'spec' }
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ filed: true, issueNumber: 10 })
+    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 10 } })).toBe(0)
+    crash = false
+    h.store.readCard.mockImplementation(async (_repo, n) => ({
+      issueId: BigInt(5_000_000 + n),
+      nodeId: `I_${n}`,
+      number: n,
+      state,
+      stateReason: null,
+      labels: [],
+      authorType: 'Bot',
+      authorLogin: 'agentconnect[bot]'
+    }))
+    // A fresh toolset has lost the process-local pending map and must recover from the durable marker.
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ created: true, issueNumber: 10 })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    expect(issues).toHaveLength(1)
+    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 10 } })).toBe(1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.epic.id } })).epicCardsCreated).toBe(1)
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toEqual({ existing: true, issueNumber: 10 })
+    expect(h.store.closeIssue).not.toHaveBeenCalled()
+  }
+)

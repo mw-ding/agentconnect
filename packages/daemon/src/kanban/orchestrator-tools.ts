@@ -1,12 +1,20 @@
 // The daemon files masked issue text directly; the CP only registers metadata under the trusted caller identity.
 import { createHash } from 'node:crypto'
-import type { KanbanOrchestrate, KanbanOrchestrateOk, KanbanOrchestrateRefusalCode } from '@agentconnect.md/protocol'
+import {
+  kanbanCardKeyMarker,
+  kanbanOrchestrateCardKey,
+  type KanbanOrchestrate,
+  type KanbanOrchestrateOk,
+  type KanbanOrchestrateRefusalCode
+} from '@agentconnect.md/protocol'
 
 export interface KanbanOrchestratorToolsDeps {
   /** D→C `kanban/orchestrate`; rejects when the CP is unreachable. */
   orchestrate(payload: KanbanOrchestrate): Promise<KanbanOrchestrateOk>
   /** Resolves a board id to `owner/repo` (via list), or returns the string as-is when it is already `owner/repo`. */
   repoFullNameFor(agentId: string, board: string): Promise<string | null>
+  // Look up a durable B1 marker on GitHub before creating another issue after a crash.
+  findIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null>
   /** Files the issue with the orchestrator's issues-only token; returns the new issue number. */
   fileIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number>
   // Clock for pending-create expiry, injectable for tests.
@@ -35,7 +43,7 @@ export const KANBAN_ORCHESTRATE_REFUSAL_TEXT: Record<KanbanOrchestrateRefusalCod
   epic_not_found: 'the epic is not a card on this board',
   epic_budget_exhausted: 'the epic has reached its card budget',
   card_not_found: 'no card on this board has that issue number',
-  issue_not_found: 'the issue was not found on GitHub (or is a pull request / closed)',
+  issue_not_found: 'the issue was not found on GitHub (or is a pull request)',
   issue_not_from_app: "the issue was not filed by this deployment's App",
   unknown_agent: 'the assignee slug does not name an agent in this organization',
   agent_not_assignable: 'the assignee is a restricted agent and cannot be assigned',
@@ -113,7 +121,17 @@ export class KanbanOrchestratorTools {
     const mapKey = JSON.stringify([req.agentId, req.board, req.epic ?? null, req.step ?? 'default', specDigest])
     let issueNumber = this.pending.get(mapKey)?.issueNumber
     if (issueNumber === undefined) {
-      issueNumber = await this.deps.fileIssue(req.agentId, repoFullName, req.title, req.body)
+      const marker = kanbanCardKeyMarker(
+        kanbanOrchestrateCardKey({
+          boardId: req.board,
+          epicIssueNumber: req.epic,
+          step: req.step ?? 'default',
+          specDigest
+        })
+      )
+      issueNumber =
+        (await this.deps.findIssue(req.agentId, repoFullName, marker)) ??
+        (await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`))
       this.pending.set(mapKey, { issueNumber, filedAt: this.deps.now?.() ?? Date.now() })
       this.prunePending()
     }

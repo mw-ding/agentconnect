@@ -10,8 +10,8 @@ issue title, body, or comment.
 Body-free and strict, discriminated by `op`. Every request carries `agentId` (uuid); every op except `list` also
 carries `boardId` (uuid). `step` is `/^[a-z0-9][a-z0-9_.:-]{0,63}$/`; `specDigest` is 64 lowercase hex (sha256 of
 the masked title+body, computed in the daemon). The CP computes the B1 key as
-`cardIdempotencyKey({ epic: String(epicIssueId || 'board:'+boardId), step, spec: specDigest })`, so no spec text
-crosses the wire.
+`kanbanOrchestrateCardKey({ boardId, epicIssueNumber, step, specDigest })`, so no spec text
+crosses the wire. The epic ref is its issue **number**, or `board:<id>` when absent.
 
 | op               | fields                                                                                              | reply (`ok: true`)                                                                                                                                                                |
 | ---------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -38,11 +38,20 @@ enabled, and have `orchestratorAgentId === agentId`. An unknown or other-org boa
 
 - The daemon masks `{ title, body }` with `maskAgentSecrets`, computes `specDigest`, and POSTs
   `/repos/{owner}/{repo}/issues` with a purpose-bound `kanban_orchestrator_write` token (issues-only, board repo
-  only, minted when the agent orchestrates an enabled board on that repo).
+  only, minted when the agent orchestrates an enabled board on that repo). A 401/403 invalidates the presented
+  cached grant and forces the next mint past the CP token cache; other errors keep the grant.
+- Each issue body carries `<!-- agentconnect:kanban-card-key:<B1 digest> -->`. After `prepare_create` finds no
+  registered B1 card, the daemon lists the repository's issues (`state=all`, paginated, excluding PRs) and matches
+  that exact marker before POSTing. Listing avoids search-index lag immediately after a crash. A lookup failure
+  stops creation. If an orphan exists, the daemon skips POST and commits that issue, including a closed orphan
+  (its GitHub state stays closed). The CP receives only the number and digest, never the body. A card already
+  registered under B1 is returned by prepare before either GitHub lookup or B2. The bounded process-local pending
+  map retains its agent/board/epic/step/spec key, one-hour expiry, and 256-entry cap as a fast retry path.
 - `commit_create` then registers the issue through `createEpicChild`: one transaction locks the epic card
   `FOR UPDATE`, re-checks B2, and composes the Lane 1 `upsertCard` (B1 key, `source: 'orchestrator'`,
   `actorAgentId`). Labels (`ac/status:<status>`, `ac/agent:<slug>`) and the epic sub-issue / `blocked_by` edges are
-  written via `CardStore`; a GitHub 422 duplicate counts as success, and a failure after the DB write is
+  written via `CardStore`; an edge already present in the live graph is skipped, while a 422 is accepted only if
+  a re-read confirms the edge. A failure after the DB write is
   `github_partial` (idempotent to retry). A key matched to a different issue closes our duplicate as `not_planned`
   and returns the winner.
 
@@ -67,10 +76,9 @@ two boards claiming in parallel serialize and cannot overshoot.
 
 ## Known gaps
 
-- The daemon's in-memory pending map re-commits the same issue after a failed commit within a process; a daemon
-  crash between the file and the commit can file a duplicate (the CP's `issue_not_from_app` / duplicate-close path
-  bounds the damage).
+- Simultaneous independent creates can still race past the marker lookup; the CP's B1 uniqueness and duplicate-close
+  path select one card and retire the losing issue. Crash retries reuse the durable marker.
 - Sub-issue and dependency writes take GitHub's numeric issue **id**, never the issue number; the CardStore methods
   take a `bigint` id to make that hard to get wrong. The live E2E asserts both edges on GitHub.
 - `kanbanCreate` takes a board id (uuid); an `owner/repo` alias is not yet accepted.
-- Board CRUD does not yet surface `epicMaxCards` / `epicMaxActive` in the owner routes (defaults apply).
+- Board CRUD exposes `epicMaxCards` / `epicMaxActive`; lowering a budget blocks new cards without changing replays.

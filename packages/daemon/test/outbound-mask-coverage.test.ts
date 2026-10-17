@@ -656,7 +656,8 @@ describe('orchestrator outbound coverage', () => {
     vi.spyOn((daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
     const post = vi
       .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+      .mockResolvedValueOnce(new Response('[]', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
     try {
       await (daemon as any).mcp.deps.kanbanCreate({
         agentId: AGENT,
@@ -664,15 +665,17 @@ describe('orchestrator outbound coverage', () => {
         title: `title ${API_KEY}`,
         body: `body ${HEADER}`
       })
-      expect(post).toHaveBeenCalledTimes(1)
-      const [url, init] = post.mock.calls[0]!
+      expect(post).toHaveBeenCalledTimes(2)
+      const [url, init] = post.mock.calls[1]!
       expect(url).toBe('https://api.github.com/repos/acme/web/issues')
       expect(init?.method).toBe('POST')
       const payload = JSON.parse(String(init?.body))
-      expect(payload).toEqual({ title: `title ${KEY_PH}`, body: `body ${HEADER_PH}` })
+      expect(payload.title).toBe(`title ${KEY_PH}`)
+      expect(payload.body.startsWith(`body ${HEADER_PH}\n\n<!-- agentconnect:kanban-card-key:`)).toBe(true)
+      expect(payload.body).toMatch(/[0-9a-f]{64} -->$/)
       expect(init?.body).not.toContain(API_KEY)
       expect(init?.body).not.toContain(HEADER)
-      const digest = orchestratorSpecDigest(payload.title, payload.body)
+      const digest = orchestratorSpecDigest(payload.title, `body ${HEADER_PH}`)
       for (const [req] of orchestrate.mock.calls) {
         if (req.op === 'list') continue
         expect(req).toMatchObject({ specDigest: digest })

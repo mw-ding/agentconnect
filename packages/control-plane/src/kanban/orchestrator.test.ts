@@ -1,5 +1,4 @@
-// Kanban orchestrator service (issue #2 M3): role gate, B1 replay, B2 refusals, and link/unblock/assign semantics
-// over fakes — the GitHub and repo writes are observed, never real.
+// Orchestrator unit tests observe role gates, idempotency, budgets, and GitHub metadata writes.
 import { describe, expect, it, vi } from 'vitest'
 import type { KanbanOrchestrate } from '@agentconnect.md/protocol'
 import { cardIdempotencyKey } from './card-key.js'
@@ -808,4 +807,21 @@ describe('KanbanOrchestrator assign (S6)', () => {
     })
     expect(poke).toHaveBeenCalledWith(BOARD)
   })
+})
+
+it('adopts a closed App crash orphan without reopening it', async () => {
+  const h = harness({ appSlug: 'agentconnect' })
+  h.store.readCard.mockResolvedValue(issue({ state: 'closed', authorType: 'Bot', authorLogin: 'agentconnect[bot]' }))
+  expect(
+    await h.svc.orchestrate(
+      ORG,
+      AGENT,
+      req('commit_create', {
+        step: 'recovery',
+        specDigest: 'a'.repeat(64),
+        issueNumber: 7
+      })
+    )
+  ).toMatchObject({ ok: true, issueNumber: 7 })
+  expect(h.store.applyPlan.mock.calls[0][3]).not.toHaveProperty('issueState')
 })
