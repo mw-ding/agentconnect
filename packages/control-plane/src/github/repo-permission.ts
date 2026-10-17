@@ -34,7 +34,7 @@ export interface GithubRepoPermissionDeps {
   tokens: Pick<InstallationTokenService, 'mintKanbanCard'>
   fetchImpl?: FetchLike
   baseUrl?: string
-  /** Successful lookups are reused this long; 0 disables the cache. */
+  /** Non-write results are reused this long; write levels are never cached, so a demotion is seen at once. 0 = off. */
   ttlMs?: number
   now?: () => number
 }
@@ -55,7 +55,8 @@ export class GithubRepoPermission implements RepoPermissionLookup {
     const hit = this.cache.get(key)
     if (hit && hit.expiresAt > now()) return hit.level
     const level = await this.fetch(repo, login)
-    if (ttl > 0) {
+    // A cached write would outlive a demotion and hide an outage from the fail-closed gate; negatives are safe to reuse.
+    if (ttl > 0 && !hasWriteAccess(level)) {
       if (this.cache.size >= MAX_CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value!)
       this.cache.set(key, { level, expiresAt: now() + ttl })
     }

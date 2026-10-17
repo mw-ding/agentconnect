@@ -33,15 +33,18 @@ async function seedOtherOrgAgent(): Promise<void> {
 }
 
 function issue(boardId: string, n: number, extra: Partial<KanbanCardUpsertInput> = {}): KanbanCardUpsertInput {
-  return { boardId, issueId: BigInt(900_000 + n), issueNumber: n, source: 'import', ...extra }
+  return { boardId, expectedRepoId: 4242n, issueId: BigInt(900_000 + n), issueNumber: n, source: 'import', ...extra }
 }
+
+/** The import path's live-verified human writer, which any status past todo requires. */
+const WRITER = { humanAuthority: { login: 'maintainer', permission: 'write' as const } }
 
 describe('PgKanbanCardRepo.upsertCard (real Postgres)', () => {
   it('creates once in triage by default and returns the same row on every redelivery', async () => {
     const boardId = await seedBoard()
     const first = await repo.upsertCard(issue(boardId, 1, { issueNodeId: 'I_1' }))
     expect(first).toMatchObject({ created: true, matchedBy: 'created', card: { status: 'triage', issueNumber: 1 } })
-    const again = await repo.upsertCard(issue(boardId, 1, { status: 'ready', assigneeAgentId: A1 }))
+    const again = await repo.upsertCard(issue(boardId, 1, { status: 'ready', assigneeAgentId: A1, ...WRITER }))
     expect(again).toMatchObject({ created: false, matchedBy: 'issue' })
     // An existing card keeps its status and assignee; upsert never overwrites.
     expect(again.card).toEqual(first.card)
@@ -54,12 +57,12 @@ describe('PgKanbanCardRepo.upsertCard (real Postgres)', () => {
     })
   })
 
-  it('applies the initial status, assignee, priority and mode on create', async () => {
+  it('applies the initial status, assignee and priority on create, and always inherits the board mode', async () => {
     const boardId = await seedBoard()
     const { card } = await repo.upsertCard(
-      issue(boardId, 2, { status: 'ready', assigneeAgentId: A1, priority: 5, mode: 'write' })
+      issue(boardId, 2, { status: 'ready', assigneeAgentId: A1, priority: 5, ...WRITER })
     )
-    expect(card).toMatchObject({ status: 'ready', assigneeAgentId: A1, priority: 5, mode: 'write' })
+    expect(card).toMatchObject({ status: 'ready', assigneeAgentId: A1, priority: 5, mode: null })
   })
 
   it('never duplicates under concurrent upserts of one issue', async () => {
@@ -167,7 +170,7 @@ describe('PgKanbanCardRepo.setAssignee (real Postgres)', () => {
   const dispatch = new PgKanbanDispatchRepo(prisma)
 
   async function leasedCard(boardId: string) {
-    const { card } = await repo.upsertCard(issue(boardId, 20, { status: 'ready', assigneeAgentId: A1 }))
+    const { card } = await repo.upsertCard(issue(boardId, 20, { status: 'ready', assigneeAgentId: A1, ...WRITER }))
     const [lease] = await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })
     expect(lease).toBeDefined()
     return { card, lease: lease! }

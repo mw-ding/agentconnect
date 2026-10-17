@@ -6,6 +6,7 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
 import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import { hasWriteAccess } from '../../github/repo-permission.js'
 import {
   KanbanCardUpsertError,
   type KanbanBoardAdminRepo,
@@ -404,15 +405,36 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
     if (!isKanbanStatus(status) || (status as KanbanStatus) === 'running') {
       throw new KanbanCardUpsertError('invalid_status')
     }
-    const board = await this.db.kanbanBoard.findUnique({ where: { id: input.boardId }, select: { orgId: true } })
-    if (!board) throw new KanbanCardUpsertError('board_not_found')
-    if (input.assigneeAgentId && !(await this.agentInOrg(board.orgId, input.assigneeAgentId))) {
-      throw new KanbanCardUpsertError('agent_not_in_org')
+    // Agents file into triage/todo; anything further needs a live-verified human writer via import, never an agent.
+    if (!UNATTENDED_STATUSES.has(status) && !humanAuthorized(input)) {
+      throw new KanbanCardUpsertError('status_not_allowed')
     }
     const key = input.idempotencyKey ?? null
-    for (let attempt = 0; attempt < UPSERT_ATTEMPTS; attempt++) {
-      // ON CONFLICT DO NOTHING covers all three uniques (issue id, number, key) without aborting an ambient transaction.
-      const created = await withAmbientTx(this.db, async (tx) => {
+    const authority = humanAuthorized(input) ? input.humanAuthority! : null
+    return withAmbientTx(this.db, async (tx) => {
+      // FOR SHARE serializes against updateBoard's FOR UPDATE, so a retarget cannot slip between this check and the insert.
+      const [board] = await tx.$queryRaw<Array<{ orgId: string; repoId: bigint }>>(Prisma.sql`
+        SELECT "orgId", "repoId" FROM "kanban_board" WHERE "id" = ${input.boardId}::uuid FOR SHARE
+      `)
+      if (!board) throw new KanbanCardUpsertError('board_not_found')
+      if (board.repoId !== input.expectedRepoId) throw new KanbanCardUpsertError('repo_mismatch')
+      if (input.assigneeAgentId) {
+        const refusal = await assigneeRefusal(tx, board.orgId, input.assigneeAgentId)
+        if (refusal) throw new KanbanCardUpsertError(refusal)
+      }
+      const audit = (cardId: string, issueNumber: number, message: string, details: Record<string, unknown>) =>
+        tx.auditEvent.create({
+          data: {
+            kind: 'kanban_card_change',
+            orgId: board.orgId,
+            actorUserId: input.actorUserId ?? null,
+            agentId: input.actorAgentId ?? null,
+            message: `kanban card ${cardId} ${message}`,
+            details: { boardId: input.boardId, cardId, issueNumber, ...details, source: input.source }
+          }
+        })
+      for (let attempt = 0; attempt < UPSERT_ATTEMPTS; attempt++) {
+        // ON CONFLICT DO NOTHING covers all three uniques (issue id, number, key) without aborting an ambient transaction.
         const [row] = await tx.kanbanCard.createManyAndReturn({
           data: [
             {
@@ -425,69 +447,68 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
               status,
               assigneeAgentId: input.assigneeAgentId ?? null,
               priority: input.priority ?? 0,
-              mode: input.mode ?? null
+              // Never from the input, even a cast one: only setCardMode (audited, revisioned) sets an override.
+              mode: null
             }
           ],
           skipDuplicates: true,
           select: CARD_ROW_SELECT
         })
-        if (!row) return null
-        await tx.auditEvent.create({
-          data: {
-            kind: 'kanban_card_change',
-            orgId: board.orgId,
-            actorUserId: input.actorUserId ?? null,
-            agentId: input.actorAgentId ?? null,
-            message: `kanban card ${row.id} created`,
-            details: {
-              boardId: row.boardId,
-              cardId: row.id,
-              issueNumber: row.issueNumber,
-              change: 'created',
-              to: row.status,
-              assigneeAgentId: row.assigneeAgentId,
-              keyed: key !== null,
-              source: input.source
-            }
-          }
-        })
-        return toCardRow(row)
-      })
-      if (created) return { card: created, created: true, matchedBy: 'created' }
+        if (row) {
+          await audit(row.id, row.issueNumber, 'created', {
+            change: 'created',
+            to: row.status,
+            assigneeAgentId: row.assigneeAgentId,
+            keyed: key !== null,
+            humanAuthority: authority ? { login: authority.login, permission: authority.permission } : null
+          })
+          return { card: toCardRow(row), created: true, matchedBy: 'created' }
+        }
 
-      // The key outranks the issue: a re-plan that already filed this spec gets that card back, whatever issue it names.
-      if (key !== null) {
-        const byKey = await this.findByIdempotencyKey(input.boardId, key)
-        if (byKey) return { card: byKey, created: false, matchedBy: 'idempotency_key' }
-      }
-      const byIssue = await this.db.kanbanCard.findFirst({
-        where: {
-          boardId: input.boardId,
-          OR: [{ issueId: input.issueId }, { issueNumber: input.issueNumber }]
-        },
-        orderBy: { createdAt: 'asc' },
-        select: CARD_ROW_SELECT
-      })
-      if (!byIssue) continue
-      if (key === null || byIssue.idempotencyKey === key) {
-        return { card: toCardRow(byIssue), created: false, matchedBy: 'issue' }
-      }
-      if (byIssue.idempotencyKey !== null) throw new KanbanCardUpsertError('key_conflict')
-      // An imported card adopts the orchestrator's key, so the next re-plan finds it by key alone.
-      try {
-        const { count } = await this.db.kanbanCard.updateMany({
-          where: { id: byIssue.id, idempotencyKey: null },
-          data: { idempotencyKey: key }
+        // The key outranks the issue: a re-plan that already filed this spec gets that card back, whatever issue it names.
+        if (key !== null) {
+          const byKey = await tx.kanbanCard.findUnique({
+            where: { boardId_idempotencyKey: { boardId: input.boardId, idempotencyKey: key } },
+            select: CARD_ROW_SELECT
+          })
+          if (byKey) return { card: toCardRow(byKey), created: false, matchedBy: 'idempotency_key' }
+        }
+        const byIssue = await tx.kanbanCard.findFirst({
+          where: {
+            boardId: input.boardId,
+            OR: [{ issueId: input.issueId }, { issueNumber: input.issueNumber }]
+          },
+          orderBy: { createdAt: 'asc' },
+          select: CARD_ROW_SELECT
         })
+        if (!byIssue) continue
+        // The number now names another issue (e.g. one transferred in after this card's issue left).
+        if (byIssue.issueId !== input.issueId) throw new KanbanCardUpsertError('issue_mismatch')
+        if (key === null || byIssue.idempotencyKey === key) {
+          return { card: toCardRow(byIssue), created: false, matchedBy: 'issue' }
+        }
+        if (byIssue.idempotencyKey !== null) throw new KanbanCardUpsertError('key_conflict')
+        // An imported card adopts the orchestrator's key; the savepoint keeps a racing P2002 from aborting the transaction.
+        await tx.$executeRaw`SAVEPOINT kanban_key_adopt`
+        let count = 0
+        try {
+          ;({ count } = await tx.kanbanCard.updateMany({
+            where: { id: byIssue.id, idempotencyKey: null },
+            data: { idempotencyKey: key }
+          }))
+          await tx.$executeRaw`RELEASE SAVEPOINT kanban_key_adopt`
+        } catch (err) {
+          await tx.$executeRaw`ROLLBACK TO SAVEPOINT kanban_key_adopt`
+          // A concurrent upsert attached the same key to another card first; that card is the answer.
+          if (!isUniqueViolation(err)) throw err
+        }
         if (count === 1) {
+          await audit(byIssue.id, byIssue.issueNumber, 'key attached', { change: 'key_attached' })
           return { card: toCardRow({ ...byIssue, idempotencyKey: key }), created: false, matchedBy: 'issue' }
         }
-      } catch (err) {
-        // A concurrent upsert attached the same key to another card first; that card is the answer.
-        if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err
       }
-    }
-    throw new Error('kanban card upsert: the conflicting card vanished on every attempt')
+      throw new Error('kanban card upsert: the conflicting card vanished on every attempt')
+    })
   }
 
   async findByIdempotencyKey(boardId: string, idempotencyKey: string): Promise<KanbanCardRow | null> {
@@ -506,9 +527,10 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async resolveAgentSlug(orgId: string, slug: string): Promise<string | null> {
     const agent = await this.db.agent.findUnique({
       where: { orgId_name: { orgId, name: slug.toLowerCase() } },
-      select: { id: true }
+      select: { id: true, visibility: true }
     })
-    return agent?.id ?? null
+    // Restricted agents serve a named audience, never a board-wide label; a paused agent resolves and claim skips it.
+    return agent && agent.visibility !== 'restricted' ? agent.id : null
   }
 
   setAssignee(input: KanbanSetAssigneeInput): Promise<KanbanSetAssigneeResult> {
@@ -533,9 +555,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
           revokedLease: null
         }
       }
-      if (input.agentId !== null && !(await this.agentInOrg(card.orgId, input.agentId, tx))) {
-        return { ok: false, reason: 'agent_not_in_org' }
-      }
+      const refusal = input.agentId !== null ? await assigneeRefusal(tx, card.orgId, input.agentId) : null
+      if (refusal) return { ok: false, reason: refusal }
       const [open] = await tx.$queryRaw<KanbanLeaseRef[]>(Prisma.sql`
         SELECT "leaseId", "id" AS "runId", "agentId", "daemonId", "dispatchRevision" FROM "kanban_run"
         WHERE "cardId" = ${card.id}::uuid AND "endedAt" IS NULL
@@ -600,11 +621,6 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       }
     })
   }
-
-  private async agentInOrg(orgId: string, agentId: string, db: PrismaLike = this.db): Promise<boolean> {
-    const agent = await db.agent.findFirst({ where: { id: agentId, orgId }, select: { id: true } })
-    return agent !== null
-  }
 }
 
 function toCardRow(row: {
@@ -624,6 +640,25 @@ function toCardRow(row: {
 }): KanbanCardRow {
   if (!isKanbanStatus(row.status)) throw new Error(`kanban card ${row.id} has unknown status ${row.status}`)
   return { ...row, status: row.status }
+}
+
+/** Statuses any caller may file a card in; nothing in them is claimable without a later human-gated move. */
+const UNATTENDED_STATUSES: ReadonlySet<string> = new Set(['triage', 'todo'])
+
+function humanAuthorized(input: KanbanCardUpsertInput): boolean {
+  const authority = input.humanAuthority
+  return input.source === 'import' && !input.actorAgentId && !!authority?.login && hasWriteAccess(authority.permission)
+}
+
+/** The same assignee policy for upsert and setAssignee: an agent of the org that is not restricted to an audience. */
+async function assigneeRefusal(
+  db: PrismaLike,
+  orgId: string,
+  agentId: string
+): Promise<'agent_not_in_org' | 'agent_not_assignable' | null> {
+  const agent = await db.agent.findFirst({ where: { id: agentId, orgId }, select: { visibility: true } })
+  if (!agent) return 'agent_not_in_org'
+  return agent.visibility === 'restricted' ? 'agent_not_assignable' : null
 }
 
 async function isOwner(tx: Prisma.TransactionClient, orgId: string, userId: string): Promise<boolean> {

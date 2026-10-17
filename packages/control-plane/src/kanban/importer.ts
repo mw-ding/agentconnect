@@ -1,15 +1,25 @@
-// Import only status-labeled issues; author permission is read live and unknown authority stays in triage.
-import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
-import type { KanbanBoardRecord, KanbanCardRepo, KanbanInitialStatus } from '../persistence/ports.js'
-import { parseAgentLabel } from './agent-label.js'
-import { observedCardStatus, planStatusWrite, STATUS_LABEL_PREFIX } from './card-state.js'
-import type { CardStore, KanbanRepoRef } from './card-store.js'
+// Import only status-labeled issues; the author and every label that carries authority are attributed live, else triage.
+import { checkWriteAccess, type RepoPermissionLevel, type RepoPermissionLookup } from '../github/repo-permission.js'
+import type {
+  KanbanBoardRecord,
+  KanbanCardRepo,
+  KanbanHumanAuthority,
+  KanbanInitialStatus
+} from '../persistence/ports.js'
+import { AGENT_LABEL_PREFIX, parseAgentLabel } from './agent-label.js'
+import { observedCardStatus, parseStatusLabels, planStatusWrite, STATUS_LABEL_PREFIX } from './card-state.js'
+import { isAppActor, isHumanActor, type CardStore, type KanbanRepoRef, type LabelEvent } from './card-store.js'
 
 export interface KanbanImporterDeps {
   cards: Pick<KanbanCardRepo, 'findByIssueNumber' | 'upsertCard' | 'resolveAgentSlug'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan'>
+  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'readLabelEvents'>
   permissions: RepoPermissionLookup
+  /** This deployment's App slug: its writes are the agents' too, so they never attribute a label. */
+  appSlug?: string
+  log?: { warn: (obj: unknown, msg?: string) => void }
 }
+
+type WriteCheck = { level: RepoPermissionLevel; write: boolean }
 
 export class KanbanImporter {
   constructor(private readonly deps: KanbanImporterDeps) {}
@@ -19,23 +29,119 @@ export class KanbanImporter {
     if (await this.deps.cards.findByIssueNumber(board.id, issueNumber)) return false
     const issue = await this.deps.store.readCard(repo, issueNumber)
     if (!issue || !issue.labels.some((label) => label.startsWith(STATUS_LABEL_PREFIX))) return false
-    const access = await checkWriteAccess(this.deps.permissions, repo, issue.authorLogin ?? '')
+    // TRD §7: an unattributed card is still imported, but as triage, which a claim never takes (it needs ready + assignee).
+    const checks = new Map<string, Promise<WriteCheck>>()
+    const writer = (login: string | null | undefined): Promise<WriteCheck> => {
+      if (!login) return Promise.resolve({ level: 'none', write: false })
+      const id = login.toLowerCase()
+      if (!checks.has(id)) checks.set(id, this.check(board, repo, issueNumber, login))
+      return checks.get(id)!
+    }
+    const authority = await this.attribute(board, repo, issueNumber, issue.labels, issue.authorLogin, writer)
     const observed = observedCardStatus(issue)
-    const status: KanbanInitialStatus = access.write && observed !== 'running' ? observed : 'triage'
+    const kept = authority !== null && observed !== 'running'
+    const status: KanbanInitialStatus = kept ? observed : 'triage'
     const agentLabel = parseAgentLabel(issue.labels)
     const assigneeAgentId =
-      agentLabel.kind === 'agent' ? await this.deps.cards.resolveAgentSlug(board.orgId, agentLabel.slug) : null
+      kept && agentLabel.kind === 'agent' && (await this.agentLabelsAttributed(authority.events, issue.labels, writer))
+        ? await this.deps.cards.resolveAgentSlug(board.orgId, agentLabel.slug)
+        : null
     // A failed triage write must leave no importable DB row whose next delivery could adopt the original ready label.
     await this.deps.store.applyPlan(repo, issueNumber, issue, planStatusWrite(status, issue))
     await this.deps.cards.upsertCard({
       boardId: board.id,
+      expectedRepoId: repo.repoId,
       issueId: issue.issueId,
       issueNumber,
       issueNodeId: issue.nodeId,
       status,
       assigneeAgentId,
-      source: 'import'
+      source: 'import',
+      ...(kept ? { humanAuthority: authority.human } : {})
     })
     return true
   }
+
+  // The author, the latest transferrer, and the adder of the one current status label must all be live human writers.
+  private async attribute(
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    labels: readonly string[],
+    authorLogin: string | null | undefined,
+    writer: (login: string | null | undefined) => Promise<WriteCheck>
+  ): Promise<{ human: KanbanHumanAuthority; events: LabelEvent[] } | null> {
+    if (!(await writer(authorLogin)).write) return null
+    // Exactly one well-formed status label to attribute; drift, a malformed value, or `running` never carries authority.
+    const statusLabels = labels.filter((label) => label.startsWith(STATUS_LABEL_PREFIX))
+    const { statuses, malformed } = parseStatusLabels(labels)
+    if (statusLabels.length !== 1 || malformed.length > 0 || statuses[0] === 'running') return null
+    let events: LabelEvent[]
+    try {
+      events = await this.deps.store.readLabelEvents(repo, issueNumber)
+    } catch (err) {
+      this.warn(board, issueNumber, 'events_unreadable', err)
+      return null
+    }
+    const transfer = latest(events, (e) => e.event === 'transferred')
+    if (transfer && !(await this.humanWriter(transfer, writer))) return null
+    const added = latest(events, (e) => e.event === 'labeled' && e.label?.name === statusLabels[0])
+    if (!added || !(await this.humanWriter(added, writer))) return null
+    const { level } = await writer(added.actor!.login)
+    return { human: { login: added.actor!.login!, permission: level }, events }
+  }
+
+  // Every current ac/agent:* label, not just the parsed one, so a second label cannot ride in unattributed.
+  private async agentLabelsAttributed(
+    events: readonly LabelEvent[],
+    labels: readonly string[],
+    writer: (login: string | null | undefined) => Promise<WriteCheck>
+  ): Promise<boolean> {
+    const agentLabels = labels.filter((label) => label.toLowerCase().startsWith(AGENT_LABEL_PREFIX))
+    for (const label of agentLabels) {
+      const added = latest(events, (e) => e.event === 'labeled' && e.label?.name === label)
+      if (!added || !(await this.humanWriter(added, writer))) return false
+    }
+    return true
+  }
+
+  private async humanWriter(
+    event: LabelEvent,
+    writer: (login: string | null | undefined) => Promise<WriteCheck>
+  ): Promise<boolean> {
+    if (!isHumanActor(event) || isAppActor(event, this.deps.appSlug)) return false
+    return (await writer(event.actor?.login)).write
+  }
+
+  private async check(
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    login: string
+  ): Promise<WriteCheck> {
+    const result = await checkWriteAccess(this.deps.permissions, repo, login)
+    if (result.error !== undefined) this.warn(board, issueNumber, 'permission_lookup_failed', result.error)
+    return { level: result.level, write: result.write }
+  }
+
+  // Body-free: ids, a reason, and the error's class and HTTP status only, never its message.
+  private warn(board: KanbanBoardRecord, issueNumber: number, reason: string, err: unknown): void {
+    const status = (err as { status?: unknown } | null)?.status
+    this.deps.log?.warn(
+      {
+        boardId: board.id,
+        issueNumber,
+        reason,
+        errorName: err instanceof Error ? err.name : typeof err,
+        ...(typeof status === 'number' ? { status } : {})
+      },
+      'kanban import: attribution failed; importing as triage'
+    )
+  }
+}
+
+function latest(events: readonly LabelEvent[], match: (event: LabelEvent) => boolean): LabelEvent | undefined {
+  let found: LabelEvent | undefined
+  for (const event of events) if (match(event) && (!found || event.id > found.id)) found = event
+  return found
 }

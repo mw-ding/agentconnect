@@ -349,63 +349,6 @@ repository until it is within 15 minutes of expiry. The daemon cache is keyed
 by the open lease and mode, so a read run does not reuse a write grant; this
 control-plane cache is not.
 
-## M1 — Board configuration and issue import
-
-Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
-under `/api/v1/orgs/:orgId/kanban/boards`; members list and read only boards
-permitted by the shared resource visibility policy. Restricted boards require a
-current member audience, with the organization Owner exception. Each create or
-update rechecks repository identity through a live installation belonging to the
-organization. Board configuration changes produce body-free audit events.
-
-An enabled board imports issues on human `opened`, `transferred`, or `labeled`
-doorbells when a live issue read carries any `ac/status:*` label. Other labels
-alone do not import. A single valid status is retained for a write-capable author;
-missing, malformed, conflicting, or `running` initial status becomes `triage`.
-The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
-unknown permission and other roles always become `triage`. The safety label write
-precedes the idempotent card upsert, so a failed write cannot leave a ready card.
-One `ac/agent:<slug>` resolves to an agent name within the board's organization;
-unknown, conflicting, or malformed assignment labels leave it unassigned.
-The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
-imports and orchestrator creates without duplicate cards or creation audits.
-
-Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
-redelivery, not by an installation-wide issue enumeration. The live tests use a
-PAT as the injected installation-token source; production uses the App token.
-
-Known gaps update (M1 board CRUD): board writes now use the shared membership
-locks and member-removal audience repair. A repository rename keeps its numeric
-identity; changing that identity is refused while the board has cards, so old
-issue numbers cannot silently refer to another repository.
-
-Human status and assignment edits now synchronize on every card, not only
-mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
-labels, unlabels, closes, or reopens the issue is adopted through
-`planLabelReconcile`: one legal status moves the card, several status labels are
-drift repaired to one with an explanatory comment, and a missing label restores
-the committed status. A leased card accepts only `blocked`, `triage`, and
-`archived`; every other edit reverts with the explanatory comment. An
-`ac/agent:<slug>` change maps to an assignee through the organization's agents;
-on a leased card it kills the lease (never transfers it), bumps the dispatch
-revision, posts a "reassigned from X to Y" comment, and the next dispatch opens
-a fresh session. Reopening a `done` card via a label moves it back through the
-state machine. A periodic drift reconciler, driven by the same 60-second tick,
-repairs a CP status write that failed (a card left with `labelWritePending` is
-re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
-Every transition writes one body-free `kanban_card_change` audit row.
-
-Known gaps update (M1 label sync permission): a human edit is adopted only after
-a live, uncached check that the actor holds `admin`, `maintain`, or `write` on
-the repository; a failed lookup counts as no access. An edit by a `triage`,
-`read`, or non-collaborator actor is consumed without a transition: the status
-label (or a closed issue) is restored to the committed status, a refused
-`ac/agent:<slug>` add or removal is undone, and one fixed-template comment
-explains the revert. Edits by the deployment App bot, any other bot, an App
-acting on a user's behalf, or an unknown actor are ignored without a lookup.
-Agents have no GitHub identity of their own: they write only through App
-installation tokens, so the App check covers them.
-
 M3 hardening (daemon and relay):
 
 - **Agent environment.** The daemon launches every agent from an explicit allowlist
@@ -456,3 +399,69 @@ Known gaps (M3):
   runtime or agent env; it is no longer inherited from the daemon.
 - **The pre-POST clock read is best-effort.** If that GET fails the POST still goes
   out, and a lost response is then recovered by the unbounded scan above.
+
+## M1 — Board configuration and issue import
+
+Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
+under `/api/v1/orgs/:orgId/kanban/boards`; members list and read only boards
+permitted by the shared resource visibility policy. Restricted boards require a
+current member audience, with the organization Owner exception. Each create or
+update rechecks repository identity through a live installation belonging to the
+organization. Board configuration changes produce body-free audit events.
+
+An enabled board imports issues on human `opened`, `transferred`, or `labeled`
+doorbells when a live issue read carries any `ac/status:*` label. Other labels
+alone do not import. A single valid status is retained for a write-capable author;
+missing, malformed, conflicting, or `running` initial status becomes `triage`.
+The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
+unknown permission and other roles always become `triage`. The same live check
+applies to whoever added the current status label (its latest `labeled` issue
+event) and to the latest transferrer: each must be a human, not the App identity
+its agents share, with write access, or the card imports as `triage`. The upsert
+itself refuses any status past `triage`/`todo` without that verified human
+authority, and never takes a mode. The safety label write
+precedes the idempotent card upsert, so a failed write cannot leave a ready card.
+One `ac/agent:<slug>` resolves to an unrestricted agent name within the board's
+organization, and only when the status was kept and a human writer added every
+current `ac/agent:*` label; otherwise, or for unknown, conflicting, or malformed
+assignment labels, the card stays unassigned.
+The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
+imports and orchestrator creates without duplicate cards or creation audits.
+
+Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
+redelivery, not by an installation-wide issue enumeration. The live tests use a
+PAT as the injected installation-token source; production uses the App token.
+
+Known gaps update (M1 board CRUD): board writes now use the shared membership
+locks and member-removal audience repair. A repository rename keeps its numeric
+identity; changing that identity is refused while the board has cards, so old
+issue numbers cannot silently refer to another repository. Human status and
+assignment synchronization beyond mismatch-parked cards and periodic drift repair
+remain for the stacked M1 follow-up.
+
+Human status and assignment edits now synchronize on every card, not only
+mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
+labels, unlabels, closes, or reopens the issue is adopted through
+`planLabelReconcile`: one legal status moves the card, several status labels are
+drift repaired to one with an explanatory comment, and a missing label restores
+the committed status. A leased card accepts only `blocked`, `triage`, and
+`archived`; every other edit reverts with the explanatory comment. An
+`ac/agent:<slug>` change maps to an assignee through the organization's agents;
+on a leased card it kills the lease (never transfers it), bumps the dispatch
+revision, posts a "reassigned from X to Y" comment, and the next dispatch opens
+a fresh session. Reopening a `done` card via a label moves it back through the
+state machine. A periodic drift reconciler, driven by the same 60-second tick,
+repairs a CP status write that failed (a card left with `labelWritePending` is
+re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
+Every transition writes one body-free `kanban_card_change` audit row.
+
+Known gaps update (M1 label sync permission): a human edit is adopted only after
+a live, uncached check that the actor holds `admin`, `maintain`, or `write` on
+the repository; a failed lookup counts as no access. An edit by a `triage`,
+`read`, or non-collaborator actor is consumed without a transition: the status
+label (or a closed issue) is restored to the committed status, a refused
+`ac/agent:<slug>` add or removal is undone, and one fixed-template comment
+explains the revert. Edits by the deployment App bot, any other bot, an App
+acting on a user's behalf, or an unknown actor are ignored without a lookup.
+Agents have no GitHub identity of their own: they write only through App
+installation tokens, so the App check covers them.

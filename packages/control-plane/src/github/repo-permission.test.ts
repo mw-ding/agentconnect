@@ -75,9 +75,9 @@ describe('GithubRepoPermission', () => {
     await expect(lookup.permission(repo, 'octocat')).rejects.toThrow()
   })
 
-  it('reuses a lookup within the TTL, case-insensitively, and asks again after it', async () => {
+  it('reuses a non-write lookup within the TTL, case-insensitively, and asks again after it', async () => {
     let now = 1_000
-    const fetchImpl = respond(200, { permission: 'admin', role_name: 'admin' })
+    const fetchImpl = respond(200, { permission: 'read', role_name: 'triage' })
     const lookup = new GithubRepoPermission({
       tokens: { mintKanbanCard: async () => grant },
       fetchImpl,
@@ -85,12 +85,43 @@ describe('GithubRepoPermission', () => {
       ttlMs: 500,
       now: () => now
     })
-    await lookup.permission(repo, 'mw-ding')
-    await lookup.permission(repo, 'MW-Ding')
+    await expect(lookup.permission(repo, 'mw-ding')).resolves.toBe('triage')
+    await expect(lookup.permission(repo, 'MW-Ding')).resolves.toBe('triage')
     expect(fetchImpl).toHaveBeenCalledTimes(1)
     now += 501
     await lookup.permission(repo, 'mw-ding')
     expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['admin', 'maintain', 'write'])('never caches %s, so a demoted writer is seen at once', async (role) => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ permission: role === 'admin' ? 'admin' : 'write', role_name: role }))
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ permission: 'read', role_name: 'read' })))
+    const lookup = new GithubRepoPermission({
+      tokens: { mintKanbanCard: async () => grant },
+      fetchImpl,
+      baseUrl: 'https://gh.test'
+    })
+    await expect(lookup.permission(repo, 'mw-ding')).resolves.toBe(role)
+    await expect(lookup.permission(repo, 'mw-ding')).resolves.toBe('read')
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('fails the gate closed when GitHub goes down after a positive lookup', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ permission: 'admin', role_name: 'admin' })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ message: 'bad gateway' }), { status: 502 }))
+    const lookup = new GithubRepoPermission({
+      tokens: { mintKanbanCard: async () => grant },
+      fetchImpl,
+      baseUrl: 'https://gh.test'
+    })
+    await expect(checkWriteAccess(lookup, repo, 'mw-ding')).resolves.toEqual({ level: 'admin', write: true })
+    await expect(checkWriteAccess(lookup, repo, 'mw-ding')).resolves.toMatchObject({ level: 'none', write: false })
   })
 
   it('never caches a failure', async () => {

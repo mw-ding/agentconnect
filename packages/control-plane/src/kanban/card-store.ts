@@ -51,6 +51,8 @@ export interface CardStore {
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
+  /** Body-free issue events, oldest first; throws when the history runs past the page bound, so callers fail closed. */
+  readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]>
   /** The newest visible issue-event id (0 for none): the pre-POST cursor bounding which events can be our write. */
   lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number>
   /** Judge a pending promotion from the events after `cursor`; an unreadable window is inconclusive. */
@@ -257,6 +259,22 @@ export class GithubCardStore implements CardStore {
       if (isTargetAdd(event) && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
     }
     return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
+  }
+
+  async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {
+    const events = await this.recentEvents(repo, issueNumber, () => false)
+    if (!events) throw new Error('kanban: issue events run past the page bound')
+    // Keep attribution fields only: a `renamed` event would otherwise carry the issue title.
+    return events
+      .map((e) => ({
+        id: e.id,
+        event: e.event,
+        ...(e.created_at !== undefined ? { created_at: e.created_at } : {}),
+        ...(e.label?.name !== undefined ? { label: { name: e.label.name } } : {}),
+        actor: e.actor ? { type: e.actor.type, login: e.actor.login } : null,
+        ...(e.performed_via_github_app ? { performed_via_github_app: true } : {})
+      }))
+      .sort((a, b) => a.id - b.id)
   }
 
   async lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number> {

@@ -131,13 +131,13 @@ describe('Kanban board routes — an interactive owner', () => {
   })
 
   it.each([
-    [{ ok: false, status: 400, message: 'repository is not covered' }, 400],
-    [{ ok: false, status: 409, message: 'GitHub App is not configured' }, 409],
-    [{ ok: false, status: 429, message: 'github: rate limited' }, 429],
-    [{ ok: false, status: 502, message: 'github: down' }, 502]
-  ] as Array<[KanbanRepoResolution, number]>)(
-    'maps a resolver refusal %j to %s and writes nothing',
-    async (refusal, status) => {
+    [{ ok: false, status: 400, message: 'repository is not covered' }, 400, 'repo_not_covered'],
+    [{ ok: false, status: 409, message: 'GitHub App is not configured' }, 409, 'github_app_not_configured'],
+    [{ ok: false, status: 429, message: 'github: rate limited' }, 429, 'github_rate_limited'],
+    [{ ok: false, status: 502, message: 'github: down' }, 502, 'github_unavailable']
+  ] as Array<[KanbanRepoResolution, number, string]>)(
+    'maps a resolver refusal %j to %s with a stable code and writes nothing',
+    async (refusal, status, code) => {
       const { app, close } = buildApp(fakeResolver({ 'acme/web': refusal }))
       const headers = await ownerBearer(prisma, oidc)
       try {
@@ -148,6 +148,7 @@ describe('Kanban board routes — an interactive owner', () => {
           payload: { name: 'web', repoFullName: 'acme/web' }
         })
         expect(res.statusCode).toBe(status)
+        expect(res.json()).toMatchObject({ statusCode: status, code })
         expect(await prisma.kanbanBoard.count()).toBe(0)
         expect(await boardAudit()).toHaveLength(0)
       } finally {
@@ -164,12 +165,20 @@ describe('Kanban board routes — an interactive owner', () => {
     const headers = await ownerBearer(prisma, oidc)
     try {
       const post = (payload: object) => app.inject({ method: 'POST', url: BOARDS, headers, payload })
+      const refusal = async (payload: object) => {
+        const res = await post(payload)
+        return [res.statusCode, (res.json() as { code?: string }).code]
+      }
       expect((await post({ name: 'web', repoFullName: 'acme/web' })).statusCode).toBe(201)
-      expect((await post({ name: 'web2', repoFullName: 'acme/web' })).statusCode).toBe(409)
-      expect(
-        (await post({ name: 'api', repoFullName: 'acme/api', orchestratorAgentId: FOREIGN_AGENT })).statusCode
-      ).toBe(400)
-      expect((await post({ name: 'api', repoFullName: 'acme/api', visibility: 'restricted' })).statusCode).toBe(400)
+      expect(await refusal({ name: 'web2', repoFullName: 'acme/web' })).toEqual([409, 'repo_taken'])
+      expect(await refusal({ name: 'api', repoFullName: 'acme/api', orchestratorAgentId: FOREIGN_AGENT })).toEqual([
+        400,
+        'agent_not_in_org'
+      ])
+      expect(await refusal({ name: 'api', repoFullName: 'acme/api', visibility: 'restricted' })).toEqual([
+        400,
+        'empty_audience'
+      ])
       // A non-member id is dropped from the audience, which leaves it empty.
       expect(
         (await post({ name: 'api', repoFullName: 'acme/api', visibility: 'restricted', sharedWith: ['not-a-member'] }))
@@ -258,6 +267,7 @@ describe('Kanban board routes — an interactive owner', () => {
       resolver.resolve.mockResolvedValueOnce({ ok: true, repoId: 9999n, repoFullName: 'acme/api', installationId: 77n })
       const changed = await app.inject({ method: 'PATCH', url, headers, payload: { enabled: true } })
       expect(changed.statusCode).toBe(409)
+      expect(changed.json()).toMatchObject({ code: 'repo_changed' })
       expect((await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: board.id } })).enabled).toBe(false)
     } finally {
       await close()
@@ -271,9 +281,9 @@ describe('Kanban board routes — an interactive owner', () => {
     const headers = await ownerBearer(prisma, oidc)
     try {
       const url = `${BOARDS}/${board.id}`
-      expect(
-        (await app.inject({ method: 'PATCH', url, headers, payload: { repoFullName: 'acme/api' } })).statusCode
-      ).toBe(409)
+      const retarget = await app.inject({ method: 'PATCH', url, headers, payload: { repoFullName: 'acme/api' } })
+      expect(retarget.statusCode).toBe(409)
+      expect(retarget.json()).toMatchObject({ code: 'repo_has_cards' })
       resolver.resolve.mockResolvedValueOnce({
         ok: true,
         repoId: 4242n,
@@ -311,13 +321,21 @@ describe('Kanban board routes — an interactive owner', () => {
     const headers = await ownerBearer(prisma, oidc)
     const url = `${BOARDS}/${board.id}`
     try {
-      expect((await app.inject({ method: 'DELETE', url, headers })).statusCode).toBe(409)
+      const busy = await app.inject({ method: 'DELETE', url, headers })
+      expect(busy.statusCode).toBe(409)
+      expect(busy.json()).toMatchObject({ code: 'active_runs' })
       await prisma.kanbanRun.update({ where: { id: run.id }, data: { endedAt: new Date(), outcome: 'reclaimed' } })
       expect((await app.inject({ method: 'DELETE', url, headers })).statusCode).toBe(204)
       expect(await prisma.kanbanBoard.count()).toBe(0)
       expect(await prisma.kanbanCard.count()).toBe(0)
       expect((await boardAudit()).map((e) => (e.details as { change: string }).change)).toEqual(['deleted'])
-      expect((await app.inject({ method: 'DELETE', url, headers })).statusCode).toBe(404)
+      const gone = await app.inject({ method: 'DELETE', url, headers })
+      expect(gone.statusCode).toBe(404)
+      expect(gone.json()).toMatchObject({ code: 'not_found' })
+      const missing = await app.inject({ method: 'PATCH', url, headers, payload: { maxInProgress: 2 } })
+      expect(missing.json()).toMatchObject({ statusCode: 404, code: 'not_found' })
+      const unseen = await app.inject({ method: 'GET', url, headers })
+      expect(unseen.json()).toMatchObject({ statusCode: 404, code: 'not_found' })
     } finally {
       await close()
     }
