@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHmac } from 'node:crypto'
+import { once } from 'node:events'
+import { request } from 'node:http'
+import type { AddressInfo, Socket } from 'node:net'
 import { FakeClock } from '@agentconnect.md/connection'
 import {
   CODE_HOST_SUBJECT_MAX_BYTES,
@@ -253,6 +256,8 @@ interface Harness {
   rerequestRequests: RcGithubRerequest[]
   feedback: RcPullRequestFeedback[]
   feedbackError: boolean
+  /** Holds the CP feedback write open until it resolves. */
+  feedbackGate?: () => Promise<void>
   rerequestResult: RcGithubRerequestResult | (() => Promise<RcGithubRerequestResult>)
   authzResult: boolean | ((request: RcGithubCommentAuthz) => boolean | Promise<boolean>)
   ack: RdAck | (() => Promise<RdAck>)
@@ -341,6 +346,7 @@ function makeHarness(authzCapacity = 20): Harness {
     },
     reportPullRequestFeedback: async (signal) => {
       if (h.feedbackError) throw new Error('CP unavailable')
+      await h.feedbackGate?.()
       h.feedback.push(signal)
       return true
     },
@@ -526,6 +532,60 @@ describe('github ingress', () => {
         pullPayload({ action: 'created', comment: { body: 'please change this' } })
       )
       expect(res.statusCode).toBe(503)
+    })
+
+    it('processes a redelivery after GitHub hung up during a slow feedback write', async () => {
+      h.table.upsert(rule({}, { events: ['pull_request_review_comment:*'] }))
+      const payload = pullPayload({
+        action: 'created',
+        comment: { id: 555, body: 'please change this', user: { login: 'alice' }, author_association: 'MEMBER' }
+      })
+      const options = { headers: { 'x-github-delivery': 'feedback-abort' } }
+      let release!: () => void
+      let started!: () => void
+      const writing = new Promise<void>((resolve) => (started = resolve))
+      h.feedbackGate = () => {
+        started()
+        return new Promise<void>((resolve) => (release = resolve))
+      }
+      await h.app.listen({ port: 0, host: '127.0.0.1' })
+      const accepted = once(h.app.server, 'connection') as Promise<[Socket]>
+      const body = JSON.stringify(payload)
+      const req = request({
+        host: '127.0.0.1',
+        port: (h.app.server.address() as AddressInfo).port,
+        method: 'POST',
+        path: '/webhooks/github',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': sign(body),
+          'x-github-event': 'pull_request_review_comment',
+          'x-github-delivery': 'feedback-abort'
+        }
+      })
+      req.on('error', () => {})
+      req.end(body)
+      const [socket] = await accepted
+      await writing
+      req.destroy()
+      if (!socket.destroyed) await once(socket, 'close')
+      release()
+      await flush()
+      h.feedbackGate = undefined
+
+      const retry = await post('pull_request_review_comment', payload, options)
+      expect(retry.statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(1)
+
+      // Past the committed TTL the same GUID is new again.
+      h.clock.advance(11 * 60 * 1000)
+      expect((await post('pull_request_review_comment', payload, options)).statusCode).toBe(202)
+      await flush()
+      expect(h.sent).toHaveLength(2)
     })
 
     it('persists feedback when the same delivery retries after a 503', async () => {

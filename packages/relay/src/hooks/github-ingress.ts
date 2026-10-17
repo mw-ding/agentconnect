@@ -1137,6 +1137,9 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         return reply.code(400).send({ error: 'Bad Request', statusCode: 400 })
       }
 
+      // Tracked from the start: GitHub may hang up during the feedback write, before any claim or close listener exists.
+      let closed = false
+      reply.raw.once('close', () => (closed = true))
       const feedbackSignals = pullRequestFeedbackSignals(event, payload, deliveryKey)
       try {
         if (deps.reportPullRequestFeedback) {
@@ -1144,6 +1147,11 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         }
       } catch {
         deps.log.warn(`github ingress: PR feedback persistence unavailable ${deliveryKey}`)
+        return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
+      }
+      // A caller gone during the write never claims the id, so GitHub's redelivery of the GUID is processed.
+      if (closed || reply.raw.destroyed) {
+        deps.log.info(`github ingress: delivery ${deliveryKey} disconnected before it was claimed`)
         return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
       }
 
@@ -1176,10 +1184,12 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
           deps.report(report)
         }
       }
-      reply.raw.once('close', () => {
+      const settle = (): void => {
         if (forwardDropped || reply.statusCode >= 500) deliveries.forget(deliveryHeader)
         else deliveries.commit(deliveryHeader)
-      })
+      }
+      if (closed || reply.raw.destroyed) settle()
+      else reply.raw.once('close', settle)
 
       if (event === 'check_run' && payload.action === 'rerequested') {
         void dispatchGithubRerequest(hookDeps, payload, deliveryKey, 'check_run', 'rerequested')
