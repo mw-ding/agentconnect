@@ -1,5 +1,6 @@
 // Kanban provider-error classifier (issue #2 M3): transient vs fatal from the turn's ACP error; pure, and unknown stays today's failed/turn_error.
 import type { KanbanProviderReasonCode } from '@agentconnect.md/protocol'
+import { AcpConnectionClosedError } from '../acp/transport-error.js'
 
 export type ProviderErrorClass =
   | { kind: 'transient'; reasonCode: KanbanProviderReasonCode }
@@ -47,11 +48,8 @@ const INVALID = /invalid_request_error|invalid params|invalid request|bad reques
 const OVERLOADED = /overloaded/i
 const RATE =
   /rate[_ -]?limit|too many requests|resource_exhausted|requests? per min|tokens? per min|per[- ]minute|usage limit|quota (?:exceeded|exhausted)/i
-// A dead agent process reads as a network error (EPIPE, "connection closed") but is not a provider outage to retry: the agent must be relaunched, so it is counted.
-const AGENT_CRASH =
-  /acp connection (?:closed|terminated|lost)|agent (?:process )?(?:crashed|exited|terminated|died)|child process (?:exited|died|closed)|process (?:exited|terminated) with|exit(?:ed)? with (?:code|status)|broken pipe|epipe/i
 const NETWORK =
-  /econnreset|etimedout|enotfound|eai_again|econnrefused|enetunreach|socket hang up|fetch failed|network (?:error|request failed)|connection (?:reset|refused|error|terminated)/i
+  /epipe|broken pipe|econnreset|etimedout|enotfound|eai_again|econnrefused|enetunreach|socket hang up|fetch failed|network (?:error|request failed)|connection (?:reset|refused|error|terminated)/i
 const SERVER = /internal server error|bad gateway|service unavailable|gateway time-?out|server_error|api_error/i
 
 /** Classify a settled turn's error: transient retries with backoff and is not counted; fatal is a counted failure. */
@@ -61,7 +59,6 @@ export function classifyProviderError(err: unknown): ProviderErrorClass {
   const { codes, text } = s
   const anyCode = (...n: number[]) => n.some((c) => codes.has(c))
 
-  if (has(AGENT_CRASH, text)) return { kind: 'fatal', reasonCode: 'agent_crashed' }
   if (has(CONTEXT, text)) return { kind: 'fatal', reasonCode: 'provider_context_overflow' }
   if (anyCode(401, 403, -32000) || has(AUTH, text) || has(status('401|403'), text))
     return { kind: 'fatal', reasonCode: 'provider_auth' }
@@ -71,9 +68,11 @@ export function classifyProviderError(err: unknown): ProviderErrorClass {
     return { kind: 'transient', reasonCode: 'provider_overloaded' }
   if (anyCode(429) || has(RATE, text) || has(status('429'), text))
     return { kind: 'transient', reasonCode: 'provider_rate_limited' }
-  if (has(NETWORK, text)) return { kind: 'transient', reasonCode: 'provider_network' }
   if ([...codes].some((code) => code >= 500 && code <= 599) || has(SERVER, text) || has(status('5[0-9]{2}'), text))
     return { kind: 'transient', reasonCode: 'provider_server_error' }
+
+  if (err instanceof AcpConnectionClosedError) return { kind: 'fatal', reasonCode: 'agent_crashed' }
+  if (has(NETWORK, text)) return { kind: 'transient', reasonCode: 'provider_network' }
 
   return UNCLASSIFIED_PROVIDER_ERROR
 }

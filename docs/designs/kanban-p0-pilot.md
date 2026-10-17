@@ -326,7 +326,11 @@ ACP errors retain their structured JSON-RPC code, message, data, and cause for a
 pure daemon-side classifier. Rate limits (429), network errors, overload (529),
 and server errors (5xx) report `transient` with a fixed `provider_*` reason code.
 Authentication (401/403), invalid requests (400/invalid params), and context
-overflow report counted `failed` outcomes. Unknown errors keep `failed/turn_error`.
+overflow report counted `failed` outcomes. After those provider checks, only a
+daemon-created ACP transport error (a prompt rejected by the local connection
+closing or resetting, including agent process exit) reports `failed/agent_crashed`.
+Free-text process/tool exit messages cannot establish a crash; provider-side EPIPE
+remains `transient/provider_network`. Unknown errors keep `failed/turn_error`.
 Neither initial-turn nor nudge-turn errors trigger another nudge. Error text stays
 on the daemon; only the reason code reaches the control plane.
 

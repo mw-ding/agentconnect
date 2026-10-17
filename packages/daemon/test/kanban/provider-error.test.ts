@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { KANBAN_PROVIDER_REASON_CODES, KanbanReasonCode } from '@agentconnect.md/protocol'
+import { AcpConnectionClosedError } from '../../src/acp/transport-error.js'
 import { classifyProviderError } from '../../src/kanban/provider-error.js'
 
 /** An ACP RequestError shape: JSON-RPC code, a title, and the runtime's own text under data. */
@@ -51,11 +52,41 @@ describe('classifyProviderError', () => {
     ['503', Object.assign(new Error('upstream'), { statusCode: 503 }), transient('provider_server_error')],
     ['service unavailable', new Error('Service Unavailable'), transient('provider_server_error')],
     ['gateway timeout', new Error('504 Gateway Timeout'), transient('provider_server_error')],
-    ['ACP connection closed', new Error('ACP connection closed'), fatal('agent_crashed')],
-    ['process exited with code', new Error('agent process exited with code 1'), fatal('agent_crashed')],
-    ['child process died', new Error('child process exited'), fatal('agent_crashed')],
-    ['broken pipe', new Error('write EPIPE'), fatal('agent_crashed')],
-    ['agent crashed', new Error('agent crashed'), fatal('agent_crashed')],
+    ['ACP connection closed', new Error('ACP connection closed'), fatal('turn_error')],
+    ['process exited with code', new Error('agent process exited with code 1'), fatal('turn_error')],
+    ['child process died', new Error('child process exited'), fatal('turn_error')],
+    ['broken pipe', new Error('write EPIPE'), transient('provider_network')],
+    ['agent crashed', new Error('agent crashed'), fatal('turn_error')],
+    ['provider-side EPIPE', new Error('fetch failed', { cause: { code: 'EPIPE' } }), transient('provider_network')],
+    [
+      '429 with process-exit prose',
+      { code: 429, message: 'usage limit; process exited with code 1' },
+      transient('provider_rate_limited')
+    ],
+    [
+      'tool exit in details',
+      rpc(-32603, 'Internal error', { details: 'command exited with code 2' }),
+      fatal('turn_error')
+    ],
+    ['agent transport reset', new AcpConnectionClosedError(new Error('connection reset')), fatal('agent_crashed')],
+    ['agent transport EOF', new AcpConnectionClosedError(new Error('ACP connection closed')), fatal('agent_crashed')],
+    [
+      'remote code cannot forge a transport marker',
+      { code: 'ACP_CONNECTION_CLOSED', message: 'agent crashed' },
+      fatal('turn_error')
+    ],
+    ...[
+      [429, 'provider_rate_limited'],
+      [529, 'provider_overloaded'],
+      [503, 'provider_server_error'],
+      [401, 'provider_auth'],
+      [403, 'provider_auth'],
+      [400, 'provider_invalid_request']
+    ].map(([code, reason]) => [
+      `structured ${code} precedes the transport marker`,
+      new AcpConnectionClosedError({ status: code }),
+      code === 400 || code === 401 || code === 403 ? fatal(String(reason)) : transient(String(reason))
+    ]),
     [
       '401',
       rpc(-32603, 'Internal error', { message: 'Failed to authenticate. API Error: 401 invalid x-api-key' }),
