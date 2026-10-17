@@ -47,6 +47,7 @@ export interface CardGraph {
 export interface CardStore {
   /** Null when the number is missing, transferred away, or a pull request. */
   readCard(repo: KanbanRepoRef, issueNumber: number): Promise<CardIssue | null>
+  managedEdits(repo: KanbanRepoRef, issueNumber: number): Promise<ManagedEdits>
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
@@ -84,6 +85,29 @@ export interface LabelEvent {
   label?: { name?: string }
   actor?: { type?: string; login?: string } | null
   performed_via_github_app?: unknown
+}
+
+export interface ManagedEdits {
+  status: LabelEvent | null
+  assignee: LabelEvent | null
+  cursor: number
+}
+
+// Preserve the latest actor, including bots and unknown actors, so an earlier human edit cannot authorize a later write.
+export function latestManagedEdits(events: readonly LabelEvent[]): ManagedEdits {
+  const result: ManagedEdits = { status: null, assignee: null, cursor: 0 }
+  for (const event of events) {
+    result.cursor = Math.max(result.cursor, event.id)
+    const labelEdit = event.event === 'labeled' || event.event === 'unlabeled'
+    const status =
+      event.event === 'closed' ||
+      event.event === 'reopened' ||
+      (labelEdit && event.label?.name?.startsWith(STATUS_LABEL_PREFIX))
+    const assignee = labelEdit && event.label?.name?.toLowerCase().startsWith('ac/agent:')
+    if (status && (!result.status || result.status.id < event.id)) result.status = event
+    if (assignee && (!result.assignee || result.assignee.id < event.id)) result.assignee = event
+  }
+  return result
 }
 
 /** A person acting directly: not a bot account, not an App, and not an App acting on a user's behalf. */
@@ -200,12 +224,21 @@ export class GithubCardStore implements CardStore {
       this.get<GhIssue[]>(repo, `/issues/${issueNumber}/dependencies/blocking?per_page=${PAGE}`)
     ])
     return {
-      parent: parent ? toLink(parent) : null,
-      subIssues: subIssues.map(toLink),
-      blockedBy: blockedBy.map(toLink),
-      blocking: blocking.map(toLink),
+      parent: parent ? toLink(parent, repo) : null,
+      subIssues: subIssues.map((issue) => toLink(issue, repo)),
+      blockedBy: blockedBy.map((issue) => toLink(issue, repo)),
+      blocking: blocking.map((issue) => toLink(issue, repo)),
       truncated: subIssues.length >= PAGE || blockedBy.length >= PAGE || blocking.length >= PAGE
     }
+  }
+
+  async managedEdits(repo: KanbanRepoRef, issueNumber: number): Promise<ManagedEdits> {
+    const events = await this.recentEvents(repo, issueNumber, (seen) => {
+      const latest = latestManagedEdits(seen)
+      return latest.status !== null && latest.assignee !== null
+    })
+    if (!events) throw new Error('kanban: managed edit attribution exceeded the issue-event page bound')
+    return latestManagedEdits(events)
   }
 
   async statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean> {
@@ -296,11 +329,16 @@ export class GithubCardStore implements CardStore {
   }
 }
 
-function toLink(issue: GhIssue): CardLink {
+function toLink(issue: GhIssue, repo: KanbanRepoRef): CardLink {
   return {
     issueId: BigInt(issue.id),
     number: issue.number,
-    repoId: issue.repository?.id !== undefined ? BigInt(issue.repository.id) : null,
+    repoId:
+      issue.repository?.id !== undefined
+        ? BigInt(issue.repository.id)
+        : issue.repository_url?.toLowerCase() === `https://api.github.com/repos/${repo.repoFullName}`.toLowerCase()
+          ? repo.repoId
+          : null,
     state: issue.state,
     stateReason: issue.state_reason ?? null
   }

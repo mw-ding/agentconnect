@@ -148,6 +148,16 @@ export class KanbanWorker {
     return admission
   }
 
+  async revoke(leaseId: string, cardId: string): Promise<void> {
+    await this.admitting.get(leaseId)?.catch(() => undefined)
+    const lease = this.leases.get(leaseId)
+    if (!lease || lease.dispatch.cardId !== cardId) return
+    await this.deps.cancel(lease)
+    this.leases.delete(leaseId)
+    this.deps.onLeaseChanged?.(lease.dispatch)
+    await this.deps.outbox.release(leaseId)
+  }
+
   private async admit(d: KanbanDispatch): Promise<KanbanDispatchOk> {
     if (this.leases.has(d.leaseId)) return { leaseId: d.leaseId, accepted: true }
     try {

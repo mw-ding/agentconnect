@@ -1,4 +1,5 @@
 // Kanban repos (issue #2 M1): PgKanbanBoardRepo serves the doorbell and redelivery sweep; PgKanbanCardRepo the graph reconciler.
+import { applyCardTransition, auditCardTransition } from '../../kanban/audit.js'
 import { randomUUID } from 'node:crypto'
 import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
@@ -326,11 +327,12 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   }
 
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision },
-      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED }
-    })
-    return count === 1
+    return applyCardTransition(
+      this.db,
+      { id: cardId, stateRevision: expectedStateRevision },
+      { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED },
+      'cas_status'
+    )
   }
 
   async beginPromotion(
@@ -340,15 +342,16 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
     startedAt: Date
   ): Promise<boolean> {
     // One write for the ready CAS and the intent; an open intent keeps its caps, and a flagged card is a human's.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: {
+    return applyCardTransition(
+      this.db,
+      {
         id: cardId,
         stateRevision: expectedStateRevision,
         status: 'todo',
         promotionPending: false,
         needsAttention: false
       },
-      data: {
+      {
         status: 'ready',
         stateRevision: { increment: 1 },
         githubSyncedAt: new Date(),
@@ -360,9 +363,9 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
         // A minute out, so a tick cannot settle the card while this write is still in flight.
         recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
         recoveryChecks: 0
-      }
-    })
-    return count === 1
+      },
+      'graph_promotion'
+    )
   }
 
   async notePromotionPosted(cardId: string): Promise<void> {
@@ -375,24 +378,25 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
   async clearPromotionIntent(cardId: string): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, status: 'ready', promotionPending: true },
-      data: PROMOTION_CLEARED
+      data: { ...PROMOTION_CLEARED, labelWritePending: false }
     })
     return count === 1
   }
 
   async revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean> {
     // The timed-out POST can still land after this rollback, so the watch restarts from now.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
-      data: {
+    return applyCardTransition(
+      this.db,
+      { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
+      {
         status: 'todo',
         stateRevision: { increment: 1 },
         promotionWatchUntil: new Date(revertedAt.getTime() + PROMOTION_WATCH_MS),
         recoveryCheckAt: null,
         recoveryChecks: 0
-      }
-    })
-    return count === 1
+      },
+      'graph_rollback'
+    )
   }
 
   async upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult> {
@@ -553,9 +557,18 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
           assigneeAgentId: input.agentId,
           // A new generation fences every late write of the superseded holder, as a claim or run end does.
           dispatchRevision: { increment: 1 },
-          ...(restart ? { status: 'ready', stateRevision: { increment: 1 }, ...PROMOTION_CLEARED } : {})
+          ...(restart
+            ? { status: 'ready', stateRevision: { increment: 1 }, labelWritePending: true, ...PROMOTION_CLEARED }
+            : {})
         },
         select: CARD_ROW_SELECT
+      })
+      await auditCardTransition(tx, {
+        cardId: card.id,
+        from: current.status,
+        to: updated.status,
+        source: input.source,
+        ...(open ? { leaseId: open.leaseId } : {})
       })
       await tx.auditEvent.create({
         data: {

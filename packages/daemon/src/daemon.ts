@@ -26595,6 +26595,7 @@ export class Daemon {
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       cronReportOutbox: () => this.cronReportOutbox,
       kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
+      kanbanRevoke: (req) => this.kanbanWorker().revoke(req.leaseId, req.cardId),
       kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
@@ -27050,10 +27051,10 @@ export class Daemon {
         const agentId = lease.dispatch.agentId
         const session = await this.store.getSession(lease.sessionKey)
         const acpSessionId = session?.acpSessionId ?? undefined
-        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
+        await this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
         // SDK background work has no Pending turn for interruptTurn to cancel; stop its host before admitting another writer.
         if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), acpSessionId)) {
-          void this.stopHost(agentId).catch((err) =>
+          await this.stopHost(agentId).catch((err) =>
             this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
           )
         }
@@ -27138,6 +27139,19 @@ export class Daemon {
   ): Promise<KanbanStartResult> {
     const msg = buildKanbanMessage(d, randomUUID())
     const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
+    if (d.attempt > 1) {
+      const previous = await this.store.getSession(key)
+      if (previous) {
+        this.hostForOwner(this.sessionOwnerKey(d.agentId, key))?.forgetSession(previous.acpSessionId ?? '')
+        await this.store.upsertSession({
+          ...previous,
+          acpSessionId: null,
+          state: 'idle',
+          lastDeliveredTs: null,
+          updatedAt: this.clock.now()
+        })
+      }
+    }
     let admitted!: (result: { accepted: boolean; reason?: string }) => void
     const admission = new Promise<{ accepted: boolean; reason?: string }>((resolve) => (admitted = resolve))
     const done = this.dispatch(d.agentId, msg, undefined, undefined, undefined, {

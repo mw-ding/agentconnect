@@ -8048,7 +8048,7 @@ export interface KanbanDispatchRepo {
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
   // Due non-terminal cards that are mismatch-parked, flagged for attention, or hold a pending promotion; most overdue first.
-  listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]>
+  listRecoveryDue(boardId: string, now: Date, limit: number, pendingOnly?: boolean): Promise<KanbanRecoveryDue[]>
   // The status a mismatch or an attention flag parked the card in; null when neither holds it.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.

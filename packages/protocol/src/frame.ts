@@ -73,6 +73,8 @@ import {
   CodeHostReviewResultReport
 } from './frames/codehost-review.js'
 import {
+  KanbanRevoke,
+  KanbanRevokeOk,
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
@@ -409,6 +411,8 @@ export const FRAME_SCHEMAS = {
   'codehost/review-result': CodeHostReviewResultReport,
   'codehost/review-result/ok': CodeHostReviewResultOk,
   // ── kanban dispatch (issue #2 M2; body-free ids + lease fence only) ──
+  'kanban/revoke': KanbanRevoke,
+  'kanban/revoke/ok': KanbanRevokeOk,
   'kanban/dispatch': KanbanDispatch,
   'kanban/dispatch/ok': KanbanDispatchOk,
   'kanban/lease-heartbeat': KanbanLeaseHeartbeat,
@@ -793,6 +797,8 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('codehost/review-lease-renew/ok', FRAME_SCHEMAS['codehost/review-lease-renew/ok']),
   frame('codehost/review-result', FRAME_SCHEMAS['codehost/review-result']),
   frame('codehost/review-result/ok', FRAME_SCHEMAS['codehost/review-result/ok']),
+  frame('kanban/revoke', FRAME_SCHEMAS['kanban/revoke']),
+  frame('kanban/revoke/ok', FRAME_SCHEMAS['kanban/revoke/ok']),
   frame('kanban/dispatch', FRAME_SCHEMAS['kanban/dispatch']),
   frame('kanban/dispatch/ok', FRAME_SCHEMAS['kanban/dispatch/ok']),
   frame('kanban/lease-heartbeat', FRAME_SCHEMAS['kanban/lease-heartbeat']),

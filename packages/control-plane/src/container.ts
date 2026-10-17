@@ -1,3 +1,4 @@
+import { KanbanSync } from './kanban/sync.js'
 import { KanbanImporter } from './kanban/importer.js'
 import { GithubRepoPermission } from './github/repo-permission.js'
 import { CodeHostFeedbackService } from './codehost/feedback.service.js'
@@ -181,6 +182,7 @@ import {
   PgHookSecretStore,
   PgKanbanBoardRepo,
   PgKanbanDispatchRepo,
+  PgKanbanSyncRepo,
   PgKanbanCardRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
@@ -1778,10 +1780,62 @@ export function buildContainer(
         })
       : undefined
 
+  const kanbanGraphLog = {
+    debug: (o: unknown, m?: string) => http.log.debug(o, m),
+    warn: (o: unknown, m?: string) => http.log.warn(o, m)
+  }
+  const kanbanGraphReconciler = kanbanCardStore
+    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    : undefined
+
+  const kanbanSync =
+    kanbanCardStore && kanbanTokens
+      ? new KanbanSync({
+          repo: new PgKanbanSyncRepo(prisma),
+          cards: repos.kanbanCard,
+          store: kanbanCardStore,
+          permissions: new GithubRepoPermission({
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          repoRef: async (boardId) => {
+            const board = await repos.kanbanDispatch.getBoardRef(boardId)
+            if (!board) return null
+            const owner = board.repoFullName.split('/')[0]!
+            const installation = await repos.githubInstallation.liveByOrgAndAccount(board.orgId, owner)
+            return installation && !installation.revokedAt && !installation.suspendedAt
+              ? { installationId: installation.installationId, repoId: board.repoId, repoFullName: board.repoFullName }
+              : null
+          },
+          revoke: async (lease, cardId) => {
+            try {
+              await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
+            } catch (err) {
+              http.log.warn(
+                { err, leaseId: lease.leaseId },
+                'kanban: immediate revocation failed; heartbeat fences the holder'
+              )
+            }
+          },
+          promote: async (boardId, repo, issueNumber) => {
+            const board = (await repos.kanbanBoard.listEnabledByRepoId(repo.repoId)).find((b) => b.id === boardId)
+            if (board)
+              await kanbanGraphReconciler?.apply(
+                board,
+                repo,
+                issueNumber,
+                await kanbanCardStore.readGraph(repo, issueNumber)
+              )
+          },
+          log: kanbanGraphLog
+        })
+      : undefined
+
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,
+        sync: kanbanSync,
         installations: repos.githubInstallation,
         store: kanbanCardStore,
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
@@ -1793,14 +1847,6 @@ export function buildContainer(
           warn: (o, m) => http.log.warn(o, m)
         }
       })
-    : undefined
-
-  const kanbanGraphLog = {
-    debug: (o: unknown, m?: string) => http.log.debug(o, m),
-    warn: (o: unknown, m?: string) => http.log.warn(o, m)
-  }
-  const kanbanGraphReconciler = kanbanCardStore
-    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
     : undefined
 
   // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
@@ -1820,6 +1866,13 @@ export function buildContainer(
             ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
             (await kanbanImporter?.import(board, repo, issueNumber))
           if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
+          if (action === 'closed')
+            await kanbanGraphReconciler?.apply(
+              board,
+              repo,
+              issueNumber,
+              await kanbanCardStore.readGraph(repo, issueNumber)
+            )
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog
