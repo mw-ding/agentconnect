@@ -1556,8 +1556,9 @@ describe('KanbanDispatcher — card read and progress-note grant (real Postgres)
     ['an unknown lease', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, leaseId: D2 } })]
   ])('refuses a card read from %s', async (_name, mutate) => {
     const { h, req } = await leased()
-    const { daemon, epoch, req: bad } = mutate(req)
-    expect(await h.dispatcher.onCardShow(daemon, epoch, bad as typeof req)).toEqual(superseded(bad.leaseId!))
+    const { daemon, epoch, req: mutated } = mutate(req)
+    const bad = mutated as typeof req
+    expect(await h.dispatcher.onCardShow(daemon, epoch, bad)).toEqual(superseded(bad.leaseId))
   })
 
   it('refuses a card read and a progress grant once the card was reassigned', async () => {
