@@ -16,7 +16,7 @@ import {
   type KanbanReportOutcome
 } from '@agentconnect.md/protocol'
 import { WireError, type Clock, type TimerHandle } from '@agentconnect.md/connection'
-import { UNCLASSIFIED_PROVIDER_ERROR, classifyProviderError, type ProviderErrorClass } from './provider-error.js'
+import { classifyProviderError, type ProviderErrorClass } from './provider-error.js'
 
 /** How a run ended, as the terminal tools record it; absent at turn end ⇒ `protocol_violation`. */
 export interface KanbanTerminal {
@@ -315,6 +315,7 @@ export class KanbanWorker {
       const beats: KanbanLeaseBeat[] = []
       for (const [leaseId, lease] of [...this.leases]) {
         const live = await this.liveness(lease)
+        if (this.leases.get(leaseId) !== lease) continue
         if (live === null) {
           if (lease.turnSettled) await this.conclude(leaseId, lease)
           continue
@@ -412,16 +413,16 @@ export class KanbanWorker {
     done.then(
       // A null session id is an operator interrupt, which is not a forgotten terminal call.
       (sessionId) => this.settleTurn(leaseId, sessionId ?? undefined, undefined, sessionId === null),
-      (err: unknown) => this.settleTurn(leaseId, undefined, err)
+      (err: unknown) => this.settleTurn(leaseId, undefined, err, false, true)
     )
   }
 
-  private settleTurn(leaseId: string, sessionId?: string, error?: unknown, interrupted = false): void {
+  private settleTurn(leaseId: string, sessionId?: string, error?: unknown, interrupted = false, failed = false): void {
     const lease = this.leases.get(leaseId)
     if (!lease) return
     lease.turnSettled = true
     if (sessionId) lease.sessionId ??= sessionId
-    if (error !== undefined) {
+    if (failed || error !== undefined) {
       lease.turnError = error instanceof Error ? error.message : String(error)
       lease.turnErrorClass = classifyProviderError(error)
       this.deps.log.warn(`kanban: lease ${leaseId} turn failed (${lease.turnError})`)
@@ -446,7 +447,7 @@ export class KanbanWorker {
 
   /** A settled, idle lease ends here: with no terminal call and no error it gets its one nudge turn first. */
   private async conclude(leaseId: string, lease: KanbanLease): Promise<void> {
-    if (lease.terminal || lease.turnError || lease.interrupted || lease.nudged || this.halted)
+    if (lease.terminal || lease.turnErrorClass || lease.interrupted || lease.nudged || this.halted)
       return this.finalize(leaseId, lease)
     // Claimed before any await so the tick and the settle timer cannot both nudge.
     lease.nudged = true
@@ -479,7 +480,7 @@ export class KanbanWorker {
   private buildReport(leaseId: string, lease: KanbanLease): KanbanReport {
     const d = lease.dispatch
     const terminal = lease.terminal
-    const errorClass = lease.turnError ? (lease.turnErrorClass ?? UNCLASSIFIED_PROVIDER_ERROR) : undefined
+    const errorClass = lease.turnErrorClass
     const outcome: KanbanReportOutcome =
       terminal?.outcome ??
       (errorClass ? (errorClass.kind === 'transient' ? 'transient' : 'failed') : 'protocol_violation')

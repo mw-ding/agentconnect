@@ -44,6 +44,9 @@ describe('classifyProviderError', () => {
       transient('provider_network')
     ],
     ['500', new Error('API Error: 500 Internal Server Error'), transient('provider_server_error')],
+    ['501 status field', { status: 501 }, transient('provider_server_error')],
+    ['507 HTTP status', new Error('HTTP 507'), transient('provider_server_error')],
+    ['400 wins over api_error', { status: 400, type: 'api_error' }, fatal('provider_invalid_request')],
     ['502 bad gateway', new Error('Bad Gateway'), transient('provider_server_error')],
     ['503', Object.assign(new Error('upstream'), { statusCode: 503 }), transient('provider_server_error')],
     ['service unavailable', new Error('Service Unavailable'), transient('provider_server_error')],

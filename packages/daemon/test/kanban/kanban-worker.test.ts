@@ -32,7 +32,7 @@ function harness() {
   }
   const nudgeTurns: Array<{ resolve: (id: string | null) => void; reject: (err: unknown) => void }> = []
   let resolve!: (id: string) => void
-  let reject!: (err: Error) => void
+  let reject!: (err: unknown) => void
   const done = new Promise<string>((res, rej) => {
     resolve = res
     reject = rej
@@ -432,6 +432,44 @@ describe('Kanban worker protocol-violation nudge', () => {
     expect(g.cp.report).toHaveBeenCalledWith(
       expect.objectContaining({ outcome: 'failed', reasonCode: 'provider_auth' })
     )
+  })
+
+  it.each([new Error(''), undefined, null])(
+    'counts an empty or missing rejection as a failure without nudging (%s)',
+    async (error) => {
+      const h = harness()
+      await h.worker.dispatch(dispatch)
+      h.state.active = false
+      h.reject(error)
+      await Promise.resolve()
+      await h.worker.tick()
+      expect(h.nudge).not.toHaveBeenCalled()
+      expect(h.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reasonCode: 'turn_error' }))
+    }
+  )
+
+  it('waits for background work before nudging a terminal-less turn', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    h.state.tasks = 1
+    await h.settle()
+    expect(h.nudge).not.toHaveBeenCalled()
+    expect(h.cp.report).not.toHaveBeenCalled()
+    h.state.tasks = 0
+    await h.worker.tick()
+    expect(h.nudge).toHaveBeenCalledOnce()
+  })
+
+  it('cancels a superseded live nudge without reporting its eventual failure', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.settle()
+    h.cp.heartbeat.mockResolvedValueOnce({ superseded: [dispatch.leaseId] })
+    await h.worker.tick()
+    expect(h.cancel).toHaveBeenCalledOnce()
+    await h.failNudge(new Error('API Error: 429 rate limit'))
+    expect(h.cp.report).not.toHaveBeenCalled()
+    expect(h.nudge).toHaveBeenCalledOnce()
   })
 
   it('does not nudge a turn that errored, was interrupted, or whose lease was superseded', async () => {

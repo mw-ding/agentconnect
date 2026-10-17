@@ -61,14 +61,15 @@ export function classifyProviderError(err: unknown): ProviderErrorClass {
   if (has(CONTEXT, text)) return { kind: 'fatal', reasonCode: 'provider_context_overflow' }
   if (anyCode(401, 403, -32000) || has(AUTH, text) || has(status('401|403'), text))
     return { kind: 'fatal', reasonCode: 'provider_auth' }
+  if (anyCode(400, -32602) || has(INVALID, text) || has(status('400'), text))
+    return { kind: 'fatal', reasonCode: 'provider_invalid_request' }
   if (anyCode(529) || has(OVERLOADED, text) || has(status('529'), text))
     return { kind: 'transient', reasonCode: 'provider_overloaded' }
   if (anyCode(429) || has(RATE, text) || has(status('429'), text))
     return { kind: 'transient', reasonCode: 'provider_rate_limited' }
   if (has(NETWORK, text)) return { kind: 'transient', reasonCode: 'provider_network' }
-  if (anyCode(500, 502, 503, 504) || has(SERVER, text) || has(status('500|502|503|504'), text))
+  if ([...codes].some((code) => code >= 500 && code <= 599) || has(SERVER, text) || has(status('5[0-9]{2}'), text))
     return { kind: 'transient', reasonCode: 'provider_server_error' }
-  if (anyCode(400, -32602) || has(INVALID, text) || has(status('400'), text))
-    return { kind: 'fatal', reasonCode: 'provider_invalid_request' }
+
   return UNCLASSIFIED_PROVIDER_ERROR
 }
