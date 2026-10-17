@@ -41,6 +41,8 @@ import type {
   KanbanLeaseHeartbeatOk,
   KanbanCardShow,
   KanbanCardShowOk,
+  KanbanOrchestrate,
+  KanbanOrchestrateOk,
   KanbanReport,
   KanbanReportOk,
   CronReport,
@@ -978,6 +980,14 @@ export class CpClient {
     const rep = await this.request('kanban/card', payload)
     if (rep.type !== 'kanban/card/ok') throw new WireError('INTERNAL', 'unexpected card reply', false)
     return rep.payload as KanbanCardShowOk
+  }
+
+  /** D→C `kanban/orchestrate` REQ: the orchestrator's list/create/link/unblock/assign surface. */
+  async kanbanOrchestrate(payload: KanbanOrchestrate): Promise<KanbanOrchestrateOk> {
+    this.requireReady('kanban/orchestrate')
+    const rep = await this.request('kanban/orchestrate', payload)
+    if (rep.type !== 'kanban/orchestrate/ok') throw new WireError('INTERNAL', 'unexpected orchestrate reply', false)
+    return rep.payload as KanbanOrchestrateOk
   }
 
   // Re-emit the daemon's last-run stamp on reconnect so dropped cron telemetry converges.

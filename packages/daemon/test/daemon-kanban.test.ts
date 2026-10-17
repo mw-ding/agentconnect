@@ -480,6 +480,60 @@ it('masks the org model provider credential in a progress note and in the stored
   }
 })
 
+it('masks title and body through the real orchestrator create path before the issue is filed', async () => {
+  const apiKey = 'org-model-api-key-secret'
+  const headerValue = 'org-model-header-secret'
+  const h = await harness()
+  ;(h.daemon as any).modelProviderSecrets.set(AGENT, [
+    { name: 'MODEL_API_KEY', value: apiKey },
+    { name: 'MODEL_HEADER_X_Tenant', value: headerValue }
+  ])
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const BOARD = '22222222-2222-4222-8222-222222222222'
+  ;(h.daemon as any).cpClient = {
+    state: 'READY',
+    stop: async () => {},
+    kanbanOrchestrate: async (p: { op: string; agentId: string }) => {
+      if (p.op === 'list')
+        return {
+          ok: true,
+          op: 'list',
+          truncated: false,
+          boards: [{ boardId: BOARD, repoFullName: 'acme/web', cards: [] }]
+        }
+      if (p.op === 'prepare_create') return { ok: true, op: 'prepare_create', verdict: 'proceed' }
+      if (p.op === 'commit_create') return { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+      return { ok: false, op: p.op, code: 'not_orchestrator' }
+    }
+  }
+  const posted: string[] = []
+  const realFetch = globalThis.fetch.bind(globalThis)
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = String(input instanceof Request ? input.url : input)
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
+    if (method === 'POST' && url.endsWith('/issues')) {
+      posted.push(String(init?.body ?? ''))
+      return Promise.resolve(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+    }
+    return realFetch(input as Parameters<typeof fetch>[0], init)
+  })
+  try {
+    await (h.daemon as any).mcp.deps.kanbanCreate({
+      agentId: AGENT,
+      board: BOARD,
+      title: `fix ${apiKey}`,
+      body: `use ${headerValue}`
+    })
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toContain('[secret:MODEL_API_KEY]')
+    expect(posted[0]).toContain('[secret:MODEL_HEADER_X_Tenant]')
+    expect(posted[0]).not.toContain(apiKey)
+    expect(posted[0]).not.toContain(headerValue)
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
 it('defers a nudge refused by a draining daemon without charging the card', async () => {
   const h = await harness()
   let release!: () => void

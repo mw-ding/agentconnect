@@ -87,6 +87,10 @@ const GITEA_EFFECT_KEY = (agentId: string, repoId: string): string => `fxgitea\u
 const KANBAN_KEY = (agentId: string, repo: string, leaseId: string): string =>
   `kanban\u0000${agentId}\u0000${repo.toLowerCase()}\u0000${leaseId}`
 
+/** Cache key for the orchestrator's issue-file token. One per (agent, repo); the CP gates on the board role. */
+const KANBAN_ORCH_KEY = (agentId: string, repo: string): string =>
+  `kanbanorch\u0000${agentId}\u0000${repo.toLowerCase()}`
+
 export class GitCredUnavailableError extends Error {
   constructor(
     message: string,
@@ -421,6 +425,19 @@ export class GitCredentialCache {
     if (presentedToken !== undefined && entry.token !== presentedToken) return
     this.entries.delete(key)
     this.refreshKanban.add(key)
+  }
+
+  /** The orchestrator's issues-only token for filing a card on its board repo; the CP gates on the board role. */
+  getKanbanOrchestratorToken(agentId: string, repo: string): Promise<Entry> {
+    const key = KANBAN_ORCH_KEY(agentId, repo)
+    return this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper' as const,
+      capabilities: ['issues' as const],
+      repoFullName: repo,
+      purpose: 'kanban_orchestrator_write' as const,
+      ...this.githubProvider()
+    })
   }
 
   /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */

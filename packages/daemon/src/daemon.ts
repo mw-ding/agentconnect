@@ -1,6 +1,7 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
+import { KanbanOrchestratorTools } from './kanban/orchestrator-tools.js'
 import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
@@ -344,6 +345,7 @@ import {
   CODE_HOST_EFFECT_TOOLS,
   GITHUB_REVIEW_TOOLS,
   KANBAN_TOOLS,
+  KANBAN_ORCHESTRATOR_TOOLS,
   KNOWLEDGE_TOOLS
 } from './mcp/tools.js'
 import {
@@ -1490,6 +1492,7 @@ export class Daemon {
   private kanban?: KanbanWorker
   private kanbanCommentPoster?: KanbanCommentPublisher
   private kanbanCardToolset?: KanbanCardTools
+  private kanbanOrchestratorToolset?: KanbanOrchestratorTools
   // Effective agents combine user-authored agent.json files with the in-memory CP
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
@@ -4378,6 +4381,17 @@ export class Daemon {
           // The org model credential (MODEL_API_KEY / MODEL_HEADER_*) rides this mask too, so a prompt-injected agent cannot exfiltrate it through a progress note.
           this.maskAgentSecrets(req.agentId, req.text)
         ),
+      kanbanList: (req) => this.kanbanOrchestratorTools().list(req),
+      kanbanCreate: (req) =>
+        // The issue title/body are masked before the spec digest is computed or the issue is filed, so a prompt-injected agent cannot exfiltrate a secret through a card.
+        this.kanbanOrchestratorTools().create({
+          ...req,
+          title: this.maskAgentSecrets(req.agentId, req.title),
+          body: this.maskAgentSecrets(req.agentId, req.body)
+        }),
+      kanbanLink: (req) => this.kanbanOrchestratorTools().link(req),
+      kanbanUnblock: (req) => this.kanbanOrchestratorTools().unblock(req),
+      kanbanAssign: (req) => this.kanbanOrchestratorTools().assign(req),
       codeHostEffect: (req) => this.runCodeHostEffect(req),
       codeHostResearch: {
         list: async (ctx) => {
@@ -9389,7 +9403,8 @@ export class Daemon {
     // Static descriptor, dynamic authority: the call resolves the current daemon-private turn and fails closed elsewhere.
     tools = [...tools, ...GITHUB_REVIEW_TOOLS]
     // Kanban cards share the GitHub issue thread session (D4); the call binds to the live lease or fails closed.
-    if (platform === 'hook' && at.transportScope?.startsWith('github:')) tools = [...tools, ...KANBAN_TOOLS]
+    if (platform === 'hook' && at.transportScope?.startsWith('github:'))
+      tools = [...tools, ...KANBAN_TOOLS, ...KANBAN_ORCHESTRATOR_TOOLS]
     // Assistant mode's follow-ups (assistant-mode.md §5.12); each call re-checks the mode, since this list is fixed per session.
     tools = [...tools, ...followUpToolsFor(agent)]
     // A first look on request (§5.13), only to a place's long session where one could run, with `propose` for its report round where the place has cards.
@@ -27125,6 +27140,49 @@ export class Daemon {
       invalidateToken: (agentId, repo, leaseId, token) =>
         this.gitCreds.invalidateKanbanComment(agentId, repo, leaseId, token)
     }))
+  }
+
+  private kanbanOrchestratorTools(): KanbanOrchestratorTools {
+    return (this.kanbanOrchestratorToolset ??= new KanbanOrchestratorTools({
+      orchestrate: (payload) => {
+        const cp = this.cpClient
+        if (!cp) throw new Error('control plane is not connected')
+        return cp.kanbanOrchestrate(payload)
+      },
+      repoFullNameFor: (agentId, board) => this.kanbanBoardRepo(agentId, board),
+      fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body)
+    }))
+  }
+
+  /** Resolves a board id to its `owner/repo` via the CP list, so the daemon files the issue on the right repository. */
+  private async kanbanBoardRepo(agentId: string, board: string): Promise<string | null> {
+    const cp = this.cpClient
+    if (!cp) return null
+    const reply = await cp.kanbanOrchestrate({ op: 'list', agentId, boardId: board })
+    if (!reply.ok) return null
+    return (reply as Extract<typeof reply, { op: 'list' }>).boards[0]?.repoFullName ?? null
+  }
+
+  /** Files the issue body with the orchestrator's issues-only token; the CP writes only metadata. */
+  private async fileKanbanIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number> {
+    const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
+    const res = await fetch(`https://api.github.com/repos/${repoFullName}/issues`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${grant.token}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ title, body }),
+      signal: AbortSignal.timeout(30_000)
+    })
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined)
+      throw new Error(`GitHub issue create failed (${res.status})`)
+    }
+    const issue = (await res.json()) as { number: number }
+    return issue.number
   }
 
   /** A worker terminal tool call: the lease comes from the session's own live run, never from the model. */
