@@ -193,6 +193,48 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
     )
   })
 
+  it('falls back to the open-lease grant for a progress note, with the authenticated epoch', async () => {
+    const mintForKanbanComment = vi.fn(async () => ({
+      token: 'ghs_progress',
+      ttlSec: 3540,
+      expiresAt: '2026-07-11T01:00:00.000Z',
+      repoFullName: 'acme/web',
+      access: 'read' as const
+    }))
+    const commentGrant = vi.fn(async () => null)
+    const liveCommentGrant = vi.fn(async () => ({ repoId: 42n }))
+    const deps = {
+      agent: { get: async () => PLACED_AGENT },
+      kanbanDispatcher: { commentGrant, liveCommentGrant },
+      github: { mintForKanbanComment }
+    } as unknown as DaemonWsDeps
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      purpose: 'kanban_card_write',
+      leaseId: LEASE_ID,
+      capabilities: ['issues'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(frame, conn, deps)
+    expect(liveCommentGrant).toHaveBeenCalledWith(DAEMON_ID, conn.sessionEpoch, AGENT_ID, LEASE_ID, 'acme/web')
+    expect(conn.replyTo).toHaveBeenCalledWith(
+      frame,
+      'gitcred/grant',
+      expect.objectContaining({ token: 'ghs_progress' })
+    )
+
+    liveCommentGrant.mockResolvedValueOnce(null as never)
+    const refused = gitcredFrame({
+      purpose: 'kanban_card_write',
+      leaseId: LEASE_ID,
+      capabilities: ['issues'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(refused, conn, deps)
+    expect(conn.sendError).toHaveBeenCalledWith(refused.id, 'SCOPE_DENIED', expect.any(String), false)
+    expect(mintForKanbanComment).toHaveBeenCalledTimes(1)
+  })
+
   it('denies a Kanban comment token when the lease was not accepted or the ask is wider than issues', async () => {
     const mintForKanbanComment = vi.fn()
     const commentGrant = vi.fn(async () => null)

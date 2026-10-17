@@ -39,6 +39,8 @@ import type {
   IntegrationRevokedOk,
   KanbanLeaseHeartbeat,
   KanbanLeaseHeartbeatOk,
+  KanbanCardShow,
+  KanbanCardShowOk,
   KanbanReport,
   KanbanReportOk,
   CronReport,
@@ -969,6 +971,14 @@ export class CpClient {
     const rep = await this.request('kanban/report', payload)
     if (rep.type !== 'kanban/report/ok') throw new WireError('INTERNAL', 'unexpected report reply', false)
     return rep.payload as KanbanReportOk
+  }
+
+  /** D→C `kanban/card` REQ: body-free metadata of the card this daemon's open lease holds. */
+  async kanbanCard(payload: KanbanCardShow): Promise<KanbanCardShowOk> {
+    this.requireReady('kanban/card')
+    const rep = await this.request('kanban/card', payload)
+    if (rep.type !== 'kanban/card/ok') throw new WireError('INTERNAL', 'unexpected card reply', false)
+    return rep.payload as KanbanCardShowOk
   }
 
   // Re-emit the daemon's last-run stamp on reconnect so dropped cron telemetry converges.

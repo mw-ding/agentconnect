@@ -1,11 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
-  KanbanRevoke,
+  KANBAN_CARD_SHOW_MAX_RUNS,
+  KANBAN_PROVIDER_FATAL_REASON_CODES,
+  KANBAN_PROVIDER_REASON_CODES,
+  KANBAN_PROVIDER_TRANSIENT_REASON_CODES,
+  KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
+  KANBAN_REASON_NUDGE_DEFERRED,
+  KANBAN_REASON_NUDGE_UNAVAILABLE,
+  KanbanCardShow,
+  KanbanCardShowOk,
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
+  KanbanReasonCode,
   KanbanReport,
   KanbanReportOk,
+  KanbanRevoke,
   buildEnvelope,
   decodeEnvelope,
   isFrame
@@ -119,5 +129,70 @@ describe('kanban wire (issue #2 M2)', () => {
     expect(KanbanReport.safeParse({ ...report, outcome: 'blocked', blockKind: 'needs_input' }).success).toBe(true)
     expect(KanbanReport.safeParse({ ...report, blockKind: 'needs_input' }).success).toBe(false)
     expect(KanbanReportOk.safeParse({ leaseId: LEASE, accepted: false, reason: 'superseded' }).success).toBe(true)
+  })
+
+  it('provider and nudge reason codes all satisfy KanbanReasonCode and ride a report', () => {
+    expect(new Set(KANBAN_PROVIDER_REASON_CODES).size).toBe(8)
+    expect([...KANBAN_PROVIDER_TRANSIENT_REASON_CODES, ...KANBAN_PROVIDER_FATAL_REASON_CODES]).toEqual([
+      ...KANBAN_PROVIDER_REASON_CODES
+    ])
+    for (const code of [
+      ...KANBAN_PROVIDER_REASON_CODES,
+      KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
+      KANBAN_REASON_NUDGE_UNAVAILABLE,
+      KANBAN_REASON_NUDGE_DEFERRED
+    ]) {
+      expect(KanbanReasonCode.safeParse(code).success, code).toBe(true)
+      expect(KanbanReport.safeParse({ ...report, outcome: 'transient', reasonCode: code }).success, code).toBe(true)
+    }
+  })
+
+  const run = {
+    attempt: 1,
+    outcome: 'transient',
+    reasonCode: 'provider_rate_limited',
+    dispatchedAt: 't0',
+    endedAt: 't1'
+  }
+  const card = {
+    status: 'running',
+    priority: 2,
+    attempt: 2,
+    mode: 'read' as const,
+    blockKind: null,
+    consecutiveFailures: 0,
+    protocolViolations: 1,
+    blockRecurrence: 0,
+    linkedPrNumber: null,
+    runs: [run]
+  }
+
+  it('kanban/card is ids and the lease fence only, strict', () => {
+    const req = { boardId: BOARD, cardId: CARD, leaseId: LEASE, dispatchRevision: '3' }
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/card', req))).ok).toBe(true)
+    expect(KanbanCardShow.safeParse({ ...req, title: 'x' }).success).toBe(false)
+    expect(KanbanCardShow.safeParse({ ...req, dispatchRevision: '0' }).success).toBe(false)
+    const { leaseId: _, ...noLease } = req
+    expect(KanbanCardShow.safeParse(noLease).success).toBe(false)
+  })
+
+  it('kanban/card/ok returns bounded body-free metadata or a superseded refusal', () => {
+    expect(
+      decodeEnvelope(JSON.stringify(buildEnvelope('kanban/card/ok', { leaseId: LEASE, accepted: true, card }))).ok
+    ).toBe(true)
+    expect(KanbanCardShowOk.safeParse({ leaseId: LEASE, accepted: false, reason: 'superseded' }).success).toBe(true)
+    expect(KanbanCardShowOk.safeParse({ leaseId: LEASE, accepted: false }).success).toBe(false)
+    expect(KanbanCardShowOk.safeParse({ leaseId: LEASE, accepted: true, card: { ...card, title: 'x' } }).success).toBe(
+      false
+    )
+    const runs = Array.from({ length: KANBAN_CARD_SHOW_MAX_RUNS + 1 }, () => run)
+    expect(KanbanCardShowOk.safeParse({ leaseId: LEASE, accepted: true, card: { ...card, runs } }).success).toBe(false)
+    expect(
+      KanbanCardShowOk.safeParse({
+        leaseId: LEASE,
+        accepted: true,
+        card: { ...card, runs: [{ ...run, summary: 'x' }] }
+      }).success
+    ).toBe(false)
   })
 })

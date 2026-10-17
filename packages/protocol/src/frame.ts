@@ -75,6 +75,8 @@ import {
 import {
   KanbanRevoke,
   KanbanRevokeOk,
+  KanbanCardShow,
+  KanbanCardShowOk,
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
@@ -419,6 +421,8 @@ export const FRAME_SCHEMAS = {
   'kanban/lease-heartbeat/ok': KanbanLeaseHeartbeatOk,
   'kanban/report': KanbanReport,
   'kanban/report/ok': KanbanReportOk,
+  'kanban/card': KanbanCardShow,
+  'kanban/card/ok': KanbanCardShowOk,
   // ── integrations (platform config distribution; token-bearing — never log) ──
   'integration/upsert': IntegrationUpsert,
   'integration/remove': IntegrationRemove,
@@ -805,6 +809,8 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('kanban/lease-heartbeat/ok', FRAME_SCHEMAS['kanban/lease-heartbeat/ok']),
   frame('kanban/report', FRAME_SCHEMAS['kanban/report']),
   frame('kanban/report/ok', FRAME_SCHEMAS['kanban/report/ok']),
+  frame('kanban/card', FRAME_SCHEMAS['kanban/card']),
+  frame('kanban/card/ok', FRAME_SCHEMAS['kanban/card/ok']),
   frame('integration/upsert', FRAME_SCHEMAS['integration/upsert']),
   frame('integration/remove', FRAME_SCHEMAS['integration/remove']),
   frame('integration/channels', FRAME_SCHEMAS['integration/channels']),
