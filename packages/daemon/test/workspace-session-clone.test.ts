@@ -40,6 +40,7 @@ import type { ShimRequester } from '../src/shim/channels.js'
 import { buildWorkspaceRootsAppend } from '../src/session/turn/standing-context.js'
 import { sessionHomeIn } from '../src/workspace/session-layout.js'
 import { WorkspaceManager, type PrepareSessionWorkspaceRequest } from '../src/workspace/workspace-manager.js'
+import { kanbanCardBranch } from '../src/kanban/card-branch.js'
 import { MicrosandboxWorkspaceFs } from '../src/microsandbox/workspace-fs.js'
 import { LocalWorkspaceFs } from '../src/workspace/workspace-fs.js'
 import { wireTestPlane } from './workspace-plane-support.js'
@@ -1616,5 +1617,30 @@ describe('the confined tier issues only Git the sandbox admits (k8s-daemon-pool.
       expect.arrayContaining(['branch', 'clone', 'fetch', 'ls-remote', 'reset', 'show-ref', 'symbolic-ref'])
     )
     expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+  })
+})
+
+// A Kanban write session (issue #2 B3) checks out its own `ac/card-<n>` branch on the worktree tier.
+describe('a Kanban write session checks out its ac/card-<n> branch', () => {
+  it('creates the branch on first use, reuses it on a later attempt, and gives two cards two branches', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+
+    const card7 = unconfined({ sessionKey: 'slack:C7:1700000000.000007', branch: kanbanCardBranch(7) })
+    const cwd7 = await workspaces.prepareSessionWorkspace(agent, card7)
+    expect(statSync(join(cwd7, '.git')).isFile()).toBe(true)
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd7, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+
+    // A later attempt on the same card (same session key) reuses the worktree and its branch.
+    expect(await workspaces.prepareSessionWorkspace(agent, card7)).toBe(cwd7)
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+
+    // A second card gets its own worktree and branch, never the first card's.
+    const card8 = unconfined({ sessionKey: 'slack:C8:1700000000.000008', branch: kanbanCardBranch(8) })
+    const cwd8 = await workspaces.prepareSessionWorkspace(agent, card8)
+    expect(cwd8).not.toBe(cwd7)
+    expect(git(cwd8, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-8')
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
   })
 })

@@ -129,6 +129,7 @@ import type { SessionAccessPlugin } from './session-access-plugin.js'
 import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
 import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
+import type { KanbanControls } from '../kanban/controls.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
   SLACK_INSTALL_TTL_SEC?: number
@@ -471,6 +472,8 @@ export interface HttpDeps {
   github?: GithubService
   /** Board repository resolution for Kanban CRUD; absent ⇒ derived from `github` and the installation repo. */
   kanbanRepoResolver?: KanbanRepoResolver
+  /** Kanban human controls (issue #2 B5): pause/resume, skip/restart; absent ⇒ the control routes 404. */
+  kanbanControls?: KanbanControls
   /** Resolves a typed login to the host's numeric user id for the "Trusted users" list; per-provider arms
    *  are present only where that host is configured, so an unconfigured host answers 409 rather than 404. */
   trustedActors: CodeHostTrustedActorService

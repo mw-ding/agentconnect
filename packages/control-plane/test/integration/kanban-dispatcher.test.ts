@@ -1438,6 +1438,39 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect(h.sent).toEqual([])
     expect(h.store.writes).toEqual([])
   })
+
+  it('synthesizes a completed epic to its synthesizer agent (real Postgres)', async () => {
+    const h = await graphHarness()
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { synthesizerAgentId: A1 } })
+    const epic = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: epic.id }, data: { status: 'todo', assigneeAgentId: null } })
+    h.graphs.set(epic.issueNumber, {
+      ...emptyGraph(),
+      subIssues: [{ issueId: 900n, number: 900, repoId: REPO_ID, state: 'closed', stateReason: 'completed' }]
+    })
+    h.graphs.set(900, {
+      ...emptyGraph(),
+      parent: { issueId: epic.issueId, number: epic.issueNumber, repoId: REPO_ID, state: 'open', stateReason: null }
+    })
+    await h.ring(900)
+    // Synthesis assigned the synthesizer and promoted to ready; the dispatcher then claimed it.
+    expect(await h.card(epic.id)).toMatchObject({ status: 'running', assigneeAgentId: A1 })
+    expect(h.store.writes.map((p) => p.status)).toContain('ready')
+    expect(h.sent.some(({ d }) => d.cardId === epic.id)).toBe(true)
+    // A not_planned sub-issue never synthesizes.
+    const epic2 = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: epic2.id }, data: { status: 'todo', assigneeAgentId: null } })
+    h.graphs.set(epic2.issueNumber, {
+      ...emptyGraph(),
+      subIssues: [{ issueId: 901n, number: 901, repoId: REPO_ID, state: 'closed', stateReason: 'not_planned' }]
+    })
+    h.graphs.set(901, {
+      ...emptyGraph(),
+      parent: { issueId: epic2.issueId, number: epic2.issueNumber, repoId: REPO_ID, state: 'open', stateReason: null }
+    })
+    await h.ring(901)
+    expect((await h.card(epic2.id)).status).toBe('todo')
+  })
 })
 
 describe('KanbanDispatcher — provider outage backoff (real Postgres)', () => {

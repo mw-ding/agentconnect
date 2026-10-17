@@ -4403,6 +4403,24 @@ export const KanbanCardModeDto = z.object({
   mode: KanbanRunModeDto.nullable()
 })
 
+// ── kanban human controls (B5) — pause/resume and skip/restart; body-free responses ──
+export const KanbanCardStatusDto = z.enum([
+  'triage',
+  'todo',
+  'ready',
+  'running',
+  'blocked',
+  'review',
+  'done',
+  'archived'
+])
+export const KanbanCardControlDto = z.object({
+  boardId: z.string(),
+  cardId: z.string(),
+  status: KanbanCardStatusDto
+})
+export type KanbanCardControlDtoT = z.infer<typeof KanbanCardControlDto>
+
 // ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
 const KanbanRepoFullName = z
   .string()
@@ -4412,6 +4430,7 @@ const KanbanBoardConfigFields = {
   name: z.string().trim().min(1).max(100),
   orchestratorAgentId: z.string().uuid().nullable(),
   verifierAgentId: z.string().uuid().nullable(),
+  synthesizerAgentId: z.string().uuid().nullable(),
   maxInProgress: z.number().int().min(1).max(100),
   maxInProgressPerAgent: z.number().int().min(1).max(100),
   staleLeaseSec: z
@@ -4435,6 +4454,7 @@ export const CreateKanbanBoardBody = z
     ...KanbanBoardConfigFields,
     orchestratorAgentId: KanbanBoardConfigFields.orchestratorAgentId.optional(),
     verifierAgentId: KanbanBoardConfigFields.verifierAgentId.optional(),
+    synthesizerAgentId: KanbanBoardConfigFields.synthesizerAgentId.optional(),
     maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
     maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
     staleLeaseSec: KanbanBoardConfigFields.staleLeaseSec.optional(),
@@ -4462,6 +4482,7 @@ export const KanbanBoardDto = z.object({
   repoFullName: z.string(),
   orchestratorAgentId: z.string().nullable(),
   verifierAgentId: z.string().nullable(),
+  synthesizerAgentId: z.string().nullable(),
   maxInProgress: z.number().int(),
   maxInProgressPerAgent: z.number().int(),
   staleLeaseSec: z.number().int(),
@@ -4471,6 +4492,9 @@ export const KanbanBoardDto = z.object({
   defaultMode: KanbanRunModeDto,
   completionContract: z.enum(['close', 'pr_merged', 'pr_checks_green']),
   enabled: z.boolean(),
+  paused: z.boolean(),
+  pausedAt: z.string().nullable(),
+  pausedByUserId: z.string().nullable(),
   configRevision: z.string(),
   visibility: ResourceVisibilityEnum,
   sharedWith: z.array(z.string()),

@@ -86,6 +86,7 @@ import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
+import { KanbanControls } from './kanban/controls.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -1805,6 +1806,20 @@ export function buildContainer(
     ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
     : undefined
 
+  // Human controls (issue #2 B5): the DB writes live in the repos; this wraps the GitHub close/reopen + comment.
+  const kanbanControls = kanbanCardStore
+    ? new KanbanControls({
+        boards: repos.kanbanBoard,
+        cards: repos.kanbanCard,
+        installations: repos.githubInstallation,
+        store: kanbanCardStore,
+        resolveLogin: async (userId) =>
+          (await prisma.githubRepoIdentity.findFirst({ where: { userId }, select: { login: true } }))?.login ?? null,
+        poke: (boardId) => kanbanDispatcher?.poke(boardId),
+        log: { warn: (o, m) => http.log.warn(o, m) }
+      })
+    : undefined
+
   // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
   const kanbanGraphDoorbell = kanbanCardStore
     ? new KanbanGraphDoorbell({
@@ -1821,7 +1836,16 @@ export function buildContainer(
           const imported =
             ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
             (await kanbanImporter?.import(board, repo, issueNumber, { action }))
-          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
+          if (!imported) {
+            if (action === 'closed' || action === 'reopened') {
+              // A close or reopen changes the dependency graph, so re-evaluate the card's parent epic and dependents.
+              const graph = await kanbanCardStore?.readGraph(repo, issueNumber)
+              if (graph) await kanbanGraphReconciler?.apply(board, repo, issueNumber, graph)
+              await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'graph')
+            } else {
+              await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
+            }
+          }
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog
@@ -2083,6 +2107,7 @@ export function buildContainer(
       kanbanMode: repos.kanbanBoard,
       kanbanBoards: repos.kanbanBoard
     },
+    ...(kanbanControls ? { kanbanControls } : {}),
     registry,
     agentSpecs,
     ...(daemonRelease ? { daemonRelease } : {}),

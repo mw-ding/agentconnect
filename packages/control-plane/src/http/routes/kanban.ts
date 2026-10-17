@@ -17,6 +17,7 @@ import {
   type KanbanBoardDtoT,
   KanbanBoardModeDto,
   KanbanBoardParams,
+  KanbanCardControlDto,
   KanbanCardModeDto,
   KanbanCardParams,
   SetKanbanBoardModeBody,
@@ -57,6 +58,7 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
     repoFullName: board.repoFullName,
     orchestratorAgentId: board.orchestratorAgentId,
     verifierAgentId: board.verifierAgentId,
+    synthesizerAgentId: board.synthesizerAgentId,
     maxInProgress: board.maxInProgress,
     maxInProgressPerAgent: board.maxInProgressPerAgent,
     staleLeaseSec: board.staleLeaseSec,
@@ -66,6 +68,9 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
     defaultMode: board.defaultMode,
     completionContract: board.completionContract,
     enabled: board.enabled,
+    paused: board.paused,
+    pausedAt: board.pausedAt?.toISOString() ?? null,
+    pausedByUserId: board.pausedByUserId,
     configRevision: board.configRevision.toString(),
     visibility: board.visibility,
     sharedWith: board.sharedWith,
@@ -125,6 +130,19 @@ const UPSTREAM_ERRORS = {
 
 function upstreamError(status: keyof typeof UPSTREAM_ERRORS, message: string) {
   return { ...UPSTREAM_ERRORS[status], statusCode: status, message }
+}
+
+/** A skip/restart refusal: 404 for a card not on the board, 409 when the transition is not allowed. */
+function controlRefusal(reply: FastifyReply, reason: 'not_found' | 'illegal_transition') {
+  if (reason === 'illegal_transition') {
+    return reply.code(409).send({
+      error: 'Conflict',
+      statusCode: 409,
+      message: 'this card cannot move to that status from its current one',
+      code: 'illegal_transition'
+    })
+  }
+  return reply.code(404).send({ ...notFound, message: 'card not found' })
 }
 
 export function kanbanRoutes(deps: HttpDeps) {
@@ -345,6 +363,96 @@ export function kanbanRoutes(deps: HttpDeps) {
           return reply.code(404).send({ ...notFound, message: 'card not found' })
         }
         return { boardId, cardId, mode: req.body.mode }
+      }
+    )
+
+    r.post(
+      '/kanban/boards/:boardId/pause',
+      {
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Pause a Kanban board',
+          description:
+            'Owner-only, interactive sign-in only. A paused board claims nothing: ready cards stay ready, open leases finish normally, and the reaper, reports, heartbeats, label sync and doorbells keep running. Idempotent.',
+          operationId: 'pauseKanbanBoard',
+          params: KanbanBoardParams,
+          response: { 200: KanbanBoardDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const { orgId, userId } = req.orgCtx!
+        const result = await deps.kanbanControls?.pause(orgId, req.params.boardId, userId)
+        if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
+        if (!result.ok) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        return boardDto(result.value, req)
+      }
+    )
+
+    r.post(
+      '/kanban/boards/:boardId/resume',
+      {
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Resume a Kanban board',
+          description:
+            'Owner-only, interactive sign-in only. Resuming re-arms the dispatcher so ready cards are claimed without waiting for the next tick. Idempotent.',
+          operationId: 'resumeKanbanBoard',
+          params: KanbanBoardParams,
+          response: { 200: KanbanBoardDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const { orgId, userId } = req.orgCtx!
+        const result = await deps.kanbanControls?.resume(orgId, req.params.boardId, userId)
+        if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
+        if (!result.ok) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        return boardDto(result.value, req)
+      }
+    )
+
+    r.post(
+      '/kanban/boards/:boardId/cards/:cardId/skip',
+      {
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Skip a Kanban card',
+          description:
+            'Owner-only, interactive sign-in only. Archives the card (closing the issue as not_planned), revokes any open lease, and posts one body-free comment. Dependents of a skipped card do not auto-promote.',
+          operationId: 'skipKanbanCard',
+          params: KanbanCardParams,
+          response: { 200: KanbanCardControlDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const { orgId, userId } = req.orgCtx!
+        const { boardId, cardId } = req.params
+        const result = await deps.kanbanControls?.skip(orgId, boardId, cardId, userId)
+        if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
+        if (!result.ok) return controlRefusal(reply, result.reason)
+        return { boardId, cardId, status: result.value.status }
+      }
+    )
+
+    r.post(
+      '/kanban/boards/:boardId/cards/:cardId/restart',
+      {
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Restart a Kanban card',
+          description:
+            'Owner-only, interactive sign-in only. Resets the card to ready, clears its failure counters and flags, revokes any open lease, reopens a closed issue, writes the status label and one body-free comment, then re-arms the dispatcher.',
+          operationId: 'restartKanbanCard',
+          params: KanbanCardParams,
+          response: { 200: KanbanCardControlDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const { orgId, userId } = req.orgCtx!
+        const { boardId, cardId } = req.params
+        const result = await deps.kanbanControls?.restart(orgId, boardId, cardId, userId)
+        if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
+        if (!result.ok) return controlRefusal(reply, result.reason)
+        return { boardId, cardId, status: result.value.status }
       }
     )
   }

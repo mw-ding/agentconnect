@@ -4,9 +4,16 @@ import { OrgId } from '../domain/ids.js'
 import type { KanbanBoardRecord, KanbanCardRecord } from '../persistence/ports.js'
 import type { KanbanStatus, LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardLink } from './card-store.js'
-import { KanbanGraphReconciler, planGraphPromotion } from './graph-reconciler.js'
+import { KanbanGraphReconciler, planGraphPromotion, planSynthesis } from './graph-reconciler.js'
 
-const BOARD: KanbanBoardRecord = { id: 'b1', orgId: OrgId('o'), name: 'eng', repoId: 42n, repoFullName: 'acme/web' }
+const BOARD: KanbanBoardRecord = {
+  id: 'b1',
+  orgId: OrgId('o'),
+  name: 'eng',
+  repoId: 42n,
+  repoFullName: 'acme/web',
+  synthesizerAgentId: null
+}
 const REPO = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
 
 const link = (number: number, state: 'open' | 'closed', stateReason: string | null = null): CardLink => ({
@@ -25,6 +32,31 @@ const graph = (over: Partial<CardGraph> = {}): CardGraph => ({
   ...over
 })
 const done = link(1, 'closed', 'completed')
+
+describe('planSynthesis', () => {
+  const completedSub = link(2, 'closed', 'completed')
+  it('promotes a todo epic whose sub-issues all completed', () => {
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'closed', 'completed')] }), 'a1')
+    ).toBe('promote')
+  })
+  it('holds when any sub-issue is open or closed not_planned', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'open')] }), 'a1')).toBe('none')
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'closed', 'not_planned')] }), 'a1')
+    ).toBe('none')
+  })
+  it('holds on a truncated graph read', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub], truncated: true }), 'a1')).toBe('none')
+  })
+  it('holds when no synthesizer is configured', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub] }), null)).toBe('none')
+  })
+  it('holds when the issue is not an epic or not todo', () => {
+    expect(planSynthesis({ status: 'todo' }, graph(), 'a1')).toBe('none')
+    expect(planSynthesis({ status: 'ready' }, graph({ subIssues: [completedSub] }), 'a1')).toBe('none')
+  })
+})
 
 describe('planGraphPromotion', () => {
   it('holds while a blocker is open', () => {
@@ -75,6 +107,13 @@ function make(
     findByIssueNumber: vi.fn(async (_b: string, n: number) => db.get(n) ?? null),
     // The fake applies the ready CAS and the intent together, as the single DB write does.
     beginPromotion: vi.fn(async (id: string, _rev: bigint, ..._intent: unknown[]) => {
+      if (!casResult) return false
+      const card = [...db.values()].find((c) => c.id === id)!
+      card.status = 'ready'
+      card.promotionPending = true
+      return true
+    }),
+    beginSynthesis: vi.fn(async (id: string, _rev: bigint, ..._intent: unknown[]) => {
       if (!casResult) return false
       const card = [...db.values()].find((c) => c.id === id)!
       card.status = 'ready'
@@ -341,5 +380,27 @@ describe('KanbanGraphReconciler', () => {
     const h = make({ 7: { status: 'todo', labels: todoLabels } }, {}, false)
     await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
     expect(h.store.applyPlan).not.toHaveBeenCalled()
+  })
+
+  it('synthesizes a todo epic by assigning the synthesizer and opening the same intent', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    await h.reconciler.apply(board, REPO, 7, graph({ subIssues: [link(2, 'closed', 'completed')] }))
+    expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
+    expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.labels.get(7)).toEqual(['ac/agent:eng', 'ac/status:ready'])
+  })
+
+  it('re-evaluates the parent epic when a sub-issue closes', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make(
+      { 9: { status: 'running', labels: ['ac/status:running'] }, 7: { status: 'todo', labels: todoLabels } },
+      { 7: graph({ subIssues: [link(9, 'closed', 'completed'), link(10, 'closed', 'completed')] }) }
+    )
+    await h.reconciler.apply(board, REPO, 9, graph({ parent: link(7, 'open') }))
+    expect(h.store.readGraph).toHaveBeenCalledWith(REPO, 7)
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
   })
 })

@@ -188,7 +188,13 @@ function abortable<T>(start: () => PromiseLike<T> | T, signal?: AbortSignal): Pr
 }
 
 /** What a logical session asks of its workspace — also what keys its host where hosts are per session. */
-export type SessionWorkspaceRequest = { sessionKey: string; isolation: 'shared' | 'session'; initiatedBy?: string }
+export type SessionWorkspaceRequest = {
+  sessionKey: string
+  isolation: 'shared' | 'session'
+  initiatedBy?: string
+  /** An exact branch override (a Kanban write card's `ac/card-<n>`). */
+  branch?: string
+}
 
 export class SessionManager {
   /** The owning daemon's plane when it supplied one; otherwise a private plane, so two harnesses
@@ -423,6 +429,8 @@ export class SessionManager {
        * explicitly forces an exact workspace migration. */
       workspaceIsolation?: 'shared' | 'session'
       forceWorkspaceIsolation?: boolean
+      /** An exact branch override for a fresh logical session (a Kanban write card). */
+      branch?: string
       /** A daemon-verified cwd prepared before handle() (GitHub exact-ref turns). */
       preparedWorkspaceCwd?: string
     } = {}
@@ -562,7 +570,12 @@ export class SessionManager {
     const creatorSessionId = rec ? (rec.originSessionId ?? undefined) : originSessionId
     // Names a session's branch by whoever opened it, so a shared thread keeps its owner when someone else replies.
     const initiatedBy = await sessionInitiatedBy((ids) => this.deps.store.getDisplayNames(ids), rec?.triggeredBy, msg)
-    const workspaceRequest = { sessionKey: key, isolation: workspaceIsolation, initiatedBy }
+    const workspaceRequest = {
+      sessionKey: key,
+      isolation: workspaceIsolation,
+      initiatedBy,
+      ...(options.branch ? { branch: options.branch } : {})
+    }
     // Production hostFor owns the single cold-host preparation gate before spawn.
     // After it resolves, consume that already-prepared cwd through the pure resolver.
     // Lightweight embedders without that contract retain the legacy pre-host fallback.

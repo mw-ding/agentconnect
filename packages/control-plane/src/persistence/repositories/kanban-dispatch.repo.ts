@@ -121,7 +121,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       const [board] = await tx.$queryRaw<BoardRow[]>(Prisma.sql`
         SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode"
         FROM "kanban_board"
-        WHERE "id" = ${boardId}::uuid AND "enabled"
+        WHERE "id" = ${boardId}::uuid AND "enabled" AND NOT "paused"
         FOR UPDATE SKIP LOCKED
       `)
       if (!board) return []

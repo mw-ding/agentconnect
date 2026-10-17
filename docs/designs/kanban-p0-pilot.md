@@ -541,3 +541,30 @@ identity; changing that identity is refused while the board has cards, so old
 issue numbers cannot silently refer to another repository. Human status and
 assignment synchronization beyond mismatch-parked cards and periodic drift repair
 remain for the stacked M1 follow-up.
+
+## M4 — Human controls (B5 pause/resume, skip, restart) and the synthesizer (B3)
+
+Interactive organization owners pause and resume a board with
+`POST /api/v1/orgs/:orgId/kanban/boards/:boardId/pause` and `.../resume`, and
+skip or restart a card with
+`POST /api/v1/orgs/:orgId/kanban/boards/:boardId/cards/:cardId/skip` and
+`.../restart`, all owner + interactive-OIDC gated like the run-mode setters.
+A paused board claims nothing (`AND NOT "paused"` beside `"enabled"` in the
+claim), but its reaper, reports, heartbeats, label sync, graph promotion and
+doorbells keep running, and open leases finish normally; resume re-arms the
+dispatcher. Skip archives the card (closing the issue `not_planned`), revokes any
+open lease with a dispatch-revision bump so a late report fails the fence, and
+posts one body-free comment; dependents of a skipped card do not auto-promote.
+Restart moves a card from triage/blocked/review/done/archived/ready/running back
+to `ready` — resetting the failure counters, block recurrence, cooldown, block
+kind and the attention flag — revokes any open lease, reopens a closed issue,
+writes the status label and one comment, then re-arms the dispatcher.
+
+Known gaps (M4 controls): a half-landed synthesis promotion is not adopted by
+the attributed pending-promotion recovery (the graph reconciler's adoption rule
+still only reads `blockedBy`), so it escalates to a human like any other
+unattributed promotion. The skip comment names the actor's GitHub login only when
+a linked `github_repo_identity` row exists; otherwise it omits the login. Board
+pause/resume and card skip/restart leave body-free audit rows (`board_paused`,
+`board_resumed`, `card_skipped`, `card_restarted`); a claim-eligibility predicate
+that reports the gate code `board_paused` is left to the notification lane.

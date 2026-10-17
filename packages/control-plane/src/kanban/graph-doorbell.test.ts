@@ -11,7 +11,8 @@ const BOARD: KanbanBoardRecord = {
   orgId: OrgId('org-a'),
   name: 'eng',
   repoId: 42n,
-  repoFullName: 'acme/web'
+  repoFullName: 'acme/web',
+  synthesizerAgentId: null
 }
 const EMPTY: CardGraph = { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
 

@@ -1,6 +1,7 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
+import { kanbanCardBranch } from './kanban/card-branch.js'
 import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
@@ -17561,7 +17562,11 @@ export class Daemon {
           ...(entry.selectedHost ? { host: entry.selectedHost.host } : {}),
           ...(webchatIsolation ? { workspaceIsolation: webchatIsolation } : {}),
           ...(entry.kanban?.mode === 'write'
-            ? { workspaceIsolation: 'session' as const, forceWorkspaceIsolation: true }
+            ? {
+                workspaceIsolation: 'session' as const,
+                forceWorkspaceIsolation: true,
+                branch: kanbanCardBranch(entry.kanban.issueNumber)
+              }
             : {}),
           ...reviewWorkspace,
           ...(launchWorkspaceCwd !== undefined ? { preparedWorkspaceCwd: launchWorkspaceCwd } : {})

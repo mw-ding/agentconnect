@@ -7835,6 +7835,8 @@ export interface KanbanBoardRecord {
   name: string
   repoId: bigint
   repoFullName: string
+  /** B3: the agent a fully-completed epic is promoted to; null ⇒ no synthesis. */
+  synthesizerAgentId: string | null
 }
 
 /** Run-mode authority; callers pass the authenticated human's id, and only an owner in the board's org may write. */
@@ -7858,6 +7860,7 @@ export interface KanbanBoardView {
   repoFullName: string
   orchestratorAgentId: string | null
   verifierAgentId: string | null
+  synthesizerAgentId: string | null
   maxInProgress: number
   maxInProgressPerAgent: number
   staleLeaseSec: number
@@ -7867,6 +7870,10 @@ export interface KanbanBoardView {
   defaultMode: 'read' | 'write'
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
   enabled: boolean
+  /** A paused board claims nothing; its reaper, reports, heartbeats and doorbells keep running. */
+  paused: boolean
+  pausedAt: Date | null
+  pausedByUserId: string | null
   configRevision: bigint
   visibility: 'org' | 'restricted'
   sharedWith: string[]
@@ -7883,6 +7890,7 @@ export interface KanbanBoardConfigInput {
   repoFullName?: string
   orchestratorAgentId?: string | null
   verifierAgentId?: string | null
+  synthesizerAgentId?: string | null
   maxInProgress?: number
   maxInProgressPerAgent?: number
   staleLeaseSec?: number
@@ -7919,6 +7927,13 @@ export interface KanbanBoardAdminRepo {
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
   /** Refused while any card holds an open lease: disable the board and let its runs end first. */
   deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>
+  /** Pause/resume the board (issue #2 B5). Idempotent: setting the current state is a no-op with no audit row. */
+  setPaused(
+    orgId: string,
+    boardId: string,
+    userId: string,
+    paused: boolean
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
 }
 
 export interface KanbanBoardRepo {
@@ -8234,10 +8249,53 @@ export interface KanbanCardRepo {
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** CAS todo to ready and open the intent in one write; refused while an intent is open or the card awaits a human. */
   beginPromotion(cardId: string, expectedStateRevision: bigint, eventCursor: bigint, startedAt: Date): Promise<boolean>
+  /** CAS todo to ready, assign the synthesizer, and open the intent in one write (issue #2 B3). */
+  beginSynthesis(
+    cardId: string,
+    expectedStateRevision: bigint,
+    eventCursor: bigint,
+    startedAt: Date,
+    assigneeAgentId: string
+  ): Promise<boolean>
   /** The ready POST returned success, so a lone App ready-add after the cursor may be adopted as ours. */
   notePromotionPosted(cardId: string): Promise<void>
   /** The label write finished; drop the intent so the ready card can be claimed. */
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+}
+
+// ── Kanban human controls (issue #2 B5) — skip and restart; body-free, owner + interactive OIDC only ──
+
+/** What the CP needs to finish a skip/restart on GitHub after the DB write committed. */
+export interface KanbanCardControlOutcome {
+  cardId: string
+  issueNumber: number
+  status: KanbanStatus
+  /** Board facts for the label/close write. */
+  orgId: OrgId
+  repoId: bigint
+  repoFullName: string
+  /** The open lease this write ended as `reclaimed` (dispatchRevision already bumped); null when none. */
+  revokedLease: KanbanLeaseRef | null
+}
+
+export type KanbanCardControlRefusal = 'not_found' | 'illegal_transition'
+
+export type KanbanCardControlResult =
+  { ok: true; value: KanbanCardControlOutcome } | { ok: false; reason: KanbanCardControlRefusal }
+
+export interface KanbanCardControlInput {
+  orgId: string
+  boardId: string
+  cardId: string
+  actorUserId: string
+  source: string
+}
+
+export interface KanbanCardControlRepo {
+  /** Archive the card and revoke its lease (issue #2 B5). The caller writes the close + comment. */
+  skipCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult>
+  /** Reset the card to ready and revoke its lease (issue #2 B5). The caller writes the reopen + status label + comment. */
+  restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult>
 }

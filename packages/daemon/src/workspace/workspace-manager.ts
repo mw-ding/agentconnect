@@ -266,6 +266,8 @@ export interface PrepareSessionWorkspaceRequest {
   /** Display label of the user who OPENED this logical session — it names the
    * worktree's branch. Presentation only; never an identity or auth input. */
   initiatedBy?: string
+  /** An exact branch name (e.g. a Kanban write card's `ac/card-<n>`); overrides the generated session branch. */
+  branch?: string
   review?: GithubReviewWorkspaceRevision
   /** `owner/repo` the review is about, only with `review`: a secondary root's exact worktree becomes the cwd, the others ride along at their default branches (decisions 5, 6); absent or the primary is the ordinary review. */
   reviewRepoFullName?: string
@@ -2384,15 +2386,31 @@ export class WorkspaceManager {
     root: WorkspaceRoot,
     cwd: string,
     target: string,
-    initiatedBy?: string
+    initiatedBy?: string,
+    branch?: string
   ): Promise<void> {
     const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
-    const branch = await this.drawSessionBranch(git(), initiatedBy)
+    // A fixed card branch is created from the root's default branch on first use and reused on later attempts.
+    if (branch !== undefined) {
+      const exists = await git()
+        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+        .then(() => true)
+        .catch(() => false)
+      // --no-track: the start point is a remote-tracking ref, so git's own `branch.autoSetupMerge`
+      // would otherwise make `origin/<base>` this branch's upstream (see the generated-branch path).
+      await git().raw(
+        exists
+          ? ['worktree', 'add', '--no-track', cwd, branch]
+          : ['worktree', 'add', '-b', branch, '--no-track', cwd, target]
+      )
+      return
+    }
+    const name = await this.drawSessionBranch(git(), initiatedBy)
     // --no-track: the start point is a remote-tracking ref, so git's own `branch.autoSetupMerge`
     // would otherwise make `origin/<base>` this branch's upstream. That upstream is what the console's
     // push authorizes against — it would turn the push button into a remote-branch creator — and it
     // leaves a plain `git push` failing under push.default=simple on the name mismatch.
-    await git().raw(['worktree', 'add', '-b', branch, '--no-track', cwd, target])
+    await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
   }
 
   /** A session branch name no ref in the repository `git` runs in blocks — word pairs first, random bytes once the draws are spent; only a printed ref counts, since a miss exits 1 silently, which one runner resolves and the other throws. */
@@ -2626,7 +2644,7 @@ export class WorkspaceManager {
     if (!attached) {
       await fs.rmTree(cwd)
       await this.runnerFor(agent.id, root.path).withEnv(workspaceGitLocalEnv()).raw(['worktree', 'prune'])
-      await this.addRootSessionWorktree(agent.id, root, cwd, target, request.initiatedBy)
+      await this.addRootSessionWorktree(agent.id, root, cwd, target, request.initiatedBy, request.branch)
     } else if (review) {
       // Tracked files alone follow the revision; untracked and ignored files (node_modules, a cargo target, build output) are the session's own intermediates and stay, so a re-review does not rebuild them.
       await this.runnerFor(agent.id, cwd).withEnv(workspaceGitLocalEnv()).raw(['reset', '--hard', target])
@@ -2789,7 +2807,7 @@ export class WorkspaceManager {
         : this.submoduleReposAtRevision(agentId, root, cwd, target)
     )
     if (!attached) {
-      await this.checkoutSessionBranch(agentId, root, cwd, target, request.initiatedBy)
+      await this.checkoutSessionBranch(agentId, root, cwd, target, request.initiatedBy, request.branch)
     } else if (review) {
       // Tracked files alone follow the revision, as on the worktree tier: the session keeps its untracked and ignored intermediates across deliveries.
       await this.runnerFor(agentId, cwd)
@@ -2871,16 +2889,24 @@ export class WorkspaceManager {
     root: WorkspaceRoot,
     cwd: string,
     target: string,
-    initiatedBy?: string
+    initiatedBy?: string,
+    branch?: string
   ): Promise<void> {
-    const branch = await this.drawSessionBranch(
-      this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()),
-      initiatedBy
-    )
+    const name =
+      branch ??
+      (await this.drawSessionBranch(this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()), initiatedBy))
     // Three admitted subcommands rather than `checkout -b`, which the sandbox refuses by design: create the branch, point HEAD at it, then materialize the tree HEAD now names.
     const git = this.runnerFor(agentId, cwd).withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
-    await git.raw(['branch', '--no-track', branch, target])
-    await git.raw(['symbolic-ref', 'HEAD', `refs/heads/${branch}`])
+    if (branch !== undefined) {
+      const exists = await git
+        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+        .then(() => true)
+        .catch(() => false)
+      if (!exists) await git.raw(['branch', '--no-track', branch, target])
+    } else {
+      await git.raw(['branch', '--no-track', name, target])
+    }
+    await git.raw(['symbolic-ref', 'HEAD', `refs/heads/${name}`])
     // The materialization is what may lazily fetch, so it runs under the clone env like the review reset below.
     await git.raw(['reset', '--hard'])
   }

@@ -4,7 +4,7 @@ import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
-import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import { canTransition, isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
 import { isAttestedHumanAuthority } from '../../kanban/human-authority.js'
 import { hasWriteAccess } from '../../github/repo-permission.js'
 import {
@@ -16,6 +16,9 @@ import {
   type KanbanBoardRepo,
   type KanbanBoardView,
   type KanbanBoardWriteResult,
+  type KanbanCardControlInput,
+  type KanbanCardControlRepo,
+  type KanbanCardControlResult,
   type KanbanCardRecord,
   type KanbanCardRepo,
   type KanbanCardRow,
@@ -27,7 +30,14 @@ import {
   type KanbanSetAssigneeResult
 } from '../ports.js'
 
-const BOARD_SELECT = { id: true, orgId: true, name: true, repoId: true, repoFullName: true } as const
+const BOARD_SELECT = {
+  id: true,
+  orgId: true,
+  name: true,
+  repoId: true,
+  repoFullName: true,
+  synthesizerAgentId: true
+} as const
 
 const CARD_ROW_SELECT = {
   id: true,
@@ -53,6 +63,7 @@ const BOARD_VIEW_SELECT = {
   repoFullName: true,
   orchestratorAgentId: true,
   verifierAgentId: true,
+  synthesizerAgentId: true,
   maxInProgress: true,
   maxInProgressPerAgent: true,
   staleLeaseSec: true,
@@ -62,6 +73,9 @@ const BOARD_VIEW_SELECT = {
   defaultMode: true,
   completionContract: true,
   enabled: true,
+  paused: true,
+  pausedAt: true,
+  pausedByUserId: true,
   configRevision: true,
   visibility: true,
   sharedWith: true,
@@ -221,6 +235,47 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     })
   }
 
+  async setPaused(
+    orgId: string,
+    boardId: string,
+    userId: string,
+    paused: boolean
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
+    return withAmbientTx(this.db, async (tx) => {
+      // The board row is the claim mutex, so a pause cannot race a claim reading `paused`.
+      await tx.$queryRaw`
+        SELECT "id" FROM "kanban_board" WHERE "id" = ${boardId}::uuid AND "orgId" = ${orgId} FOR UPDATE
+      `
+      if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
+      const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
+      if (!current) return { ok: false, reason: 'not_found' }
+      // Idempotent: re-pausing or re-resuming writes nothing and leaves no audit row.
+      if (current.paused === paused) return { ok: true, value: toBoardView(current) }
+      const row = await tx.kanbanBoard.update({
+        where: { id: boardId },
+        data: {
+          paused,
+          pausedAt: paused ? new Date() : null,
+          pausedByUserId: paused ? userId : null,
+          configRevision: { increment: 1 },
+          lastModifiedByUserId: userId,
+          lastModifiedAt: new Date()
+        },
+        select: BOARD_VIEW_SELECT
+      })
+      await tx.auditEvent.create({
+        data: {
+          kind: paused ? 'board_paused' : 'board_resumed',
+          orgId,
+          actorUserId: userId,
+          message: `kanban board ${boardId} ${paused ? 'paused' : 'resumed'}`,
+          details: { boardId }
+        }
+      })
+      return { ok: true, value: toBoardView(row) }
+    })
+  }
+
   // Only the human-authenticated owner route calls this, with the caller's user id; never expose it on worker RPCs.
   async setDefaultMode(orgId: string, boardId: string, userId: string, mode: 'read' | 'write'): Promise<boolean> {
     return withAmbientTx(this.db, async (tx) => {
@@ -304,7 +359,7 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
   }
 }
 
-export class PgKanbanCardRepo implements KanbanCardRepo {
+export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
   constructor(private readonly db: PrismaLike) {}
 
   async findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null> {
@@ -372,6 +427,39 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       where: { id: cardId, promotionPending: true },
       data: { promotionPostAccepted: true }
     })
+  }
+
+  async beginSynthesis(
+    cardId: string,
+    expectedStateRevision: bigint,
+    eventCursor: bigint,
+    startedAt: Date,
+    assigneeAgentId: string
+  ): Promise<boolean> {
+    // One write for the ready CAS, the synthesizer assignment, and the intent — same shape as beginPromotion.
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: {
+        id: cardId,
+        stateRevision: expectedStateRevision,
+        status: 'todo',
+        promotionPending: false,
+        needsAttention: false
+      },
+      data: {
+        status: 'ready',
+        assigneeAgentId,
+        stateRevision: { increment: 1 },
+        githubSyncedAt: new Date(),
+        ...PROMOTION_CLEARED,
+        promotionPending: true,
+        promotionEventCursor: eventCursor,
+        promotionStartedAt: startedAt,
+        promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
+        recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
+        recoveryChecks: 0
+      }
+    })
+    return count === 1
   }
 
   async clearPromotionIntent(cardId: string): Promise<boolean> {
@@ -609,6 +697,101 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       }
     })
   }
+
+  skipCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult> {
+    return this.controlCard(input, 'archived', 'card_skipped', 'skipped')
+  }
+
+  restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult> {
+    return this.controlCard(input, 'ready', 'card_restarted', 'restarted')
+  }
+
+  /** The shared B5 control write: revoke any open lease (bumping the fence), move the card, and audit — all in one transaction. */
+  private controlCard(
+    input: KanbanCardControlInput,
+    to: KanbanStatus,
+    auditKind: 'card_skipped' | 'card_restarted',
+    reasonCode: string
+  ): Promise<KanbanCardControlResult> {
+    return withAmbientTx(this.db, async (tx) => {
+      // The card lock orders this write against a claim (which skips locked cards) and against run ends.
+      const [row] = await tx.$queryRaw<
+        Array<{ id: string; status: string; issueNumber: number; orgId: string; repoId: bigint; repoFullName: string }>
+      >(
+        Prisma.sql`
+          SELECT c."id", c."status", c."issueNumber", b."orgId", b."repoId", b."repoFullName"
+          FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+          WHERE c."id" = ${input.cardId}::uuid AND c."boardId" = ${input.boardId}::uuid AND b."orgId" = ${input.orgId}
+          FOR UPDATE OF c
+        `
+      )
+      if (!row) return { ok: false, reason: 'not_found' }
+      if (!isKanbanStatus(row.status)) return { ok: false, reason: 'illegal_transition' }
+      // Restart routes archived→triage→ready (the table's two-hop path) in one write; everything else honors the table directly.
+      const legal =
+        to === 'ready' ? canTransition(row.status, to) || row.status === 'archived' : canTransition(row.status, to)
+      if (!legal) return { ok: false, reason: 'illegal_transition' }
+      const [open] = await tx.$queryRaw<KanbanLeaseRef[]>(Prisma.sql`
+        SELECT "leaseId", "id" AS "runId", "agentId", "daemonId", "dispatchRevision" FROM "kanban_run"
+        WHERE "cardId" = ${row.id}::uuid AND "endedAt" IS NULL
+        FOR UPDATE
+      `)
+      if (open) {
+        // Reassignment never transfers: the ended run is reclaimed so its late writes fail the fence, counting no failure.
+        await tx.kanbanRun.update({
+          where: { id: open.runId },
+          data: { endedAt: new Date(), outcome: 'reclaimed', reasonCode }
+        })
+      }
+      const reset = {
+        consecutiveFailures: 0,
+        protocolViolations: 0,
+        blockRecurrence: 0,
+        cooldownUntil: null,
+        blockKind: null,
+        ...PROMOTION_CLEARED
+      }
+      await tx.kanbanCard.update({
+        where: { id: row.id },
+        data: {
+          status: to,
+          stateRevision: { increment: 1 },
+          dispatchRevision: { increment: 1 },
+          githubSyncedAt: new Date(),
+          ...(to === 'ready' ? reset : {})
+        }
+      })
+      await tx.auditEvent.create({
+        data: {
+          kind: auditKind,
+          orgId: row.orgId,
+          actorUserId: input.actorUserId,
+          message: `kanban card ${row.id} ${to === 'archived' ? 'skipped' : 'restarted'}`,
+          details: {
+            boardId: input.boardId,
+            cardId: row.id,
+            issueNumber: row.issueNumber,
+            from: row.status,
+            to,
+            revokedLeaseId: open?.leaseId ?? null,
+            source: input.source
+          }
+        }
+      })
+      return {
+        ok: true,
+        value: {
+          cardId: row.id,
+          issueNumber: row.issueNumber,
+          status: to,
+          orgId: OrgId(row.orgId),
+          repoId: row.repoId,
+          repoFullName: row.repoFullName,
+          revokedLease: open ?? null
+        }
+      }
+    })
+  }
 }
 
 function toCardRow(row: {
@@ -672,7 +855,9 @@ async function normalizeConfig(
   for (const [key, value] of Object.entries(input)) {
     if (value !== undefined) (data as Record<string, unknown>)[key] = value
   }
-  const agentIds = [data.orchestratorAgentId, data.verifierAgentId].filter((id): id is string => !!id)
+  const agentIds = [data.orchestratorAgentId, data.verifierAgentId, data.synthesizerAgentId].filter(
+    (id): id is string => !!id
+  )
   if (agentIds.length > 0) {
     const found = await tx.agent.count({ where: { orgId, id: { in: [...new Set(agentIds)] } } })
     if (found !== new Set(agentIds).size) return { ok: false, reason: 'agent_not_in_org' }

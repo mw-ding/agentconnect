@@ -1,6 +1,7 @@
 // Kanban dispatch → turn (issue #2 D3/D4): keys the GitHub hook's `<prefix>#<n>` thread session; the worker reads the issue itself.
 import type { KanbanDispatch } from '@agentconnect.md/protocol'
 import type { NormalizedMessage } from './normalized.js'
+import { kanbanCardBranch } from '../kanban/card-branch.js'
 
 /** The same coordinates a headless GitHub hook delivery on this issue uses, so both land in one session. */
 export function kanbanSessionCoords(d: KanbanDispatch): {
@@ -22,7 +23,7 @@ export function buildKanbanText(d: KanbanDispatch): string {
   const ref = `${d.repoFullName}#${d.issueNumber}`
   const mode =
     d.mode === 'write'
-      ? 'Mode: write. You may change code in this session worktree and open a pull request that references the issue.'
+      ? `Mode: write. You may change code in this session worktree and open a pull request that references the issue. Your worktree is on branch \`${kanbanCardBranch(d.issueNumber)}\`, created on first use and reused on later attempts.`
       : 'Mode: read-only. Do not commit, push, or open pull requests; investigate and report findings only.'
   return [
     `AgentConnect Kanban dispatched card ${ref} to you (attempt ${d.attempt}).`,
