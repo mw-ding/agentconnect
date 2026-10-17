@@ -465,3 +465,13 @@ explains the revert. Edits by the deployment App bot, any other bot, an App
 acting on a user's behalf, or an unknown actor are ignored without a lookup.
 Agents have no GitHub identity of their own: they write only through App
 installation tokens, so the App check covers them.
+
+Known gaps update (M1 label sync attribution): an edit is adopted only when the
+visible issue events attribute the live label to a human writer; when the events
+API lags the live labels, the pass is deferred and neither adopts, reverts, nor
+advances the cursor. A deferred card is retried on later passes and fails closed
+to `needsAttention` after 10 deferred checks or 10 minutes, whichever comes
+first, reverting the live status label to the committed status with a comment.
+An agent using a writer's own host `gh` credentials is indistinguishable from
+that human (the shared-GitHub-login limit): label attribution trusts the events
+API's actor, which reports the credential's login, not the process behind it.
