@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
+import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
 import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
 import {
   KanbanCardUpsertError,
@@ -112,6 +113,12 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
     try {
       return await withAmbientTx(this.db, async (tx) => {
+        await lockResourceWriteMemberships(tx, {
+          orgId,
+          actorUserId: userId,
+          visibility: 'org',
+          sharedWith: input.sharedWith
+        })
         if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
         const config = await normalizeConfig(tx, orgId, input)
         if (!config.ok) return config
@@ -148,12 +155,25 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
     try {
       return await withAmbientTx(this.db, async (tx) => {
+        await lockResourceWriteMemberships(tx, {
+          orgId,
+          actorUserId: userId,
+          visibility: 'org',
+          sharedWith: patch.sharedWith
+        })
         await tx.$queryRaw`
           SELECT "id" FROM "kanban_board" WHERE "id" = ${boardId}::uuid AND "orgId" = ${orgId} FOR UPDATE
         `
         if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
         const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
         if (!current) return { ok: false, reason: 'not_found' }
+        if (
+          patch.repoId !== undefined &&
+          patch.repoId !== current.repoId &&
+          (await tx.kanbanCard.count({ where: { boardId } })) > 0
+        ) {
+          return { ok: false, reason: 'repo_has_cards' }
+        }
         // Restricting a board keeps its current audience unless the patch names a new one.
         const config = await normalizeConfig(tx, orgId, {
           ...patch,

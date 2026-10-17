@@ -78,6 +78,7 @@ const REFUSALS: Record<KanbanBoardWriteRefusal, { statusCode: 400 | 404 | 409; e
     error: 'Bad Request',
     message: 'a restricted board must be shared with at least one current member'
   },
+  repo_has_cards: { statusCode: 409, error: 'Conflict', message: 'a board with cards cannot change repository' },
   active_runs: {
     statusCode: 409,
     error: 'Conflict',

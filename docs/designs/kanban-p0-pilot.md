@@ -370,3 +370,10 @@ imports and orchestrator creates without duplicate cards or creation audits.
 Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
 redelivery, not by an installation-wide issue enumeration. The live tests use a
 PAT as the injected installation-token source; production uses the App token.
+
+Known gaps update (M1 board CRUD): board writes now use the shared membership
+locks and member-removal audience repair. A repository rename keeps its numeric
+identity; changing that identity is refused while the board has cards, so old
+issue numbers cannot silently refer to another repository. Human status and
+assignment synchronization beyond mismatch-parked cards and periodic drift repair
+remain for the stacked M1 follow-up.

@@ -264,6 +264,31 @@ describe('Kanban board routes — an interactive owner', () => {
     }
   })
 
+  it('refuses to retarget existing cards to another repository but permits a repository rename', async () => {
+    const board = await seedBoardRow({ name: 'web', repoId: 4242n })
+    await prisma.kanbanCard.create({ data: { boardId: board.id, issueId: 1n, issueNumber: 1 } })
+    const { app, close, resolver } = buildApp()
+    const headers = await ownerBearer(prisma, oidc)
+    try {
+      const url = `${BOARDS}/${board.id}`
+      expect(
+        (await app.inject({ method: 'PATCH', url, headers, payload: { repoFullName: 'acme/api' } })).statusCode
+      ).toBe(409)
+      resolver.resolve.mockResolvedValueOnce({
+        ok: true,
+        repoId: 4242n,
+        repoFullName: 'acme/renamed',
+        installationId: 77n
+      })
+      expect(
+        (await app.inject({ method: 'PATCH', url, headers, payload: { repoFullName: 'acme/renamed' } })).statusCode
+      ).toBe(200)
+      expect((await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: board.id } })).repoId).toBe(4242n)
+    } finally {
+      await close()
+    }
+  })
+
   it('deletes a board and its cards, refusing while a card holds an open lease', async () => {
     await seedDaemon(prisma, DAEMON)
     await seedAgent(prisma, AGENT, { daemonId: DAEMON })
@@ -347,6 +372,15 @@ describe('Kanban board routes — visibility', () => {
     } finally {
       await close()
     }
+  })
+
+  it('repairs a restricted board audience when its last explicit member leaves', async () => {
+    const { userId } = await memberBearer(prisma, oidc, 'collaborator', 'kanban-departing')
+    const board = await seedBoardRow({ name: 'web', repoId: 4242n, visibility: 'restricted', sharedWith: [userId] })
+    await new PgUserRepo(prisma).removeMember(DEFAULT_ORG_ID, userId, DEFAULT_OWNER_ID)
+    expect((await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: board.id } })).sharedWith).toEqual([
+      DEFAULT_OWNER_ID
+    ])
   })
 
   it('restricting a board keeps the audience it already had', async () => {

@@ -7903,7 +7903,8 @@ export interface KanbanBoardConfigInput {
 
 export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
 
-export type KanbanBoardWriteRefusal = 'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs'
+export type KanbanBoardWriteRefusal =
+  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards'
 
 export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
 
