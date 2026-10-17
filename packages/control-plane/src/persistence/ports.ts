@@ -7861,6 +7861,10 @@ export interface KanbanBoardView {
   verifierAgentId: string | null
   maxInProgress: number
   maxInProgressPerAgent: number
+  /** B2: lifetime children per epic (default 100); lowering it below a count blocks new creates, never existing cards. */
+  epicMaxCards: number
+  /** B2: open runs per epic's children (default 16). */
+  epicMaxActive: number
   staleLeaseSec: number
   failureLimit: number
   protocolRetryLimit: number
@@ -7886,6 +7890,8 @@ export interface KanbanBoardConfigInput {
   verifierAgentId?: string | null
   maxInProgress?: number
   maxInProgressPerAgent?: number
+  epicMaxCards?: number
+  epicMaxActive?: number
   staleLeaseSec?: number
   failureLimit?: number
   protocolRetryLimit?: number

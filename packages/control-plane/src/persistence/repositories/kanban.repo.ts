@@ -55,6 +55,8 @@ const BOARD_VIEW_SELECT = {
   verifierAgentId: true,
   maxInProgress: true,
   maxInProgressPerAgent: true,
+  epicMaxCards: true,
+  epicMaxActive: true,
   staleLeaseSec: true,
   failureLimit: true,
   protocolRetryLimit: true,
