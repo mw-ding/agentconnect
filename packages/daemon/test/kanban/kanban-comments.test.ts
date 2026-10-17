@@ -198,6 +198,29 @@ describe('KanbanCommentPublisher', () => {
     expect(store.rows.size).toBe(0)
   })
 
+  it('does not mistake a progress note for the final comment when it looks for the lease marker', async () => {
+    const store = memoryStore()
+    seed(store, { attempted: true, attempts: 1 })
+    let posts = 0
+    const note = `working on it\n<!-- ac-kanban-note:${report.leaseId}:1 -->`
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return new Response(JSON.stringify([{ body: note }]), { status: 200 })
+      posts += 1
+      return new Response(JSON.stringify({ id: 9 }), { status: 201 })
+    })
+    const publisher = new KanbanCommentPublisher({
+      clock: { now: () => 1_000 },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      store,
+      token: async () => 'ghs_test',
+      fetchImpl: fetchImpl as typeof fetch,
+      baseUrl: 'https://api.test'
+    })
+    await publisher.drain()
+    expect(posts).toBe(1)
+    expect(store.rows.size).toBe(0)
+  })
+
   it('defers without posting when the token mint fails', async () => {
     const store = memoryStore()
     seed(store)

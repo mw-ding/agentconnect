@@ -1,3 +1,5 @@
+import { KanbanImporter } from './kanban/importer.js'
+import { GithubRepoPermission } from './github/repo-permission.js'
 import { CodeHostFeedbackService } from './codehost/feedback.service.js'
 import { GitlabFeedbackProvider } from './gitlab/feedback-provider.js'
 import { GiteaFeedbackProvider } from './gitea/feedback-provider.js'
@@ -1764,6 +1766,20 @@ export function buildContainer(
       })
     : undefined
 
+  const kanbanImporter =
+    kanbanCardStore && kanbanTokens
+      ? new KanbanImporter({
+          cards: repos.kanbanCard,
+          store: kanbanCardStore,
+          permissions: new GithubRepoPermission({
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          appSlug: githubAppCfg?.slug,
+          log: { warn: (o, m) => http.log.warn(o, m) }
+        })
+      : undefined
+
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
@@ -1801,8 +1817,11 @@ export function buildContainer(
           kanbanDispatcher?.poke(board.id)
         },
         // A human status relabel or close/reopen re-reads the card at once instead of waiting out its backoff.
-        onCard: async (board, _repo, issueNumber) => {
-          await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
+        onCard: async (board, repo, issueNumber, action) => {
+          const imported =
+            ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
+            (await kanbanImporter?.import(board, repo, issueNumber, { action }))
+          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog
@@ -2061,7 +2080,8 @@ export function buildContainer(
       audit: repos.audit,
       webchatMcpOperation: repos.webchatMcpOperation,
       oauth: repos.oauth,
-      kanbanMode: repos.kanbanBoard
+      kanbanMode: repos.kanbanBoard,
+      kanbanBoards: repos.kanbanBoard
     },
     registry,
     agentSpecs,

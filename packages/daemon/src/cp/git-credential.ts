@@ -389,20 +389,26 @@ export class GitCredentialCache {
     this.dropCached(GITEA_EFFECT_KEY(agentId, repoId), presentedToken)
   }
 
-  /** Issues-write token for one accepted Kanban run's summary comment. The CP rechecks this lease. */
-  async getKanbanCommentToken(agentId: string, repo: string, leaseId: string): Promise<Entry> {
+  // Live worker tools revalidate on every call; final summaries can reuse their accepted-run grant.
+  async getKanbanCommentToken(
+    agentId: string,
+    repo: string,
+    leaseId: string,
+    opts: { revalidate?: boolean } = {}
+  ): Promise<Entry> {
     const key = KANBAN_KEY(agentId, repo, leaseId)
     const forceRefresh = this.refreshKanban.has(key)
-    const entry = await this.getKeyed(key, agentId, {
+    const payload = {
       agentId,
-      reason: 'helper',
-      capabilities: ['issues'],
+      reason: 'helper' as const,
+      capabilities: ['issues' as const],
       repoFullName: repo,
-      purpose: 'kanban_card_write',
+      purpose: 'kanban_card_write' as const,
       leaseId,
       ...this.githubProvider(),
       ...(forceRefresh ? { forceRefresh: true } : {})
-    })
+    }
+    const entry = opts.revalidate ? await this.fetch(key, payload) : await this.getKeyed(key, agentId, payload)
     if (forceRefresh) this.refreshKanban.delete(key)
     return entry
   }

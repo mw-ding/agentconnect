@@ -6,7 +6,9 @@ export type KanbanCompletionContract = 'close' | 'pr_merged' | 'pr_checks_green'
 
 /** How one run ended; `reclaimed` is the reaper's, the rest come from the worker's report or a dispatch nack. */
 export type KanbanRunEnd =
-  | { outcome: 'completed' | 'review_requested' | 'failed' | 'protocol_violation' | 'transient' | 'reclaimed' }
+  | { outcome: 'completed' | 'review_requested' | 'failed' | 'protocol_violation' | 'reclaimed' }
+  /** `provider` marks a classified provider outage, which backs off and is bounded; other transients keep the flat cooldown. */
+  | { outcome: 'transient'; provider?: boolean }
   | { outcome: 'blocked'; blockKind: KanbanBlockKind }
 
 export interface AccountingBoard {
@@ -26,7 +28,8 @@ export interface AccountingCard {
   blockKind: KanbanBlockKind | null
 }
 
-export type TrippedLimit = 'failure_limit' | 'protocol_retry_limit' | 'block_recurrence_limit' | 'capability'
+export type TrippedLimit =
+  'failure_limit' | 'protocol_retry_limit' | 'block_recurrence_limit' | 'capability' | 'transient_limit'
 
 export interface RunEndPlan extends AccountingCard {
   countsAsFailure: boolean
@@ -37,6 +40,14 @@ export interface RunEndPlan extends AccountingCard {
 export const FAILURE_COOLDOWN_BASE_MS = 60_000
 export const FAILURE_COOLDOWN_MAX_MS = 60 * 60_000
 export const TRANSIENT_COOLDOWN_MS = 60_000
+/** Consecutive provider-outage runs after which a card goes to triage instead of retrying forever (backoff reaches the hour cap at the 7th). */
+export const PROVIDER_TRANSIENT_LIMIT = 8
+
+/** Facts about earlier runs that the card row does not carry. */
+export interface RunEndContext {
+  /** Provider-outage `transient` runs that ended back to back just before this one. */
+  trailingProviderTransients: number
+}
 
 /** Respawn cooldown after the nth consecutive failure: doubling from one minute, capped at an hour. */
 export function failureCooldownMs(n: number): number {
@@ -49,7 +60,13 @@ function reaches(count: number, limit: number): boolean {
 }
 
 /** The card after one run ends; only a `running` card moves, so a human's earlier move (blocked, triage) stands. */
-export function planRunEnd(card: AccountingCard, board: AccountingBoard, end: KanbanRunEnd, now: Date): RunEndPlan {
+export function planRunEnd(
+  card: AccountingCard,
+  board: AccountingBoard,
+  end: KanbanRunEnd,
+  now: Date,
+  ctx: RunEndContext = { trailingProviderTransients: 0 }
+): RunEndPlan {
   if (card.status !== 'running') return { ...card, countsAsFailure: false }
   const after = (ms: number) => new Date(now.getTime() + ms)
   const settled = { consecutiveFailures: 0, protocolViolations: 0, cooldownUntil: null, blockKind: null }
@@ -98,8 +115,15 @@ export function planRunEnd(card: AccountingCard, board: AccountingBoard, end: Ka
       const cooldownUntil = after(failureCooldownMs(protocolViolations))
       return { ...card, protocolViolations, cooldownUntil, status: 'ready', countsAsFailure: false }
     }
-    case 'transient':
-      return { ...card, cooldownUntil: after(TRANSIENT_COOLDOWN_MS), status: 'ready', countsAsFailure: false }
+    case 'transient': {
+      if (!end.provider)
+        return { ...card, cooldownUntil: after(TRANSIENT_COOLDOWN_MS), status: 'ready', countsAsFailure: false }
+      // A provider outage is not the card's fault, so it backs off like a failure without counting as one, and is bounded.
+      const run = ctx.trailingProviderTransients + 1
+      if (reaches(run, PROVIDER_TRANSIENT_LIMIT))
+        return { ...card, cooldownUntil: null, status: 'triage', countsAsFailure: false, tripped: 'transient_limit' }
+      return { ...card, cooldownUntil: after(failureCooldownMs(run)), status: 'ready', countsAsFailure: false }
+    }
     case 'reclaimed':
       return { ...card, cooldownUntil: null, status: 'ready', countsAsFailure: false }
   }

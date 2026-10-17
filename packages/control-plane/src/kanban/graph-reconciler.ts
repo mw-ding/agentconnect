@@ -1,6 +1,6 @@
 // Kanban graph reconciler (issue #2 M1): promotes todo cards whose blockers all completed, then writes the status label.
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
-import { STATUS_LABEL_PREFIX, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
+import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
 
 export interface GraphReconcilerLog {
@@ -9,7 +9,10 @@ export interface GraphReconcilerLog {
 
 export interface KanbanGraphReconcilerDeps {
   // No bare casStatus: a promotion's ready move and its intent land only together, through beginPromotion.
-  cards: Omit<KanbanCardRepo, 'casStatus'>
+  cards: Pick<
+    KanbanCardRepo,
+    'findByIssueNumber' | 'beginPromotion' | 'notePromotionPosted' | 'clearPromotionIntent' | 'revertPromotion'
+  >
   store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>
   log: GraphReconcilerLog
   /** Defaults to the wall clock; stamps when the promotion intent opened, for the recovery age cap. */
@@ -59,7 +62,7 @@ export class KanbanGraphReconciler {
     const observed = await this.deps.store.readCard(repo, issueNumber)
     if (!observed || observed.state !== 'open') return
     if (residueOnly) return this.writeReadyLabels(repo, issueNumber, true, observed)
-    const statuses = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX))
+    const statuses = observed.labels.filter((l) => isStatusLabel(l))
     // Existing ready labels, including todo+ready, require the dispatcher's attributed pending-promotion repair.
     if (statuses.length !== 1 || statuses[0] !== statusLabel('todo')) return
     // Only events after this cursor can be our write; it is read last so the window opens just before the POST.
@@ -95,7 +98,7 @@ export class KanbanGraphReconciler {
     onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
     const keep = statusLabel('ready')
-    const stale = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+    const stale = observed.labels.filter((l) => isStatusLabel(l) && l !== keep)
     const hasKeep = observed.labels.includes(keep)
     // Only todo+ready can be promotion residue; preserve other conflicts for dispatcher mismatch recovery.
     if (residueOnly && (!hasKeep || stale.length !== 1 || stale[0] !== statusLabel('todo'))) return

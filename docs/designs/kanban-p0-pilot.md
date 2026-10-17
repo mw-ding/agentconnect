@@ -310,6 +310,65 @@ worktree recovery policy that preserves uncommitted work before another write ru
 report receipts and abandoned reservations need retention rules that preserve
 restart deduplication. These are outside the dispatch fixes above.
 
+## M3 — Worker protocol and card tools
+
+A dispatched turn that ends without a terminal tool call gets exactly one short
+nudge in the same session and lease. The daemon waits for live background work to
+finish first and keeps heartbeating while the nudge turn runs. The nudge asks for
+exactly one of `kanbanComplete`, `kanbanRequestReview`, `kanbanBlock`, or `kanbanFail`.
+A terminal from that turn keeps its own outcome and reason. Ignoring the nudge
+reports `protocol_violation/no_terminal_call_after_nudge`; a refused or unstartable
+nudge reports `protocol_violation/nudge_unavailable`. Protocol violations consume
+the existing `protocolRetryLimit` budget. Errored, interrupted, superseded, and
+stopping turns do not get a nudge. Admission still checks paused/draining state.
+
+ACP errors retain their structured JSON-RPC code, message, data, and cause for a
+pure daemon-side classifier. Rate limits (429), network errors, overload (529),
+and server errors (5xx) report `transient` with a fixed `provider_*` reason code.
+Authentication (401/403), invalid requests (400/invalid params), and context
+overflow report counted `failed` outcomes. After those provider checks, only a
+daemon-created ACP transport error (a prompt rejected by the local connection
+closing or resetting, including agent process exit) reports `failed/agent_crashed`.
+Free-text process/tool exit messages cannot establish a crash; provider-side EPIPE
+remains `transient/provider_network`. Unknown errors keep `failed/turn_error`.
+Neither initial-turn nor nudge-turn errors trigger another nudge. Error text stays
+on the daemon; only the reason code reaches the control plane.
+
+Consecutive provider transients derive their backoff from prior ended runs,
+without a schema change: 1, 2, 4, 8, 16, 32, then 60 minutes. The eighth consecutive
+provider transient moves the card to `triage`. These retries preserve failure and
+protocol counters. Transient `nudge_deferred` and `dispatch_refused:*` runs are
+skipped without counting or resetting the provider sequence; any other outcome
+resets it. Non-provider transients retain their fixed one-minute cooldown.
+
+`kanbanShow()` and `kanbanComment({text})` resolve the worker's own card from the
+trusted session context. Neither accepts a card, agent, or lease argument, and
+both refuse after a terminal has been recorded or the lease has ended.
+`kanbanShow` obtains body-free metadata and at most 10 prior runs through the
+strict `kanban/card` RPC, fenced by the authenticated daemon/epoch, agent placement,
+open lease, card/board ids, and dispatch revision. The daemon reads the issue's
+title, body, labels, links, sub-issues, dependencies, and last 10 comments directly
+from GitHub. Each field is capped before normalization. The daemon normalizes a
+copy for detection only — combining-mark runs are capped at 30 before NFKC/NFKD,
+default-ignorable characters and Hangul fillers are stripped, and small capitals are
+folded to ASCII — then slides `beginuntrustedexternalcontent` and
+`enduntrustedexternalcontent` across the concatenated line skeletons, so a marker
+split across any number of lines (or an empty `-----` line inside it) is removed in
+linear time. The returned lines are the originals, so honest text is never re-shaped,
+and a bare mention of the phrase without a begin/end marker survives. The assembled
+block is hard-capped before the fences are added. Each call wraps the result in fresh
+nonce-bearing untrusted-content fences; only the END line with that exact nonce closes
+the block. An unavailable lease check fails the tool call.
+
+`kanbanComment` posts up to 4,000 characters per note, with at most 10 successful
+or in-flight notes per lease. A failed post releases its slot. It works in read
+mode too, like the final summary. Each read or progress post requests a fresh
+lease check through the daemon-owned issues token path, without falling back to a
+cached token on refusal or outage. The grant stays out of the agent environment.
+Progress markers use `ac-kanban-note:`; the final summary's `ac-kanban-lease:`
+lookup ignores them. The final summary retains its existing exactly-once outbox
+behavior. Workers still cannot mutate any `ac/*` label.
+
 ## M3 — App installation tokens and webhook delivery
 
 App mode is on only when `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`, and
@@ -399,3 +458,86 @@ Known gaps (M3):
   runtime or agent env; it is no longer inherited from the daemon.
 - **The pre-POST clock read is best-effort.** If that GET fails the POST still goes
   out, and a lost response is then recovered by the unbounded scan above.
+
+Known gaps (M3 worker additions):
+
+- **A daemon restart does not resume a nudge.** Its spent flag and lease are in
+  memory. The durable lease reservation prevents the restarted daemon from
+  executing the same dispatch again; the existing orphan/reaper path applies.
+- **Progress notes are not durable or exactly-once.** A POST that GitHub accepts
+  before the response is lost may appear even though the tool reports failure.
+  Retrying can duplicate that progress note. This does not affect the separate
+  terminal summary marker. The per-lease cap bounds acknowledged and in-flight
+  notes, rather than ambiguous writes GitHub accepted without acknowledgement.
+- **The worker E2E uses an injected PAT and fake ACP agent.** It exercises real
+  GitHub issues, Postgres, daemon admission, nudge turns, the MCP control socket,
+  and the fenced card-read RPC. Heartbeats/reports use the same in-process
+  dispatcher seam as the existing dispatch E2E so one queue owns label writes;
+  token minting reuses the repository's PAT injection. It does not validate a
+  real App installation or a provider's live ACP error format.
+- **Provider-outage triage is quiet.** When run-accounting trips
+  `transient_limit` (a provider outage routed to `ac/status:triage`), the only
+  signal beyond the label is a warn log line — the card's `needsAttention` flag
+  is not set and no body-free issue comment is posted, matching `failure_limit`.
+  Surfacing the outage for humans is a follow-up.
+- **Classifier status precedence.** A nested `data.status`/`cause` code beats the
+  top-level code (`{code:529, data:{status:400}}` → `provider_invalid_request`),
+  and 400 is checked before the overload/rate-limit text, so a message that
+  carries both a 400 and "rate limit exceeded" reads fatal. Both are the
+  conservative direction (counted, bounded by `failureLimit`), but using the
+  top-level code first is a follow-up.
+- **Progress-note lease id is public before the summary.** `kanbanComment`
+  publishes `ac-kanban-note:<leaseId>:<n>`, so the lease id is on the issue
+  before the final summary. Anyone (or the agent via `kanbanShow` comment
+  bodies) could post `ac-kanban-lease:<leaseId>` and spoof the final-comment
+  marker, which matches any author; that only matters after a failed or
+  ambiguous final POST inside the lookup window. Stripping `ac-kanban-lease:`
+  from note/summary text, or a non-reversible note marker, is a follow-up.
+
+- **Homoglyph confusables remain an accepted gap.** Cyrillic and other look-alike
+  letters require confusables tables; the entire GitHub block remains untrusted.
+- **A line that quotes a begin/end marker is over-redacted.** Detection removes every
+  line whose letters touch `beginuntrustedexternalcontent` or `enduntrustedexternalcontent`,
+  so legitimate prose that reproduces the fence delimiters — an issue discussing the fence
+  itself, or a sentence wrapped as `…untrusted` / `external content…` — loses the whole
+  line, and a single-line comment can vanish entirely. The nonce END line remains the real
+  boundary, so this is safe but more aggressive than strictly necessary.
+
+## M1 — Board configuration and issue import
+
+Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
+under `/api/v1/orgs/:orgId/kanban/boards`; members list and read only boards
+permitted by the shared resource visibility policy. Restricted boards require a
+current member audience, with the organization Owner exception. Each create or
+update rechecks repository identity through a live installation belonging to the
+organization. Board configuration changes produce body-free audit events.
+
+An enabled board imports issues on human `opened`, `transferred`, or `labeled`
+doorbells when a live issue read carries any `ac/status:*` label. Other labels
+alone do not import. A single valid status is retained for a write-capable author;
+missing, malformed, conflicting, or `running` initial status becomes `triage`.
+The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
+unknown permission and other roles always become `triage`. The same live check
+applies to whoever added the current status label (its latest `labeled` issue
+event) and to the latest transferrer: each must be a human, not the App identity
+its agents share, with write access, or the card imports as `triage`. The upsert
+itself refuses any status past `triage`/`todo` without that verified human
+authority, and never takes a mode. The safety label write
+precedes the idempotent card upsert, so a failed write cannot leave a ready card.
+One `ac/agent:<slug>` resolves to an unrestricted agent name within the board's
+organization, and only when the status was kept and a human writer added every
+current `ac/agent:*` label; otherwise, or for unknown, conflicting, or malformed
+assignment labels, the card stays unassigned.
+The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
+imports and orchestrator creates without duplicate cards or creation audits.
+
+Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
+redelivery, not by an installation-wide issue enumeration. The live tests use a
+PAT as the injected installation-token source; production uses the App token.
+
+Known gaps update (M1 board CRUD): board writes now use the shared membership
+locks and member-removal audience repair. A repository rename keeps its numeric
+identity; changing that identity is refused while the board has cards, so old
+issue numbers cannot silently refer to another repository. Human status and
+assignment synchronization beyond mismatch-parked cards and periodic drift repair
+remain for the stacked M1 follow-up.
