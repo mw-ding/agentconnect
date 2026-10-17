@@ -115,8 +115,8 @@ export class KanbanWorker {
   private readonly leases = new Map<string, KanbanLease>()
   // A CP retry of an in-flight admission joins it instead of racing the outbox reservation.
   private readonly admitting = new Map<string, Promise<KanbanDispatchOk>>()
-  // Last known session key per card, kept after finalize so a late revoke can still forget the session.
-  private readonly sessionsByCard = new Map<string, { agentId: string; sessionKey: string }>()
+  // Last known session key per lease, kept after finalize so a late revoke forgets exactly the addressed session.
+  private readonly sessionsByLease = new Map<string, { agentId: string; sessionKey: string }>()
   private timer: TimerHandle | undefined
   private stopped = true
   private flushing = false
@@ -160,13 +160,13 @@ export class KanbanWorker {
       this.leases.delete(leaseId)
       this.deps.onLeaseChanged?.(lease.dispatch)
       await this.deps.outbox.release(leaseId)
-      this.sessionsByCard.delete(cardId)
+      this.sessionsByLease.delete(leaseId)
       return
     }
-    const remembered = this.sessionsByCard.get(cardId)
+    const remembered = this.sessionsByLease.get(leaseId)
     if (remembered) {
       await this.deps.forget(remembered.agentId, remembered.sessionKey)
-      this.sessionsByCard.delete(cardId)
+      this.sessionsByLease.delete(leaseId)
     }
   }
 
@@ -212,7 +212,7 @@ export class KanbanWorker {
       turnSettled: false
     }
     this.leases.set(d.leaseId, lease)
-    this.sessionsByCard.set(d.cardId, { agentId: d.agentId, sessionKey: started.sessionKey })
+    this.sessionsByLease.set(d.leaseId, { agentId: d.agentId, sessionKey: started.sessionKey })
     this.deps.onLeaseChanged?.(d)
     started.done.then(
       (sessionId) => this.settleTurn(d.leaseId, sessionId ?? undefined),
