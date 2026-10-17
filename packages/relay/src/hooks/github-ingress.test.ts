@@ -905,15 +905,23 @@ describe('github ingress', () => {
       expect(h.sent).toHaveLength(1)
     })
 
-    it('rings for a status unlabel and a close or reopen, without any hook rule', async () => {
+    it('rings for opened, transferred, a status unlabel and a close or reopen, without any hook rule', async () => {
       await post(
         'issues',
         issuesPayload({ action: 'unlabeled', label: { name: 'ac/status:blocked' }, issue: { id: 5042 } })
       )
+      await post('issues', issuesPayload({ action: 'opened', issue: { id: 5042 } }))
+      await post('issues', issuesPayload({ action: 'transferred', issue: { id: 5042 } }))
       await post('issues', issuesPayload({ action: 'reopened', issue: { id: 5042 } }))
       await post('issues', issuesPayload({ action: 'closed', issue: { id: 5042 } }))
       await flush()
-      expect(h.graphDoorbells.map((p) => p.action)).toEqual(['unlabeled', 'reopened', 'closed'])
+      expect(h.graphDoorbells.map((p) => p.action)).toEqual([
+        'unlabeled',
+        'opened',
+        'transferred',
+        'reopened',
+        'closed'
+      ])
     })
 
     it('sends only a seen marker for other labels, bot senders, and unprovable ids, and nothing for other actions', () => {

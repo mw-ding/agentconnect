@@ -502,3 +502,42 @@ Known gaps (M3 worker additions):
   itself, or a sentence wrapped as `…untrusted` / `external content…` — loses the whole
   line, and a single-line comment can vanish entirely. The nonce END line remains the real
   boundary, so this is safe but more aggressive than strictly necessary.
+
+## M1 — Board configuration and issue import
+
+Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
+under `/api/v1/orgs/:orgId/kanban/boards`; members list and read only boards
+permitted by the shared resource visibility policy. Restricted boards require a
+current member audience, with the organization Owner exception. Each create or
+update rechecks repository identity through a live installation belonging to the
+organization. Board configuration changes produce body-free audit events.
+
+An enabled board imports issues on human `opened`, `transferred`, or `labeled`
+doorbells when a live issue read carries any `ac/status:*` label. Other labels
+alone do not import. A single valid status is retained for a write-capable author;
+missing, malformed, conflicting, or `running` initial status becomes `triage`.
+The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
+unknown permission and other roles always become `triage`. The same live check
+applies to whoever added the current status label (its latest `labeled` issue
+event) and to the latest transferrer: each must be a human, not the App identity
+its agents share, with write access, or the card imports as `triage`. The upsert
+itself refuses any status past `triage`/`todo` without that verified human
+authority, and never takes a mode. The safety label write
+precedes the idempotent card upsert, so a failed write cannot leave a ready card.
+One `ac/agent:<slug>` resolves to an unrestricted agent name within the board's
+organization, and only when the status was kept and a human writer added every
+current `ac/agent:*` label; otherwise, or for unknown, conflicting, or malformed
+assignment labels, the card stays unassigned.
+The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
+imports and orchestrator creates without duplicate cards or creation audits.
+
+Known gaps (M1 import): a missed opened/transferred webhook is recovered by GitHub
+redelivery, not by an installation-wide issue enumeration. The live tests use a
+PAT as the injected installation-token source; production uses the App token.
+
+Known gaps update (M1 board CRUD): board writes now use the shared membership
+locks and member-removal audience repair. A repository rename keeps its numeric
+identity; changing that identity is refused while the board has cards, so old
+issue numbers cannot silently refer to another repository. Human status and
+assignment synchronization beyond mismatch-parked cards and periodic drift repair
+remain for the stacked M1 follow-up.

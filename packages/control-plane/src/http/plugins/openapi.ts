@@ -149,7 +149,7 @@ const TAG_DESCRIPTIONS: ReadonlyArray<{ name: string; description: string }> = [
   {
     name: Tag.Kanban,
     description:
-      'GitHub-issue Kanban boards. Run mode (read or write) is control-plane configuration that only an interactively signed-in organization owner can change.'
+      'GitHub-issue Kanban boards. Members list and read the boards they may see (org-visible, or restricted and shared with them). Creating, updating, and deleting a board, and its run mode (read or write), are control-plane configuration that only an interactively signed-in organization owner can change.'
   }
 ]
 

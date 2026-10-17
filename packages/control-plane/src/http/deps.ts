@@ -72,6 +72,7 @@ import type {
   DaemonLifecycleOpRepo,
   OAuthRepo,
   KanbanModeAdminRepo,
+  KanbanBoardAdminRepo,
   WebchatMcpOperationRepo
 } from '../persistence/ports.js'
 import type { Clock } from '../domain/clock.js'
@@ -127,6 +128,7 @@ import type { ConnectorsClient } from '../connectors/client.js'
 import type { SessionAccessPlugin } from './session-access-plugin.js'
 import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
+import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
   SLACK_INSTALL_TTL_SEC?: number
@@ -327,6 +329,8 @@ export interface HttpDeps {
     oauth: OAuthRepo
     /** Kanban run-mode authority (board default + per-card override), written only by an interactive owner. */
     kanbanMode: KanbanModeAdminRepo
+    /** Kanban board CRUD; writes recheck owner membership in their own transaction. */
+    kanbanBoards: KanbanBoardAdminRepo
   }
   registry: DaemonRegistry
   /**
@@ -465,6 +469,8 @@ export interface HttpDeps {
   /** github-app workspaces façade; absent ⇒ feature disabled (GITHUB_APP_* unset) and
    *  every github route 404s. */
   github?: GithubService
+  /** Board repository resolution for Kanban CRUD; absent ⇒ derived from `github` and the installation repo. */
+  kanbanRepoResolver?: KanbanRepoResolver
   /** Resolves a typed login to the host's numeric user id for the "Trusted users" list; per-provider arms
    *  are present only where that host is configured, so an unconfigured host answers 409 rather than 404. */
   trustedActors: CodeHostTrustedActorService

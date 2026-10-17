@@ -4403,6 +4403,87 @@ export const KanbanCardModeDto = z.object({
   mode: KanbanRunModeDto.nullable()
 })
 
+// ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
+const KanbanRepoFullName = z
+  .string()
+  .regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'repoFullName must be "owner/repo"')
+  .max(200)
+const KanbanBoardConfigFields = {
+  name: z.string().trim().min(1).max(100),
+  orchestratorAgentId: z.string().uuid().nullable(),
+  verifierAgentId: z.string().uuid().nullable(),
+  maxInProgress: z.number().int().min(1).max(100),
+  maxInProgressPerAgent: z.number().int().min(1).max(100),
+  staleLeaseSec: z
+    .number()
+    .int()
+    .min(60)
+    .max(7 * 86_400),
+  failureLimit: z.number().int().min(1).max(20),
+  protocolRetryLimit: z.number().int().min(1).max(20),
+  blockRecurrenceLimit: z.number().int().min(1).max(20),
+  completionContract: z.enum(['close', 'pr_merged', 'pr_checks_green']),
+  enabled: z.boolean(),
+  visibility: ResourceVisibilityEnum,
+  // The complete audience when visibility is restricted; intersected with current org members.
+  sharedWith: z.array(z.string()).max(500)
+}
+/** Run mode is not settable here: it has its own owner route and audit (`setKanbanBoardMode`). */
+export const CreateKanbanBoardBody = z
+  .object({
+    repoFullName: KanbanRepoFullName,
+    ...KanbanBoardConfigFields,
+    orchestratorAgentId: KanbanBoardConfigFields.orchestratorAgentId.optional(),
+    verifierAgentId: KanbanBoardConfigFields.verifierAgentId.optional(),
+    maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
+    maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
+    staleLeaseSec: KanbanBoardConfigFields.staleLeaseSec.optional(),
+    failureLimit: KanbanBoardConfigFields.failureLimit.optional(),
+    protocolRetryLimit: KanbanBoardConfigFields.protocolRetryLimit.optional(),
+    blockRecurrenceLimit: KanbanBoardConfigFields.blockRecurrenceLimit.optional(),
+    completionContract: KanbanBoardConfigFields.completionContract.optional(),
+    enabled: KanbanBoardConfigFields.enabled.optional(),
+    visibility: KanbanBoardConfigFields.visibility.default('org'),
+    sharedWith: KanbanBoardConfigFields.sharedWith.default([])
+  })
+  .strict()
+export type CreateKanbanBoardBodyT = z.infer<typeof CreateKanbanBoardBody>
+export const UpdateKanbanBoardBody = z
+  .object({ repoFullName: KanbanRepoFullName, ...KanbanBoardConfigFields })
+  .partial()
+  .strict()
+  .refine((body) => Object.keys(body).length > 0, 'at least one field is required')
+export type UpdateKanbanBoardBodyT = z.infer<typeof UpdateKanbanBoardBody>
+export const KanbanBoardDto = z.object({
+  id: z.string(),
+  orgId: z.string(),
+  name: z.string(),
+  repoId: z.string(),
+  repoFullName: z.string(),
+  orchestratorAgentId: z.string().nullable(),
+  verifierAgentId: z.string().nullable(),
+  maxInProgress: z.number().int(),
+  maxInProgressPerAgent: z.number().int(),
+  staleLeaseSec: z.number().int(),
+  failureLimit: z.number().int(),
+  protocolRetryLimit: z.number().int(),
+  blockRecurrenceLimit: z.number().int(),
+  defaultMode: KanbanRunModeDto,
+  completionContract: z.enum(['close', 'pr_merged', 'pr_checks_green']),
+  enabled: z.boolean(),
+  configRevision: z.string(),
+  visibility: ResourceVisibilityEnum,
+  sharedWith: z.array(z.string()),
+  createdBy: z.string().nullable(),
+  lastModifiedBy: z.string().nullable(),
+  lastModifiedAt: z.string(),
+  createdAt: z.string(),
+  /** Board configuration is owner-only, like run mode. */
+  canEdit: z.boolean()
+})
+export type KanbanBoardDtoT = z.infer<typeof KanbanBoardDto>
+export const KanbanBoardListDto = z.object({ boards: z.array(KanbanBoardDto) })
+
 // ── shared ────────────────────────────────────────────────────────────────
 export const IdParam = z.object({ id: z.string() })
 export const HealthDto = z.object({ status: z.literal('ok') })

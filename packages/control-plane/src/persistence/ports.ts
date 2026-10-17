@@ -1,16 +1,8 @@
-/**
- * Repository ports — the Red-Green seam (design §3.14 / §2.3).
- *
- * Services (C3/C4/C5) and edges depend on these INTERFACES, never on
- * `PrismaClient`. Methods are shaped around the frame handlers so tests drive
- * them with protocol payloads. The only implementors are
- * `persistence/repositories/*.repo.ts`.
- *
- * Record types are lightweight, domain-facing shapes (NOT raw Prisma models) so
- * nothing above this layer imports `@prisma/client`.
- */
+// Lightweight repository ports: services and edges depend on these interfaces, never Prisma models.
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type { KanbanStatus } from '../kanban/card-state.js'
+import type { KanbanHumanAuthority } from '../kanban/human-authority.js'
+export type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 import type {
   AccountingBoard,
   AccountingCard,
@@ -190,6 +182,8 @@ export type AuditKind =
   | 'agent_repo_change'
   | 'org_invite_change'
   | 'kanban_mode_change'
+  | 'kanban_board_change'
+  | 'kanban_card_change'
   | 'protocol_error'
   | 'api_key_create'
   | 'api_key_rotate'
@@ -7855,6 +7849,78 @@ export interface KanbanModeAdminRepo {
   ): Promise<boolean>
 }
 
+/** A board's full CP configuration; body-free, and `repoId` is always the one GitHub resolved, never client input. */
+export interface KanbanBoardView {
+  id: string
+  orgId: OrgId
+  name: string
+  repoId: bigint
+  repoFullName: string
+  orchestratorAgentId: string | null
+  verifierAgentId: string | null
+  maxInProgress: number
+  maxInProgressPerAgent: number
+  staleLeaseSec: number
+  failureLimit: number
+  protocolRetryLimit: number
+  blockRecurrenceLimit: number
+  defaultMode: 'read' | 'write'
+  completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  enabled: boolean
+  configRevision: bigint
+  visibility: 'org' | 'restricted'
+  sharedWith: string[]
+  createdByUserId: string | null
+  lastModifiedByUserId: string | null
+  lastModifiedAt: Date
+  createdAt: Date
+}
+
+/** The owner-editable configuration; run mode is set only through KanbanModeAdminRepo. */
+export interface KanbanBoardConfigInput {
+  name?: string
+  repoId?: bigint
+  repoFullName?: string
+  orchestratorAgentId?: string | null
+  verifierAgentId?: string | null
+  maxInProgress?: number
+  maxInProgressPerAgent?: number
+  staleLeaseSec?: number
+  failureLimit?: number
+  protocolRetryLimit?: number
+  blockRecurrenceLimit?: number
+  completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+  enabled?: boolean
+  visibility?: 'org' | 'restricted'
+  sharedWith?: string[]
+}
+
+export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
+
+export type KanbanBoardWriteRefusal =
+  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards'
+
+export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
+
+/** Board CRUD: callers pass the authenticated human's id, and the write rechecks owner membership in its own transaction. */
+export interface KanbanBoardAdminRepo {
+  listForOrg(orgId: string): Promise<KanbanBoardView[]>
+  getForOrg(orgId: string, boardId: string): Promise<KanbanBoardView | null>
+  createBoard(
+    orgId: string,
+    userId: string,
+    input: KanbanBoardCreateInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
+  updateBoard(
+    orgId: string,
+    boardId: string,
+    userId: string,
+    patch: KanbanBoardConfigInput
+  ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
+  /** Refused while any card holds an open lease: disable the board and let its runs end first. */
+  deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>
+}
+
 export interface KanbanBoardRepo {
   /** Enabled boards watching one repository, across orgs (graph doorbell lookup). */
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
@@ -8049,8 +8115,121 @@ export interface KanbanCardRecord {
   needsAttention: boolean
 }
 
+/** A card may be filed in any status but `running`, which only a claim (and its lease) can produce. */
+export type KanbanInitialStatus = Exclude<KanbanStatus, 'running'>
+
+/** Body-free card metadata: GitHub ids and CP configuration only, never the issue title or body. */
+export interface KanbanCardRow {
+  id: string
+  boardId: string
+  issueId: bigint
+  issueNumber: number
+  issueNodeId: string | null
+  /** B1 key for orchestrator-filed cards (`cardIdempotencyKey`); null for human-filed or imported cards. */
+  idempotencyKey: string | null
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  priority: number
+  mode: 'read' | 'write' | null
+  stateRevision: bigint
+  dispatchRevision: bigint
+  createdAt: Date
+}
+
+/** Run mode is never an input: a new card inherits the board default, and only `setCardMode` overrides it. */
+export interface KanbanCardUpsertInput {
+  boardId: string
+  /** The repository the issue was read from; a board retargeted since then refuses with `repo_mismatch`. */
+  expectedRepoId: bigint
+  issueId: bigint
+  issueNumber: number
+  issueNodeId?: string | null
+  /** Re-plans reuse the card filed under the same key instead of filing another. */
+  idempotencyKey?: string | null
+  /** Create-only, default `triage`; anything but `triage`/`todo` needs an import-sourced, agent-free write-level `humanAuthority`. */
+  status?: KanbanInitialStatus
+  /** Must be an assignable (non-restricted) agent of the board's org; only applied on create. */
+  assigneeAgentId?: string | null
+  priority?: number
+  /** Who filed it, for the body-free audit row, e.g. `import` or `orchestrator`. */
+  source: string
+  actorUserId?: string | null
+  /** The agent that filed it, when an orchestrator did. */
+  actorAgentId?: string | null
+  humanAuthority?: KanbanHumanAuthority | null
+}
+
+export interface KanbanCardUpsertResult {
+  card: KanbanCardRow
+  created: boolean
+  /** `idempotency_key`: an earlier create under this key won; when its issue differs, the caller filed a duplicate. */
+  matchedBy: 'created' | 'issue' | 'idempotency_key'
+}
+
+export type KanbanCardUpsertErrorCode =
+  | 'board_not_found'
+  | 'agent_not_in_org'
+  | 'agent_not_assignable'
+  | 'invalid_status'
+  | 'status_not_allowed'
+  | 'key_conflict'
+  | 'repo_mismatch'
+  | 'issue_mismatch'
+
+/** `key_conflict`: a different key on the issue's card; `issue_mismatch`: its number matched under another issue id. */
+export class KanbanCardUpsertError extends Error {
+  constructor(readonly code: KanbanCardUpsertErrorCode) {
+    super(`kanban card upsert refused: ${code}`)
+    this.name = 'KanbanCardUpsertError'
+  }
+}
+
+/** An open run's placement, as the reassign rule (spike §5) needs it to kill the lease and cancel its turns. */
+export interface KanbanLeaseRef {
+  leaseId: string
+  runId: string
+  agentId: string
+  daemonId: string
+  dispatchRevision: bigint
+}
+
+export interface KanbanSetAssigneeInput {
+  cardId: string
+  /** Null unassigns; the card then waits in its status until someone assigns it. */
+  agentId: string | null
+  /** Optional CAS on the card's dispatch generation; a mismatch is `stale`. */
+  expectedDispatchRevision?: bigint
+  /** An open lease held by another agent is refused by default; `revoke` kills it in the same write. */
+  onLease?: 'refuse' | 'revoke'
+  now: Date
+  source: string
+  actorUserId?: string | null
+  actorAgentId?: string | null
+}
+
+export type KanbanSetAssigneeResult =
+  | {
+      ok: true
+      /** False when the card already had this assignee; nothing was written. */
+      changed: boolean
+      card: KanbanCardRow
+      previousAgentId: string | null
+      /** The lease this write ended as `reclaimed`; the caller cancels its turns and posts the reassign comment. */
+      revokedLease: KanbanLeaseRef | null
+    }
+  | { ok: false; reason: 'not_found' | 'stale' | 'agent_not_in_org' | 'agent_not_assignable' }
+  | { ok: false; reason: 'leased'; lease: KanbanLeaseRef }
+
 export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
+  /** Create the card for this issue, or return the one that already exists; race-safe and never duplicates. */
+  upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult>
+  findByIdempotencyKey(boardId: string, idempotencyKey: string): Promise<KanbanCardRow | null>
+  getCard(cardId: string): Promise<KanbanCardRow | null>
+  /** The org-scoped, non-restricted agent an `ac/agent:<slug>` label names; null when none (paused still resolves). */
+  resolveAgentSlug(orgId: string, slug: string): Promise<string | null>
+  /** Change the assignee under the reassign rule: a live lease is refused, or killed (never transferred) on `revoke`. */
+  setAssignee(input: KanbanSetAssigneeInput): Promise<KanbanSetAssigneeResult>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** CAS todo to ready and open the intent in one write; refused while an intent is open or the card awaits a human. */
