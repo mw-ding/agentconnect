@@ -23,8 +23,8 @@ interface GithubCall {
   jwtValid?: boolean
 }
 
-/** A GitHub API stand-in: one ready-labelled issue whose latest status edit is a human's. */
-function fakeGithub(publicKeyPem: string) {
+/** A GitHub API stand-in: one ready-labelled issue whose latest status edit is a human's, at `level` on the repo. */
+function fakeGithub(publicKeyPem: string, level: string) {
   const calls: GithubCall[] = []
   const fetch = async (url: string, init?: RequestInit): Promise<Response> => {
     const { pathname } = new URL(url)
@@ -38,6 +38,9 @@ function fakeGithub(publicKeyPem: string) {
     if (method === 'POST' && pathname === `/app/installations/${INSTALLATION_ID}/access_tokens`) {
       call.jwtValid = verifyRs256(auth.replace(/^Bearer /, ''), publicKeyPem)
       return json(201, { token: 'ghs_test_installation', expires_at: new Date(Date.now() + 3_600_000).toISOString() })
+    }
+    if (pathname === `/repositories/${REPO_ID}/collaborators/${HUMAN.login}/permission`) {
+      return json(200, { permission: level, role_name: level })
     }
     const base = `/repositories/${REPO_ID}/issues/${ISSUE.number}`
     if (pathname === base) {
@@ -91,9 +94,9 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot() {
+async function boot(level = 'write') {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string)
+  const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, level)
   await prisma.githubInstallation.create({
     data: {
       orgId: DEFAULT_ORG_ID,
@@ -187,6 +190,35 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     expect(mint?.jwtValid).toBe(true)
     expect(mint?.body).toEqual({ repository_ids: [REPO_ID], permissions: { metadata: 'read', issues: 'read' } })
     expect(github.calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/issues/${ISSUE.number}/events`)
+    // The edit was adopted only after a live lookup of the sender's repository role.
+    expect(github.calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/collaborators/alice/permission`)
+  })
+
+  it('a human without write access is refused: the card stays parked and the label reverts with a comment', async () => {
+    const { github, card, link } = await boot('read')
+    const sent = await postGithubWebhook(link.webhookUrl, {
+      secret: WEBHOOK_SECRET,
+      event: 'issues',
+      payload: issuesLabeled(HUMAN)
+    })
+    expect(sent.status).toBe(202)
+    const base = `/repositories/${REPO_ID}/issues/${ISSUE.number}`
+    const calls = await until(
+      async () => github.calls,
+      (all) => all.some((c) => c.method === 'POST' && c.path === `${base}/comments`)
+    )
+    expect(calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/collaborators/alice/permission`)
+    expect(calls).toContainEqual(
+      expect.objectContaining({ method: 'POST', path: `${base}/labels`, body: { labels: ['ac/status:triage'] } })
+    )
+    expect(calls).toContainEqual(
+      expect.objectContaining({ method: 'DELETE', path: `${base}/labels/${encodeURIComponent('ac/status:ready')}` })
+    )
+    expect(calls.find((c) => c.path === `${base}/comments`)?.body).toEqual({
+      body: expect.stringContaining('only collaborators with write access')
+    })
+    const saved = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
+    expect(saved).toMatchObject({ status: 'triage', syncEventCursor: 3n })
   })
 
   it('a bad signature answers 401 and puts no frame on the wire', async () => {

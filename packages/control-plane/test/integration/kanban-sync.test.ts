@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
-import { planLabelReconcile } from '../../src/kanban/card-state.js'
+import { planLabelReconcile, planStatusWrite } from '../../src/kanban/card-state.js'
 import { prisma } from '../setup.db.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 
@@ -59,6 +59,23 @@ describe('Kanban synchronization transactions (Postgres)', () => {
     expect(await f.repo.ack(snapshot, 7n)).toBe(false)
     expect(await f.repo.ack(next, 7n)).toBe(true)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).labelWritePending).toBe(false)
+  })
+
+  it('consumes a refused edit: the cursors advance, status and revisions stay, and no audit row is written', async () => {
+    const f = await fixture()
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const plan = planStatusWrite('todo', { state: 'open', labels: ['ac/status:ready'] })
+    expect(await f.repo.apply(snapshot, plan, 9n, false, 4n)).toEqual({ changed: false, revoked: null })
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      status: 'todo',
+      stateRevision: 1n,
+      dispatchRevision: 1n,
+      labelWritePending: true,
+      syncEventCursor: 9n,
+      syncAgentCursor: 4n
+    })
+    expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(0)
+    expect(await f.repo.ack((await f.repo.get(f.board.id, 1))!, 9n, 4n)).toBe(true)
   })
 
   it.each(['blocked', 'triage', 'archived'] as const)(

@@ -210,6 +210,14 @@ function issueStateDiffers(
   return desired.state === 'closed' && (observed.stateReason ?? null) !== desired.reason
 }
 
+/** Fixed-template revert of an edit by a GitHub user without live write access; it names only the kept status. */
+export function permissionRefusalComment(status: KanbanStatus): string {
+  return (
+    `AgentConnect Kanban: only collaborators with write access can change a card's status or agent, ` +
+    `so this edit was reverted. Kept \`${statusLabel(status)}\`.`
+  )
+}
+
 /** Fixed-template comment text: it names only statuses and labels, never issue content. */
 function renderPlanComment(
   card: CardSnapshot,

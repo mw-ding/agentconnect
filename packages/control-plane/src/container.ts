@@ -1794,6 +1794,13 @@ export function buildContainer(
           repo: new PgKanbanSyncRepo(prisma),
           cards: repos.kanbanCard,
           store: kanbanCardStore,
+          // Uncached: every adopted human edit re-checks the actor's live write grant.
+          permissions: new GithubRepoPermission({
+            tokens: kanbanTokens,
+            ttlMs: 0,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          appSlug: githubAppCfg?.slug,
           repoRef: async (boardId) => {
             const board = await repos.kanbanDispatch.getBoardRef(boardId)
             if (!board) return null

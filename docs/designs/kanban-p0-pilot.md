@@ -391,3 +391,14 @@ state machine. A periodic drift reconciler, driven by the same 60-second tick,
 repairs a CP status write that failed (a card left with `labelWritePending` is
 re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
 Every transition writes one body-free `kanban_card_change` audit row.
+
+Known gaps update (M1 label sync permission): a human edit is adopted only after
+a live, uncached check that the actor holds `admin`, `maintain`, or `write` on
+the repository; a failed lookup counts as no access. An edit by a `triage`,
+`read`, or non-collaborator actor is consumed without a transition: the status
+label (or a closed issue) is restored to the committed status, a refused
+`ac/agent:<slug>` add or removal is undone, and one fixed-template comment
+explains the revert. Edits by the deployment App bot, any other bot, an App
+acting on a user's behalf, or an unknown actor are ignored without a lookup.
+Agents have no GitHub identity of their own: they write only through App
+installation tokens, so the App check covers them.

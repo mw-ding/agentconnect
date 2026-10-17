@@ -3,6 +3,7 @@ import { expect } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { systemClock } from '../../src/domain/clock.js'
+import { GithubRepoPermission, type RepoPermissionLevel } from '../../src/github/repo-permission.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
@@ -40,11 +41,20 @@ export async function liveSync() {
     }
   }
   const graph = new KanbanGraphReconciler({ cards, store, log })
+  // Live GitHub answers by default; a scenario pins a level to model a non-write actor with the one real account.
+  const live = new GithubRepoPermission({ tokens, ttlMs: 0 })
+  const permission = { override: null as RepoPermissionLevel | null, logins: [] as string[] }
   const record = { ...board, orgId: OrgId(board.orgId) }
   const sync = new KanbanSync({
     repo,
     cards,
     store,
+    permissions: {
+      permission: async (ref, login) => {
+        permission.logins.push(login)
+        return permission.override ?? live.permission(ref, login)
+      }
+    },
     repoRef: async () => repoRef,
     revoke: async (lease) => {
       revoked.push(lease)
@@ -82,6 +92,7 @@ export async function liveSync() {
     sync,
     dispatcher,
     revoked,
+    permission,
     async ring(issueNumber: number, action = 'labeled') {
       bell.poke({
         deliveryKey: crypto.randomUUID(),

@@ -1,9 +1,11 @@
 // Human edits are attributed from GitHub events; periodic repair projects committed state after failed label writes.
 import type { KanbanCardRepo, KanbanLeaseRef } from '../persistence/ports.js'
 import type { CardStore, KanbanRepoRef, ManagedEdits } from './card-store.js'
-import { isHumanActor } from './card-store.js'
+import { isAppActor, isHumanActor } from './card-store.js'
+import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
 import { parseAgentLabel } from './agent-label.js'
 import {
+  permissionRefusalComment,
   planLabelReconcile,
   planStatusWrite,
   parseStatusLabels,
@@ -47,6 +49,10 @@ export interface KanbanSyncDeps {
   repo: KanbanSyncRepo
   cards: Pick<KanbanCardRepo, 'resolveAgentSlug' | 'setAssignee'>
   store: Pick<CardStore, 'readCard' | 'applyPlan' | 'managedEdits' | 'statusSetByHuman'>
+  /** Live lookup with caching off (`ttlMs: 0`): a revoked write grant must stop moving cards on the next edit. */
+  permissions: RepoPermissionLookup
+  /** The deployment App slug; its bot is the actor of every CP and agent write, since agents only hold App tokens. */
+  appSlug?: string
   repoRef(boardId: string): Promise<KanbanRepoRef | null>
   revoke(lease: KanbanLeaseRef, cardId: string): Promise<void>
   promote(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<void>
@@ -54,6 +60,21 @@ export interface KanbanSyncDeps {
 }
 
 const BATCH = 25
+
+type EditVerdict = 'accept' | 'refuse' | 'ignore'
+
+// Exactly undoes one refused `ac/agent:*` label edit against the labels the issue carries now.
+function undoLabelEdit(
+  event: NonNullable<ManagedEdits['assignee']>,
+  labels: readonly string[]
+): { add: string[]; remove: string[] } {
+  const name = event.label?.name
+  if (!name) return { add: [], remove: [] }
+  const present = labels.includes(name)
+  if (event.event === 'labeled' && present) return { add: [], remove: [name] }
+  if (event.event === 'unlabeled' && !present) return { add: [name], remove: [] }
+  return { add: [], remove: [] }
+}
 
 export class KanbanSync {
   private readonly running = new Map<string, Promise<boolean>>()
@@ -96,8 +117,24 @@ export class KanbanSync {
     await this.deps.repo.ack(card, BigInt(edits.status?.id ?? 0), BigInt(edits.assignee?.id ?? 0))
   }
 
-  private async authorized(event: ManagedEdits['status']): Promise<boolean> {
-    return !!event && isHumanActor(event)
+  // App, bot, App-on-behalf and unknown actors are ignored; a human needs live write access, failing closed.
+  private async judge(
+    repo: KanbanRepoRef,
+    event: ManagedEdits['status'],
+    writers: Map<string, Promise<boolean>>
+  ): Promise<EditVerdict> {
+    if (!event || isAppActor(event, this.deps.appSlug) || !isHumanActor(event)) return 'ignore'
+    const login = event.actor!.login!.toLowerCase()
+    let write = writers.get(login)
+    if (!write) {
+      write = checkWriteAccess(this.deps.permissions, repo, login).then((access) => {
+        if (access.error)
+          this.deps.log.warn({ err: access.error, repoId: repo.repoId }, 'kanban: permission lookup failed')
+        return access.write
+      })
+      writers.set(login, write)
+    }
+    return (await write) ? 'accept' : 'refuse'
   }
 
   private async reconcile(boardId: string, issueNumber: number, humanDoorbell: boolean): Promise<boolean> {
@@ -112,10 +149,14 @@ export class KanbanSync {
     const agentCursor = BigInt(edits.assignee?.id ?? 0)
     const newStatus = !!edits.status && BigInt(edits.status.id) > card.syncEventCursor
     const newAgent = !!edits.assignee && BigInt(edits.assignee.id) > card.syncAgentCursor
+    const writers = new Map<string, Promise<boolean>>()
     // A periodic retry of a committed transition must not adopt the label that its failed write was replacing.
-    let acceptStatus = (!card.labelWritePending || humanDoorbell) && newStatus && (await this.authorized(edits.status))
+    const statusVerdict =
+      (!card.labelWritePending || humanDoorbell) && newStatus ? await this.judge(repo, edits.status, writers) : 'ignore'
+    const agentVerdict = newAgent ? await this.judge(repo, edits.assignee, writers) : 'ignore'
+    let acceptStatus = statusVerdict === 'accept'
     let changed = false
-    if (newAgent && (await this.authorized(edits.assignee))) {
+    if (agentVerdict === 'accept') {
       const parsed = parseAgentLabel(issue.labels)
       const target =
         parsed.kind === 'agent'
@@ -195,10 +236,14 @@ export class KanbanSync {
     changed ||= result.changed
     const current = await this.deps.repo.get(boardId, issueNumber)
     if (!current) return changed
-    await this.deps.store.applyPlan(repo, issueNumber, issue, {
-      ...planStatusWrite(current.status, issue),
-      ...(plan.comment ? { comment: plan.comment } : {})
-    })
+    const projection = planStatusWrite(current.status, issue)
+    const undo = agentVerdict === 'refuse' ? undoLabelEdit(edits.assignee!, issue.labels) : { add: [], remove: [] }
+    projection.addLabels.push(...undo.add)
+    projection.removeLabels.push(...undo.remove)
+    const reverted = projection.addLabels.length > 0 || projection.removeLabels.length > 0 || !!projection.issueState
+    const refused = statusVerdict === 'refuse' || agentVerdict === 'refuse'
+    const comment = plan.comment ?? (refused && reverted ? permissionRefusalComment(current.status) : undefined)
+    await this.deps.store.applyPlan(repo, issueNumber, issue, { ...projection, ...(comment ? { comment } : {}) })
     if (!(await this.deps.repo.ack(current, cursor, agentCursor))) return changed
     if (current.status === 'todo') await this.deps.promote(boardId, repo, issueNumber)
     return changed
