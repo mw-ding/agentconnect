@@ -23,47 +23,13 @@ import type { SandboxMechanism } from '../acp/sandbox.js'
 import { effectiveRunInSandbox, type PreparedRuntimeLaunch } from '../launch/prepare.js'
 import { composeRuntimeLaunch } from '../launch/compose.js'
 import { PACKAGE_LAUNCHERS } from './probe.js'
-import { CLAUDE_MODEL_ALIAS_ENV } from './model-provider-config.js'
+import { CERTIFICATE_ENV_KEYS, PROVIDER_ENV_KEYS } from './agent-env.js'
 
 const PROCESS_ENV_KEYS = new Map([
   ['PATH', 'PATH'],
   ['PATHEXT', 'PATHEXT'],
   ['SYSTEMROOT', 'SystemRoot']
 ])
-const CERTIFICATE_ENV_KEYS = new Set([
-  'SSL_CERT_FILE',
-  'SSL_CERT_DIR',
-  'NODE_EXTRA_CA_CERTS',
-  'REQUESTS_CA_BUNDLE',
-  'CURL_CA_BUNDLE',
-  // A probe may fetch through git; the same operator bundle has to reach it (§24.5).
-  'GIT_SSL_CAINFO'
-])
-const PROVIDER_ENV_KEYS = new Set([
-  'OPENAI_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_IDENTITY_TOKEN',
-  'CLAUDE_CODE_OAUTH_TOKEN',
-  'GOOGLE_API_KEY',
-  'GEMINI_API_KEY',
-  'META_API_KEY',
-  'KIRO_API_KEY',
-  'MOONSHOT_API_KEY',
-  'KIMI_API_KEY',
-  'XAI_API_KEY',
-  'OPENROUTER_API_KEY',
-  // The OpenClaw acp bridge's gateway connection overrides — credentials for a
-  // host configured via env instead of ~/.openclaw/openclaw.json.
-  'OPENCLAW_GATEWAY_URL',
-  'OPENCLAW_GATEWAY_TOKEN',
-  'OPENCLAW_GATEWAY_PASSWORD',
-  // Claude's alias→model declarations. A real launch inherits these from the host environment;
-  // without them here the probe would read a picker the sessions do not have.
-  ...CLAUDE_MODEL_ALIAS_ENV
-])
-
 /** Minimal ambient environment for an untrusted disposable compatibility probe. */
 export function curatedProbeEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {}

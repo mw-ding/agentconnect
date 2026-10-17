@@ -292,7 +292,10 @@ only a CP log line.
   the watch's closing read leaves GitHub on `ready` and the card on `todo` with
   nothing pending or flagged. The relay ignores App senders, and the reconciler does
   not promote over existing `ready` labels. The window is 10 minutes from the rollback,
-  plus the wait for the next backoff step, against a 10-second request timeout.
+  plus the wait for the next backoff step, against a 10-second request timeout, so a
+  POST landing more than 10–15 minutes late leaves `todo` and `ready` both on GitHub
+  while the DB stays `todo`, unflagged. A future periodic scan of unparked `todo`
+  cards for an App-added `ready` would close it; that scan is an optional follow-up.
 - **Escalation comments are best-effort.** If the comment POST fails, the card still
   carries `needsAttention` and a warning is logged, but nothing shows on the issue.
   The console does not surface the flag yet.
@@ -346,6 +349,57 @@ repository until it is within 15 minutes of expiry. The daemon cache is keyed
 by the open lease and mode, so a read run does not reuse a write grant; this
 control-plane cache is not.
 
+M3 hardening (daemon and relay):
+
+- **Agent environment.** The daemon launches every agent from an explicit allowlist
+  (`agentBaseEnvironment` in `runtimes/agent-env.ts`): process basics, locale, temp
+  dirs, XDG roots, proxy and CA settings, toolchain homes, provider keys, and the
+  `LC_`, `ANTHROPIC_`, `OPENAI_`, `CLAUDE_`, `CODEX_`, `GEMINI_`, and `DEEPSEEK_`
+  families. Runtime env, per-agent env, and injected `AC_*` variables are added
+  explicitly. Non-allowlisted variables such as `DATABASE_URL`, `PGPASSWORD`,
+  `DB_PASSWORD`, `AWS_*`, App key material, and the relay token are dropped. Names
+  inside the allowlisted prefix families (an `OPENAI_DB_PASSWORD`, say) and provider
+  credential keys such as `OPENCLAW_GATEWAY_PASSWORD` still pass. The e2e harness uses
+  the same shape (`test/kanban-agent-env.ts`), and unit tests plant a sentinel for each
+  dropped secret.
+- **Webhook dedupe.** The relay claims an `X-GitHub-Delivery` id in flight and marks
+  it seen only after the reply is out and no CP doorbell was dropped. A dropped
+  forward or a 5xx forgets the id, so GitHub's redelivery is processed. A copy that
+  arrives while the first is in flight gets a retryable 503, not a silent 202. A
+  caller that hangs up during the PR-feedback write never claims the id, and a claim
+  left unsettled for 5 minutes counts as abandoned, so no GUID stays wedged.
+- **Dedupe versus CP redelivery.** The CP redelivers through GitHub's API, which keeps
+  the GUID and cannot carry a header. The relay therefore forgets an id when it
+  reports a failure the CP redelivers for (`daemon_offline`, `rejected:draining`,
+  `rejected:not_holder`, `review_request_required`), so the redelivery is not
+  answered as a duplicate inside the 10-minute TTL. Other hooks of the same delivery
+  that already ran are deduplicated at the CP on `(hookId, deliveryKey)`.
+- **Comment outbox schema.** `kanban_terminals` columns added after its first shape
+  come from the versioned local-store migration (v59), not only
+  `CREATE TABLE IF NOT EXISTS`. v60 clears any `attemptedAt` written from local time.
+- **Clock skew.** The marker lookup's `since` bound is GitHub's `Date` header, read
+  by a GET just before the first POST. It is never this daemon's clock. When that
+  header is unreadable, the retry scans every comment page with no bound and, past
+  the page limit, parks the row instead of posting a duplicate.
+- **UTC session pin.** `withUtcSession` edits the connection URL's `options` as text,
+  so empty-host libpq URLs (`postgresql:///db?host=/var/run/postgresql`) are pinned
+  too. A value that is not a `postgres://` URL throws instead of passing through
+  unpinned. `prisma/seed.ts` opens its client through `createPrisma`.
+
+Known gaps (M3):
+
+- **Failed outbox rows are never cleaned up.** A comment that exhausts its undecided
+  marker lookups moves to state `failed` and stays in the daemon's SQLite store. The
+  only signal is the error log line; nothing alerts and nothing retires the row.
+- **An unbounded marker scan is capped.** With no readable GitHub clock, an issue
+  with more than five pages (500) of comments parks the row for a human, rather than
+  finding a marker beyond that.
+- **The agent allowlist drops ambient variables it does not know.** A host variable an
+  agent needs (for example `SSH_AUTH_SOCK` or a cloud-provider key) must be set in the
+  runtime or agent env; it is no longer inherited from the daemon.
+- **The pre-POST clock read is best-effort.** If that GET fails the POST still goes
+  out, and a lost response is then recovered by the unbounded scan above.
+
 ## M1 — Board configuration and issue import
 
 Interactive organization owners manage boards with `POST`, `PATCH`, and `DELETE`
@@ -360,10 +414,17 @@ doorbells when a live issue read carries any `ac/status:*` label. Other labels
 alone do not import. A single valid status is retained for a write-capable author;
 missing, malformed, conflicting, or `running` initial status becomes `triage`.
 The author's live GitHub repository role must be `admin`, `maintain`, or `write`;
-unknown permission and other roles always become `triage`. The safety label write
+unknown permission and other roles always become `triage`. The same live check
+applies to whoever added the current status label (its latest `labeled` issue
+event) and to the latest transferrer: each must be a human, not the App identity
+its agents share, with write access, or the card imports as `triage`. The upsert
+itself refuses any status past `triage`/`todo` without that verified human
+authority, and never takes a mode. The safety label write
 precedes the idempotent card upsert, so a failed write cannot leave a ready card.
-One `ac/agent:<slug>` resolves to an agent name within the board's organization;
-unknown, conflicting, or malformed assignment labels leave it unassigned.
+One `ac/agent:<slug>` resolves to an unrestricted agent name within the board's
+organization, and only when the status was kept and a human writer added every
+current `ac/agent:*` label; otherwise, or for unknown, conflicting, or malformed
+assignment labels, the card stays unassigned.
 The `(boardId, issue)` and B1 idempotency-key constraints serialize concurrent
 imports and orchestrator creates without duplicate cards or creation audits.
 

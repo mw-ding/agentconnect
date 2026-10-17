@@ -424,15 +424,16 @@ export class RelayCpClient {
 
   /**
    * Emit one installation doorbell EVT (`rc/github-installation`, fire-and-forget,
-   * decision 11). A drop is safe: the CP's pull-based sync paths (setup callback /
+   * decision 11). Returns false when dropped, which is safe: the CP's pull-based sync paths (setup callback /
    * manual Sync / mint-failure markRevoked) converge without the poke.
    */
-  emitGithubInstallation(poke: RcGithubInstallation): void {
+  emitGithubInstallation(poke: RcGithubInstallation): boolean {
     if (this.state !== 'READY' || !this.transport) {
       this.deps.log.warn(`relay: dropping rc/github-installation ${poke.installationId} (link ${this.state})`)
-      return
+      return false
     }
     this.transport.send(JSON.stringify(buildRelayCpFrame('rc/github-installation', poke)))
+    return true
   }
 
   /** Persist feedback coordinates before acknowledging the provider webhook. */
@@ -463,12 +464,13 @@ export class RelayCpClient {
   }
 
   /** Emit one Kanban graph doorbell EVT (`rc/github-graph`); a drop is recovered by the CP's redelivery sweep. */
-  emitGithubGraph(poke: RcGithubGraph): void {
+  emitGithubGraph(poke: RcGithubGraph): boolean {
     if (this.state !== 'READY' || !this.transport) {
       this.deps.log.warn(`relay: dropping rc/github-graph ${poke.deliveryKey} (link ${this.state})`)
-      return
+      return false
     }
     this.transport.send(JSON.stringify(buildRelayCpFrame('rc/github-graph', poke)))
+    return true
   }
 
   /** Emit `rc/set-channel-agent` (fire-and-forget) — the config modal picked a

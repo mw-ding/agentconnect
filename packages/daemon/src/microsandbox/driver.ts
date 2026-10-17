@@ -28,6 +28,7 @@ import {
   type MicrosandboxExecStdin,
   type MicrosandboxExecStream
 } from './exec.js'
+import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 const runFile = promisify(execFile)
 const STOP_TIMEOUT_MS = 10_000
@@ -271,7 +272,7 @@ export class MicrosandboxManager {
     const { command, args } = this.options.msbCommand
     this.options.log?.info(`microsandbox: preparing image ${this.options.config.image}`)
     await runFile(command, [...args, 'pull', this.options.config.image, '--materialize', 'layered', '--quiet'], {
-      env: { ...process.env, MSB_HOME: join(this.options.root, 'microsandbox'), MSB_BACKEND: 'local' },
+      env: { ...agentBaseEnvironment(), MSB_HOME: join(this.options.root, 'microsandbox'), MSB_BACKEND: 'local' },
       timeout: 5 * 60_000,
       maxBuffer: 1024 * 1024
     })
