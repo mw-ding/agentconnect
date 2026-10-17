@@ -31,6 +31,8 @@ export interface KanbanTerminal {
 
 export const KANBAN_SUMMARY_MAX_CHARS = 20_000
 export const KANBAN_REASON_MAX_CHARS = 2_000
+/** Progress notes one lease may post; the final summary comment is separate and never counted. */
+export const KANBAN_PROGRESS_NOTE_CAP = 10
 
 /** A durably recorded terminal outcome: the report to send plus the comment to post once the CP accepts it. */
 export interface KanbanTerminalEntry {
@@ -57,6 +59,8 @@ export interface KanbanLease {
   turnErrorClass?: ProviderErrorClass
   /** The one protocol-violation nudge was spent (or refused); a lease is never nudged twice. The flag is in memory, so a restart falls to the CP reaper instead of re-nudging. */
   nudged: boolean
+  /** Progress notes posted or in flight under this lease, against {@link KANBAN_PROGRESS_NOTE_CAP}. */
+  progressNotes: number
   /** The turn was interrupted by the operator; that is reported as it ended, never nudged. */
   interrupted?: boolean
   /** The nudge could not be started, so the violation is reported at once. */
@@ -206,7 +210,8 @@ export class KanbanWorker {
       sessionKey: started.sessionKey,
       sessionId: readySessionId,
       turnSettled: false,
-      nudged: false
+      nudged: false,
+      progressNotes: 0
     }
     this.leases.set(d.leaseId, lease)
     this.deps.onLeaseChanged?.(d)
@@ -238,6 +243,30 @@ export class KanbanWorker {
   leaseForSession(sessionKey: string): string | undefined {
     for (const [id, lease] of this.leases) if (lease.sessionKey === sessionKey) return id
     return undefined
+  }
+
+  /** The live lease a worker tool binds to; none once the run reported its outcome, since the card then belongs to AgentConnect. */
+  toolLease(
+    sessionKey: string
+  ): { ok: true; lease: Readonly<KanbanLease> } | { ok: false; reason: 'no_lease' | 'already_reported' } {
+    for (const lease of this.leases.values()) {
+      if (lease.sessionKey !== sessionKey) continue
+      return lease.terminal ? { ok: false, reason: 'already_reported' } : { ok: true, lease }
+    }
+    return { ok: false, reason: 'no_lease' }
+  }
+
+  /** Claim the next progress-note number synchronously, so concurrent calls cannot pass the cap together; undefined when refused. */
+  reserveProgressNote(leaseId: string): number | undefined {
+    const lease = this.leases.get(leaseId)
+    if (!lease || lease.terminal || lease.progressNotes >= KANBAN_PROGRESS_NOTE_CAP) return undefined
+    return ++lease.progressNotes
+  }
+
+  /** Give the slot back when the note did not post. */
+  releaseProgressNote(leaseId: string): void {
+    const lease = this.leases.get(leaseId)
+    if (lease && lease.progressNotes > 0) lease.progressNotes -= 1
   }
 
   /** Record the run's one outcome durably; the report is sent once the session goes idle, so the turn can finish. */

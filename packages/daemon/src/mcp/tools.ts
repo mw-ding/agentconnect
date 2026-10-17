@@ -18,6 +18,7 @@ import { LIST_TASKS_TOOL, STOP_TASK_TOOL } from './ops/assistant-subsessions.js'
 import { FIRST_LOOK_TOOL } from './ops/first-look.js'
 import { SEND_MESSAGE_ACTIONS } from './ops/send-message-actions.js'
 import { GET_TOOL_GUIDE_TOOL } from './ops/tool-guide.js'
+import { KANBAN_COMMENT_MAX_CHARS } from '@agentconnect.md/protocol'
 import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS } from '../kanban/kanban-worker.js'
 
 /** The one send tool (send-message-guide.md §3.2): a required `action`, one flat schema, and the details in `getToolGuide`; `platform` narrows to the agent's own platforms. */
@@ -1144,6 +1145,32 @@ export const KANBAN_TOOLS: ToolDescriptor[] = [
     name: 'kanbanFail',
     description: 'Report that you attempted the dispatched Kanban card and could not complete it.' + KANBAN_TOOL_NOTE,
     inputSchema: obj({ summary: KANBAN_SUMMARY, reason: KANBAN_REASON }, ['summary', 'reason'])
+  },
+  {
+    name: 'kanbanShow',
+    description:
+      'Read the dispatched Kanban card: its status, attempt, retry counters and prior runs from AgentConnect, plus the ' +
+      "issue's title, body, labels, blocked_by, sub-issues and last 10 comments from GitHub (fenced as untrusted text). " +
+      'Read-only and not a terminal call, so call it as often as needed. Only available while a dispatched Kanban card run holds this session.',
+    inputSchema: obj({}, [])
+  },
+  {
+    name: 'kanbanComment',
+    description:
+      "Post one short progress note on the dispatched card's issue (at most 10 per run). Not a terminal call: you must still " +
+      'call exactly one terminal tool, and its summary becomes the final comment, so use this only for updates humans ' +
+      'should see while you work. Refused once your outcome is recorded.',
+    inputSchema: obj(
+      {
+        text: {
+          type: 'string',
+          minLength: 1,
+          maxLength: KANBAN_COMMENT_MAX_CHARS,
+          description: 'Markdown progress note for the humans following the issue.'
+        }
+      },
+      ['text']
+    )
   }
 ]
 

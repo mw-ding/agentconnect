@@ -1,5 +1,6 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
+import { KanbanCardTools } from './kanban/card-tools.js'
 import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
@@ -273,7 +274,13 @@ import { WorkBoundary } from './messages/message-boundary.js'
 import { attachmentMention, sniffImageMimeType } from './session/attachment-block.js'
 import { McpControlServer } from './mcp/control-server.js'
 import { ADMIN_MCP_SERVER_NAME, RemoteWebchatGrantManager } from './mcp/remote-webchat-grant.js'
-import type { CodeHostEffectReq, KanbanTerminalReq, MessageGateway, SessionContext } from './mcp/ops.js'
+import type {
+  CodeHostEffectReq,
+  KanbanSessionReq,
+  KanbanTerminalReq,
+  MessageGateway,
+  SessionContext
+} from './mcp/ops.js'
 import { notJoinedChannel } from './platforms/not-joined.js'
 import { GitCredentialCache } from './cp/git-credential.js'
 import { GitlabBroker } from './gitlab/broker.js'
@@ -1438,6 +1445,7 @@ export class Daemon {
   private pendingSpawnNotices = new Map<string, string[]>()
   private kanban?: KanbanWorker
   private kanbanCommentPoster?: KanbanCommentPublisher
+  private kanbanCardToolset?: KanbanCardTools
   // Effective agents combine user-authored agent.json files with the in-memory CP
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
@@ -4317,6 +4325,13 @@ export class Daemon {
       submitCodeReview: (req) => this.codeReviews.submit(req),
       replyGithubReviewThreads: (req) => this.githubReviews.replyGithubReviewThreads(req),
       recordKanbanTerminal: (req) => this.recordKanbanTerminal(req),
+      kanbanShow: (req) => this.kanbanCardTools().show(this.kanbanToolSession(req)),
+      kanbanComment: (req) =>
+        this.kanbanCardTools().comment(
+          this.kanbanToolSession(req),
+          // Masked like a terminal summary: the note is posted to GitHub as written.
+          maskSecretsDeep(req.text, maskableSecrets(this.agents.get(req.agentId)))
+        ),
       codeHostEffect: (req) => this.runCodeHostEffect(req),
       memory: this.memory,
       memoryEntryStore: this.store,
@@ -26533,6 +26548,29 @@ export class Daemon {
           .then((grant) => grant.token),
       invalidateToken: (entry, token) =>
         this.gitCreds.invalidateKanbanComment(entry.report.agentId, entry.repoFullName, entry.report.leaseId, token)
+    }))
+  }
+
+  private kanbanToolSession(req: KanbanSessionReq) {
+    return {
+      agentId: req.agentId,
+      sessionKey: sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope)
+    }
+  }
+
+  private kanbanCardTools(): KanbanCardTools {
+    return (this.kanbanCardToolset ??= new KanbanCardTools({
+      worker: this.kanbanWorker(),
+      log: this.log,
+      cpCard: (payload) => {
+        const cp = this.cpClient
+        if (!cp) throw new Error('control plane is not connected')
+        return cp.kanbanCard(payload)
+      },
+      token: (agentId, repo, leaseId) =>
+        this.gitCreds.getKanbanCommentToken(agentId, repo, leaseId).then((g) => g.token),
+      invalidateToken: (agentId, repo, leaseId, token) =>
+        this.gitCreds.invalidateKanbanComment(agentId, repo, leaseId, token)
     }))
   }
 

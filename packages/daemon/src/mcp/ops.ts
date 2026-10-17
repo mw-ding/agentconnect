@@ -180,7 +180,7 @@ export type {
   ReplyToSessionResult
 } from './ops/messaging.js'
 export type { SessionStatusReq, SessionStatusResult } from './ops/session.js'
-export type { KanbanTerminalReq } from './ops/kanban.js'
+export type { KanbanSessionReq, KanbanTerminalReq } from './ops/kanban.js'
 export { askHost, AskRequired } from './ask.js'
 export type { AskDeps, AskOutcome, AskPort, AskSpec } from './ask.js'
 

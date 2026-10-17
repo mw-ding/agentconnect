@@ -155,6 +155,9 @@ export const KanbanReportOk = z
   .strict()
 export type KanbanReportOk = z.infer<typeof KanbanReportOk>
 
+/** Longest progress note a worker may post to its card's issue. */
+export const KANBAN_COMMENT_MAX_CHARS = 4_000
+
 /** Prior runs are bounded so a long-lived card cannot grow the reply. */
 export const KANBAN_CARD_SHOW_MAX_RUNS = 10
 

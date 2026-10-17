@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { KANBAN_BLOCK_KINDS } from '@agentconnect.md/protocol'
+import { KANBAN_BLOCK_KINDS, KANBAN_COMMENT_MAX_CHARS } from '@agentconnect.md/protocol'
 import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS, type KanbanTerminal } from '../../kanban/kanban-worker.js'
 import type { SessionContext, ToolHandler } from './context.js'
 import { optionalBoundedInt, parseArgs, requiredEnum } from './args.js'
@@ -14,10 +14,17 @@ export interface KanbanTerminalReq {
   terminal: KanbanTerminal & { summary: string }
 }
 
+/** The same trusted coordinates for the read and comment tools; no lease or card id ever comes from arguments. */
+export type KanbanSessionReq = Omit<KanbanTerminalReq, 'terminal'>
+
 /** Kanban card runs: record the run's one terminal outcome against the session's live lease. */
 export interface KanbanDeps {
   /** Throws when refused (no live lease, already reported, or not durable). */
   recordKanbanTerminal?: (req: KanbanTerminalReq) => Promise<unknown>
+  /** Reads the session's own leased card; throws when no live lease holds the session. */
+  kanbanShow?: (req: KanbanSessionReq) => Promise<unknown>
+  /** Posts one progress note on the session's own leased card; throws when refused or over the cap. */
+  kanbanComment?: (req: KanbanSessionReq & { text: string }) => Promise<unknown>
 }
 
 const unexpectedKeys: { error: z.core.$ZodErrorMap } = {
@@ -46,18 +53,26 @@ export const KANBAN_BLOCK_ARGS = z.strictObject(
   { summary, kind: requiredEnum('kind', KANBAN_BLOCK_KINDS), reason },
   unexpectedKeys
 )
+export const KANBAN_SHOW_ARGS = z.strictObject({}, unexpectedKeys)
+export const KANBAN_COMMENT_ARGS = z.strictObject(
+  { text: boundedText('text', KANBAN_COMMENT_MAX_CHARS) },
+  unexpectedKeys
+)
 export const KANBAN_FAIL_ARGS = z.strictObject({ summary, reason }, unexpectedKeys)
 
-function record(ctx: SessionContext, deps: KanbanDeps, terminal: KanbanTerminalReq['terminal']): Promise<unknown> {
-  if (!deps.recordKanbanTerminal) throw new Error('Kanban terminal reports are unavailable on this daemon')
-  return deps.recordKanbanTerminal({
+function sessionReq(ctx: SessionContext): KanbanSessionReq {
+  return {
     agentId: ctx.agentId,
     platform: ctx.platform,
     channel: ctx.channel,
     thread: ctx.thread,
-    ...(ctx.transportScope !== undefined ? { transportScope: ctx.transportScope } : {}),
-    terminal
-  })
+    ...(ctx.transportScope !== undefined ? { transportScope: ctx.transportScope } : {})
+  }
+}
+
+function record(ctx: SessionContext, deps: KanbanDeps, terminal: KanbanTerminalReq['terminal']): Promise<unknown> {
+  if (!deps.recordKanbanTerminal) throw new Error('Kanban terminal reports are unavailable on this daemon')
+  return deps.recordKanbanTerminal({ ...sessionReq(ctx), terminal })
 }
 
 // Reason codes are daemon-chosen constants, so no model text reaches the body-free report.
@@ -100,16 +115,32 @@ export const kanbanFail: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
   })
 }
 
+export const kanbanShow: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  parseArgs(KANBAN_SHOW_ARGS, args ?? {})
+  if (!deps.kanbanShow) throw new Error('Kanban card reads are unavailable on this daemon')
+  return deps.kanbanShow(sessionReq(ctx))
+}
+
+export const kanbanComment: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_COMMENT_ARGS, args)
+  if (!deps.kanbanComment) throw new Error('Kanban comments are unavailable on this daemon')
+  return deps.kanbanComment({ ...sessionReq(ctx), text: parsed.text })
+}
+
 /** Handler and argument-schema registry entries for {@link executeTool}. */
 export const KANBAN_HANDLERS: [string, ToolHandler<KanbanDeps>][] = [
   ['kanbanComplete', kanbanComplete],
   ['kanbanRequestReview', kanbanRequestReview],
   ['kanbanBlock', kanbanBlock],
-  ['kanbanFail', kanbanFail]
+  ['kanbanFail', kanbanFail],
+  ['kanbanShow', kanbanShow],
+  ['kanbanComment', kanbanComment]
 ]
 export const KANBAN_ARG_SCHEMAS: [string, z.ZodType][] = [
   ['kanbanComplete', KANBAN_COMPLETE_ARGS],
   ['kanbanRequestReview', KANBAN_REQUEST_REVIEW_ARGS],
   ['kanbanBlock', KANBAN_BLOCK_ARGS],
-  ['kanbanFail', KANBAN_FAIL_ARGS]
+  ['kanbanFail', KANBAN_FAIL_ARGS],
+  ['kanbanShow', KANBAN_SHOW_ARGS],
+  ['kanbanComment', KANBAN_COMMENT_ARGS]
 ]
