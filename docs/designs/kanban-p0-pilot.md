@@ -351,20 +351,35 @@ control-plane cache is not.
 
 M3 hardening (daemon and relay):
 
-- **Agent environment.** The e2e harness hands adapters an explicit allowlist
-  (`test/kanban-agent-env.ts`) instead of stripping known-bad names, so
-  `DATABASE_URL`, `*PASSWORD`, `AWS_*`, and App key material never reach an agent.
-  Unit tests plant sentinels for each.
-- **Webhook dedupe.** The relay marks an `X-GitHub-Delivery` id only after the reply
-  is out and no CP doorbell was dropped. A forward lost to a down relay-to-CP link
-  releases the id, so GitHub's redelivery is processed. A concurrent duplicate of an
-  in-flight id is dropped with a 202.
+- **Agent environment.** The daemon launches every agent from an explicit allowlist
+  (`agentBaseEnvironment` in `runtimes/agent-env.ts`): process basics, locale, temp
+  dirs, XDG roots, proxy and CA settings, toolchain homes, provider keys, and the
+  `ANTHROPIC_`, `OPENAI_`, `CLAUDE_`, `CODEX_`, and `GEMINI_` families. Runtime env,
+  per-agent env, and injected `AC_*` variables are added explicitly. `DATABASE_URL`,
+  `*PASSWORD`, `AWS_*`, App key material, and the relay token never reach an agent. The
+  e2e harness uses the same shape (`test/kanban-agent-env.ts`), and unit tests plant a
+  sentinel for each secret.
+- **Webhook dedupe.** The relay claims an `X-GitHub-Delivery` id in flight and marks
+  it seen only after the reply is out and no CP doorbell was dropped. A dropped
+  forward or a 5xx forgets the id, so GitHub's redelivery is processed. A copy that
+  arrives while the first is in flight gets a retryable 503, not a silent 202.
+- **Dedupe versus CP redelivery.** The CP redelivers through GitHub's API, which keeps
+  the GUID and cannot carry a header. The relay therefore forgets an id when it
+  reports a failure the CP redelivers for (`daemon_offline`, `rejected:draining`,
+  `rejected:not_holder`, `review_request_required`), so the redelivery is not
+  answered as a duplicate inside the 10-minute TTL. Other hooks of the same delivery
+  that already ran are deduplicated at the CP on `(hookId, deliveryKey)`.
 - **Comment outbox schema.** `kanban_terminals` columns added after its first shape
-  come from a versioned local-store migration, not only `CREATE TABLE IF NOT EXISTS`.
+  come from the versioned local-store migration (v59), not only
+  `CREATE TABLE IF NOT EXISTS`. v60 clears any `attemptedAt` written from local time.
 - **Clock skew.** The marker lookup's `since` bound is GitHub's `Date` header, read
   by a GET just before the first POST. It is never this daemon's clock. When that
   header is unreadable, the retry scans every comment page with no bound and, past
   the page limit, parks the row instead of posting a duplicate.
+- **UTC session pin.** `withUtcSession` edits the connection URL's `options` as text,
+  so empty-host libpq URLs (`postgresql:///db?host=/var/run/postgresql`) are pinned
+  too. A value that is not a `postgres://` URL throws instead of passing through
+  unpinned. `prisma/seed.ts` opens its client through `createPrisma`.
 
 Known gaps (M3):
 
@@ -374,5 +389,8 @@ Known gaps (M3):
 - **An unbounded marker scan is capped.** With no readable GitHub clock, an issue
   with more than five pages (500) of comments parks the row for a human, rather than
   finding a marker beyond that.
+- **The agent allowlist drops ambient variables it does not know.** A host variable an
+  agent needs (for example `SSH_AUTH_SOCK` or a cloud-provider key) must be set in the
+  runtime or agent env; it is no longer inherited from the daemon.
 - **The pre-POST clock read is best-effort.** If that GET fails the POST still goes
   out, and a lost response is then recovered by the unbounded scan above.
