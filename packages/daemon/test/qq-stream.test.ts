@@ -48,6 +48,31 @@ describe('QQ private streaming', () => {
     ])
   })
 
+  it('logs (lengths only) when the final does not extend the delivered preview', async () => {
+    vi.useFakeTimers()
+    const debug = vi.fn()
+    const stream = new QQPrivateStream(
+      {
+        sendText: async () => {},
+        sendStream: async (_channel, _reply, cursor, _text, _done) => {
+          cursor.id = 'stream-1'
+        }
+      },
+      'c2c:user-1',
+      'incoming-1',
+      { debug }
+    )
+    stream.update('key sk-batchprobe-SECRET-')
+    await vi.advanceTimersByTimeAsync(1000)
+    await stream.finish('key [secret:MODEL_API_KEY]')
+    expect(debug).toHaveBeenCalledTimes(1)
+    const msg = debug.mock.calls[0]![0]
+    expect(msg).toMatch(/^qq: final \(\d+ chars\) does not extend the delivered preview \(\d+ chars\)$/)
+    // Lengths only — never the content.
+    expect(msg).not.toContain('sk-batchprobe')
+    expect(msg).not.toContain('MODEL_API_KEY')
+  })
+
   it('records the final before a failing delivery and never retries', async () => {
     const record = vi.fn(async () => {})
     const sendText = vi.fn(async () => {

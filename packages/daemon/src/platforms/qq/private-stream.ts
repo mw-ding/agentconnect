@@ -1,5 +1,6 @@
 import { QQStreamUnavailable, splitQQText, type QQStreamCursor, type QQReplyPort } from './sender.js'
 import { QQTextMaxBytes } from './text.js'
+import type { Logger } from '../../log.js'
 
 // A turn owns its C2C stream; the sender owns ordering across all turns in the conversation.
 export class QQPrivateStream {
@@ -18,7 +19,8 @@ export class QQPrivateStream {
   constructor(
     private readonly conn: QQReplyPort,
     private readonly channel: string,
-    private readonly replyId: string
+    private readonly replyId: string,
+    private readonly log?: Pick<Logger, 'debug'>
   ) {}
 
   update(text: string): void {
@@ -70,6 +72,12 @@ export class QQPrivateStream {
     if (this.failed) throw this.failure
     if (!this.cursor.id) return this.conn.sendText(this.channel, this.replyId, text)
     // Final secret masking can rewrite a preview; QQ's replace mode accepts the full final snapshot.
+    // When the final does not extend the delivered preview, log the lengths (never the text) so a
+    // retraction that replaced a chunk with masked text is observable without leaking content.
+    if (!text.startsWith(this.confirmed))
+      this.log?.debug(
+        `qq: final (${text.length} chars) does not extend the delivered preview (${this.confirmed.length} chars)`
+      )
     const parts = splitQQText(text)
     let first = parts.shift() ?? this.confirmed
     if (text.startsWith(this.confirmed) && first.length < this.confirmed.length) {

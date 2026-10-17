@@ -266,7 +266,7 @@ import {
   steeredTranscriptText
 } from './daemon/steering-admission.js'
 import { recallQueryFromBlocks } from './memory/recall.js'
-import { maskableSecrets, maskSecretsDeep } from './session/secret-mask.js'
+import { maskableSecrets, maskSecretsDeep, maskToolArgs, type SecretMaskEntry } from './session/secret-mask.js'
 import { monotonicTs } from './store/monotonic-ts.js'
 import { StoreRetentionSweeper, resolveStoreRetentionSettings } from './store/retention.js'
 import { TranscriptRecorder, type TranscriptEvent } from './session/transcript-recorder.js'
@@ -1704,18 +1704,21 @@ export class Daemon {
         }
       })
       registry.register(
-        createQQTurnOutput(async (p, text) => {
-          if (p.plan.transcriptChannel && p.plan.statusThread)
-            await this.store.appendTranscript({
-              channel: p.plan.transcriptChannel,
-              thread: p.plan.statusThread,
-              admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
-              ts: monotonicTs(),
-              sender: p.plan.agentId,
-              kind: 'text',
-              text
-            })
-        })
+        createQQTurnOutput(
+          async (p, text) => {
+            if (p.plan.transcriptChannel && p.plan.statusThread)
+              await this.store.appendTranscript({
+                channel: p.plan.transcriptChannel,
+                thread: p.plan.statusThread,
+                admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
+                ts: monotonicTs(),
+                sender: p.plan.agentId,
+                kind: 'text',
+                text
+              })
+          },
+          { debug: (message) => this.log.debug(message) }
+        )
       )
       registry.register({
         platform: 'linear',
@@ -4218,6 +4221,8 @@ export class Daemon {
       // MCP Apps: a daemon-hosted UI server's tool. Resolution is by the `<server>__<tool>`
       // namespace the host minted, so nothing here can shadow a product tool.
       appTool: (ctx, name, args) => this.runAppTool(ctx, name, args),
+      // Every dispatched MCP tool's arguments are masked before any handler sees them.
+      maskAgentSecrets: (agentId, args) => this.maskAgentToolArgs(agentId, args),
       // Peer discovery goes to the CP (the only authority for the cross-daemon
       // roster). Resolve the client lazily; fail closed when it isn't connected.
       channelAgents: async ({ currentChannel, currentThread, currentTransportScope, ...req }) => {
@@ -17309,7 +17314,7 @@ export class Daemon {
       await this.settleUsage(p, run, sessionId)
       await this.commitWebchatReply(p, run, outcome)
       // The assembled reply feeds memory capture, evaluation, and an inferred parent reply.
-      p.reply.text = this.maskAgentSecrets(p.plan.agentId, p.reply.text)
+      p.reply.text = this.maskAgentSecretsIn(p.plan.agentId, p.reply.text, p.maskEntries)
       await this.flushPlatformFinals(p, run, sessionId, currentAttributionInfo)
       await this.finalizeDelivery(p, run, { rec, sessionId, handled, outcome, memoryCaptureTarget })
     } catch (err) {
@@ -18212,6 +18217,9 @@ export class Daemon {
       builtinSystemToolCallIds: new Set(),
       acpSessionId: sessionId,
       outwardSessionId,
+      // Snapshot the agent's mask entries now: a host released mid-flush drops the BYOK entries,
+      // and the final-mask paths below must still see them.
+      maskEntries: this.maskEntriesFor(agentId),
       ...(turn.resolveFileLink ? { resolveFileLink: turn.resolveFileLink } : {}),
       ...(entry.selectedHost ? { selectedHost: entry.selectedHost } : {}),
       turnState: plan.turnSurface.initialTurnState({
@@ -19112,7 +19120,7 @@ export class Daemon {
     if (!p.webchat) return
     const agentId = p.entry.agentId
     // A segment concatenates chunks, so mask the assembled text before it is stored and posted.
-    const text = this.maskAgentSecrets(agentId, segment.text)
+    const text = this.maskAgentSecretsIn(agentId, segment.text, p.maskEntries)
     const scope = hopCount !== undefined ? (p.webchatRouting ?? initialWebchatRouting(p.entry)).scope : undefined
     const replyTs = await webchatTurnOutput.appendWebchatTextRow(
       this.store,
@@ -19244,7 +19252,8 @@ export class Daemon {
         plan.transcriptChannel,
         plan.statusThread,
         { agentId, sessionKey: plan.sessionKey },
-        ev
+        ev,
+        p.maskEntries
       )
     // The turn is over, so nothing more will supersede a coalesced tool body: make the last
     // state of every streamed tool call durable now rather than on the buffer's own timer.
@@ -19560,7 +19569,7 @@ export class Daemon {
         {
           appendTranscript: async (row) => await this.store.appendTranscript(row),
           monotonicTs: () => monotonicTs(),
-          maskFinal: (text) => this.maskAgentSecrets(agentId, text),
+          maskFinal: (text) => this.maskAgentSecretsIn(agentId, text, p.maskEntries),
           beginPublish: async (hasFinal) => {
             try {
               // A replay of `in_flight` suppresses another comment. If this write
@@ -21309,7 +21318,7 @@ export class Daemon {
   private enqueueApply(p: Pending, action: DaemonRenderAction, opts: { allowWhenSuppressed?: boolean } = {}): void {
     if (p.outputSuppressed && !opts.allowWhenSuppressed) return
     // Converger text is assembled across chunks, where the per-chunk ingress mask misses a split secret.
-    const mask = (text: string) => this.maskAgentSecrets(p.plan.agentId, text)
+    const mask = (text: string) => this.maskAgentSecretsIn(p.plan.agentId, text, p.maskEntries)
     if ('text' in action) action = { ...action, text: mask(action.text) }
     else if (action.kind === 'activity' && 'body' in action) action = { ...action, body: mask(action.body) }
     else if (action.kind === 'stream-append' || action.kind === 'stream-stop') {
@@ -21536,10 +21545,32 @@ export class Daemon {
    *  payload about to be rendered, streamed, or persisted (session/secret-mask.ts).
    *  No-op (same reference) for agents without maskable secrets. */
   private maskAgentSecrets<T>(agentId: string, payload: T): T {
+    return maskSecretsDeep(payload, this.maskEntriesFor(agentId))
+  }
+
+  /** Copy-on-write mask over a payload, including a per-turn snapshot (`extra`) of the
+   *  provider secrets captured before the host's process could exit. */
+  private maskAgentSecretsIn<T>(agentId: string, payload: T, extra?: SecretMaskEntry[]): T {
+    return maskSecretsDeep(payload, this.maskEntriesFor(agentId, extra))
+  }
+
+  /** Copy-on-write mask of an agent's write-only secrets over a tool call's
+   *  arguments, leaving structural routing/enum/timestamp keys untouched. */
+  private maskAgentToolArgs<T>(agentId: string, payload: T): T {
+    return maskToolArgs(payload, this.maskEntriesFor(agentId))
+  }
+
+  /** The {name,value} mask entries for an agent: its runtime-override secrets plus
+   *  the BYOK provider secrets recorded for any of its live hosts, plus `extra` — the
+   *  turn's snapshot — so a host released mid-flush still masks its BYOK entries. */
+  private maskEntriesFor(agentId: string, extra?: SecretMaskEntry[]): SecretMaskEntry[] {
     const providerSecrets = [...this.modelProviderSecrets].flatMap(([key, secrets]) =>
       hostKeyAgentId(key) === agentId ? secrets : []
     )
-    return maskSecretsDeep(payload, [...maskableSecrets(this.agents.get(agentId)), ...providerSecrets])
+    const live = [...maskableSecrets(this.agents.get(agentId)), ...providerSecrets]
+    if (!extra?.length) return live
+    const seen = new Set(live.map((e) => e.value))
+    return [...live, ...extra.filter((e) => !seen.has(e.value))]
   }
 
   /** Keep native usage and the runtime's concrete model together, including notifications after turn completion. */
@@ -22037,7 +22068,8 @@ export class Daemon {
           agentId: p.plan.agentId,
           sessionKey: p.plan.sessionKey
         },
-        ev
+        ev,
+        p.maskEntries
       )
   }
 
@@ -22048,10 +22080,13 @@ export class Daemon {
     channel: string,
     thread: string,
     admission: TranscriptAdmission,
-    ev: TranscriptEvent
+    ev: TranscriptEvent,
+    extra?: SecretMaskEntry[]
   ): Promise<void> {
     // A reasoning row concatenates thought chunks, so mask the assembled row too.
-    ev = { ...ev, text: this.maskAgentSecrets(agentId, ev.text) }
+    ev = { ...ev, text: this.maskAgentSecretsIn(agentId, ev.text, extra) }
+    // A tool/plan row's merged body (rawInput/rawOutput/entries) can split a secret across updates.
+    if (ev.kind !== 'reasoning') ev = { ...ev, body: this.maskAgentSecretsIn(agentId, ev.body, extra) }
     if (ev.kind === 'plan') {
       await this.store.upsertPlan({
         channel,
