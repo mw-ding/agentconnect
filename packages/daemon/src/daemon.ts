@@ -19523,6 +19523,7 @@ export class Daemon {
         {
           appendTranscript: async (row) => await this.store.appendTranscript(row),
           monotonicTs: () => monotonicTs(),
+          maskFinal: (text) => this.maskAgentSecrets(agentId, text),
           beginPublish: async (hasFinal) => {
             try {
               // A replay of `in_flight` suppresses another comment. If this write

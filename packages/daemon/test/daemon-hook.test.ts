@@ -38,7 +38,7 @@ import { GITLAB_HOST_MISMATCH_REASON } from '../src/gitlab/host-fence.js'
 import { NO_ACTIVE_REVIEW_TURN } from '../src/codehost/review-adapter.js'
 import { transcriptCoords } from '../src/session/session-manager.js'
 import { DatabaseSync } from 'node:sqlite'
-import { sessionKey, type LocalStore } from '../src/store/local-store.js'
+import { sessionKey, transcriptChannelKey, type LocalStore } from '../src/store/local-store.js'
 import { SqliteAsyncDatabase } from '../src/store/sqlite-async-database.js'
 import { openTestStore } from './store-support.js'
 import { statePath } from '../src/paths.js'
@@ -351,6 +351,74 @@ describe('Daemon rd/msg hook fires', () => {
       sourceInstallationId: '456',
       repoFullName: 'agentconnect-md/agentconnect'
     })
+    await daemon.stop()
+  })
+
+  it('masks a secret split across final chunks in the stored final and the posted comment', async () => {
+    const secret = 'sk-provider-api-key-value'
+    const chunk = (text: string) => ({
+      sessionUpdate: 'agent_message_chunk',
+      _meta: { codex: { phase: 'final_answer' } },
+      content: { type: 'text', text }
+    })
+    const { factory, host } = streamingHost()
+    host.prompt.mockImplementation(async (sid: string) => {
+      const onUpdate = (host as any).onUpdate as (sid: string, u: unknown) => void
+      onUpdate(sid, chunk('key is sk-provider-'))
+      onUpdate(sid, chunk('api-key-value ok'))
+      return { stopReason: 'end_turn' }
+    })
+    const hostFactory = (agent: unknown, cb: (sid: string, u: unknown) => void) => {
+      ;(host as any).onUpdate = cb
+      return factory(agent, cb)
+    }
+    const root = scaffold({ runtimeOverrides: { secrets: [{ name: 'MODEL_API_KEY', value: secret }] } })
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory })
+    await daemon.start()
+    const cp = fakeCpClient()
+    ;(daemon as never as { cpClient: unknown }).cpClient = cp
+    const publish = vi.fn(async (_text?: string) => {})
+    ;(daemon as any).githubReviews.makeCodeHostReply = vi.fn(() => ({
+      poster: { publish },
+      collector: new GithubReplyCollector()
+    }))
+
+    await (daemon as any).handleRelayMsg(
+      fire({
+        sessionKey: 'agentconnect-md/agentconnect#145',
+        github: {
+          repoId: '123',
+          repoFullName: 'agentconnect-md/agentconnect',
+          sourceInstallationId: '456',
+          subjectKind: 'pull_request',
+          pullNumber: 145
+        },
+        context: {
+          source: 'github',
+          event: 'pull_request',
+          action: 'opened',
+          repo: 'agentconnect-md/agentconnect',
+          number: 145,
+          title: 'leak check',
+          truncated: false
+        }
+      }),
+      () => {}
+    )
+    await vi.waitFor(() => expect(cp.hookReports).toHaveLength(1), WAIT)
+
+    const posted = publish.mock.calls.map((c) => c[0] ?? '').join('\n')
+    expect(posted).toContain('[secret:MODEL_API_KEY]')
+    const rows = (await (daemon as any).store.threadTranscript(
+      transcriptChannelKey('agentconnect-md/agentconnect', 'github:123'),
+      '145'
+    )) as Array<{ text: string }>
+    const stored = rows.map((r) => r.text).join('\n')
+    expect(stored).toContain('[secret:MODEL_API_KEY]')
+    for (const text of [posted, stored]) {
+      expect(text).not.toContain(secret)
+      expect(text.replace(/\s/g, '')).not.toContain('sk-provider-api-key-value')
+    }
     await daemon.stop()
   })
 
