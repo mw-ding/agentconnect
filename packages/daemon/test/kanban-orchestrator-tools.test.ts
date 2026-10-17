@@ -1,5 +1,4 @@
-// Kanban orchestrator tools (issue #2 M3): the daemon files the issue body, keys on a spec digest, and keeps a
-// pending map so a retry after a failed commit re-commits the same issue instead of filing a second one.
+// Failed commits retain the filed issue for a bounded, caller-scoped retry.
 import { describe, expect, it, vi } from 'vitest'
 import type { KanbanOrchestrate, KanbanOrchestrateOk } from '@agentconnect.md/protocol'
 import { KanbanOrchestratorTools, orchestratorSpecDigest } from '../src/kanban/orchestrator-tools.js'
@@ -129,5 +128,79 @@ describe('KanbanOrchestratorTools', () => {
     await expect(h.svc.assign({ agentId: AGENT, board: BOARD, issue: 7, assignee: 'ash' })).resolves.toEqual({
       assigned: true
     })
+  })
+})
+
+describe('pending creates', () => {
+  function pendingHarness() {
+    let now = 0
+    const fileIssue = vi.fn(async () => fileIssue.mock.calls.length)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: async (p) => {
+        if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+        throw new Error('CP unavailable')
+      },
+      repoFullNameFor: async () => 'acme/web',
+      fileIssue,
+      now: () => now
+    })
+    const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY }
+    return {
+      svc,
+      req,
+      fileIssue,
+      advance: (ms: number) => {
+        now += ms
+      }
+    }
+  }
+
+  it('isolates agent, board, epic, step, and masked spec while sharing the default step', async () => {
+    const h = pendingHarness()
+    const requests = [
+      h.req,
+      { ...h.req, agentId: 'other-agent' },
+      { ...h.req, board: 'other-board' },
+      { ...h.req, epic: 1 },
+      { ...h.req, epic: 2 },
+      { ...h.req, step: 'other-step' },
+      { ...h.req, body: 'other-spec' }
+    ]
+    for (const [index, req] of requests.entries()) {
+      expect(await h.svc.create(req)).toMatchObject({ issueNumber: index + 1 })
+    }
+    for (const [index, req] of requests.entries()) {
+      expect(await h.svc.create(req)).toMatchObject({ issueNumber: index + 1 })
+    }
+    expect(await h.svc.create({ ...h.req, step: 'default' })).toMatchObject({ issueNumber: 1 })
+    expect(h.fileIssue).toHaveBeenCalledTimes(requests.length)
+  })
+
+  it('evicts the oldest filed entry above 256 even if it was recently retried', async () => {
+    const h = pendingHarness()
+    for (let i = 0; i < 256; i++) {
+      await h.svc.create({ ...h.req, step: `step-${i}` })
+      h.advance(1)
+    }
+    await h.svc.create({ ...h.req, step: 'step-0' })
+    expect(h.fileIssue).toHaveBeenCalledTimes(256)
+    await h.svc.create({ ...h.req, step: 'step-256' })
+    await h.svc.create({ ...h.req, step: 'step-1' })
+    expect(h.fileIssue).toHaveBeenCalledTimes(257)
+    await h.svc.create({ ...h.req, step: 'step-0' })
+    expect(h.fileIssue).toHaveBeenCalledTimes(258)
+  })
+
+  it('expires entries older than one hour without extending their age on retry', async () => {
+    const h = pendingHarness()
+    await h.svc.create(h.req)
+    h.advance(60 * 60 * 1000)
+    await h.svc.create(h.req)
+    expect(h.fileIssue).toHaveBeenCalledTimes(1)
+    h.advance(1)
+    await h.svc.create({ ...h.req, step: 'new-step' })
+    expect((h.svc as any).pending.size).toBe(1)
+    await h.svc.create(h.req)
+    expect(h.fileIssue).toHaveBeenCalledTimes(3)
   })
 })

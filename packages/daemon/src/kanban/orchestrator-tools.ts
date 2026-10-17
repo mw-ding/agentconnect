@@ -1,5 +1,4 @@
-// Daemon-side Kanban orchestrator tools (issue #2 M3, Lane 2b): the daemon files the issue body directly with a
-// purpose-bound token, then asks the CP to register it; the CP writes only metadata. Caller identity is the trusted ctx.
+// The daemon files masked issue text directly; the CP only registers metadata under the trusted caller identity.
 import { createHash } from 'node:crypto'
 import type { KanbanOrchestrate, KanbanOrchestrateOk, KanbanOrchestrateRefusalCode } from '@agentconnect.md/protocol'
 
@@ -10,7 +9,7 @@ export interface KanbanOrchestratorToolsDeps {
   repoFullNameFor(agentId: string, board: string): Promise<string | null>
   /** Files the issue with the orchestrator's issues-only token; returns the new issue number. */
   fileIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number>
-  /** Monotonic clock for token expiry notes, injectable for tests. */
+  // Clock for pending-create expiry, injectable for tests.
   now?: () => number
 }
 
@@ -60,8 +59,8 @@ export function orchestratorSpecDigest(title: string, body: string): string {
 }
 
 export class KanbanOrchestratorTools {
-  /** A retry after a failed commit re-commits the same issue instead of filing a second one. */
-  private readonly pending = new Map<string, number>()
+  // Retain filed issues briefly so a failed commit can retry without a second POST.
+  private readonly pending = new Map<string, { issueNumber: number; filedAt: number }>()
 
   constructor(private readonly deps: KanbanOrchestratorToolsDeps) {}
 
@@ -91,6 +90,7 @@ export class KanbanOrchestratorTools {
   }
 
   async create(req: KanbanCreateReq): Promise<unknown> {
+    this.prunePending()
     const specDigest = orchestratorSpecDigest(req.title, req.body)
     const prepare = await this.deps.orchestrate({
       op: 'prepare_create',
@@ -110,11 +110,12 @@ export class KanbanOrchestratorTools {
     }
     const repoFullName = await this.deps.repoFullNameFor(req.agentId, req.board)
     if (!repoFullName) return { refused: 'could not resolve the board repository' }
-    const mapKey = `${req.board}\u0000${req.step ?? 'default'}\u0000${specDigest}`
-    let issueNumber = this.pending.get(mapKey)
+    const mapKey = JSON.stringify([req.agentId, req.board, req.epic ?? null, req.step ?? 'default', specDigest])
+    let issueNumber = this.pending.get(mapKey)?.issueNumber
     if (issueNumber === undefined) {
       issueNumber = await this.deps.fileIssue(req.agentId, repoFullName, req.title, req.body)
-      this.pending.set(mapKey, issueNumber)
+      this.pending.set(mapKey, { issueNumber, filedAt: this.deps.now?.() ?? Date.now() })
+      this.prunePending()
     }
     try {
       const commit = (await this.deps.orchestrate({
@@ -144,6 +145,15 @@ export class KanbanOrchestratorTools {
       // The CP went away after the file; the pending map keeps the issue for a retry.
       return { filed: true, issueNumber, repoFullName, retryable: true }
     }
+  }
+
+  private prunePending(): void {
+    const now = this.deps.now?.() ?? Date.now()
+    for (const [key, entry] of this.pending) {
+      if (now - entry.filedAt > 60 * 60 * 1000) this.pending.delete(key)
+    }
+    // Map insertion order keeps eviction tied to the file time, even after retries.
+    while (this.pending.size > 256) this.pending.delete(this.pending.keys().next().value!)
   }
 
   async link(req: {
