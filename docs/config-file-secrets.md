@@ -100,6 +100,17 @@ cluster's audit log attributes each action to the agent's own identity.
 - Transcript masking extends into structured secret values (a docker `auth`,
   kubeconfig tokens and client key/cert data, whole-file echoes): values the
   agent emits render as `[secret:NAME]`.
+- The mask applies to every tool the daemon dispatches itself (its MCP bridge
+  tools, platform session tools, evaluation tools, and hosted MCP Apps). Tools
+  on an **external MCP server configured directly on the agent/runtime** are
+  NOT masked: their calls run inside the runtime process and their arguments
+  never pass through the daemon. Masking cannot cover them.
+- Masking is a leak backstop, not a redaction guarantee. A short secret
+  (4+ characters) that lands inside a _structural but non-exempt_ value — a
+  branch name, emoji, `ref`, `users[]` id, `labels`, or `startSide` — is
+  replaced there too, which garbles the value and makes that tool call fail
+  loudly rather than run. The call fails closed: the secret is replaced, never
+  exposed, but the operation it was attached to does not succeed either.
 - The materialized file is distribution and routing, **not a same-host security
   boundary** — the secret value also rests in the agent's `agent.json` on the
   daemon host, and agents on one daemon run as the same OS user. Agents that

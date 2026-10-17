@@ -257,6 +257,11 @@ export interface OpsDeps
     name: string,
     args: Record<string, unknown>
   ) => Promise<{ result: unknown } | undefined>
+  /** Mask one agent's write-only secrets out of a tool call's arguments
+   *  (session/secret-mask.ts `maskToolArgs`): every string value except
+   *  structural routing/enum/timestamp keys. Applied to every dispatched tool —
+   *  platform session tools, evaluation tools, and MCP Apps tools included. */
+  maskAgentSecrets?: (agentId: string, args: Record<string, unknown>) => Record<string, unknown>
 }
 
 /**
@@ -434,6 +439,10 @@ export async function executeTool(
   // assistant-mode.md §5.13: a first look reads only its own place, whatever the arguments name.
   const elsewhere = isFirstLookCoordinate(ctx.thread) ? firstLookReadRefusal(ctx, name, args) : undefined
   if (elsewhere) throw new Error(elsewhere)
+  // Mask the agent's write-only secrets out of the arguments BEFORE any dispatch, so
+  // every tool — the static registry, platform session tools, evaluation tools, and
+  // MCP Apps tools — sees masked text by default and a new tool cannot leak one.
+  if (deps.maskAgentSecrets) args = deps.maskAgentSecrets(ctx.agentId, args)
   // Collaboration Arena evaluation tools (collaboration-arena.md §6): game-owned
   // structured actions merged into the session tool set at composition time.
   // Name collisions with product tools are rejected at daemon startup, so this

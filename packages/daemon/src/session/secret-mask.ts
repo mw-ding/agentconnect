@@ -170,7 +170,8 @@ export function maskableSecrets(agent?: {
   return entries
 }
 
-/** Replace every literal occurrence of each secret value in `text`. */
+/** Replace every literal occurrence of each secret value in `text`. Double-masking a
+ *  placeholder is accepted (this only ever over-redacts — it never unmasks a value). */
 export function maskSecretsInText(text: string, entries: SecretMaskEntry[]): string {
   let out = text
   for (const e of entries) {
@@ -204,6 +205,112 @@ export function maskSecretsDeep<T>(node: T, entries: SecretMaskEntry[]): T {
     let out: Record<string, unknown> | null = null
     for (const key of Object.keys(obj)) {
       const masked = maskSecretsDeep(obj[key], entries)
+      if (masked !== obj[key] && !out) out = { ...obj }
+      if (out) out[key] = masked
+    }
+    return (out ?? node) as T
+  }
+  return node
+}
+
+/**
+ * Structural tool-argument keys whose values are routing/identity/enum/timestamp
+ * data, never agent-authored text. `maskToolArgs` leaves a value under one of
+ * these untouched, so a secret that happens to equal an id, path, or ISO
+ * instant does not garble the call's routing while the call's free-text fields
+ * (message/title/description/body/…) are still masked.
+ *
+ * Deliberately NOT exempt: `toUser` (a user id must match a strict shape, so a
+ * masked secret fails it and the call is rejected — fail closed), and URL keys
+ * (`url`/`href`/`link`/`*Url`) — a URL is free text that can carry a secret in
+ * its query or path, so it must be masked like any other string.
+ */
+const TOOL_ARG_PASSTHROUGH_EXACT = new Set<string>([
+  // ids and refs
+  'id',
+  'iid',
+  'number',
+  'ts',
+  'user',
+  'channel',
+  'thread',
+  'threadTs',
+  'messageTs',
+  'toAgent',
+  // Linear object references
+  'issue',
+  'initiative',
+  'document',
+  'repository',
+  'project',
+  'team',
+  'parent',
+  'assignee',
+  'owner',
+  // paths and files
+  'path',
+  'paths',
+  'file',
+  'filePath',
+  // enums and actions
+  'action',
+  'kind',
+  'type',
+  'mode',
+  'status',
+  'state',
+  'stateType',
+  'platform',
+  'operation',
+  'event',
+  'verdict',
+  'side',
+  'scope',
+  'subject',
+  'part',
+  // timestamps and pagination
+  'at',
+  'when',
+  'after',
+  'before',
+  'cursor',
+  'dueDate',
+  'targetDate'
+])
+
+/** Whether a tool-argument key is structural (pass-through): the exact set above,
+ *  plus the `*Id`/`*Ids`/`*At` suffix families. URL keys (`url`/`href`/`link`/
+ *  `*Url`) are NOT pass-through: a URL is free text and can carry a secret. */
+export function isToolArgPassthroughKey(key: string): boolean {
+  return TOOL_ARG_PASSTHROUGH_EXACT.has(key) || /(?:Id|Ids|At)$/.test(key)
+}
+
+/**
+ * Copy-on-write deep mask over a tool call's arguments: every string value
+ * anywhere in the structure is masked EXCEPT the values under structural keys
+ * ({@link isToolArgPassthroughKey}) — ids, refs, paths, enums, and timestamps
+ * pass through so a secret that equals one never garbles routing. URLs and
+ * user ids are NOT exempt and are masked like any other string. Returns the
+ * SAME reference when nothing matched.
+ */
+export function maskToolArgs<T>(node: T, entries: SecretMaskEntry[]): T {
+  if (entries.length === 0 || node == null) return node
+  if (typeof node === 'string') return maskSecretsInText(node, entries) as T
+  if (Array.isArray(node)) {
+    let out: unknown[] | null = null
+    for (let i = 0; i < node.length; i++) {
+      const masked = maskToolArgs(node[i], entries)
+      if (masked !== node[i] && !out) out = node.slice()
+      if (out) out[i] = masked
+    }
+    return (out ?? node) as T
+  }
+  if (typeof node === 'object') {
+    const obj = node as Record<string, unknown>
+    let out: Record<string, unknown> | null = null
+    for (const key of Object.keys(obj)) {
+      if (isToolArgPassthroughKey(key)) continue
+      const masked = maskToolArgs(obj[key], entries)
       if (masked !== obj[key] && !out) out = { ...obj }
       if (out) out[key] = masked
     }

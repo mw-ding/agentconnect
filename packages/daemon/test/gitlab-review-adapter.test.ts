@@ -19,6 +19,8 @@ import {
   type HookConfigSnapshot
 } from '@agentconnect.md/protocol'
 import { Daemon } from '../src/daemon.js'
+import { agentHostKey } from '../src/acp/host-key.js'
+import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { CodeHostReviewRouter, type SubmitCodeReviewReq } from '../src/codehost/review-adapter.js'
 import {
@@ -643,6 +645,58 @@ describe('GitLab review adapter — pre-effect rejections (§15)', () => {
 })
 
 describe('GitLab review adapter — the happy COMMENT path (§15 steps 4-12)', () => {
+  it('masks provider secrets at the daemon boundary before GitLab drafts and publishes the review', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ac-review-mask-'))
+    writeFileSync(
+      join(root, 'config.json'),
+      JSON.stringify({ version: 1, controlPlane: { enabled: false }, runtimes: {} })
+    )
+    mkdirSync(join(root, 'agents'), { recursive: true })
+    const daemon = new Daemon({ root })
+    const h = harness()
+    const apiKey = 'sk-batchprobe-SECRET-value-0001'
+    const header = 'batchprobe-header-SECRET-0002'
+    await daemon.start()
+    try {
+      ;(daemon as any).modelProviderSecrets.set(
+        agentHostKey(AGENT_ID),
+        maskableSecrets({
+          runtimeOverrides: {
+            secrets: [
+              { name: 'MODEL_API_KEY', value: apiKey },
+              { name: 'MODEL_HEADER_x-workspace', value: header }
+            ]
+          }
+        })
+      )
+      ;(daemon as any).codeReviews.register(h.adapter)
+      const body = `key ${apiKey} header ${header}`
+      await expect(
+        (daemon as any).mcp.deps.submitCodeReview(
+          request({
+            body,
+            comments: [{ path: 'src/a.ts', line: 9, side: 'RIGHT', body }]
+          })
+        )
+      ).resolves.toMatchObject({ state: 'submitted' })
+      const drafts = drafted(h.calls)
+      expect(drafts).toHaveLength(2)
+      expect(h.state.notes).toHaveLength(2)
+      for (const text of [
+        ...drafts.map((call) => String(call.body!.note)),
+        ...h.state.notes.map((note) => note.body)
+      ]) {
+        expect(text).toContain('[secret:MODEL_API_KEY]')
+        expect(text).toContain('[secret:MODEL_HEADER_x-workspace]')
+        expect(text).not.toContain(apiKey)
+        expect(text).not.toContain(header)
+      }
+    } finally {
+      await daemon.stop()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('creates marker-signed drafts, verifies the exact set, publishes once, and reports submitted', async () => {
     const h = harness()
     const outcome = (await h.adapter.submit(
