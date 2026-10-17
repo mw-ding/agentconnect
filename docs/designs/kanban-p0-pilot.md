@@ -348,10 +348,17 @@ both refuse after a terminal has been recorded or the lease has ended.
 strict `kanban/card` RPC, fenced by the authenticated daemon/epoch, agent placement,
 open lease, card/board ids, and dispatch revision. The daemon reads the issue's
 title, body, labels, links, sub-issues, dependencies, and last 10 comments directly
-from GitHub. Each field is capped before normalization. Linear line and adjacent-line
-skeleton checks remove imitated delimiters after Unicode normalization and removal
-of default-ignorable characters. Each call wraps the result in fresh nonce-bearing
-untrusted-content fences; only the END line with that exact nonce closes the block. An unavailable lease check fails the tool call.
+from GitHub. Each field is capped before normalization. The daemon normalizes a
+copy for detection only — combining-mark runs are capped at 30 before NFKC/NFKD,
+default-ignorable characters and Hangul fillers are stripped, and small capitals are
+folded to ASCII — then slides `beginuntrustedexternalcontent` and
+`enduntrustedexternalcontent` across the concatenated line skeletons, so a marker
+split across any number of lines (or an empty `-----` line inside it) is removed in
+linear time. The returned lines are the originals, so honest text is never re-shaped,
+and a bare mention of the phrase without a begin/end marker survives. The assembled
+block is hard-capped before the fences are added. Each call wraps the result in fresh
+nonce-bearing untrusted-content fences; only the END line with that exact nonce closes
+the block. An unavailable lease check fails the tool call.
 
 `kanbanComment` posts up to 4,000 characters per note, with at most 10 successful
 or in-flight notes per lease. A failed post releases its slot. It works in read
@@ -489,3 +496,9 @@ Known gaps (M3 worker additions):
 
 - **Homoglyph confusables remain an accepted gap.** Cyrillic and other look-alike
   letters require confusables tables; the entire GitHub block remains untrusted.
+- **A line that quotes a begin/end marker is over-redacted.** Detection removes every
+  line whose letters touch `beginuntrustedexternalcontent` or `enduntrustedexternalcontent`,
+  so legitimate prose that reproduces the fence delimiters — an issue discussing the fence
+  itself, or a sentence wrapped as `…untrusted` / `external content…` — loses the whole
+  line, and a single-line comment can vanish entirely. The nonce END line remains the real
+  boundary, so this is safe but more aggressive than strictly necessary.
