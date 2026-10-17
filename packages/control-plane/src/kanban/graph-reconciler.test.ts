@@ -398,6 +398,22 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toEqual(['ac/agent:synthesizer', 'ac/status:ready'])
   })
 
+  it.each([null, 'a1'])(
+    'does not bypass synthesis through completed blockers (agent %s)',
+    async (synthesizerAgentId) => {
+      const h = make({ 7: { status: 'todo', labels: todoLabels } })
+      await h.reconciler.apply(
+        { ...BOARD, synthesizerAgentId },
+        REPO,
+        7,
+        graph({ blockedBy: [done], subIssues: [link(2, 'open')] })
+      )
+      expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+      expect(h.cards.beginSynthesis).not.toHaveBeenCalled()
+      expect(h.store.applyPlan).not.toHaveBeenCalled()
+    }
+  )
+
   it('re-evaluates the parent epic when a sub-issue closes', async () => {
     const board = { ...BOARD, synthesizerAgentId: 'a1' }
     const h = make(

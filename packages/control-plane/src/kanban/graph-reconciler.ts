@@ -79,7 +79,9 @@ export class KanbanGraphReconciler {
     const residueOnly = card.status === 'ready'
     const synthesis = card.status === 'todo' ? planSynthesis(card, graph, board.synthesizerAgentId) : 'none'
     if (card.status === 'todo') {
-      if (planGraphPromotion(card.status, graph) !== 'promote' && synthesis !== 'promote') return
+      // An epic waits for synthesis even when all of its ordinary blockers have completed.
+      if (graph.subIssues.length > 0 ? synthesis !== 'promote' : planGraphPromotion(card.status, graph) !== 'promote')
+        return
     } else if (card.status !== 'ready') {
       return
     }
