@@ -5,6 +5,10 @@ export type KanbanStatus = (typeof KANBAN_STATUSES)[number]
 
 export const STATUS_LABEL_PREFIX = 'ac/status:'
 
+export function isStatusLabel(label: string): boolean {
+  return label.toLowerCase().startsWith(STATUS_LABEL_PREFIX)
+}
+
 /** Statuses a human may still move a leased card to; every other edit reverts until the lease ends. */
 export const LEASED_HUMAN_STATUSES: ReadonlySet<KanbanStatus> = new Set(['blocked', 'triage', 'archived'])
 
@@ -79,9 +83,9 @@ export function parseStatusLabels(labels: readonly string[]): { statuses: Kanban
   const statuses: KanbanStatus[] = []
   const malformed: string[] = []
   for (const label of labels) {
-    if (!label.startsWith(STATUS_LABEL_PREFIX)) continue
+    if (!isStatusLabel(label)) continue
     const value = label.slice(STATUS_LABEL_PREFIX.length)
-    if (isKanbanStatus(value)) {
+    if (label === label.toLowerCase() && isKanbanStatus(value)) {
       if (!statuses.includes(value)) statuses.push(value)
     } else malformed.push(label)
   }
@@ -165,7 +169,7 @@ export function planLabelReconcile(card: CardSnapshot, observed: ObservedIssue):
   }
 
   const keep = statusLabel(status)
-  const removeLabels = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+  const removeLabels = observed.labels.filter((l) => isStatusLabel(l) && l !== keep)
   const addLabels = observed.labels.includes(keep) ? [] : [keep]
   const desired = issueStateFor(status)
   const issueState = issueStateDiffers(desired, observed) ? desired : undefined
@@ -187,7 +191,7 @@ export function planLabelReconcile(card: CardSnapshot, observed: ObservedIssue):
 /** The label plan for a transition the CP itself made (dispatch, run end, reap): silent, never read as a human request. */
 export function planStatusWrite(status: KanbanStatus, observed: ObservedIssue): LabelPlan {
   const keep = statusLabel(status)
-  const removeLabels = observed.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX) && l !== keep)
+  const removeLabels = observed.labels.filter((l) => isStatusLabel(l) && l !== keep)
   const addLabels = observed.labels.includes(keep) ? [] : [keep]
   const desired = issueStateFor(status)
   const issueState = issueStateDiffers(desired, observed) ? desired : undefined

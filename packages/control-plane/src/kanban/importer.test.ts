@@ -46,7 +46,9 @@ const issue = (labels = ['ac/status:ready']): CardIssue => ({
   number: 1,
   state: 'open',
   labels,
-  authorLogin: 'alice'
+  authorLogin: 'alice',
+  authorType: 'User',
+  authorViaGithubApp: false
 })
 
 let nextId = 1
@@ -58,6 +60,22 @@ const transferred = (login: string): LabelEvent[] => [{ id: nextId++, event: 'tr
 const upserted = (h: ReturnType<typeof harness>) => h.cards.upsertCard.mock.calls[0]![0] as Record<string, unknown>
 
 describe('Kanban issue import', () => {
+  it.each([
+    ['other/web', false],
+    [null, false],
+    ['ACME/Web', true],
+    [undefined, true]
+  ] as const)('fences the read on the board repository name %s', async (name, imports) => {
+    const h = harness({ ...issue(), ...(name !== undefined ? { repositoryFullName: name } : {}) })
+    expect(await h.importer.import(board, repo, 1)).toBe(imports)
+    expect(h.cards.upsertCard).toHaveBeenCalledTimes(imports ? 1 : 0)
+    expect(h.store.applyPlan).toHaveBeenCalledTimes(imports ? 1 : 0)
+    if (!imports)
+      expect(h.log.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'repository_mismatch' }),
+        expect.any(String)
+      )
+  })
   it.each(['admin', 'maintain', 'write', 'triage', 'read', 'none', new Error('offline')] as const)(
     'gates the author using live permission %s',
     async (level) => {
@@ -243,4 +261,116 @@ describe('Kanban import label attribution', () => {
     expect(upserted(h)).toMatchObject({ status: 'ready', assigneeAgentId: 'agent' })
     expect(h.permissions.permission).toHaveBeenCalledTimes(1)
   })
+})
+
+describe('Kanban import event lag and identity regressions', () => {
+  const both = ['ac/status:ready', 'ac/agent:worker']
+  const removed = (label: string) => labeled(label, 'bob', { event: 'unlabeled' })
+
+  it.each(['ac/status:ready', 'AC/STATUS:READY'])(
+    'rejects a stale writer add when the latest visible status event removes %s',
+    async (label) => {
+      const h = harness(issue(both), undefined, [
+        ...labeled('ac/status:ready', 'bob'),
+        ...labeled('ac/agent:worker', 'bob'),
+        ...removed(label)
+      ])
+      await h.importer.import(board, repo, 1)
+      expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+      expect(upserted(h)).not.toHaveProperty('humanAuthority')
+    }
+  )
+
+  it.each(['read', 'write'] as const)('checks the different re-adder with %s permission', async (level) => {
+    const h = harness(
+      issue(both),
+      { alice: 'write', bob: 'write', rita: level },
+      [
+        ...labeled('ac/status:ready', 'bob'),
+        ...labeled('ac/agent:worker', 'bob'),
+        ...removed('ac/status:ready'),
+        ...labeled('AC/STATUS:READY', 'rita')
+      ].reverse()
+    )
+    await h.importer.import(board, repo, 1)
+    expect(upserted(h)).toMatchObject({
+      status: level === 'write' ? 'ready' : 'triage',
+      assigneeAgentId: level === 'write' ? 'agent' : null
+    })
+    if (level === 'read') expect(upserted(h)).not.toHaveProperty('humanAuthority')
+    else expect(upserted(h)).toHaveProperty('humanAuthority.login', 'rita')
+  })
+
+  it.each(['ac/agent:worker', 'AC/Agent:worker'])(
+    'drops the agent when the latest visible event removes %s',
+    async (label) => {
+      const h = harness(issue(both), undefined, [
+        ...labeled('ac/status:ready', 'bob'),
+        ...labeled('ac/agent:worker', 'bob'),
+        ...removed(label)
+      ])
+      await h.importer.import(board, repo, 1)
+      expect(upserted(h)).toMatchObject({ status: 'ready', assigneeAgentId: null })
+      expect(h.cards.resolveAgentSlug).not.toHaveBeenCalled()
+    }
+  )
+
+  it('orders equal event ids by created_at, regardless of array order', async () => {
+    const h = harness(issue(both), undefined, [
+      ...labeled('ac/status:ready', 'bob', { id: 10, event: 'unlabeled', created_at: '2026-10-17T12:00:01Z' }),
+      ...labeled('ac/status:ready', 'bob', { id: 10, created_at: '2026-10-17T12:00:00Z' }),
+      ...labeled('ac/agent:worker', 'bob')
+    ])
+    await h.importer.import(board, repo, 1)
+    expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+  })
+
+  it('requires a visible transfer event for the transferred action', async () => {
+    const h = harness(issue(both), undefined, [
+      ...labeled('ac/status:ready', 'bob'),
+      ...labeled('ac/agent:worker', 'bob')
+    ])
+    await h.importer.import(board, repo, 1, { action: 'transferred' })
+    expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+    expect(upserted(h)).not.toHaveProperty('humanAuthority')
+  })
+
+  it.each([
+    ['writer', user('bob'), false, 'ready'],
+    ['non-writer', user('rita'), false, 'triage'],
+    ['App', { type: 'Bot', login: `${APP}[bot]` }, false, 'triage'],
+    ['App on behalf of a writer', user('bob'), true, 'triage']
+  ] as const)('checks a visible %s transfer actor on transferred actions', async (_name, actor, viaApp, status) => {
+    const h = harness(issue(both), { alice: 'write', bob: 'write', rita: 'read', [`${APP}[bot]`]: 'write' }, [
+      ...labeled('ac/status:ready', 'bob'),
+      ...labeled('ac/agent:worker', 'bob'),
+      { id: nextId++, event: 'transferred', actor, performed_via_github_app: viaApp }
+    ])
+    await h.importer.import(board, repo, 1, { action: 'transferred' })
+    expect(upserted(h)).toMatchObject({ status, assigneeAgentId: status === 'ready' ? 'agent' : null })
+    if (status === 'triage') expect(upserted(h)).not.toHaveProperty('humanAuthority')
+  })
+
+  it.each([
+    ['App on behalf of a writer', { authorViaGithubApp: true }],
+    ['bot', { authorType: 'Bot' }],
+    ['bot login', { authorLogin: 'helper[bot]' }],
+    ['unknown author type', { authorType: undefined }]
+  ])('forces triage for an %s author before checking permissions', async (_name, author) => {
+    const h = harness({ ...issue(both), ...author }, { alice: 'write', bob: 'write', 'helper[bot]': 'write' })
+    await h.importer.import(board, repo, 1)
+    expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+    expect(upserted(h)).not.toHaveProperty('humanAuthority')
+    expect(h.permissions.permission).not.toHaveBeenCalled()
+  })
+
+  it.each([['AC/STATUS:todo', 'ac/status:ready'], ['AC/STATUS:todo']])(
+    'imports malformed status case variants as triage: %s',
+    async (...labels) => {
+      const h = harness(issue(labels))
+      expect(await h.importer.import(board, repo, 1)).toBe(true)
+      expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+      expect(upserted(h)).not.toHaveProperty('humanAuthority')
+    }
+  )
 })

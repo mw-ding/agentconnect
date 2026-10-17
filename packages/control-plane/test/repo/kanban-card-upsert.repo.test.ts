@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { prisma } from '../setup.db.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
+import { attestHumanAuthority } from '../../src/kanban/human-authority.js'
 import { cardIdempotencyKey } from '../../src/kanban/card-key.js'
 import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -37,7 +38,7 @@ function issue(boardId: string, n: number, extra: Partial<KanbanCardUpsertInput>
 }
 
 /** The import path's live-verified human writer, which any status past todo requires. */
-const WRITER = { humanAuthority: { login: 'maintainer', permission: 'write' as const } }
+const WRITER = { humanAuthority: attestHumanAuthority('maintainer', 'write') }
 
 describe('PgKanbanCardRepo.upsertCard (real Postgres)', () => {
   it('creates once in triage by default and returns the same row on every redelivery', async () => {

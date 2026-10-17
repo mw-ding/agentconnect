@@ -49,7 +49,10 @@ function fakeGithub(publicKeyPem: string, level: string) {
         node_id: 'I_7',
         number: ISSUE.number,
         state: 'open',
-        labels: [{ name: 'ac/status:ready' }]
+        labels: [{ name: 'ac/status:ready' }],
+        repository: { id: REPO_ID },
+        repository_url: 'https://api.github.com/repos/acme/board',
+        user: { login: 'alice', type: 'User' }
       })
     }
     if (pathname === `${base}/events`) {

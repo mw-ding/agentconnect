@@ -1,38 +1,80 @@
-// Per-label attribution from visible issue events (issue #194): who last added a label, and whether a pass may decide.
-import { isAppActor, isHumanActor, type LabelEvent } from './card-store.js'
+// Per-label attribution (Lane 1a importer, reused by Lane 1b): the latest visible labeled/unlabeled event decides who may
+// have set a label currently on the issue, so a stale add never authorizes a newer removal or a lagged re-add.
+import type { RepoPermissionLevel } from '../github/repo-permission.js'
 import { checkWriteAccess, type RepoPermissionLookup, type RepoPermissionTarget } from '../github/repo-permission.js'
+import { isAppActor, isHumanActor, type LabelEvent } from './card-store.js'
 
-/** A managed label is one a human may move the card by: a status or an assignee label. `ac/mode:*` is display-only. */
-export function isManagedLabel(name: string): boolean {
-  const lower = name.toLowerCase()
-  return lower.startsWith('ac/status:') || lower.startsWith('ac/agent:')
+/** The latest event matching `match`, tie-broken by id then created_at; events need not be pre-sorted. */
+function latestEvent(events: readonly LabelEvent[], match: (event: LabelEvent) => boolean): LabelEvent | undefined {
+  let found: LabelEvent | undefined
+  for (const event of events) {
+    if (!match(event)) continue
+    if (
+      !found ||
+      event.id > found.id ||
+      (event.id === found.id && (event.created_at ?? '') > (found.created_at ?? ''))
+    ) {
+      found = event
+    }
+  }
+  return found
 }
 
-/** The latest visible labeled/unlabeled event for one exact label (case-insensitive), tie-broken by id then created_at. */
+/** The latest visible labeled/unlabeled event for this exact label (case-insensitive name compare), or undefined. */
+export function latestLabelEvent(events: readonly LabelEvent[], label: string): LabelEvent | undefined {
+  return latestEvent(
+    events,
+    (event) =>
+      (event.event === 'labeled' || event.event === 'unlabeled') &&
+      event.label?.name?.toLowerCase() === label.toLowerCase()
+  )
+}
+
+/** The latest visible `transferred` event, or undefined. */
+export function latestTransferEvent(events: readonly LabelEvent[]): LabelEvent | undefined {
+  return latestEvent(events, (event) => event.event === 'transferred')
+}
+
+/**
+ * Who authorized a label currently on the issue: the actor login of the latest visible event for that label, only if it is
+ * a `labeled` add by a human (isHumanActor) that is not the App (isAppActor); otherwise null (removal newer, no event = lag,
+ * bot/App actor). Write access is NOT checked here (it's async); callers then require live write access for the login.
+ */
+export function labelAdder(events: readonly LabelEvent[], label: string, appSlug: string | undefined): string | null {
+  const latest = latestLabelEvent(events, label)
+  if (latest?.event !== 'labeled' || !isHumanActor(latest) || isAppActor(latest, appSlug)) return null
+  return latest.actor?.login ?? null
+}
+
+/** Async convenience: labelAdder + live write check through a supplied (deduping) writer function; fail closed. */
+export async function labelAddedByWriter(
+  events: readonly LabelEvent[],
+  label: string,
+  appSlug: string | undefined,
+  writer: (login: string) => Promise<{ write: boolean; level: RepoPermissionLevel }>
+): Promise<{ login: string; level: RepoPermissionLevel } | null> {
+  const login = labelAdder(events, label, appSlug)
+  if (login === null) return null
+  const check = await writer(login)
+  return check.write ? { login, level: check.level } : null
+}
+
+/** Lane 1b: the latest visible labeled/unlabeled event for one exact label, shaped as an add/removed/none verdict. */
 export type LabelAttribution =
   { kind: 'add'; event: LabelEvent; eventId: number } | { kind: 'removed'; eventId: number } | { kind: 'none' }
 
+/** Reuses latestLabelEvent so the newest-event rule lives once; the add/removed/none shape is a sync convenience. */
 export function attributeLabel(events: readonly LabelEvent[], labelName: string): LabelAttribution {
-  const target = labelName.toLowerCase()
-  let latest: LabelEvent | undefined
-  for (const event of events) {
-    if ((event.event !== 'labeled' && event.event !== 'unlabeled') || !event.label?.name) continue
-    if (event.label.name.toLowerCase() !== target) continue
-    if (!latest || laterThan(event, latest)) latest = event
-  }
+  const latest = latestLabelEvent(events, labelName)
   if (!latest) return { kind: 'none' }
   if (latest.event === 'labeled') return { kind: 'add', event: latest, eventId: latest.id }
   return { kind: 'removed', eventId: latest.id }
 }
 
-function laterThan(a: LabelEvent, b: LabelEvent): boolean {
-  if (a.id !== b.id) return a.id > b.id
-  return (a.created_at ?? '') > (b.created_at ?? '')
-}
-
-/** A single label's adoption verdict: adopt, revert with a refusal comment, or revert silently. */
+/** Lane 1b: a single label's adoption verdict: adopt, revert with a refusal comment, or revert silently. */
 export type LabelVerdict = 'writer' | 'non_writer' | 'ignored'
 
+/** Reuses labelAdder (human + not-App) and adds the live write check; fail closed. */
 export async function judgeLabelAdd(
   attribution: LabelAttribution,
   opts: {
@@ -44,44 +86,16 @@ export async function judgeLabelAdd(
   }
 ): Promise<LabelVerdict> {
   if (attribution.kind !== 'add') return 'ignored'
-  const event = attribution.event
-  if (!isHumanActor(event) || isAppActor(event, opts.appSlug)) return 'ignored'
-  const login = event.actor!.login!.toLowerCase()
-  let write = opts.writers.get(login)
+  const login = labelAdder([attribution.event], attribution.event.label?.name ?? '', opts.appSlug)
+  if (!login) return 'ignored'
+  const id = login.toLowerCase()
+  let write = opts.writers.get(id)
   if (!write) {
-    write = checkWriteAccess(opts.permissions, opts.repo, login).then((access) => {
+    write = checkWriteAccess(opts.permissions, opts.repo, id).then((access) => {
       if (access.error) opts.warn(access.error, opts.repo.repoId)
       return access.write
     })
-    opts.writers.set(login, write)
+    opts.writers.set(id, write)
   }
   return (await write) ? 'writer' : 'non_writer'
-}
-
-/** The managed labels currently on an issue, lowercased. */
-export function liveManagedLabels(issue: { labels: readonly string[] }): Set<string> {
-  const labels = new Set<string>()
-  for (const label of issue.labels) if (isManagedLabel(label)) labels.add(label.toLowerCase())
-  return labels
-}
-
-/** Reconstruct the managed label set by replaying visible events oldest-first from an empty baseline. */
-export function replayManagedLabels(events: readonly LabelEvent[]): Set<string> {
-  const labels = new Set<string>()
-  const ordered = [...events].sort((a, b) =>
-    a.id !== b.id ? a.id - b.id : (a.created_at ?? '').localeCompare(b.created_at ?? '')
-  )
-  for (const event of ordered) {
-    if ((event.event !== 'labeled' && event.event !== 'unlabeled') || !event.label?.name) continue
-    if (!isManagedLabel(event.label.name)) continue
-    if (event.event === 'labeled') labels.add(event.label.name.toLowerCase())
-    else labels.delete(event.label.name.toLowerCase())
-  }
-  return labels
-}
-
-export function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false
-  for (const value of a) if (!b.has(value)) return false
-  return true
 }

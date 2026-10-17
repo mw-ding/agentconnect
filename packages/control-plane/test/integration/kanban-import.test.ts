@@ -24,6 +24,11 @@ const labeled = (id: number, label: string, login: string): LabelEvent => ({
   actor: { type: 'User', login }
 })
 
+const unlabeled = (id: number, label: string, login: string): LabelEvent => ({
+  ...labeled(id, label, login),
+  event: 'unlabeled'
+})
+
 describe('issue import doorbells (Postgres)', () => {
   it.each(['opened', 'transferred', 'labeled'])(
     'imports %s idempotently through the body-free doorbell',
@@ -42,9 +47,12 @@ describe('issue import doorbells (Postgres)', () => {
         number: 1,
         state: 'open',
         labels: ['ac/status:ready', 'ac/agent:worker'],
-        authorLogin: 'alice'
+        authorLogin: 'alice',
+        authorType: 'User',
+        authorViaGithubApp: false
       }
       const cards = new PgKanbanCardRepo(prisma)
+      // No `transferred` event is visible, so a `transferred` doorbell must fail closed to triage (Blocker 2).
       const events = [labeled(1, 'ac/status:ready', 'alice'), labeled(2, 'ac/agent:worker', 'alice')]
       const store = {
         readCard: async () => issue,
@@ -58,7 +66,7 @@ describe('issue import doorbells (Postgres)', () => {
         boards: new PgKanbanBoardRepo(prisma),
         installations: { getByInstallationId: async () => installation },
         store,
-        onCard: (b, r, n) => importer.import(b, r, n).then(() => {}),
+        onCard: (b, r, n, doorbellAction) => importer.import(b, r, n, { action: doorbellAction }).then(() => {}),
         log: { debug: vi.fn(), warn: vi.fn() }
       })
       const frame = {
@@ -75,7 +83,11 @@ describe('issue import doorbells (Postgres)', () => {
       bell.poke(frame)
       await bell.settle()
       expect(await prisma.kanbanCard.findMany({ where: { boardId: board.id } })).toEqual([
-        expect.objectContaining({ status: 'ready', assigneeAgentId: agent })
+        expect.objectContaining(
+          action === 'transferred'
+            ? { status: 'triage', assigneeAgentId: null }
+            : { status: 'ready', assigneeAgentId: agent }
+        )
       ])
       expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(1)
       expect(permissions.permission).toHaveBeenCalledTimes(1)
@@ -92,7 +104,9 @@ describe('issue import doorbells (Postgres)', () => {
       number: 1,
       state: 'open',
       labels: ['ac/status:ready'],
-      authorLogin: 'outsider'
+      authorLogin: 'outsider',
+      authorType: 'User',
+      authorViaGithubApp: false
     }
     const applyPlan = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
     const importer = new KanbanImporter({
@@ -131,7 +145,9 @@ describe('issue import doorbells (Postgres)', () => {
       number: 1,
       state: 'open',
       labels: ['ac/status:ready', 'ac/agent:worker'],
-      authorLogin: 'alice'
+      authorLogin: 'alice',
+      authorType: 'User',
+      authorViaGithubApp: false
     }
     const applyPlan = vi.fn()
     const permission = vi.fn(async (_r: unknown, login: string): Promise<RepoPermissionLevel> =>
@@ -154,5 +170,88 @@ describe('issue import doorbells (Postgres)', () => {
     expect(applyPlan).toHaveBeenCalledWith(repo, 1, issue, expect.objectContaining({ status: 'triage' }))
     const [audit] = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
     expect(audit!.details).toMatchObject({ to: 'triage', humanAuthority: null })
+  })
+
+  // Vera round 2: the latest visible event for each current label decides; lag and newer removals fail closed.
+  it.each([
+    {
+      name: 'a lagging re-add after a writer removed ready',
+      events: [
+        labeled(1, 'ac/status:ready', 'bob'),
+        labeled(2, 'ac/agent:worker', 'bob'),
+        unlabeled(3, 'ac/status:ready', 'bob')
+      ],
+      status: 'triage',
+      assigned: false,
+      authority: null
+    },
+    {
+      name: 'a removal followed by a non-writer re-add',
+      events: [
+        labeled(1, 'ac/status:ready', 'bob'),
+        unlabeled(2, 'ac/status:ready', 'bob'),
+        labeled(3, 'ac/status:ready', 'tim'),
+        labeled(4, 'ac/agent:worker', 'bob')
+      ],
+      status: 'triage',
+      assigned: false,
+      authority: null
+    },
+    {
+      name: 'a lagging ac/agent re-add',
+      events: [
+        labeled(1, 'ac/status:ready', 'bob'),
+        labeled(2, 'ac/agent:worker', 'bob'),
+        unlabeled(3, 'AC/Agent:worker', 'bob')
+      ],
+      status: 'ready',
+      assigned: false,
+      authority: { login: 'bob', permission: 'write' }
+    },
+    {
+      name: 'a removal followed by a writer re-add',
+      events: [
+        labeled(1, 'ac/status:ready', 'tim'),
+        unlabeled(2, 'ac/status:ready', 'tim'),
+        labeled(3, 'ac/status:ready', 'bob'),
+        labeled(4, 'ac/agent:worker', 'bob')
+      ],
+      status: 'ready',
+      assigned: true,
+      authority: { login: 'bob', permission: 'write' }
+    }
+  ])('attributes $name against the latest visible event', async ({ events, status, assigned, authority }) => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'board', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    await seedDaemon(prisma, 'd7777777-7777-4777-8777-777777777777')
+    const agent = await seedAgent(prisma, 'a7777777-7777-4777-8777-777777777777', {
+      daemonId: 'd7777777-7777-4777-8777-777777777777'
+    })
+    await prisma.agent.update({ where: { id: agent }, data: { name: 'worker' } })
+    const issue: CardIssue = {
+      issueId: 100n,
+      nodeId: 'I_100',
+      number: 1,
+      state: 'open',
+      labels: ['ac/status:ready', 'ac/agent:worker'],
+      authorLogin: 'alice',
+      authorType: 'User',
+      authorViaGithubApp: false
+    }
+    const importer = new KanbanImporter({
+      cards: new PgKanbanCardRepo(prisma),
+      store: { readCard: async () => issue, applyPlan: vi.fn(), readLabelEvents: async () => events },
+      permissions: {
+        permission: async (_r: unknown, login: string): Promise<RepoPermissionLevel> =>
+          login === 'tim' ? 'triage' : 'write'
+      }
+    })
+    expect(await importer.import({ ...board, orgId: OrgId(board.orgId) }, repo, 1, { action: 'labeled' })).toBe(true)
+    expect(await prisma.kanbanCard.findMany({ where: { boardId: board.id } })).toEqual([
+      expect.objectContaining({ status, assigneeAgentId: assigned ? agent : null, mode: null })
+    ])
+    const [audit] = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
+    expect(audit!.details).toMatchObject({ to: status, humanAuthority: authority })
   })
 })

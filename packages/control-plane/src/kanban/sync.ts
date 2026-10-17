@@ -10,19 +10,14 @@ import {
 } from './card-store.js'
 import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
 import { parseAgentLabel, agentLabel } from './agent-label.js'
-import {
-  attributeLabel,
-  judgeLabelAdd,
-  liveManagedLabels,
-  replayManagedLabels,
-  setsEqual,
-  type LabelVerdict
-} from './label-attribution.js'
+import { attributeLabel, judgeLabelAdd, type LabelVerdict } from './label-attribution.js'
+import { liveManagedLabels, replayManagedLabels, setsEqual } from './label-sync.js'
 import {
   permissionRefusalComment,
   planLabelReconcile,
   planStatusWrite,
   parseStatusLabels,
+  isStatusLabel,
   statusLabel,
   type KanbanStatus,
   type LabelPlan
@@ -342,7 +337,7 @@ export class KanbanSync {
         ? {
             ...issue,
             labels: [
-              ...issue.labels.filter((label) => !label.startsWith('ac/status:')),
+              ...issue.labels.filter((label) => !isStatusLabel(label)),
               `ac/status:${issue.stateReason === 'not_planned' ? 'archived' : 'done'}`
             ]
           }

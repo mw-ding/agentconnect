@@ -7,8 +7,17 @@ import type {
   KanbanInitialStatus
 } from '../persistence/ports.js'
 import { AGENT_LABEL_PREFIX, parseAgentLabel } from './agent-label.js'
-import { observedCardStatus, parseStatusLabels, planStatusWrite, STATUS_LABEL_PREFIX } from './card-state.js'
-import { isAppActor, isHumanActor, type CardStore, type KanbanRepoRef, type LabelEvent } from './card-store.js'
+import { observedCardStatus, parseStatusLabels, planStatusWrite, isStatusLabel } from './card-state.js'
+import { attestHumanAuthority } from './human-authority.js'
+import { labelAddedByWriter, latestTransferEvent } from './label-attribution.js'
+import {
+  isAppActor,
+  isHumanActor,
+  type CardIssue,
+  type CardStore,
+  type KanbanRepoRef,
+  type LabelEvent
+} from './card-store.js'
 
 export interface KanbanImporterDeps {
   cards: Pick<KanbanCardRepo, 'findByIssueNumber' | 'upsertCard' | 'resolveAgentSlug'>
@@ -25,10 +34,26 @@ export class KanbanImporter {
   constructor(private readonly deps: KanbanImporterDeps) {}
 
   // Returns true when this delivery imported a candidate, including a concurrent create winner.
-  async import(board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number): Promise<boolean> {
+  async import(
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    options: { action?: string } = {}
+  ): Promise<boolean> {
     if (await this.deps.cards.findByIssueNumber(board.id, issueNumber)) return false
     const issue = await this.deps.store.readCard(repo, issueNumber)
-    if (!issue || !issue.labels.some((label) => label.startsWith(STATUS_LABEL_PREFIX))) return false
+    if (!issue || !issue.labels.some(isStatusLabel)) return false
+    // Import only from the board's repository by name too; a redirect or a not-yet-refreshed rename imports nothing.
+    if (
+      issue.repositoryFullName !== undefined &&
+      issue.repositoryFullName?.toLowerCase() !== repo.repoFullName.toLowerCase()
+    ) {
+      this.deps.log?.warn(
+        { boardId: board.id, issueNumber, reason: 'repository_mismatch' },
+        'kanban import: issue read resolved outside the board repository; not importing'
+      )
+      return false
+    }
     // TRD §7: an unattributed card is still imported, but as triage, which a claim never takes (it needs ready + assignee).
     const checks = new Map<string, Promise<WriteCheck>>()
     const writer = (login: string | null | undefined): Promise<WriteCheck> => {
@@ -37,7 +62,7 @@ export class KanbanImporter {
       if (!checks.has(id)) checks.set(id, this.check(board, repo, issueNumber, login))
       return checks.get(id)!
     }
-    const authority = await this.attribute(board, repo, issueNumber, issue.labels, issue.authorLogin, writer)
+    const authority = await this.attribute(board, repo, issueNumber, issue, options.action, writer)
     const observed = observedCardStatus(issue)
     const kept = authority !== null && observed !== 'running'
     const status: KanbanInitialStatus = kept ? observed : 'triage'
@@ -67,13 +92,18 @@ export class KanbanImporter {
     board: KanbanBoardRecord,
     repo: KanbanRepoRef,
     issueNumber: number,
-    labels: readonly string[],
-    authorLogin: string | null | undefined,
+    issue: CardIssue,
+    action: string | undefined,
     writer: (login: string | null | undefined) => Promise<WriteCheck>
   ): Promise<{ human: KanbanHumanAuthority; events: LabelEvent[] } | null> {
-    if (!(await writer(authorLogin)).write) return null
+    const author = {
+      actor: { type: issue.authorType ?? undefined, login: issue.authorLogin ?? undefined },
+      performed_via_github_app: issue.authorViaGithubApp
+    }
+    if (!(await this.humanWriter(author, writer))) return null
+    const { labels } = issue
     // Exactly one well-formed status label to attribute; drift, a malformed value, or `running` never carries authority.
-    const statusLabels = labels.filter((label) => label.startsWith(STATUS_LABEL_PREFIX))
+    const statusLabels = labels.filter(isStatusLabel)
     const { statuses, malformed } = parseStatusLabels(labels)
     if (statusLabels.length !== 1 || malformed.length > 0 || statuses[0] === 'running') return null
     let events: LabelEvent[]
@@ -83,12 +113,12 @@ export class KanbanImporter {
       this.warn(board, issueNumber, 'events_unreadable', err)
       return null
     }
-    const transfer = latest(events, (e) => e.event === 'transferred')
+    const transfer = latestTransferEvent(events)
+    if (action === 'transferred' && !transfer) return null
     if (transfer && !(await this.humanWriter(transfer, writer))) return null
-    const added = latest(events, (e) => e.event === 'labeled' && e.label?.name === statusLabels[0])
-    if (!added || !(await this.humanWriter(added, writer))) return null
-    const { level } = await writer(added.actor!.login)
-    return { human: { login: added.actor!.login!, permission: level }, events }
+    const added = await labelAddedByWriter(events, statusLabels[0]!, this.deps.appSlug, writer)
+    if (!added) return null
+    return { human: attestHumanAuthority(added.login, added.level), events }
   }
 
   // Every current ac/agent:* label, not just the parsed one, so a second label cannot ride in unattributed.
@@ -99,14 +129,13 @@ export class KanbanImporter {
   ): Promise<boolean> {
     const agentLabels = labels.filter((label) => label.toLowerCase().startsWith(AGENT_LABEL_PREFIX))
     for (const label of agentLabels) {
-      const added = latest(events, (e) => e.event === 'labeled' && e.label?.name === label)
-      if (!added || !(await this.humanWriter(added, writer))) return false
+      if (!(await labelAddedByWriter(events, label, this.deps.appSlug, writer))) return false
     }
     return true
   }
 
   private async humanWriter(
-    event: LabelEvent,
+    event: Pick<LabelEvent, 'actor' | 'performed_via_github_app'>,
     writer: (login: string | null | undefined) => Promise<WriteCheck>
   ): Promise<boolean> {
     if (!isHumanActor(event) || isAppActor(event, this.deps.appSlug)) return false
@@ -138,10 +167,4 @@ export class KanbanImporter {
       'kanban import: attribution failed; importing as triage'
     )
   }
-}
-
-function latest(events: readonly LabelEvent[], match: (event: LabelEvent) => boolean): LabelEvent | undefined {
-  let found: LabelEvent | undefined
-  for (const event of events) if (match(event) && (!found || event.id > found.id)) found = event
-  return found
 }

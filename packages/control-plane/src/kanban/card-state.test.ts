@@ -275,3 +275,23 @@ describe('isPromotionResidue', () => {
     expect(isPromotionResidue(open(L('todo'), L('ready'), 'ac/status:bogus'))).toBe(false)
   })
 })
+
+describe('status label case variants', () => {
+  it('classifies every noncanonical status spelling as malformed', () => {
+    expect(parseStatusLabels(['AC/STATUS:todo', 'ac/Status:ready', 'ac/status:Ready', 'ac/status:ready'])).toEqual({
+      statuses: ['ready'],
+      malformed: ['AC/STATUS:todo', 'ac/Status:ready', 'ac/status:Ready']
+    })
+  })
+
+  it('removes stale case variants when writing a canonical status', () => {
+    expect(planStatusWrite('ready', open('AC/STATUS:todo', 'ac/status:Ready', 'bug'))).toMatchObject({
+      addLabels: ['ac/status:ready'],
+      removeLabels: ['AC/STATUS:todo', 'ac/status:Ready']
+    })
+    expect(planLabelReconcile({ status: 'ready', leased: false }, open('AC/STATUS:ready'))).toMatchObject({
+      addLabels: ['ac/status:ready'],
+      removeLabels: ['AC/STATUS:ready']
+    })
+  })
+})

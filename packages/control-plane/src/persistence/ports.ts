@@ -1,17 +1,8 @@
-/**
- * Repository ports — the Red-Green seam (design §3.14 / §2.3).
- *
- * Services (C3/C4/C5) and edges depend on these INTERFACES, never on
- * `PrismaClient`. Methods are shaped around the frame handlers so tests drive
- * them with protocol payloads. The only implementors are
- * `persistence/repositories/*.repo.ts`.
- *
- * Record types are lightweight, domain-facing shapes (NOT raw Prisma models) so
- * nothing above this layer imports `@prisma/client`.
- */
+// Lightweight repository ports: services and edges depend on these interfaces, never Prisma models.
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type { KanbanStatus } from '../kanban/card-state.js'
-import type { RepoPermissionLevel } from '../github/repo-permission.js'
+import type { KanbanHumanAuthority } from '../kanban/human-authority.js'
+export type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 import type {
   AccountingBoard,
   AccountingCard,
@@ -8121,12 +8112,6 @@ export interface KanbanCardRow {
   stateRevision: bigint
   dispatchRevision: bigint
   createdAt: Date
-}
-
-/** The live-verified human whose label set an imported card's status; only the import path may carry one. */
-export interface KanbanHumanAuthority {
-  login: string
-  permission: RepoPermissionLevel
 }
 
 /** Run mode is never an input: a new card inherits the board default, and only `setCardMode` overrides it. */
