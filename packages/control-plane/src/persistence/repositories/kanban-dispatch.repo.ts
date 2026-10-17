@@ -53,6 +53,7 @@ interface BoardRow {
   defaultMode: 'read' | 'write'
   maxInProgress: number
   maxInProgressPerAgent: number
+  epicMaxActive: number
 }
 
 interface CandidateRow {
@@ -64,6 +65,7 @@ interface CandidateRow {
   agentId: string
   daemonId: string
   sessionEpoch: bigint
+  epicCardId: string | null
 }
 
 interface RunEndRow {
@@ -119,12 +121,25 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return this.inTransaction(async (tx) => {
       // A concurrent claimer already holds this board: skip it rather than queue behind it.
       const [board] = await tx.$queryRaw<BoardRow[]>(Prisma.sql`
-        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode"
+        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "epicMaxActive", "defaultMode"
         FROM "kanban_board"
         WHERE "id" = ${boardId}::uuid AND "enabled"
         FOR UPDATE SKIP LOCKED
       `)
       if (!board) return []
+
+      // The per-daemon cap spans boards, so its count must be serialized against other boards claiming in parallel.
+      // Advisory xact locks for every daemon this board could claim, in one sorted order, keep those claims deadlock-free.
+      if (opts.maxPerDaemon !== undefined) {
+        const daemons = await tx.$queryRaw<Array<{ daemonId: string }>>(Prisma.sql`
+          SELECT DISTINCT a."daemonId" FROM "kanban_card" c
+          JOIN "agent" a ON a."id" = c."assigneeAgentId" AND a."orgId" = ${board.orgId}
+          WHERE c."boardId" = ${boardId}::uuid AND c."status" = 'ready' AND NOT c."promotionPending"
+        `)
+        for (const id of daemons.map((d) => d.daemonId).sort()) {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'kanban-daemon-cap:' + id}))::text`
+        }
+      }
 
       // In progress = an open lease, so an unacked dispatch already occupies its slot.
       const open = await tx.$queryRaw<{ agentId: string; n: number }[]>(Prisma.sql`
@@ -138,11 +153,36 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       const room = Math.min(board.maxInProgress - inProgress, opts.limit ?? Number.POSITIVE_INFINITY)
       if (room <= 0) return []
 
+      // Open-run counts per epic and per daemon, cached within the claim loop and bumped as this claim mints leases.
+      const perEpic = new Map<string, number>()
+      const perDaemon = new Map<string, number>()
+      const epicActive = async (epicCardId: string): Promise<number> => {
+        const known = perEpic.get(epicCardId)
+        if (known !== undefined) return known
+        const [row] = await tx.$queryRaw<{ n: number }[]>(Prisma.sql`
+          SELECT count(*)::int AS "n" FROM "kanban_run" r
+          JOIN "kanban_card" c ON c."id" = r."cardId"
+          WHERE c."epicCardId" = ${epicCardId}::uuid AND r."endedAt" IS NULL
+        `)
+        perEpic.set(epicCardId, row!.n)
+        return row!.n
+      }
+      const daemonActive = async (daemonId: string): Promise<number> => {
+        const known = perDaemon.get(daemonId)
+        if (known !== undefined) return known
+        const [row] = await tx.$queryRaw<{ n: number }[]>(Prisma.sql`
+          SELECT count(*)::int AS "n" FROM "kanban_run" r WHERE r."daemonId" = ${daemonId}::uuid AND r."endedAt" IS NULL
+        `)
+        perDaemon.set(daemonId, row!.n)
+        return row!.n
+      }
+
       const claimed: KanbanClaimedLease[] = []
       let cursor: CandidateRow | undefined
       while (claimed.length < room) {
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
-        SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt", c."assigneeAgentId" AS "agentId", a."daemonId", d."sessionEpoch"
+        SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt", c."assigneeAgentId" AS "agentId",
+               c."epicCardId", a."daemonId", d."sessionEpoch"
         FROM "kanban_card" c
         JOIN "agent" a ON a."id" = c."assigneeAgentId" AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
         JOIN "daemon" d ON d."id" = a."daemonId"
@@ -168,6 +208,10 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if (claimed.length >= room || inProgress >= board.maxInProgress) break
           if ((perAgent.get(card.agentId) ?? 0) >= board.maxInProgressPerAgent) continue
           if (!opts.isDaemonLive(card.daemonId)) continue
+          // B2 maxActive: a child waits while its epic already has enough open runs.
+          if (card.epicCardId !== null && (await epicActive(card.epicCardId)) >= board.epicMaxActive) continue
+          // Per-daemon cap across all boards: skip a card whose daemon already holds the cap.
+          if (opts.maxPerDaemon !== undefined && (await daemonActive(card.daemonId)) >= opts.maxPerDaemon) continue
 
           const [next] = await tx.$queryRaw<{ attempt: number }[]>(Prisma.sql`
           SELECT COALESCE(MAX("attempt"), 0)::int + 1 AS "attempt" FROM "kanban_run" WHERE "cardId" = ${card.id}::uuid
@@ -221,6 +265,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             sessionKeyPrefix: hook?.githubSessionKey ?? `github:${board.repoId}`
           })
           perAgent.set(card.agentId, (perAgent.get(card.agentId) ?? 0) + 1)
+          if (card.epicCardId !== null) perEpic.set(card.epicCardId, (perEpic.get(card.epicCardId) ?? 0) + 1)
+          perDaemon.set(card.daemonId, (perDaemon.get(card.daemonId) ?? 0) + 1)
           inProgress += 1
         }
       }

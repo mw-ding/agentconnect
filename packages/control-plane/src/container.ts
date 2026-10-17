@@ -1793,7 +1793,8 @@ export function buildContainer(
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),
           warn: (o, m) => http.log.warn(o, m)
-        }
+        },
+        maxPerDaemon: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON
       })
     : undefined
 

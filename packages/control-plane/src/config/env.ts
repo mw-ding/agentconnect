@@ -218,6 +218,10 @@ const CoreConfigShape = {
   // recommendation). Unset ⇒ iss=GITHUB_APP_ID (still supported).
   GITHUB_APP_CLIENT_ID: z.string().optional(),
   GITHUB_APP_CLIENT_SECRET: z.string().optional(),
+  // ── Kanban (issue #2) ──
+  // Per-daemon concurrency cap (audit 2.2): a ready card is skipped while its placed daemon already
+  // holds this many open kanban runs across all boards.
+  KANBAN_MAX_IN_PROGRESS_PER_DAEMON: z.coerce.number().int().min(1).default(8),
   // ── GitLab OAuth application (gitlab-com-integration.md §18.3, §24.1) ──
   // Both must be set to enable the GitLab integration; either unset ⇒ the
   // gitlab module is not assembled and its routes 404. Plain env is the

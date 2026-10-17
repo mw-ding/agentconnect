@@ -7963,6 +7963,8 @@ export interface KanbanClaimOpts {
   limit?: number
   /** Live-connection check; a card whose agent's daemon is offline stays ready. */
   isDaemonLive(daemonId: string): boolean
+  /** Per-daemon cap across all boards (audit 2.2); absent means uncapped. */
+  maxPerDaemon?: number
 }
 
 /** What a daemon-originated write must echo to pass the lease fence. */
