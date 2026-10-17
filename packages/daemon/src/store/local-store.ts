@@ -230,7 +230,7 @@ export interface KanbanCommentRow {
   attempts: number
   /** A POST may already have landed, so the publisher must look for it before posting again. */
   attempted: boolean
-  /** Daemon clock just before the first POST; the marker search reads only comments updated since then. */
+  /** GitHub's clock at the first POST attempt, absent when unreadable; the marker search reads only comments updated since then. */
   attemptedAt?: number
   /** Marker lookups that could not decide; the publisher parks the row as failed once these hit its cap. */
   lookupMisses: number
@@ -1329,7 +1329,7 @@ export const SOURCE_CACHE_SCHEMA = `
       );
 `
 
-export const SCHEMA_VERSION = 58
+export const SCHEMA_VERSION = 60
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -2022,8 +2022,27 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean; postgres: bool
       externalResourceKey = (SELECT externalResourceKey FROM audience a WHERE a.key = sessions.key),
       externalResourceKind = 'conversation', sourceBindingKind = 'external'
       WHERE externalProvider IS NULL AND key IN (SELECT key FROM audience)`)
+  },
+  // v59: kanban_terminals shipped without its retry columns at an earlier head, which the CREATE block cannot widen.
+  async (db, store) => {
+    for (const [column, type] of KANBAN_TERMINALS_RETRY_COLUMNS)
+      await addColumn(db, store.postgres, 'kanban_terminals', column, type)
+  },
+  // v60: an attemptedAt written from local time is untrustworthy under clock skew; clearing it makes the next lookup scan without a bound.
+  async (db, store) => {
+    if (await columnExists(db, store.postgres, 'kanban_terminals', 'attemptedAt'))
+      await db.exec('UPDATE kanban_terminals SET attemptedAt = NULL')
   }
 ]
+
+/** The comment outbox's retry columns, as v59 adds them where an older kanban_terminals lacks them. */
+const KANBAN_TERMINALS_RETRY_COLUMNS = [
+  ['attempts', 'INTEGER NOT NULL DEFAULT 0'],
+  ['attempted', 'INTEGER NOT NULL DEFAULT 0'],
+  ['attemptedAt', 'INTEGER'],
+  ['lookupMisses', 'INTEGER NOT NULL DEFAULT 0'],
+  ['nextAt', 'INTEGER NOT NULL DEFAULT 0']
+] as const
 
 /** Add a column a table lacks, on either dialect; a table that does not exist yet gets it from the CREATE block. */
 async function addColumn(db: StoreTx, postgres: boolean, table: string, column: string, type: string): Promise<void> {
@@ -2682,7 +2701,7 @@ export class LocalStore {
       );
       -- One terminal tool call per lease. state 'held' until the CP answers the report, then 'comment' until the
       -- final issue comment lands; attempted marks a POST that may have landed, so a retry looks before posting.
-      -- attemptedAt is set once, before the first POST, and bounds that look with GitHub's since filter.
+      -- attemptedAt is GitHub's clock (Date header) before the first POST; it bounds that look with the since filter, never local time.
       -- lookupMisses counts looks that could not decide; at the cap the row is parked in state 'failed'.
       CREATE TABLE IF NOT EXISTS kanban_terminals (
         leaseId TEXT PRIMARY KEY,
@@ -5278,13 +5297,13 @@ export class LocalStore {
     }))
   }
 
-  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps the first attempt's time. */
-  async markKanbanCommentAttempt(leaseId: string, nextAt: number, at: number): Promise<void> {
+  /** Written before the POST so a crash mid-request looks first; attemptedAt keeps GitHub's clock from the first attempt (null when unreadable). */
+  async markKanbanCommentAttempt(leaseId: string, nextAt: number, githubAt: number | null): Promise<void> {
     await this.db
       .prepare(
-        'UPDATE kanban_terminals SET attempts = attempts + 1, attempted = 1, attemptedAt = COALESCE(attemptedAt, ?), nextAt = ? WHERE leaseId = ?'
+        'UPDATE kanban_terminals SET attempts = attempts + 1, attemptedAt = CASE WHEN attempted = 0 THEN ? ELSE attemptedAt END, attempted = 1, nextAt = ? WHERE leaseId = ?'
       )
-      .run(at, nextAt, leaseId)
+      .run(githubAt, nextAt, leaseId)
   }
 
   async deferKanbanComment(leaseId: string, nextAt: number): Promise<void> {

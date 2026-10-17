@@ -74,11 +74,11 @@ export async function startRelayCpLink(opts: RelayCpLinkOptions): Promise<RelayC
     report: (r) => client.emitRunReport(r),
     doorbell: (poke) => {
       installationPokes.push(poke)
-      client.emitGithubInstallation(poke)
+      return client.emitGithubInstallation(poke)
     },
     graphDoorbell: (poke) => {
       graphPokes.push(poke)
-      client.emitGithubGraph(poke)
+      return client.emitGithubGraph(poke)
     },
     authorizeComment: (request) => client.authorizeGithubComment(request),
     authorizeRerequest: (request) => client.authorizeGithubRerequest(request),

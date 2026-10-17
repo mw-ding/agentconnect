@@ -1,35 +1,66 @@
 import { describe, expect, it } from 'vitest'
-import { isLeakedAgentEnvKey, stripLeakedAgentEnv } from './kanban-agent-env.js'
+import { isAllowedAgentEnvKey, isLeakedAgentEnvKey, stripLeakedAgentEnv } from './kanban-agent-env.js'
 
 describe('stripLeakedAgentEnv', () => {
-  it('removes GitHub App material, private keys, and webhook secrets', () => {
+  it('drops planted credentials and unknown vars, keeps allowlisted ones', () => {
     const env = stripLeakedAgentEnv({
       PATH: '/usr/bin',
-      SAFE_MODE: '1',
+      HOME: '/home/x',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C',
+      TERM: 'xterm',
+      XDG_CONFIG_HOME: '/cfg',
+      ANTHROPIC_API_KEY: 'sk-ant',
+      OPENAI_API_KEY: 'sk-oai',
+      NODE_OPTIONS: '--conditions=development',
+      DATABASE_URL: 'postgres://u:p@h/db',
+      PGPASSWORD: 'pg',
+      FOO_PASSWORD: 'pw',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret',
+      AWS_ACCESS_KEY_ID: 'AKIA',
+      AWS_SESSION_TOKEN: 'tok',
       GITHUB_APP_PRIVATE_KEY_B64: 'sentinel-private-key',
       GITHUB_APP_ID: '123',
-      GITHUB_APP_SLUG: 'agentconnect',
-      GITHUB_APP_WEBHOOK_SECRET: 'whsec-app',
       GITHUB_TOKEN: 'ghp_token',
       GH_TOKEN: 'ghs_token',
       GH_CONFIG_DIR: '/tmp/gh',
-      MY_PRIVATE_KEY: 'pk',
       API_SECRET: 'sek',
       WEBHOOK_SECRET: 'whsec',
-      SOMETHING_WEBHOOK_SECRET_VALUE: 'whsec-2',
       CLAUDECODE: '1',
-      AC_GITCRED_SOCKET: '/tmp/sock'
+      AC_GITCRED_SOCKET: '/tmp/sock',
+      SAFE_MODE: '1'
     })
-    expect(env.GITHUB_APP_PRIVATE_KEY_B64).toBeUndefined()
-    expect(env.GITHUB_APP_ID).toBeUndefined()
-    expect(env.GITHUB_APP_WEBHOOK_SECRET).toBeUndefined()
-    expect(env.GITHUB_TOKEN).toBeUndefined()
-    expect(env.MY_PRIVATE_KEY).toBeUndefined()
-    expect(env.API_SECRET).toBeUndefined()
-    expect(env.WEBHOOK_SECRET).toBeUndefined()
-    expect(env.SOMETHING_WEBHOOK_SECRET_VALUE).toBeUndefined()
-    expect(env.PATH).toBe('/usr/bin')
-    expect(env.SAFE_MODE).toBe('1')
-    expect(Object.keys(env).filter(isLeakedAgentEnvKey)).toEqual([])
+    for (const key of [
+      'DATABASE_URL',
+      'PGPASSWORD',
+      'FOO_PASSWORD',
+      'AWS_SECRET_ACCESS_KEY',
+      'AWS_ACCESS_KEY_ID',
+      'AWS_SESSION_TOKEN',
+      'GITHUB_APP_PRIVATE_KEY_B64',
+      'GITHUB_APP_ID',
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'GH_CONFIG_DIR',
+      'API_SECRET',
+      'WEBHOOK_SECRET',
+      'CLAUDECODE',
+      'AC_GITCRED_SOCKET',
+      'SAFE_MODE'
+    ])
+      expect(env[key], key).toBeUndefined()
+    expect(env).toEqual({
+      PATH: '/usr/bin',
+      HOME: '/home/x',
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C',
+      TERM: 'xterm',
+      XDG_CONFIG_HOME: '/cfg',
+      ANTHROPIC_API_KEY: 'sk-ant',
+      OPENAI_API_KEY: 'sk-oai',
+      NODE_OPTIONS: '--conditions=development'
+    })
+    expect(Object.keys(env).some(isLeakedAgentEnvKey)).toBe(false)
+    expect(isAllowedAgentEnvKey('DATABASE_URL')).toBe(false)
   })
 })

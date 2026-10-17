@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
 import { AUTO_MERGE_DISARM_GRACE_MS, createAutoMergeHandler } from '../src/shim/auto-merge-handler.js'
 import { GITCRED_CAPABILITY_ENV } from '../src/gitcred/env.js'
+import { AUTO_MERGE_POLL_ENV } from '../src/github/auto-merge/core.js'
 
 /** A child process double: stdout/stderr streams plus an `exit` the test can fire. */
 function fakeChild() {
@@ -64,6 +65,17 @@ describe('in-sandbox automerge handler', () => {
     // Idempotent: arming an armed watcher keeps the process it already has.
     expect(await handler(ARM)).toEqual({ armed: true })
     expect(spawned).toHaveLength(1)
+  })
+
+  it('passes the operator poll override through to the watcher', async () => {
+    vi.stubEnv(AUTO_MERGE_POLL_ENV, '1500')
+    try {
+      const { handler, spawned } = build()
+      await handler(ARM)
+      expect(spawned[0]!.env[AUTO_MERGE_POLL_ENV]).toBe('1500')
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it('projects the watcher’s NDJSON status back to the daemon', async () => {

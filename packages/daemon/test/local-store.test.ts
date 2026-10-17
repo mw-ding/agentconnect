@@ -4127,6 +4127,172 @@ describe.skipIf(pg)('the v26 → v27 router targets column', () => {
   })
 })
 
+describe.skipIf(pg)('the v58 → v59 kanban outbox columns', () => {
+  const RETRY_COLUMNS = ['attempts', 'attempted', 'attemptedAt', 'lookupMisses', 'nextAt']
+  const columnsOf = (path: string): string[] => {
+    const db = new DatabaseSync(path)
+    const names = (db.prepare('PRAGMA table_info(kanban_terminals)').all() as { name: string }[]).map((c) => c.name)
+    db.close()
+    return names
+  }
+
+  it('creates the retry columns on a fresh store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-kanban-fresh-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    expect(columnsOf(path)).toEqual(expect.arrayContaining(RETRY_COLUMNS))
+  })
+
+  it('adds the retry columns to a legacy-shape table at v58 and keeps its rows', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-kanban-legacy-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec(`DROP TABLE kanban_terminals;
+      CREATE TABLE kanban_terminals (leaseId TEXT PRIMARY KEY, entry TEXT NOT NULL, state TEXT NOT NULL, recordedAt INTEGER NOT NULL);
+      INSERT INTO kanban_terminals VALUES ('l1', '{}', 'comment', 5);
+      PRAGMA user_version = 58`)
+    old.close()
+    expect(columnsOf(path)).not.toContain('attemptedAt')
+
+    await (await LocalStore.open(path)).close()
+    expect(columnsOf(path)).toEqual(expect.arrayContaining(RETRY_COLUMNS))
+    const check = new DatabaseSync(path)
+    expect(
+      check
+        .prepare('SELECT leaseId, attempts, attempted, attemptedAt, lookupMisses, nextAt FROM kanban_terminals')
+        .all()
+    ).toEqual([
+      expect.objectContaining({
+        leaseId: 'l1',
+        attempts: 0,
+        attempted: 0,
+        attemptedAt: null,
+        lookupMisses: 0,
+        nextAt: 0
+      })
+    ])
+    expect((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    check.close()
+    // A migrated store reopens without another step.
+    await (await LocalStore.open(path)).close()
+  })
+})
+
+describe.skipIf(pg)('the v59 → v60 kanban attemptedAt clearing', () => {
+  const rows = (path: string, sql: string): unknown[] => {
+    const db = new DatabaseSync(path)
+    const out = db.prepare(sql).all()
+    db.close()
+    return out
+  }
+  const version = (path: string): number =>
+    (rows(path, 'PRAGMA user_version')[0] as { user_version: number }).user_version
+  const exec = (path: string, sql: string): void => {
+    const db = new DatabaseSync(path)
+    db.exec(sql)
+    db.close()
+  }
+  const freshStore = async (prefix: string): Promise<string> => {
+    const path = join(mkdtempSync(join(tmpdir(), prefix)), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    return path
+  }
+
+  it('clears a locally-timestamped attemptedAt so the next marker lookup scans without a bound', async () => {
+    const path = await freshStore('ac-schema-kanban-v59-')
+    exec(
+      path,
+      "INSERT INTO kanban_terminals (leaseId, entry, state, attempted, attemptedAt, recordedAt) VALUES ('l2', '{}', 'comment', 1, 1234, 5); PRAGMA user_version = 59"
+    )
+    await (await LocalStore.open(path)).close()
+    expect(rows(path, "SELECT attemptedAt FROM kanban_terminals WHERE leaseId = 'l2'")).toEqual([{ attemptedAt: null }])
+  })
+
+  it('clears only attemptedAt: attempts, attempted, lookupMisses, nextAt, state and other rows survive', async () => {
+    const path = await freshStore('ac-schema-kanban-v59-keep-')
+    exec(
+      path,
+      `INSERT INTO kanban_terminals (leaseId, entry, state, attempts, attempted, attemptedAt, lookupMisses, nextAt, recordedAt)
+        VALUES ('a', '{}', 'comment', 3, 1, 1234, 2, 99, 5), ('b', '{}', 'held', 0, 0, NULL, 0, 0, 6);
+        PRAGMA user_version = 59`
+    )
+    await (await LocalStore.open(path)).close()
+    expect(
+      rows(
+        path,
+        'SELECT leaseId, state, attempts, attempted, attemptedAt, lookupMisses, nextAt FROM kanban_terminals ORDER BY leaseId'
+      )
+    ).toEqual([
+      { leaseId: 'a', state: 'comment', attempts: 3, attempted: 1, attemptedAt: null, lookupMisses: 2, nextAt: 99 },
+      { leaseId: 'b', state: 'held', attempts: 0, attempted: 0, attemptedAt: null, lookupMisses: 0, nextAt: 0 }
+    ])
+  })
+
+  it('does not clear a GitHub-clock attemptedAt when an already-migrated store reopens', async () => {
+    const path = await freshStore('ac-schema-kanban-v60-')
+    expect(version(path)).toBe(SCHEMA_VERSION)
+    exec(
+      path,
+      "INSERT INTO kanban_terminals (leaseId, entry, state, attempted, attemptedAt, recordedAt) VALUES ('l3', '{}', 'comment', 1, 999, 5)"
+    )
+    await (await LocalStore.open(path)).close()
+    await (await LocalStore.open(path)).close()
+    expect(rows(path, "SELECT attemptedAt FROM kanban_terminals WHERE leaseId = 'l3'")).toEqual([{ attemptedAt: 999 }])
+    expect(version(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('walks a v58 store with a legacy table through v59 and v60 in one open', async () => {
+    const path = await freshStore('ac-schema-kanban-v58-walk-')
+    exec(
+      path,
+      `DROP TABLE kanban_terminals;
+        CREATE TABLE kanban_terminals (leaseId TEXT PRIMARY KEY, entry TEXT NOT NULL, state TEXT NOT NULL, recordedAt INTEGER NOT NULL);
+        INSERT INTO kanban_terminals VALUES ('l1', '{}', 'comment', 5);
+        PRAGMA user_version = 58`
+    )
+    await (await LocalStore.open(path)).close()
+    expect(version(path)).toBe(SCHEMA_VERSION)
+    expect(rows(path, 'SELECT leaseId, attemptedAt, attempts FROM kanban_terminals')).toEqual([
+      { leaseId: 'l1', attemptedAt: null, attempts: 0 }
+    ])
+  })
+
+  it('completes a table that already has some retry columns without touching their values', async () => {
+    const path = await freshStore('ac-schema-kanban-partial-')
+    exec(
+      path,
+      `DROP TABLE kanban_terminals;
+        CREATE TABLE kanban_terminals (leaseId TEXT PRIMARY KEY, entry TEXT NOT NULL, state TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0, attempted INTEGER NOT NULL DEFAULT 0, nextAt INTEGER NOT NULL DEFAULT 0, recordedAt INTEGER NOT NULL);
+        INSERT INTO kanban_terminals VALUES ('p', '{}', 'comment', 3, 1, 77, 5);
+        PRAGMA user_version = 58`
+    )
+    await (await LocalStore.open(path)).close()
+    expect(rows(path, 'SELECT attempts, attempted, attemptedAt, lookupMisses, nextAt FROM kanban_terminals')).toEqual([
+      { attempts: 3, attempted: 1, attemptedAt: null, lookupMisses: 0, nextAt: 77 }
+    ])
+  })
+
+  it('opens a stale-version store whose table already has every column, and clears attemptedAt', async () => {
+    const path = await freshStore('ac-schema-kanban-headshape-')
+    exec(
+      path,
+      `INSERT INTO kanban_terminals (leaseId, entry, state, attempted, attemptedAt, recordedAt) VALUES ('h', '{}', 'comment', 1, 5555, 5);
+        PRAGMA user_version = 58`
+    )
+    await (await LocalStore.open(path)).close()
+    expect(rows(path, "SELECT attemptedAt FROM kanban_terminals WHERE leaseId = 'h'")).toEqual([{ attemptedAt: null }])
+    expect(version(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('creates the table when a v58 store has none', async () => {
+    const path = await freshStore('ac-schema-kanban-missing-')
+    exec(path, 'DROP TABLE kanban_terminals; PRAGMA user_version = 58')
+    await (await LocalStore.open(path)).close()
+    const names = (rows(path, 'PRAGMA table_info(kanban_terminals)') as { name: string }[]).map((c) => c.name)
+    expect(names).toEqual(expect.arrayContaining(['attempts', 'attempted', 'attemptedAt', 'lookupMisses', 'nextAt']))
+  })
+})
+
 // multi-repository-workspaces.md decision 20: v28 records that a session was handed an on-demand clone directory.
 describe.skipIf(pg)('the v27 → v28 on-demand clones column', () => {
   it('adds onDemandClones to a v27 store, empty on the sessions it already holds', async () => {
