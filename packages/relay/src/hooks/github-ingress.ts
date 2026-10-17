@@ -1142,6 +1142,13 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       }
 
       if (deliveries.seenDelivery(deliveryHeader)) {
+        // Metadata doorbells must survive redelivery when an earlier control-plane hop was lost.
+        const poke =
+          githubGraphDoorbell(event, payload, deliveryKey) ?? githubIssueDoorbell(event, payload, deliveryKey)
+        if (poke) deps.graphDoorbell?.(poke)
+        if (INSTALLATION_EVENTS.has(event) && payload.installation?.id !== undefined) {
+          deps.doorbell({ installationId: String(payload.installation.id), action: payload.action ?? 'unknown' })
+        }
         deps.log.info(`github ingress: duplicate delivery ${deliveryKey}`)
         return reply.code(202).send({ deliveryKey })
       }

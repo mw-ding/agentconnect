@@ -658,7 +658,7 @@ describe('github ingress', () => {
       expect(h.sent).toHaveLength(1)
     })
 
-    it('forwards one delivery once when GitHub retries the same X-GitHub-Delivery', async () => {
+    it('deduplicates hook dispatch while replaying metadata doorbells for the same delivery', async () => {
       h.table.upsert(rule({}, { events: ['issues:*'] }))
       const headers = { 'x-github-delivery': 'gh-delivery-dup' }
       const first = await post('issues', labeled('ac/status:ready'), { headers })
@@ -667,7 +667,8 @@ describe('github ingress', () => {
       expect(second.statusCode).toBe(202)
       expect(second.json()).toEqual({ deliveryKey: 'gh-delivery-dup' })
       await flush()
-      expect(h.graphDoorbells).toHaveLength(1)
+      expect(h.graphDoorbells).toHaveLength(2)
+      expect(h.graphDoorbells[1]).toEqual(h.graphDoorbells[0])
       expect(h.sent).toHaveLength(1)
     })
 
