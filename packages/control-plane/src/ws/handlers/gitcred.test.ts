@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { AnyFrame } from '@agentconnect.md/protocol'
+import type { KanbanGrantScope } from '../../persistence/ports.js'
 import { GitCredDeniedError } from '../../github/service.js'
 import type { DaemonConnection } from '../connection.js'
 import type { DaemonWsDeps } from '../deps.js'
@@ -872,7 +873,7 @@ const grant = {
 describe('handleGitCredRequest — Kanban run grants', () => {
   const scope = { repoId: 77n, repoFullName: 'acme/web', mode: 'read' as const }
 
-  function kanbanDeps(scopes: Array<typeof scope>, github: Record<string, unknown>) {
+  function kanbanDeps(scopes: KanbanGrantScope[], github: Record<string, unknown>) {
     return {
       agent: { get: async () => PLACED_AGENT },
       kanbanGrants: { openScopes: async () => scopes },
