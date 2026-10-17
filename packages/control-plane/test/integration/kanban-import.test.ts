@@ -310,6 +310,16 @@ describe('issue import doorbells (Postgres)', () => {
       label: 'ac/status:ready'
     })
 
+    it('vera-r2: 3 a sender-less labeled doorbell (relay not yet rolled) imports triage, never ready, nothing to claim', async () => {
+      const f = await importFixture()
+      await f.importer.import(f.board, repo, 1, { action: 'labeled' }).catch(() => false)
+      const rows = await prisma.kanbanCard.findMany({ where: { boardId: f.board.id } })
+      expect(rows.every((row) => row.status !== 'ready')).toBe(true)
+      expect(
+        await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+      ).toHaveLength(0)
+    })
+
     it("imports a non-writer sender's invisible re-add as unassigned triage, nothing to claim", async () => {
       const f = await importFixture()
       expect(await f.importer.import(f.board, repo, 1, doorbell('mallory', '7'))).toBe(true)

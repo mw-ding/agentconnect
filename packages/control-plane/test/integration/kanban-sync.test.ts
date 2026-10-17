@@ -569,3 +569,143 @@ describe('two CP replicas (stale snapshot after reassignment)', () => {
     expect(f.writes.some((w) => w.removeLabels.includes('ac/status:running'))).toBe(false)
   })
 })
+
+// Vera round 2 (review 5559523967): the blocker attacks through the real KanbanSync over Postgres; failed on 5d610cb1e.
+describe('vera-r2: KanbanSync over Postgres', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+
+  async function pg(
+    card: { status: 'todo' | 'done' | 'review' | 'ready'; syncEventCursor: bigint; syncAgentCursor?: bigint } & Record<
+      string,
+      unknown
+    >,
+    labels: string[],
+    events: LabelEvent[],
+    now: () => Date = () => new Date()
+  ) {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await seedAgent(prisma, NEXT, { daemonId: DAEMON, name: 'new' })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'vera-r2', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const row = await prisma.kanbanCard.create({
+      data: { boardId: board.id, issueId: 1n, issueNumber: 1, assigneeAgentId: AGENT, ...card }
+    })
+    const state = { issue: { issueId: 1n, nodeId: 'I_1', number: 1, state: 'open', labels } as CardIssue, events }
+    const writes: LabelPlan[] = []
+    const cards = new PgKanbanCardRepo(prisma)
+    const deps = {
+      repo: new PgKanbanSyncRepo(prisma),
+      cards,
+      store: {
+        readCard: async () => state.issue,
+        readLabelEvents: async () => [...state.events],
+        applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+          writes.push(plan)
+        }
+      },
+      permissions: {
+        permission: async (_r: unknown, login: string) => (login.toLowerCase() === 'bob' ? 'write' : 'triage') as never
+      },
+      appSlug: 'agentconnect',
+      repoRef: async () => ({ installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }),
+      revoke: async () => {},
+      promote: async () => {},
+      log: { warn: () => {} },
+      now
+    }
+    const read = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: row.id } })
+    const claim = () => new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    return { board, row, state, writes, deps, cards, read, claim }
+  }
+
+  it("vera-r2: 1a a writer's reopen does not adopt a triage user's ready label (PG)", async () => {
+    const f = await pg(
+      { status: 'done', syncEventCursor: 100n },
+      ['ac/status:ready'],
+      [
+        { id: 99, event: 'closed', actor: bob },
+        { id: 100, event: 'labeled', label: { name: 'ac/status:done' }, actor: bob },
+        { id: 101, event: 'unlabeled', label: { name: 'ac/status:done' }, actor: mallory },
+        { id: 102, event: 'labeled', label: { name: 'ac/status:ready' }, actor: mallory },
+        { id: 103, event: 'reopened', actor: bob }
+      ]
+    )
+    await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+    expect((await f.read()).status).not.toBe('ready')
+    expect(await f.claim()).toHaveLength(0)
+  })
+
+  it('vera-r2: 1b a status swap during the reassignment is re-judged after the re-read (PG)', async () => {
+    const f = await pg(
+      { status: 'todo', syncEventCursor: 10n, syncAgentCursor: 10n },
+      ['ac/status:blocked', 'ac/agent:new'],
+      [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:todo' }, actor: bob },
+        { id: 20, event: 'unlabeled', label: { name: 'ac/status:todo' }, actor: bob },
+        { id: 21, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: bob },
+        { id: 22, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob }
+      ]
+    )
+    let swapped = false
+    const sync = new KanbanSync({
+      ...f.deps,
+      cards: {
+        resolveAgentSlug: f.cards.resolveAgentSlug.bind(f.cards),
+        setAssignee: async (input) => {
+          const result = await f.cards.setAssignee(input)
+          if (!swapped) {
+            swapped = true
+            f.state.issue = { ...f.state.issue, labels: ['ac/status:ready', 'ac/agent:new'] }
+            f.state.events.push(
+              { id: 30, event: 'unlabeled', label: { name: 'ac/status:blocked' }, actor: mallory },
+              { id: 31, event: 'labeled', label: { name: 'ac/status:ready' }, actor: mallory }
+            )
+          }
+          return result
+        }
+      }
+    })
+    await sync.onCardChanged(f.board.id, 1, true)
+    await sync.onCardChanged(f.board.id, 1, true)
+    expect((await f.read()).status).not.toBe('ready')
+    expect(await f.claim()).toHaveLength(0)
+  })
+
+  it("vera-r2: 2 projectStatus neither overwrites nor acks a writer's edit during a pending CP write (PG)", async () => {
+    const f = await pg(
+      { status: 'review', syncEventCursor: 10n, labelWritePending: true },
+      ['ac/status:ready'],
+      [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+        { id: 20, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: bob },
+        { id: 21, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }
+      ]
+    )
+    const sync = new KanbanSync(f.deps)
+    await sync.projectStatus(f.board.id, 1, 'review')
+    expect((await f.read()).syncEventCursor).toBe(10n)
+    expect(f.writes.some((w) => w.removeLabels.includes('ac/status:ready'))).toBe(false)
+    await sync.onCardChanged(f.board.id, 1, true)
+    expect((await f.read()).status).toBe('ready')
+  })
+
+  it('vera-r2: 5 the deferral bound fails closed to triage and a claim neither takes it nor clears the flag (PG)', async () => {
+    const start = new Date()
+    const f = await pg(
+      {
+        status: 'ready',
+        syncEventCursor: 40n,
+        syncDeferredAt: new Date(start.getTime() - 11 * 60_000),
+        syncDeferralCount: 3
+      },
+      ['ac/status:blocked'],
+      [{ id: 40, event: 'labeled', label: { name: 'ac/status:ready' }, actor: bob }]
+    )
+    await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+    expect(await f.claim()).toHaveLength(0)
+    expect(await f.read()).toMatchObject({ status: 'triage', needsAttention: true })
+  })
+})
