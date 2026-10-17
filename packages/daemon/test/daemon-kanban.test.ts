@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Daemon } from '../src/daemon.js'
 import { sessionHostKey } from '../src/acp/host-key.js'
+import { AcpConnectionClosedError } from '../src/acp/transport-error.js'
 import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { buildKanbanMessage } from '../src/messages/kanban-message.js'
@@ -237,6 +238,15 @@ describe('Daemon Kanban dispatch', () => {
       expect(h.host.prompt).toHaveBeenCalledOnce()
     }
   )
+
+  it('reports a closed agent transport as a counted agent crash, end to end through the daemon turn path', async () => {
+    const h = await harness()
+    h.host.prompt.mockRejectedValueOnce(new AcpConnectionClosedError(new Error('connection reset')))
+    await h.worker.dispatch(dispatch)
+    await vi.waitFor(async () => expect(await h.store.listKanbanReports(10)).toHaveLength(1))
+    expect((await h.store.listKanbanReports(10))[0]).toMatchObject({ outcome: 'failed', reasonCode: 'agent_crashed' })
+    expect(h.host.prompt).toHaveBeenCalledOnce()
+  })
 
   it('keeps live read-only cards protected from chat permission changes and configuration refreshes', async () => {
     const h = await harness()
