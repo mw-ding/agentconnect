@@ -51,6 +51,7 @@ import type {
   CodeHostNoteState,
   GithubPublishedComment,
   OrganizationSuggestionInfo,
+  KanbanCardShowOk,
   KanbanReport,
   CodeHostReviewLeasePhase,
   CodeHostReviewOpKind,
@@ -7961,6 +7962,16 @@ export interface KanbanGrantScope {
   mode: 'read' | 'write'
 }
 
+export interface KanbanCardViewReq {
+  boardId: string
+  cardId: string
+  leaseId: string
+  dispatchRevision: bigint
+}
+
+/** What `kanban/card` returns: counters and prior runs only, never issue text. */
+export type KanbanCardView = Extract<KanbanCardShowOk, { accepted: true }>['card']
+
 export interface KanbanDispatchRepo {
   /** Enabled boards, for the periodic reconciler tick. */
   listEnabledBoardIds(): Promise<string[]>
@@ -8000,6 +8011,16 @@ export interface KanbanDispatchRepo {
     leaseId: string,
     repoFullName: string
   ): Promise<{ repoId: bigint } | null>
+  /** The board repo a daemon may comment on while its run is still open (progress notes); null when the lease fence fails. */
+  kanbanLiveCommentGrant(
+    daemonId: string,
+    epoch: bigint,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null>
+  /** Body-free metadata of the card an open lease holds; null unless the lease, revision, daemon, and epoch all match. */
+  kanbanCardView(daemonId: string, epoch: bigint, req: KanbanCardViewReq): Promise<KanbanCardView | null>
   /** Stamp liveness for the leases this daemon still holds; returns the superseded lease ids. */
   heartbeat(daemonId: string, epoch: bigint, beats: KanbanLeaseBeatInput[], now: Date): Promise<string[]>
   /** Open runs with stale-lease facts, paged by lease id so healthy runs cannot hide stale ones. */

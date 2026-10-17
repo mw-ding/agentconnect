@@ -1490,3 +1490,100 @@ describe('KanbanDispatcher — provider outage backoff (real Postgres)', () => {
     expect(flat2.cooldownUntil!.getTime() - h.clock.now()).toBe(60_000)
   })
 })
+
+describe('KanbanDispatcher — card read and progress-note grant (real Postgres)', () => {
+  async function leased() {
+    const h = await harness()
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const d = h.sent[0]!.d
+    const req = { boardId: d.boardId, cardId: d.cardId, leaseId: d.leaseId, dispatchRevision: d.dispatchRevision }
+    return { h, c, d, req }
+  }
+  const superseded = (leaseId: string) => ({ leaseId, accepted: false, reason: 'superseded' })
+
+  it('returns body-free card metadata and prior runs to the daemon that holds the open lease', async () => {
+    const { h, c, d, req } = await leased()
+    // A first attempt that ended transient, then the open one.
+    await h.dispatcher.onReport(D1, 4, h.reportFor(d, { outcome: 'transient', reasonCode: 'provider_rate_limited' }))
+    await h.dispatcher.settle()
+    h.clock.advance(61_000)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    const second = h.sent[1]!.d
+    const reply = await h.dispatcher.onCardShow(D1, 4, {
+      ...req,
+      leaseId: second.leaseId,
+      dispatchRevision: second.dispatchRevision
+    })
+    expect(reply).toMatchObject({
+      leaseId: second.leaseId,
+      accepted: true,
+      card: {
+        status: 'running',
+        attempt: 2,
+        mode: 'read',
+        blockKind: null,
+        consecutiveFailures: 0,
+        runs: [{ attempt: 1, outcome: 'transient', reasonCode: 'provider_rate_limited' }]
+      }
+    })
+    expect(Object.keys((reply as { card: object }).card).sort()).toEqual(
+      [
+        'attempt',
+        'blockKind',
+        'blockRecurrence',
+        'consecutiveFailures',
+        'linkedPrNumber',
+        'mode',
+        'priority',
+        'protocolViolations',
+        'runs',
+        'status'
+      ].sort()
+    )
+    expect(c.id).toBe(req.cardId)
+  })
+
+  it.each([
+    ['another daemon', (r: Record<string, string>) => ({ daemon: D2, epoch: 1, req: r })],
+    ['a stale daemon epoch', (r: Record<string, string>) => ({ daemon: D1, epoch: 3, req: r })],
+    [
+      'a stale dispatch revision',
+      (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, dispatchRevision: '99' } })
+    ],
+    ['another card', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, cardId: D2 } })],
+    ['another board', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, boardId: D2 } })],
+    ['an unknown lease', (r: Record<string, string>) => ({ daemon: D1, epoch: 4, req: { ...r, leaseId: D2 } })]
+  ])('refuses a card read from %s', async (_name, mutate) => {
+    const { h, req } = await leased()
+    const { daemon, epoch, req: bad } = mutate(req)
+    expect(await h.dispatcher.onCardShow(daemon, epoch, bad as typeof req)).toEqual(superseded(bad.leaseId!))
+  })
+
+  it('refuses a card read and a progress grant once the card was reassigned', async () => {
+    const { h, d, req } = await leased()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+    await prisma.kanbanCard.update({ where: { id: d.cardId }, data: { dispatchRevision: { increment: 1 } } })
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+  })
+
+  it('refuses a card read and a progress grant once the lease has ended, leaving the final-comment grant', async () => {
+    const { h, d, req } = await leased()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(d))
+    await h.dispatcher.settle()
+    expect(await h.dispatcher.onCardShow(D1, 4, req)).toEqual(superseded(d.leaseId))
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.commentGrant(D1, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+  })
+
+  it('grants a progress note only to the holder daemon, agent, epoch, and board repo', async () => {
+    const { h, d } = await leased()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/web')).toEqual({ repoId: REPO_ID })
+    expect(await h.dispatcher.liveCommentGrant(D2, 1, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 5, A1, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, D2, d.leaseId, 'acme/web')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/other')).toBeNull()
+    expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, D2, 'acme/web')).toBeNull()
+  })
+})

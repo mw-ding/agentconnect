@@ -1,5 +1,7 @@
 // Central claims enforce caps and fence every run; the daemon executes with body-free grants and derives its own liveness.
 import type {
+  KanbanCardShow,
+  KanbanCardShowOk,
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanDispatchRefusal,
@@ -366,6 +368,30 @@ export class KanbanDispatcher {
     repoFullName: string
   ): Promise<{ repoId: bigint } | null> {
     return this.deps.repo.kanbanCommentGrant(daemonId, agentId, leaseId, repoFullName)
+  }
+
+  /** Progress-note grant: the lease must still be open and current on this daemon and epoch. Falls back to the final-comment grant. */
+  async liveCommentGrant(
+    daemonId: string,
+    epoch: number,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null> {
+    return this.deps.repo.kanbanLiveCommentGrant(daemonId, BigInt(epoch), agentId, leaseId, repoFullName)
+  }
+
+  /** `kanban/card`: body-free metadata for the worker's own open lease; a stale one is answered as data. */
+  async onCardShow(daemonId: string, epoch: number, req: KanbanCardShow): Promise<KanbanCardShowOk> {
+    const card = await this.deps.repo.kanbanCardView(daemonId, BigInt(epoch), {
+      boardId: req.boardId,
+      cardId: req.cardId,
+      leaseId: req.leaseId,
+      dispatchRevision: BigInt(req.dispatchRevision)
+    })
+    return card
+      ? { leaseId: req.leaseId, accepted: true, card }
+      : { leaseId: req.leaseId, accepted: false, reason: 'superseded' }
   }
 
   /** `kanban/lease-heartbeat` from the daemon that holds these leases; returns the ones it must drop. */

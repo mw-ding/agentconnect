@@ -252,7 +252,16 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
         )
         return
       }
-      const allowed = await deps.kanbanDispatcher.commentGrant(conn.daemonId, agentId, leaseId, repoFullName)
+      // An ended accepted run owes its final summary; an open, current lease may post progress notes.
+      const allowed =
+        (await deps.kanbanDispatcher.commentGrant(conn.daemonId, agentId, leaseId, repoFullName)) ??
+        (await deps.kanbanDispatcher.liveCommentGrant?.(
+          conn.daemonId,
+          conn.sessionEpoch,
+          agentId,
+          leaseId,
+          repoFullName
+        ))
       if (!allowed) {
         conn.sendError(frame.id, 'SCOPE_DENIED', 'lease does not authorize a kanban comment on this repo', false)
         return

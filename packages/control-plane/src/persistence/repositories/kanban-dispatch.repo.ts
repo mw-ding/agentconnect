@@ -1,6 +1,6 @@
 // PgKanbanDispatchRepo (issue #2 D2): the board row is the claim mutex (SKIP LOCKED), card rows are skipped while another writer holds them.
 import { randomUUID } from 'node:crypto'
-import type { KanbanReport } from '@agentconnect.md/protocol'
+import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
@@ -9,6 +9,8 @@ import { PROMOTION_CLEARED } from './kanban.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
+  KanbanCardView,
+  KanbanCardViewReq,
   KanbanClaimOpts,
   KanbanClaimedLease,
   KanbanDispatchRepo,
@@ -611,6 +613,110 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         AND r."blockKind" IS NOT DISTINCT FROM ${report.blockKind ?? null}::"KanbanBlockKind"
     `)
     return rows.length === 1
+  }
+
+  /** The open run behind `leaseId`, only when the full lease fence holds: revision, holder daemon and agent, live epoch, card and board. */
+  private async fencedOpenLease(
+    daemonId: string,
+    epoch: bigint,
+    req: { leaseId: string; agentId?: string; cardId?: string; boardId?: string; dispatchRevision?: bigint }
+  ) {
+    const [row] = await this.db.$queryRaw<
+      Array<{
+        cardId: string
+        boardId: string
+        agentId: string
+        daemonId: string
+        attempt: number
+        mode: 'read' | 'write'
+        runRevision: bigint
+        cardRevision: bigint
+        assigneeAgentId: string | null
+        currentDaemonEpoch: bigint | null
+        repoId: bigint
+        repoFullName: string
+        status: string
+        priority: number
+        blockKind: KanbanBlockKind | null
+        consecutiveFailures: number
+        protocolViolations: number
+        blockRecurrence: number
+        linkedPrNumber: number | null
+      }>
+    >(Prisma.sql`
+      SELECT r."cardId", c."boardId", r."agentId", r."daemonId", r."attempt", r."mode",
+             r."dispatchRevision" AS "runRevision", c."dispatchRevision" AS "cardRevision", c."assigneeAgentId",
+             d."sessionEpoch" AS "currentDaemonEpoch", b."repoId", b."repoFullName", c."status"::text AS "status",
+             c."priority", c."blockKind", c."consecutiveFailures", c."protocolViolations", c."blockRecurrence",
+             c."linkedPrNumber"
+      FROM "kanban_run" r
+      JOIN "kanban_card" c ON c."id" = r."cardId"
+      JOIN "kanban_board" b ON b."id" = c."boardId"
+      LEFT JOIN "daemon" d ON d."id" = r."daemonId"
+      WHERE r."leaseId" = ${req.leaseId}::uuid AND r."endedAt" IS NULL
+    `)
+    if (!row) return null
+    const fenced =
+      leaseAcceptsWrite(
+        {
+          dispatchRevision: row.cardRevision,
+          lease: {
+            leaseId: req.leaseId,
+            agentId: row.agentId,
+            daemonId: row.daemonId,
+            dispatchRevision: row.runRevision
+          }
+        },
+        { leaseId: req.leaseId, dispatchRevision: req.dispatchRevision ?? row.runRevision }
+      ) &&
+      row.daemonId === daemonId &&
+      row.currentDaemonEpoch === epoch &&
+      row.assigneeAgentId === row.agentId &&
+      (req.agentId === undefined || req.agentId === row.agentId) &&
+      (req.cardId === undefined || req.cardId === row.cardId) &&
+      (req.boardId === undefined || req.boardId === row.boardId)
+    return fenced ? row : null
+  }
+
+  async kanbanLiveCommentGrant(
+    daemonId: string,
+    epoch: bigint,
+    agentId: string,
+    leaseId: string,
+    repoFullName: string
+  ): Promise<{ repoId: bigint } | null> {
+    const row = await this.fencedOpenLease(daemonId, epoch, { leaseId, agentId })
+    return row && row.repoFullName === repoFullName ? { repoId: row.repoId } : null
+  }
+
+  async kanbanCardView(daemonId: string, epoch: bigint, req: KanbanCardViewReq): Promise<KanbanCardView | null> {
+    const row = await this.fencedOpenLease(daemonId, epoch, req)
+    if (!row) return null
+    // Prior runs only: the open one is this run, whose outcome the agent is about to write.
+    const prior = await this.db.kanbanRun.findMany({
+      where: { cardId: row.cardId, endedAt: { not: null } },
+      orderBy: { attempt: 'desc' },
+      take: KANBAN_CARD_SHOW_MAX_RUNS,
+      select: { attempt: true, outcome: true, reasonCode: true, dispatchedAt: true, endedAt: true }
+    })
+    return {
+      status: row.status,
+      priority: row.priority,
+      attempt: row.attempt,
+      mode: row.mode,
+      blockKind: row.blockKind,
+      consecutiveFailures: row.consecutiveFailures,
+      protocolViolations: row.protocolViolations,
+      blockRecurrence: row.blockRecurrence,
+      linkedPrNumber: row.linkedPrNumber,
+      runs: prior.map((r) => ({
+        attempt: r.attempt,
+        outcome: r.outcome,
+        reasonCode: r.reasonCode,
+        dispatchedAt: r.dispatchedAt.toISOString(),
+        endedAt: r.endedAt?.toISOString() ?? null
+      }))
+    }
   }
 
   async kanbanCommentGrant(
