@@ -56,7 +56,11 @@ function fakeGithub(pr: PrState) {
       return json(200, { number: PR, state: pr.state, merged: pr.merged, head: { sha: pr.headSha } })
     }
     if (pathname === `/repositories/${REPO_ID}/commits/${pr.headSha}/check-runs`) {
-      return json(200, { total_count: pr.runs.length, check_runs: pr.runs })
+      // Distinct ids and names: the reader keeps the newest run per (app, name), so each listed run is its own check.
+      return json(200, {
+        total_count: pr.runs.length,
+        check_runs: pr.runs.map((r, i) => ({ id: i + 1, name: `check-${i}`, ...r }))
+      })
     }
     const base = `/repositories/${REPO_ID}/issues/${ISSUE.number}`
     if (pathname === base && method === 'GET') {

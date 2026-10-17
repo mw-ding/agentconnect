@@ -59,7 +59,10 @@ describe('GithubPrReader', () => {
   })
 
   it('reads the latest check runs of one sha, paging until total_count', async () => {
+    // Distinct ids and names: newestPerCheck keeps one run per (app, name), so 150 distinct checks stay 150.
     const run = (i: number) => ({
+      id: i + 1,
+      name: `check-${i}`,
       status: 'completed',
       conclusion: i === 0 ? 'neutral' : 'success',
       output: { text: 'x' }
