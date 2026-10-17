@@ -22,8 +22,37 @@ describe('withUtcSession', () => {
     expect(options(withUtcSession('postgresql://h/db?options=--timezone%3DEST'))).toBe('-c timezone=UTC')
   })
 
-  it('passes through a missing or unparsable URL', () => {
+  it('pins an empty-host libpq URL without parsing it', () => {
+    expect(withUtcSession('postgresql://u:p@/db?host=localhost')).toBe(
+      'postgresql://u:p@/db?host=localhost&options=-c%20timezone%3DUTC'
+    )
+    expect(withUtcSession('postgresql:///db?host=/var/run/postgresql')).toBe(
+      'postgresql:///db?host=/var/run/postgresql&options=-c%20timezone%3DUTC'
+    )
+  })
+
+  it('keeps and replaces options on an empty-host URL, and keeps the fragment', () => {
+    const url = withUtcSession(
+      'postgres:///db?host=/tmp&options=-c%20timezone%3DEST%20-c%20statement_timeout%3D5&x=1#f'
+    )!
+    expect(url.endsWith('#f')).toBe(true)
+    const query = new URLSearchParams(url.slice(url.indexOf('?') + 1, url.indexOf('#')))
+    expect(query.get('options')).toBe('-c statement_timeout=5 -c timezone=UTC')
+    expect(query.get('host')).toBe('/tmp')
+    expect(query.get('x')).toBe('1')
+  })
+
+  it('merges repeated options parameters and pins exactly once', () => {
+    const url = withUtcSession('postgresql://h/db?options=-c%20a%3D1&options=--timezone%3DEST')!
+    expect(new URL(url).searchParams.getAll('options')).toEqual(['-c a=1 -c timezone=UTC'])
+  })
+
+  it('passes a missing URL through and fails closed on anything it cannot pin', () => {
     expect(withUtcSession(undefined)).toBeUndefined()
-    expect(withUtcSession('not a url')).toBe('not a url')
+    expect(withUtcSession('')).toBe('')
+    expect(() => withUtcSession('not a url')).toThrow(/postgres/)
+    expect(() => withUtcSession('mysql://u:p@h/db')).toThrow(/postgres/)
+    expect(() => withUtcSession('host=localhost dbname=x')).toThrow(/postgres/)
+    expect(() => withUtcSession('postgresql://h/db?options=%E0%A4%A')).toThrow(/malformed/)
   })
 })

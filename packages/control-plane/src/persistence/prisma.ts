@@ -19,6 +19,7 @@ export type PrismaLike = PrismaClient | Prisma.TransactionClient
 let singleton: PrismaClient | undefined
 
 const TIMEZONE_OPTION = /(^|\s)(-c\s*|--)timezone=\S+/gi
+const POSTGRES_URL = /^postgres(?:ql)?:\/\//i
 
 /**
  * Pin the Postgres session timezone to UTC in a connection URL.
@@ -29,18 +30,45 @@ const TIMEZONE_OPTION = /(^|\s)(-c\s*|--)timezone=\S+/gi
  * silently shift lease, watch, and backoff clocks by hours. The pin goes in the
  * URL's `options` parameter because node-pg lets URL fields override pool config.
  * Other `options` flags are kept; any explicit timezone flag is replaced.
+ *
+ * The query string is edited as text, never through `new URL`, which rejects libpq-style
+ * URLs with an empty host (`postgresql:///db?host=/var/run/postgresql`). Anything that is
+ * not a postgres URL throws: an unpinned connection must never be a silent fallback.
  */
 export function withUtcSession(databaseUrl: string | undefined): string | undefined {
   if (!databaseUrl) return databaseUrl
-  let url: URL
-  try {
-    url = new URL(databaseUrl)
-  } catch {
-    return databaseUrl
+  if (!POSTGRES_URL.test(databaseUrl)) throw new Error('DATABASE_URL must be a postgres:// or postgresql:// URL')
+  const hashAt = databaseUrl.indexOf('#')
+  const fragment = hashAt === -1 ? '' : databaseUrl.slice(hashAt)
+  const beforeFragment = hashAt === -1 ? databaseUrl : databaseUrl.slice(0, hashAt)
+  const queryAt = beforeFragment.indexOf('?')
+  const base = queryAt === -1 ? beforeFragment : beforeFragment.slice(0, queryAt)
+  const kept: string[] = []
+  const flags: string[] = []
+  for (const pair of (queryAt === -1 ? '' : beforeFragment.slice(queryAt + 1)).split('&')) {
+    if (!pair) continue
+    const eq = pair.indexOf('=')
+    const name = decodeQueryComponent(eq === -1 ? pair : pair.slice(0, eq))
+    if (name !== 'options') {
+      kept.push(pair)
+      continue
+    }
+    const flag = decodeQueryComponent(eq === -1 ? '' : pair.slice(eq + 1))
+      .replace(TIMEZONE_OPTION, ' ')
+      .trim()
+    if (flag) flags.push(flag)
   }
-  const existing = (url.searchParams.get('options') ?? '').replace(TIMEZONE_OPTION, ' ').trim()
-  url.searchParams.set('options', existing ? `${existing} -c timezone=UTC` : '-c timezone=UTC')
-  return url.toString()
+  flags.push('-c timezone=UTC')
+  kept.push(`options=${encodeURIComponent(flags.join(' '))}`)
+  return `${base}?${kept.join('&')}${fragment}`
+}
+
+function decodeQueryComponent(component: string): string {
+  try {
+    return decodeURIComponent(component.replace(/\+/g, ' '))
+  } catch {
+    throw new Error('DATABASE_URL has a malformed query string')
+  }
 }
 
 /**
