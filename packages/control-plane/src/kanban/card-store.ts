@@ -1,7 +1,9 @@
 // Kanban CardStore (issue #2 M1): where cards live; the GitHub store reads body-free issue facts and the dependency graph.
 import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
+import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
 import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan, type ObservedIssue } from './card-state.js'
+import { labelAddedByWriter } from './label-attribution.js'
 import { KanbanLabelWriter } from './label-writer.js'
 
 /** The repository a board watches; installationId is resolved live by the caller, never trusted from a webhook. */
@@ -184,6 +186,8 @@ export interface GithubCardStoreDeps {
   tokens: Pick<InstallationTokenService, 'mintKanbanCard'>
   /** This deployment's App slug; without it no App write is ever attributed to us. */
   appSlug?: string
+  /** Live lookup for the human-writer gate; uncached (ttlMs: 0) so a revoked grant stops moving cards on the next read. */
+  permissions: RepoPermissionLookup
   fetchImpl?: FetchLike
   baseUrl?: string
 }
@@ -257,25 +261,17 @@ export class GithubCardStore implements CardStore {
     // Newest pages first, so a long history still finds the latest status change.
     const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some(isStatus) && seen.some(isTargetAdd))
     if (!events) return false
-    let latest: LabelEvent | undefined
-    let targetLatest: LabelEvent | undefined
-    for (const event of events) {
-      if (!isStatus(event)) continue
-      if (!latest || event.id > latest.id) latest = event
-    }
-    for (const event of events) {
-      if (!['labeled', 'unlabeled'].includes(event.event)) continue
-      if (event.label?.name !== target) continue
-      if (!targetLatest || event.id > targetLatest.id) targetLatest = event
-    }
-    // The add that produced the label must not be superseded by a later removal of the same label.
-    return (
-      !!latest &&
-      !!targetLatest &&
-      targetLatest.event === 'labeled' &&
-      isHumanActor(latest) &&
-      isHumanActor(targetLatest)
-    )
+    // The latest status-label change overall must be human (an agent writes as the App bot).
+    let latestStatus: LabelEvent | undefined
+    for (const event of events)
+      if (isStatus(event) && (!latestStatus || event.id > latestStatus.id)) latestStatus = event
+    if (!latestStatus || !isHumanActor(latestStatus)) return false
+    // The add that produced the target label must be a live human writer (per-label rule + write access, fail closed).
+    const added = await labelAddedByWriter(events, target, this.deps.appSlug, async (login) => {
+      const check = await checkWriteAccess(this.deps.permissions, repo, login)
+      return { write: check.write, level: check.level }
+    })
+    return added !== null
   }
 
   async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {

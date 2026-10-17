@@ -12,6 +12,7 @@ import {
 } from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
+import type { RepoPermissionLevel } from '../github/repo-permission.js'
 
 const REPO: KanbanRepoRef = { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }
 
@@ -22,7 +23,7 @@ interface Call {
   body: unknown
 }
 
-function harness(routes: Record<string, () => Response>, appSlug?: string) {
+function harness(routes: Record<string, () => Response>, appSlug?: string, level: RepoPermissionLevel = 'write') {
   const calls: Call[] = []
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? 'GET'
@@ -46,6 +47,7 @@ function harness(routes: Record<string, () => Response>, appSlug?: string) {
   }))
   const store = new GithubCardStore({
     tokens: { mintKanbanCard },
+    permissions: { permission: async () => level },
     fetchImpl,
     baseUrl: 'https://api.test',
     ...(appSlug ? { appSlug } : {})
@@ -322,6 +324,11 @@ describe('status label attribution', () => {
     expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(expected)
     expect(h.calls.every((c) => c.method === 'GET')).toBe(true)
     expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
+  })
+
+  it('refuses a human add when the actor lacks live write access', async () => {
+    const h = harness({ [EVENTS]: () => json([ev(1, human)]) }, undefined, 'read')
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
   })
 
   it('reads the last page first and finds a later bot write without walking the history', async () => {

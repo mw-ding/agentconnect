@@ -30,7 +30,9 @@ export async function liveSync() {
     }
   })
   const cards = new PgKanbanCardRepo(prisma)
-  const store = new GithubCardStore({ tokens })
+  // Live GitHub answers by default; a scenario pins a level to model a non-write actor with the one real account.
+  const live = new GithubRepoPermission({ tokens, ttlMs: 0 })
+  const store = new GithubCardStore({ tokens, permissions: live })
   const repo = new PgKanbanSyncRepo(prisma)
   const revoked: KanbanLeaseRef[] = []
   const log = {
@@ -41,8 +43,6 @@ export async function liveSync() {
     }
   }
   const graph = new KanbanGraphReconciler({ cards, store, log })
-  // Live GitHub answers by default; a scenario pins a level to model a non-write actor with the one real account.
-  const live = new GithubRepoPermission({ tokens, ttlMs: 0 })
   const permission = { override: null as RepoPermissionLevel | null, logins: [] as string[] }
   const record = { ...board, orgId: OrgId(board.orgId) }
   const sync = new KanbanSync({

@@ -1763,6 +1763,12 @@ export function buildContainer(
     ? new GithubCardStore({
         tokens: kanbanTokens,
         appSlug: githubAppCfg?.slug,
+        // Uncached: the store's own human-writer gate re-checks the actor's live write grant.
+        permissions: new GithubRepoPermission({
+          tokens: kanbanTokens,
+          ttlMs: 0,
+          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+        }),
         // The same GitHub transport as the token mint, so an injected fetch covers card reads and label writes too.
         ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
       })
