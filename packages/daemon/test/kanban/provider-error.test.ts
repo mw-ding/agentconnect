@@ -51,6 +51,11 @@ describe('classifyProviderError', () => {
     ['503', Object.assign(new Error('upstream'), { statusCode: 503 }), transient('provider_server_error')],
     ['service unavailable', new Error('Service Unavailable'), transient('provider_server_error')],
     ['gateway timeout', new Error('504 Gateway Timeout'), transient('provider_server_error')],
+    ['ACP connection closed', new Error('ACP connection closed'), fatal('agent_crashed')],
+    ['process exited with code', new Error('agent process exited with code 1'), fatal('agent_crashed')],
+    ['child process died', new Error('child process exited'), fatal('agent_crashed')],
+    ['broken pipe', new Error('write EPIPE'), fatal('agent_crashed')],
+    ['agent crashed', new Error('agent crashed'), fatal('agent_crashed')],
     [
       '401',
       rpc(-32603, 'Internal error', { message: 'Failed to authenticate. API Error: 401 invalid x-api-key' }),

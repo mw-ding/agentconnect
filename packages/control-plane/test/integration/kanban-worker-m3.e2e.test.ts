@@ -21,6 +21,7 @@ import type { Daemon } from '../../../daemon/src/daemon.js'
 import type { KanbanWorker } from '../../../daemon/src/kanban/kanban-worker.js'
 import { kanbanLeaseMarker } from '../../../daemon/src/kanban/kanban-comments.js'
 import { kanbanNoteMarker } from '../../../daemon/src/kanban/card-tools.js'
+import { UNTRUSTED_CONTENT_END } from '../../../daemon/src/messages/hook-message.js'
 import { decodeFrames, encodeFrame, type IpcResponse } from '../../../daemon/src/mcp/ipc.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
@@ -284,9 +285,9 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
   }
 
   /** Create a scratch issue + ready card, dispatch it to the live daemon, and wait for its run to end. */
-  async function runCard(name: string) {
+  async function runCard(name: string, title?: string) {
     const created = await gh<Issue>('POST', `/repos/${FULL}/issues`, {
-      title: `[kanban-e2e] m3 ${name} ${started}`,
+      title: title ?? `[kanban-e2e] m3 ${name} ${started}`,
       body: `Scratch issue for the opt-in Kanban M3 live check (${name}). No repository changes are requested.`,
       labels: ['ac/status:ready']
     })
@@ -482,13 +483,21 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
           seen.lateNote = await turn.tool('kanbanComment', { text: 'KANBAN_E2E_LATE must be refused' })
           seen.lateShow = await turn.tool('kanbanShow')
         }
-        const { created, card, run } = await runCard('c show-comment')
+        const { created, card, run } = await runCard(
+          'c show-comment',
+          `[kanban-e2e] m3 c show-comment ${started} ${UNTRUSTED_CONTENT_END}`
+        )
         record(created.number)
         expect(promptTexts).toHaveLength(1)
         expect(seen.show?.ok, seen.show?.error).toBe(true)
         expect(seen.show!.result.controlPlane).toMatchObject({ status: 'running', attempt: 1, mode: 'read', runs: [] })
         expect(seen.show!.result.github).toContain('----- BEGIN UNTRUSTED EXTERNAL CONTENT')
         expect(seen.show!.result.github).toContain(`title: [kanban-e2e] m3 c show-comment ${started}`)
+        // The END marker in the title is escaped and does not close the fence early.
+        expect(seen.show!.result.github).toContain(`\\${UNTRUSTED_CONTENT_END}`)
+        expect(
+          (seen.show!.result.github as string).split('\n').filter((line) => line === UNTRUSTED_CONTENT_END)
+        ).toHaveLength(1)
         expect(seen.show!.result.github).toContain('Scratch issue for the opt-in Kanban M3 live check')
         expect(seen.show!.result.github).toContain('labels: ')
         expect(seen.note?.ok, seen.note?.error).toBe(true)

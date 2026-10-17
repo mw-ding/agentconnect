@@ -407,3 +407,21 @@ Known gaps (M3 worker additions):
   dispatcher seam as the existing dispatch E2E so one queue owns label writes;
   token minting reuses the repository's PAT injection. It does not validate a
   real App installation or a provider's live ACP error format.
+- **Provider-outage triage is quiet.** When run-accounting trips
+  `transient_limit` (a provider outage routed to `ac/status:triage`), the only
+  signal beyond the label is a warn log line — the card's `needsAttention` flag
+  is not set and no body-free issue comment is posted, matching `failure_limit`.
+  Surfacing the outage for humans is a follow-up.
+- **Classifier status precedence.** A nested `data.status`/`cause` code beats the
+  top-level code (`{code:529, data:{status:400}}` → `provider_invalid_request`),
+  and 400 is checked before the overload/rate-limit text, so a message that
+  carries both a 400 and "rate limit exceeded" reads fatal. Both are the
+  conservative direction (counted, bounded by `failureLimit`), but using the
+  top-level code first is a follow-up.
+- **Progress-note lease id is public before the summary.** `kanbanComment`
+  publishes `ac-kanban-note:<leaseId>:<n>`, so the lease id is on the issue
+  before the final summary. Anyone (or the agent via `kanbanShow` comment
+  bodies) could post `ac-kanban-lease:<leaseId>` and spoof the final-comment
+  marker, which matches any author; that only matters after a failed or
+  ambiguous final POST inside the lookup window. Stripping `ac-kanban-lease:`
+  from note/summary text, or a non-reversible note marker, is a follow-up.

@@ -3,6 +3,7 @@ import {
   KANBAN_MAX_LEASES_PER_BEAT,
   KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
   KANBAN_REASON_NO_TERMINAL_CALL,
+  KANBAN_REASON_NUDGE_DEFERRED,
   KANBAN_REASON_NUDGE_UNAVAILABLE,
   type KanbanBlockKind,
   type KanbanDispatch,
@@ -65,6 +66,8 @@ export interface KanbanLease {
   interrupted?: boolean
   /** The nudge could not be started, so the violation is reported at once. */
   nudgeRefused?: boolean
+  /** Why the nudge was refused; paused/draining defer (transient) instead of charging a protocol violation. */
+  nudgeRefusalReason?: KanbanDispatchRefusal
   terminal?: KanbanTerminal
 }
 
@@ -462,6 +465,7 @@ export class KanbanWorker {
     if (this.leases.get(leaseId) !== lease) return
     if (!started?.accepted) {
       lease.nudgeRefused = true
+      lease.nudgeRefusalReason = started?.reason
       lease.turnSettled = true
       return this.finalize(leaseId, lease)
     }
@@ -481,16 +485,27 @@ export class KanbanWorker {
     const d = lease.dispatch
     const terminal = lease.terminal
     const errorClass = lease.turnErrorClass
+    // A nudge refused because the agent is paused or the daemon is draining is not the card's fault: a non-provider transient (fixed cooldown), not a counted protocol violation.
+    const nudgeDeferred =
+      lease.nudgeRefused && (lease.nudgeRefusalReason === 'paused' || lease.nudgeRefusalReason === 'draining')
     const outcome: KanbanReportOutcome =
       terminal?.outcome ??
-      (errorClass ? (errorClass.kind === 'transient' ? 'transient' : 'failed') : 'protocol_violation')
+      (errorClass
+        ? errorClass.kind === 'transient'
+          ? 'transient'
+          : 'failed'
+        : nudgeDeferred
+          ? 'transient'
+          : 'protocol_violation')
     const reasonCode =
       terminal?.reasonCode ??
       (terminal
         ? undefined
         : (errorClass?.reasonCode ??
           (lease.nudgeRefused
-            ? KANBAN_REASON_NUDGE_UNAVAILABLE
+            ? nudgeDeferred
+              ? KANBAN_REASON_NUDGE_DEFERRED
+              : KANBAN_REASON_NUDGE_UNAVAILABLE
             : lease.nudged
               ? KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE
               : KANBAN_REASON_NO_TERMINAL_CALL)))

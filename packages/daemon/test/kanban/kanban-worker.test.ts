@@ -200,7 +200,7 @@ describe('Kanban worker leases', () => {
     const h = harness()
     await h.worker.dispatch(dispatch)
     h.state.ready = false
-    h.state.nudgeRefusal = 'draining'
+    h.state.nudgeRefusal = 'busy'
     await h.settle()
     expect(h.reports.get(dispatch.leaseId)).toMatchObject({
       outcome: 'protocol_violation',
@@ -392,7 +392,7 @@ describe('Kanban worker protocol-violation nudge', () => {
     expect(h.worker.get(dispatch.leaseId)).toBeUndefined()
   })
 
-  it.each<KanbanDispatchRefusal>(['busy', 'draining', 'paused', 'no_agent'])(
+  it.each<KanbanDispatchRefusal>(['busy', 'no_agent'])(
     'reports protocol_violation at once when the nudge is refused (%s)',
     async (reason) => {
       const h = harness()
@@ -401,6 +401,19 @@ describe('Kanban worker protocol-violation nudge', () => {
       await h.settle()
       expect(h.cp.report).toHaveBeenCalledWith(
         expect.objectContaining({ outcome: 'protocol_violation', reasonCode: 'nudge_unavailable' })
+      )
+    }
+  )
+
+  it.each<KanbanDispatchRefusal>(['paused', 'draining'])(
+    'defers a nudge refused because the operator paused or drained the daemon, without charging the card (%s)',
+    async (reason) => {
+      const h = harness()
+      h.state.nudgeRefusal = reason
+      await h.worker.dispatch(dispatch)
+      await h.settle()
+      expect(h.cp.report).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: 'transient', reasonCode: 'nudge_deferred' })
       )
     }
   )

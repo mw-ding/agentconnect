@@ -24,7 +24,8 @@ export const KANBAN_PROVIDER_TRANSIENT_REASON_CODES = [
 export const KANBAN_PROVIDER_FATAL_REASON_CODES = [
   'provider_auth',
   'provider_invalid_request',
-  'provider_context_overflow'
+  'provider_context_overflow',
+  'agent_crashed'
 ] as const
 export const KANBAN_PROVIDER_REASON_CODES = [
   ...KANBAN_PROVIDER_TRANSIENT_REASON_CODES,
@@ -36,6 +37,8 @@ export type KanbanProviderReasonCode = (typeof KANBAN_PROVIDER_REASON_CODES)[num
 export const KANBAN_REASON_NO_TERMINAL_CALL = 'no_terminal_call'
 export const KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE = 'no_terminal_call_after_nudge'
 export const KANBAN_REASON_NUDGE_UNAVAILABLE = 'nudge_unavailable'
+/** A nudge was refused because the agent is paused or the daemon is draining: not the card's fault, so it reports transient instead of a protocol violation. */
+export const KANBAN_REASON_NUDGE_DEFERRED = 'nudge_deferred'
 
 /** The run's mode, chosen from CP configuration (never a label); a write run needs its own session worktree. */
 export const KanbanRunMode = z.enum(['read', 'write'])

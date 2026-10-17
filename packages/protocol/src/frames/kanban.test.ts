@@ -5,6 +5,7 @@ import {
   KANBAN_PROVIDER_REASON_CODES,
   KANBAN_PROVIDER_TRANSIENT_REASON_CODES,
   KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
+  KANBAN_REASON_NUDGE_DEFERRED,
   KANBAN_REASON_NUDGE_UNAVAILABLE,
   KanbanCardShow,
   KanbanCardShowOk,
@@ -122,14 +123,15 @@ describe('kanban wire (issue #2 M2)', () => {
   })
 
   it('provider and nudge reason codes all satisfy KanbanReasonCode and ride a report', () => {
-    expect(new Set(KANBAN_PROVIDER_REASON_CODES).size).toBe(7)
+    expect(new Set(KANBAN_PROVIDER_REASON_CODES).size).toBe(8)
     expect([...KANBAN_PROVIDER_TRANSIENT_REASON_CODES, ...KANBAN_PROVIDER_FATAL_REASON_CODES]).toEqual([
       ...KANBAN_PROVIDER_REASON_CODES
     ])
     for (const code of [
       ...KANBAN_PROVIDER_REASON_CODES,
       KANBAN_REASON_NO_TERMINAL_AFTER_NUDGE,
-      KANBAN_REASON_NUDGE_UNAVAILABLE
+      KANBAN_REASON_NUDGE_UNAVAILABLE,
+      KANBAN_REASON_NUDGE_DEFERRED
     ]) {
       expect(KanbanReasonCode.safeParse(code).success, code).toBe(true)
       expect(KanbanReport.safeParse({ ...report, outcome: 'transient', reasonCode: code }).success, code).toBe(true)
