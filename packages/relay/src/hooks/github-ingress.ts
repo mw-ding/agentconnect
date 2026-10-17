@@ -1075,7 +1075,7 @@ export function githubGraphDoorbell(
 const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string> = new Set(KANBAN_ISSUE_ACTIONS)
 const KANBAN_STATUS_LABEL_PREFIX = 'ac/status:'
 
-/** Reduce a human `ac/status:*` relabel or close/reopen to the body-free Kanban doorbell (exported for unit tests). */
+/** Reduce human creation, transfer, status relabel, or close/reopen to a body-free Kanban doorbell. */
 export function githubIssueDoorbell(
   event: string,
   payload: GithubPayload,
@@ -1096,7 +1096,7 @@ export function githubIssueDoorbell(
   }
   const statusLabel =
     (payload.action !== 'labeled' && payload.action !== 'unlabeled') ||
-    !!payload.label?.name?.startsWith(KANBAN_STATUS_LABEL_PREFIX)
+    !!payload.label?.name?.toLowerCase().startsWith(KANBAN_STATUS_LABEL_PREFIX)
   // Only a human status edit rings; anything else is a seen-only marker so the CP's redelivery sweep knows it landed.
   if (!statusLabel || payload.sender?.type !== 'User') return seen
   const id = githubNumericId(payload.issue?.id)

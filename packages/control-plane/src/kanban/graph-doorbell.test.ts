@@ -89,7 +89,12 @@ describe('KanbanGraphDoorbell', () => {
     await h.doorbell.settle()
     expect(h.readGraph).not.toHaveBeenCalled()
     expect(h.onGraph).not.toHaveBeenCalled()
-    expect(h.onCard).toHaveBeenCalledWith(BOARD, { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }, 7)
+    expect(h.onCard).toHaveBeenCalledWith(
+      BOARD,
+      { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' },
+      7,
+      'labeled'
+    )
     expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
   })
 

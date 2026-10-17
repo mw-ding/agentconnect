@@ -595,7 +595,8 @@ export function buildHttpApp(
       audit: auditRepo,
       webchatMcpOperation: webchatMcpOperationRepo,
       oauth: oauthRepo,
-      kanbanMode: new PgKanbanBoardRepo(prisma)
+      kanbanMode: new PgKanbanBoardRepo(prisma),
+      kanbanBoards: new PgKanbanBoardRepo(prisma)
     },
     registry: registryService,
     platforms,

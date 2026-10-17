@@ -31,6 +31,7 @@ import type {
 import { isHonoredRepoGrant } from '../persistence/ports.js'
 import { STALE_REASON_TEXT } from './repository-grant-reattestor.js'
 import { githubRequest, githubRequestPage, mintAppJwt, GithubApiError, type FetchLike, type GithubPage } from './api.js'
+import { parseRepoPermission } from './repo-permission.js'
 import { githubAppBotIdentity, type GithubAppConfig } from './config.js'
 import {
   InstallationTokenService,
@@ -687,11 +688,9 @@ export class GithubService {
         `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}/permission`,
         { auth: token, fetchImpl: this.deps.fetchImpl, baseUrl: this.deps.baseUrl }
       )
-      // The legacy `permission` field collapses maintain→write and triage→read; the built-in
-      // triage role is only visible in `role_name`, and a custom role never matches it exactly.
-      if (res.role_name === 'triage') return 'triage'
-      const p = res.permission
-      return p === 'admin' || p === 'write' || p === 'read' ? p : 'none'
+      // This ladder keeps GitHub's legacy write for maintain; only triage survives as its own role.
+      const level = parseRepoPermission(res)
+      return level === 'maintain' ? 'write' : level
     } catch (e) {
       if (
         e instanceof GithubApiError &&

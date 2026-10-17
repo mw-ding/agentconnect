@@ -1,13 +1,7 @@
 // Kanban CardStore (issue #2 M1): where cards live; the GitHub store reads body-free issue facts and the dependency graph.
 import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
-import {
-  STATUS_LABEL_PREFIX,
-  statusLabel,
-  type KanbanStatus,
-  type LabelPlan,
-  type ObservedIssue
-} from './card-state.js'
+import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan, type ObservedIssue } from './card-state.js'
 import { KanbanLabelWriter } from './label-writer.js'
 
 /** The repository a board watches; installationId is resolved live by the caller, never trusted from a webhook. */
@@ -22,6 +16,11 @@ export interface CardIssue extends ObservedIssue {
   issueId: bigint
   nodeId: string
   number: number
+  authorLogin?: string | null
+  authorType?: string | null
+  authorViaGithubApp?: boolean
+  /** `owner/name` from the response's `repository_url` (null if absent); the importer fences on it, other readers don't. */
+  repositoryFullName?: string | null
 }
 
 export interface CardLink {
@@ -49,6 +48,8 @@ export interface CardStore {
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
+  /** Body-free issue events, oldest first; throws when the history runs past the page bound, so callers fail closed. */
+  readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]>
   /** The newest visible issue-event id (0 for none): the pre-POST cursor bounding which events can be our write. */
   lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number>
   /** Judge a pending promotion from the events after `cursor`; an unreadable window is inconclusive. */
@@ -103,7 +104,9 @@ export type PromotionVerdict = 'adopt' | 'reject' | 'inconclusive'
 /** Managed-label adds and removals plus issue close/reopen: every event that can change what a card means. */
 function isManagedEvent(event: LabelEvent): boolean {
   if (event.event === 'closed' || event.event === 'reopened') return true
-  return (event.event === 'labeled' || event.event === 'unlabeled') && !!event.label?.name?.startsWith('ac/')
+  return (
+    (event.event === 'labeled' || event.event === 'unlabeled') && !!event.label?.name?.toLowerCase().startsWith('ac/')
+  )
 }
 
 // The App identity is shared with agents, so an App ready-add is ours only after an acknowledged POST and with no other App ac/* write.
@@ -149,6 +152,8 @@ interface GhIssue {
   repository_url?: string
   repository?: { id?: number }
   pull_request?: unknown
+  user?: { login?: string; type?: string } | null
+  performed_via_github_app?: unknown
 }
 
 export interface GithubCardStoreDeps {
@@ -174,7 +179,9 @@ export class GithubCardStore implements CardStore {
       if (err instanceof GithubApiError && (err.status === 404 || err.status === 410)) return null
       throw err
     }
-    if (issue.pull_request !== undefined) return null
+    // A transfer redirect can land on another issue: refuse a different number or a different numeric repository.
+    if (issue.pull_request !== undefined || issue.number !== issueNumber) return null
+    if (issue.repository?.id !== undefined && BigInt(issue.repository.id) !== repo.repoId) return null
     const labels = (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean)
     return {
       issueId: BigInt(issue.id),
@@ -182,7 +189,11 @@ export class GithubCardStore implements CardStore {
       number: issue.number,
       state: issue.state,
       stateReason: issue.state_reason ?? null,
-      labels
+      labels,
+      authorLogin: issue.user?.login ?? null,
+      authorType: issue.user?.type ?? null,
+      authorViaGithubApp: !!issue.performed_via_github_app,
+      repositoryFullName: repoFullNameOf(issue.repository_url)
     }
   }
 
@@ -208,7 +219,7 @@ export class GithubCardStore implements CardStore {
   async statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean> {
     const target = statusLabel(status)
     const isStatus = (event: LabelEvent) =>
-      !!event.label?.name?.startsWith(STATUS_LABEL_PREFIX) && ['labeled', 'unlabeled'].includes(event.event)
+      !!event.label?.name && isStatusLabel(event.label.name) && ['labeled', 'unlabeled'].includes(event.event)
     const isTargetAdd = (event: LabelEvent) => event.event === 'labeled' && event.label?.name === target
     // Newest pages first, so a long history still finds the latest status change.
     const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some(isStatus) && seen.some(isTargetAdd))
@@ -221,6 +232,22 @@ export class GithubCardStore implements CardStore {
       if (isTargetAdd(event) && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
     }
     return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
+  }
+
+  async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {
+    const events = await this.recentEvents(repo, issueNumber, () => false)
+    if (!events) throw new Error('kanban: issue events run past the page bound')
+    // Keep attribution fields only: a `renamed` event would otherwise carry the issue title.
+    return events
+      .map((e) => ({
+        id: e.id,
+        event: e.event,
+        ...(e.created_at !== undefined ? { created_at: e.created_at } : {}),
+        ...(e.label?.name !== undefined ? { label: { name: e.label.name } } : {}),
+        actor: e.actor ? { type: e.actor.type, login: e.actor.login } : null,
+        ...(e.performed_via_github_app ? { performed_via_github_app: true } : {})
+      }))
+      .sort((a, b) => a.id - b.id)
   }
 
   async lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number> {
@@ -301,4 +328,10 @@ function toLink(issue: GhIssue): CardLink {
     state: issue.state,
     stateReason: issue.state_reason ?? null
   }
+}
+
+/** `owner/name` from an API `repository_url`; null when absent or unparseable. */
+function repoFullNameOf(url: string | undefined): string | null {
+  const match = url?.match(/\/repos\/([^/]+\/[^/]+)$/)
+  return match ? match[1]! : null
 }

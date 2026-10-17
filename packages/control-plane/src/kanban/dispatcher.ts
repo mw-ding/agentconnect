@@ -20,7 +20,7 @@ import type {
   KanbanRunOutcomeValue
 } from '../persistence/ports.js'
 import {
-  STATUS_LABEL_PREFIX,
+  isStatusLabel,
   statusLabel,
   isDispatchableIssue,
   isPromotionResidue,
@@ -107,7 +107,7 @@ interface RecoveryRead {
 /** What recovery compares between reads, so a GitHub change restarts the backoff: issue state and status labels only. */
 export function recoveryFingerprint(issue: ObservedIssue | null): string {
   if (!issue) return 'missing'
-  const statuses = issue.labels.filter((l) => l.startsWith(STATUS_LABEL_PREFIX)).sort()
+  const statuses = issue.labels.filter((l) => isStatusLabel(l)).sort()
   return JSON.stringify([issue.state, issue.stateReason ?? null, statuses])
 }
 

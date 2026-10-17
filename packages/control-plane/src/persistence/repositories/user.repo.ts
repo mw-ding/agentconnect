@@ -32,7 +32,15 @@ import {
 } from '../ports.js'
 import { OrgMembershipMissing, OrgOwnerRequired, ServiceAccountNotAddable } from '../errors.js'
 
-const RESOURCE_AUDIENCE_TABLES = ['agent', 'daemon', 'cron_def', 'mcp_provider', 'skill_source', 'decision'] as const
+const RESOURCE_AUDIENCE_TABLES = [
+  'agent',
+  'daemon',
+  'cron_def',
+  'mcp_provider',
+  'skill_source',
+  'decision',
+  'kanban_board'
+] as const
 const ORG_ROLE_RANK: Record<OrgMemberRole, number> = { viewer: 0, collaborator: 1, owner: 2 }
 
 interface LockedOrgMembership {
