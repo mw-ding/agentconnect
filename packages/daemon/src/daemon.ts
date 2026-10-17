@@ -17144,9 +17144,10 @@ export class Daemon {
     // ONE egress lookup, so the leased client is the one the surface writes through.
     const egressConn = this.platformTurnEgress.get(msg.platform)?.(plan.integrationId)
     const run: TurnRun = { entry, key, plan, agent, replyConn, ...(egressConn ? { egressConn } : {}), evaluation }
-    // Snapshot the mask entries once, before the host can exit and drop its BYOK
-    // provider secrets — the webchat held-text flush and the turn final both use it.
-    const maskEntries = this.maskEntriesFor(agentId)
+    // One per-turn mask snapshot, read by the webchat held-text flush and the turn final.
+    // It starts as the live entry set; buildPending re-captures it AFTER openSession so a
+    // cold session's BYOK provider secrets (recorded at host construction) are included.
+    const maskSnapshot: { entries: SecretMaskEntry[] } = { entries: this.maskEntriesFor(agentId) }
     // Startup notices and replies share the queue entry's index and terminal fence from before openSession.
     const pendingWebchat = webchat
       ? Object.assign(webchat, {
@@ -17154,7 +17155,7 @@ export class Daemon {
           replyText: '',
           replySegments: [],
           heldText: '',
-          maskText: (text: string) => this.maskAgentSecretsIn(agentId, text, maskEntries),
+          maskText: (text: string) => this.maskAgentSecretsIn(agentId, text, maskSnapshot.entries),
           heldTextOffset: 0,
           messageId: undefined,
           messageEmitted: false
@@ -17270,7 +17271,7 @@ export class Daemon {
       outwardSessionId,
       resolveFileLink,
       webchat: pendingWebchat,
-      maskEntries
+      maskSnapshot
     })
     // Every turn re-stashes the stored title (fallback or runtime): the connection dedupes
     // repeats, and re-pushing heals a rename lost to a restart or an unregistered thread.
@@ -18186,7 +18187,7 @@ export class Daemon {
       outwardSessionId: string
       resolveFileLink?: WorkspaceFileLinkResolver
       webchat: Pending['webchat']
-      maskEntries: SecretMaskEntry[]
+      maskSnapshot: { entries: SecretMaskEntry[] }
     }
   ): Pending {
     const { entry, plan } = run
@@ -18199,6 +18200,10 @@ export class Daemon {
       const ordinaryHost = this.hosts.get(hostKey)
       if (ordinaryHost) entry.selectedHost = this.selectedOrdinaryTurnHost(hostKey, ordinaryHost)
     }
+    // Re-capture the snapshot now that openSession recorded the host's BYOK provider
+    // secrets — the webchat held-text flush and the final-mask paths below read this same
+    // snapshot, so a host released mid-flush still masks its BYOK entries.
+    turn.maskSnapshot.entries = this.maskEntriesFor(agentId)
     const p: Pending = {
       plan,
       entry,
@@ -18229,7 +18234,7 @@ export class Daemon {
       outwardSessionId,
       // Snapshot the agent's mask entries now: a host released mid-flush drops the BYOK entries,
       // and the final-mask paths below must still see them.
-      maskEntries: turn.maskEntries,
+      maskEntries: turn.maskSnapshot.entries,
       ...(turn.resolveFileLink ? { resolveFileLink: turn.resolveFileLink } : {}),
       ...(entry.selectedHost ? { selectedHost: entry.selectedHost } : {}),
       turnState: plan.turnSurface.initialTurnState({

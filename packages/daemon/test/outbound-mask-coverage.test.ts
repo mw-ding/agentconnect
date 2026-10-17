@@ -11,6 +11,7 @@ import { Daemon } from '../src/daemon.js'
 import { executeTool, type SessionContext } from '../src/mcp/ops.js'
 import { agentHostKey } from '../src/acp/host-key.js'
 import { maskableSecrets, secretPlaceholder } from '../src/session/secret-mask.js'
+import { CODE_HOST_PROVIDERS } from '@agentconnect.md/protocol'
 import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS } from '../src/mcp/tools.js'
 import type { CodeHostBrokerOperation } from '../src/codehost/broker.js'
 import { GithubReplyCollector } from '../src/github/poster.js'
@@ -131,7 +132,7 @@ describe('webchat outbound coverage', () => {
       hostFactory: (_agent, cb) => {
         onUpdate = cb
         return {
-          start: vi.fn(async () => {}),
+          start: vi.fn(async () => seedProviderSecrets(daemon)),
           newSession: vi.fn(async () => 'acp-wc-1'),
           modelOptions: vi.fn(() => null),
           hasSession: vi.fn(() => true),
@@ -150,7 +151,6 @@ describe('webchat outbound coverage', () => {
       }
     })
     await daemon.start()
-    seedProviderSecrets(daemon)
     const outputs: Array<{ event: { kind: string; text?: string } }> = []
     const sink = { output: (o: { event: { kind: string; text?: string } }) => outputs.push(o), done: vi.fn() }
     ;(daemon as any).cpClient = {
@@ -237,7 +237,7 @@ describe('code-host turn-final coverage', () => {
       hostFactory: (_agent, cb) => {
         onUpdate = cb
         return {
-          start: vi.fn(async () => {}),
+          start: vi.fn(async () => seedProviderSecrets(daemon)),
           newSession: vi.fn(async () => 'acp-hook-1'),
           modelOptions: vi.fn(() => null),
           hasSession: vi.fn(() => true),
@@ -264,7 +264,6 @@ describe('code-host turn-final coverage', () => {
       }
     })
     await daemon.start()
-    seedProviderSecrets(daemon)
     const cp = {
       hookReports: [] as unknown[],
       sessionEvents: [] as unknown[],
@@ -321,6 +320,14 @@ describe('code-host turn-final coverage', () => {
     expect(posted).not.toContain(API_KEY)
     expect(posted).not.toContain(HEADER)
     await daemon.stop()
+  })
+
+  it('enumerates the code-host providers whose final is masked by the daemon-wired maskFinal', () => {
+    // Every provider's assembled final goes through the SAME daemon-wired hook — maskFinal
+    // (daemon.ts settleTurn, maskAgentSecretsIn over p.maskEntries) — driven by the real-wiring
+    // case above. A new provider adds a turn-final member and must fail this snapshot until it
+    // is covered by that shared path.
+    expect([...CODE_HOST_PROVIDERS]).toEqual(['github', 'gitlab', 'gitea'])
   })
 })
 
