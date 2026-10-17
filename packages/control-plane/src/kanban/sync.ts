@@ -9,8 +9,15 @@ import {
   type LabelEvent
 } from './card-store.js'
 import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
-import { parseAgentLabel, agentLabel } from './agent-label.js'
-import { attributeLabel, judgeLabelAdd, type LabelVerdict } from './label-attribution.js'
+import { AGENT_LABEL_PREFIX, parseAgentLabel, agentLabel } from './agent-label.js'
+import {
+  attributeLabel,
+  doorbellAddVisible,
+  judgeLabelAdd,
+  type DoorbellSender,
+  type LabelVerdict
+} from './label-attribution.js'
+import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import { liveManagedLabels, replayManagedLabels, setsEqual } from './label-sync.js'
 import {
   permissionRefusalComment,
@@ -133,8 +140,13 @@ export class KanbanSync {
     return queued
   }
 
-  onCardChanged(boardId: string, issueNumber: number, humanDoorbell = false): Promise<boolean> {
-    return this.enqueue(boardId, issueNumber, () => this.reconcile(boardId, issueNumber, humanDoorbell))
+  onCardChanged(
+    boardId: string,
+    issueNumber: number,
+    humanDoorbell = false,
+    doorbell?: KanbanIssueDoorbell
+  ): Promise<boolean> {
+    return this.enqueue(boardId, issueNumber, () => this.reconcile(boardId, issueNumber, humanDoorbell, doorbell))
   }
 
   // The dispatcher just committed a CP transition; project it through the same queue as a full reconcile, so a
@@ -245,7 +257,33 @@ export class KanbanSync {
     return this.judgeEvent(repo, assigneeEvent, writers)
   }
 
-  private async reconcile(boardId: string, issueNumber: number, humanDoorbell: boolean): Promise<boolean> {
+  // A `labeled` doorbell's own add must be the latest visible event for its live label before an older visible add may
+  // attribute that label: a non-writer re-adding a dispatchable card's status label is refused now, any other lag defers.
+  private async doorbellLag(
+    card: SyncCard,
+    issue: { labels: readonly string[] },
+    events: readonly LabelEvent[],
+    repo: KanbanRepoRef,
+    writers: Map<string, Promise<boolean>>,
+    doorbell: KanbanIssueDoorbell | undefined
+  ): Promise<'none' | 'defer' | 'refuse'> {
+    const sender = doorbell?.sender
+    const label = doorbell?.label
+    if (doorbell?.action !== 'labeled' || !sender || !label) return 'none'
+    if (!isStatusLabel(label) && !label.toLowerCase().startsWith(AGENT_LABEL_PREFIX)) return 'none'
+    if (!issue.labels.some((name) => name.toLowerCase() === label.toLowerCase())) return 'none'
+    if (doorbellAddVisible(events, label, sender)) return 'none'
+    if (await this.writeAccess(repo, sender.login, writers)) return 'defer'
+    const dispatchable = card.status === 'ready' || card.status === 'running'
+    return dispatchable && label.toLowerCase() === statusLabel(card.status) ? 'refuse' : 'defer'
+  }
+
+  private async reconcile(
+    boardId: string,
+    issueNumber: number,
+    humanDoorbell: boolean,
+    doorbell?: KanbanIssueDoorbell
+  ): Promise<boolean> {
     let card = await this.deps.repo.get(boardId, issueNumber)
     if (!card || card.promotionPending) return false
     const repo = await this.deps.repoRef(boardId)
@@ -258,18 +296,25 @@ export class KanbanSync {
     let cursor = BigInt(edits.status?.id ?? 0)
     let agentCursor = BigInt(edits.assignee?.id ?? 0)
 
+    const writers = new Map<string, Promise<boolean>>()
+    const lag = await this.doorbellLag(card, issue, events, repo, writers, doorbell)
+    if (lag === 'defer') return this.defer(card, repo, issue, boardId, issueNumber)
+    // The webhook names a non-writer's add the events API does not show yet: revert now, no visible edit is adopted.
+    const doorbellRefusal: DoorbellSender | undefined = lag === 'refuse' ? doorbell!.sender : undefined
+
     // Event lag: the visible events must reproduce the live managed labels, or nothing here can be attributed.
-    if (!setsEqual(replayManagedLabels(events), liveManagedLabels(issue))) {
+    if (!doorbellRefusal && !setsEqual(replayManagedLabels(events), liveManagedLabels(issue))) {
       return this.defer(card, repo, issue, boardId, issueNumber)
     }
 
-    const writers = new Map<string, Promise<boolean>>()
     const parsed = parseAgentLabel(issue.labels)
-    const newAgent = !!edits.assignee && BigInt(edits.assignee.id) > card.syncAgentCursor
+    const newAgent = !doorbellRefusal && !!edits.assignee && BigInt(edits.assignee.id) > card.syncAgentCursor
     const agentVerdict: EditVerdict = newAgent
       ? await this.agentVerdict(repo, parsed, edits.assignee!, events, writers)
       : 'ignore'
-    const statusVerdict = await this.statusVerdict({ card, edits, issue, events, repo, writers, humanDoorbell })
+    const statusVerdict: EditVerdict | 'pending' = doorbellRefusal
+      ? 'revert'
+      : await this.statusVerdict({ card, edits, issue, events, repo, writers, humanDoorbell })
 
     // A fail-closed card is human-only: only a fresh, cleanly-attributed human writer edit moves it again.
     if (card.needsAttention && statusVerdict !== 'accept' && agentVerdict !== 'accept') return false
@@ -369,8 +414,9 @@ export class KanbanSync {
     }
     // A refused ac/agent edit is undone before its cursor advances, so a failed undo is retried next pass.
     const agentCursorCommit = agentVerdict === 'refuse' ? card.syncAgentCursor : agentCursor
-    const actor =
-      statusVerdict === 'accept' || statusVerdict === 'refuse'
+    const actor = doorbellRefusal
+      ? { login: doorbellRefusal.login, id: doorbellRefusal.id }
+      : statusVerdict === 'accept' || statusVerdict === 'refuse'
         ? statusEditActor(card, issue, events, edits)
         : statusVerdict === 'revert'
           ? revertActor(card, events)

@@ -1872,12 +1872,12 @@ export function buildContainer(
           kanbanDispatcher?.poke(board.id)
         },
         // A human status relabel or close/reopen re-reads the card at once instead of waiting out its backoff.
-        onCard: async (board, repo, issueNumber, action) => {
+        onCard: async (board, repo, issueNumber, doorbell) => {
           const imported =
-            ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
-            (await kanbanImporter?.import(board, repo, issueNumber, { action }))
-          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
-          if (action === 'closed')
+            ['opened', 'transferred', 'labeled'].includes(doorbell.action ?? '') &&
+            (await kanbanImporter?.import(board, repo, issueNumber, doorbell))
+          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human', doorbell)
+          if (doorbell.action === 'closed')
             await kanbanGraphReconciler?.apply(
               board,
               repo,

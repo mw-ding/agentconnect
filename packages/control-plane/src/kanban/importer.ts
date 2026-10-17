@@ -9,7 +9,8 @@ import type {
 import { AGENT_LABEL_PREFIX, parseAgentLabel } from './agent-label.js'
 import { observedCardStatus, parseStatusLabels, planStatusWrite, isStatusLabel } from './card-state.js'
 import { attestHumanAuthority } from './human-authority.js'
-import { labelAddedByWriter, latestTransferEvent } from './label-attribution.js'
+import { doorbellAddVisible, labelAddedByWriter, latestTransferEvent } from './label-attribution.js'
+import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import {
   isAppActor,
   isHumanActor,
@@ -26,11 +27,28 @@ export interface KanbanImporterDeps {
   /** This deployment's App slug: its writes are the agents' too, so they never attribute a label. */
   appSlug?: string
   log?: { warn: (obj: unknown, msg?: string) => void }
+  now?: () => Date
+}
+
+/** How long a live writer's not-yet-visible doorbell add keeps an import retrying before it imports as triage. */
+const DOORBELL_LAG_TIMEOUT_MS = 10 * 60_000
+/** Lagging-import memory bound (flush-at-cap, the landed-GUID precedent). */
+const MAX_LAGGING = 5_000
+
+/** The doorbell's own label add is not yet visible: the delivery stays un-landed so the redelivery sweep retries it. */
+export class KanbanImportInconclusiveError extends Error {
+  constructor() {
+    super('kanban import: the doorbell label add is not yet visible in the issue events')
+    this.name = 'KanbanImportInconclusiveError'
+  }
 }
 
 type WriteCheck = { level: RepoPermissionLevel; write: boolean }
 
 export class KanbanImporter {
+  /** First inconclusive pass per `boardId#issueNumber`, so a lagging doorbell add fails closed after the bound. */
+  private readonly lagging = new Map<string, number>()
+
   constructor(private readonly deps: KanbanImporterDeps) {}
 
   // Returns true when this delivery imported a candidate, including a concurrent create winner.
@@ -38,7 +56,7 @@ export class KanbanImporter {
     board: KanbanBoardRecord,
     repo: KanbanRepoRef,
     issueNumber: number,
-    options: { action?: string } = {}
+    options: KanbanIssueDoorbell = {}
   ): Promise<boolean> {
     if (await this.deps.cards.findByIssueNumber(board.id, issueNumber)) return false
     const issue = await this.deps.store.readCard(repo, issueNumber)
@@ -62,7 +80,7 @@ export class KanbanImporter {
       if (!checks.has(id)) checks.set(id, this.check(board, repo, issueNumber, login))
       return checks.get(id)!
     }
-    const authority = await this.attribute(board, repo, issueNumber, issue, options.action, writer)
+    const authority = await this.attribute(board, repo, issueNumber, issue, options, writer)
     const observed = observedCardStatus(issue)
     const kept = authority !== null && observed !== 'running'
     const status: KanbanInitialStatus = kept ? observed : 'triage'
@@ -93,7 +111,7 @@ export class KanbanImporter {
     repo: KanbanRepoRef,
     issueNumber: number,
     issue: CardIssue,
-    action: string | undefined,
+    doorbell: KanbanIssueDoorbell,
     writer: (login: string | null | undefined) => Promise<WriteCheck>
   ): Promise<{ human: KanbanHumanAuthority; events: LabelEvent[] } | null> {
     const author = {
@@ -113,12 +131,48 @@ export class KanbanImporter {
       this.warn(board, issueNumber, 'events_unreadable', err)
       return null
     }
+    if (!(await this.doorbellAddAttributable(board, issueNumber, issue, events, doorbell, writer))) return null
     const transfer = latestTransferEvent(events)
-    if (action === 'transferred' && !transfer) return null
+    if (doorbell.action === 'transferred' && !transfer) return null
     if (transfer && !(await this.humanWriter(transfer, writer))) return null
     const added = await labelAddedByWriter(events, statusLabels[0]!, this.deps.appSlug, writer)
     if (!added) return null
     return { human: attestHumanAuthority(added.login, added.level), events }
+  }
+
+  // A `labeled` doorbell's own add must be the latest visible event for its live label, or an older visible add would
+  // attribute it: a non-writer sender imports as triage; a writer's lag retries (throws) until the bound, then triage.
+  private async doorbellAddAttributable(
+    board: KanbanBoardRecord,
+    issueNumber: number,
+    issue: CardIssue,
+    events: readonly LabelEvent[],
+    doorbell: KanbanIssueDoorbell,
+    writer: (login: string | null | undefined) => Promise<WriteCheck>
+  ): Promise<boolean> {
+    const { sender, label } = doorbell
+    if (doorbell.action !== 'labeled' || !sender || !label) return true
+    const key = `${board.id}#${issueNumber}`
+    const managed = isStatusLabel(label) || label.toLowerCase().startsWith(AGENT_LABEL_PREFIX)
+    const live = issue.labels.some((name) => name.toLowerCase() === label.toLowerCase())
+    if (!managed || !live || doorbellAddVisible(events, label, sender)) {
+      this.lagging.delete(key)
+      return true
+    }
+    if (!(await writer(sender.login)).write) {
+      this.lagging.delete(key)
+      return false
+    }
+    const now = (this.deps.now?.() ?? new Date()).getTime()
+    const since = this.lagging.get(key) ?? now
+    if (now - since >= DOORBELL_LAG_TIMEOUT_MS) {
+      this.lagging.delete(key)
+      this.warn(board, issueNumber, 'doorbell_add_not_visible', new KanbanImportInconclusiveError())
+      return false
+    }
+    if (this.lagging.size >= MAX_LAGGING) this.lagging.clear()
+    this.lagging.set(key, since)
+    throw new KanbanImportInconclusiveError()
   }
 
   // Every current ac/agent:* label, not just the parsed one, so a second label cannot ride in unattributed.

@@ -34,6 +34,7 @@ import {
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import type { KanbanSync } from './sync.js'
+import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
@@ -233,7 +234,12 @@ export class KanbanDispatcher {
   }
 
   /** A GitHub change to this card. A human doorbell reads now; a graph doorbell leaves a pending promotion on its backoff. */
-  async onCardChanged(boardId: string, issueNumber: number, source: 'human' | 'graph' = 'graph'): Promise<boolean> {
+  async onCardChanged(
+    boardId: string,
+    issueNumber: number,
+    source: 'human' | 'graph' = 'graph',
+    doorbell?: KanbanIssueDoorbell
+  ): Promise<boolean> {
     const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
     if (pending && source !== 'human') {
       const now = await this.deps.repo.now()
@@ -243,7 +249,7 @@ export class KanbanDispatcher {
     }
     if (!pending)
       return this.deps.sync
-        ? this.deps.sync.onCardChanged(boardId, issueNumber, source === 'human')
+        ? this.deps.sync.onCardChanged(boardId, issueNumber, source === 'human', doorbell)
         : this.ingestCard(boardId, issueNumber)
     const now = await this.deps.repo.now()
     let read: RecoveryRead = { moved: false }

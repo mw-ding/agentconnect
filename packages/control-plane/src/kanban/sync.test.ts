@@ -546,3 +546,91 @@ describe('non-writer re-add of the current status label', () => {
     expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).not.toMatchObject({ status: 'triage' })
   })
 })
+
+// The webhook names the sender of a `labeled` edit the events API does not show yet; the visible history alone would
+// still attribute the live label to the writer's older add.
+describe('labeled doorbell sender against an invisible remove+re-add', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+  const perms: Record<string, RepoPermissionLevel> = { bob: 'write', carol: 'write', mallory: 'triage' }
+  const permissions = vi.fn(async (_r: unknown, login: string) => perms[login.toLowerCase()] ?? 'none')
+  const lease = { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+  const doorbell = (login: string, id: number, label = 'ac/status:ready') => ({
+    action: 'labeled',
+    sender: { login, id, type: 'User' },
+    label
+  })
+
+  function invisible(status: 'ready' | 'running' | 'done', overrides: Partial<SyncCard> = {}) {
+    const f = fixture({ status, syncEventCursor: 100n, syncAgentCursor: 99n, ...overrides })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = [`ac/status:${status}`, 'ac/agent:worker']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(99, 'labeled', 'ac/agent:worker', bob),
+      labelEvent(100, 'labeled', `ac/status:${status}`, bob)
+    )
+    return f
+  }
+
+  it('reverts a ready card to triage with a refusal comment and audits the sender', async () => {
+    const f = invisible('ready')
+    await f.sync.onCardChanged('board', 1, true, doorbell('mallory', 7))
+    expect(f.card().status).toBe('triage')
+    expect(vi.mocked(f.deps.repo.apply).mock.calls[0]![5]).toEqual({ login: 'mallory', id: 7 })
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      status: 'triage',
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:ready'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    expect(f.deps.repo.defer).not.toHaveBeenCalled()
+  })
+
+  it('revokes the lease of a running card', async () => {
+    const f = invisible('running', { lease })
+    await f.sync.onCardChanged('board', 1, true, doorbell('mallory', 7, 'ac/status:running'))
+    expect(f.card().status).toBe('triage')
+    expect(f.deps.revoke).toHaveBeenCalledWith(expect.objectContaining({ leaseId: 'lease' }), 'card')
+  })
+
+  it('refuses even when only the removal is visible (no lag deferral leaves the card claimable)', async () => {
+    const f = invisible('ready')
+    f.events.push(labelEvent(101, 'unlabeled', 'ac/status:ready', mallory))
+    await f.sync.onCardChanged('board', 1, true, doorbell('mallory', 7))
+    expect(f.card().status).toBe('triage')
+    expect(f.deps.repo.defer).not.toHaveBeenCalled()
+  })
+
+  it("defers a live writer's invisible re-add instead of adopting or reverting", async () => {
+    const f = invisible('ready')
+    await f.sync.onCardChanged('board', 1, true, doorbell('carol', 3))
+    expect(f.card()).toMatchObject({ status: 'ready', syncDeferralCount: 1 })
+    expect(f.deps.repo.apply).not.toHaveBeenCalled()
+    expect(f.deps.store.applyPlan).not.toHaveBeenCalled()
+  })
+
+  it("defers a non-writer's invisible re-add of an ac/agent label or a non-dispatchable status label", async () => {
+    const agent = invisible('ready')
+    await agent.sync.onCardChanged('board', 1, true, doorbell('mallory', 7, 'ac/agent:worker'))
+    expect(agent.card()).toMatchObject({ status: 'ready', syncDeferralCount: 1 })
+    const done = invisible('done')
+    await done.sync.onCardChanged('board', 1, true, doorbell('mallory', 7, 'ac/status:done'))
+    expect(done.card()).toMatchObject({ status: 'done', syncDeferralCount: 1 })
+    expect(done.deps.revoke).not.toHaveBeenCalled()
+  })
+
+  it("takes the normal path once the sender's add is the latest visible event, or the label is gone", async () => {
+    const visible = invisible('ready')
+    visible.events.push(
+      labelEvent(101, 'unlabeled', 'ac/status:ready', { type: 'User', login: 'carol', id: 3 }),
+      labelEvent(102, 'labeled', 'ac/status:ready', { type: 'User', login: 'carol', id: 3 })
+    )
+    await visible.sync.onCardChanged('board', 1, true, doorbell('carol', 3))
+    expect(visible.card()).toMatchObject({ status: 'ready', syncDeferralCount: 0, syncEventCursor: 102n })
+    const gone = invisible('ready')
+    await gone.sync.onCardChanged('board', 1, true, doorbell('mallory', 7, 'ac/status:blocked'))
+    expect(gone.card()).toMatchObject({ status: 'ready', syncDeferralCount: 0 })
+  })
+})

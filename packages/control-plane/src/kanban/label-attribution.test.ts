@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { LabelEvent } from './card-store.js'
 import {
   attributeLabel,
+  doorbellAddVisible,
   labelAdder,
   labelAddedByWriter,
   latestLabelEvent,
@@ -154,6 +155,28 @@ describe('attributeLabel (Lane 1b per-label latest visible event)', () => {
     }
     expect(attributeLabel([a, b], 'ac/status:ready').kind).toBe('removed')
     expect(attributeLabel([b, a], 'ac/status:ready').kind).toBe('removed')
+  })
+})
+
+describe('doorbellAddVisible', () => {
+  const sender = { login: 'Mallory', id: 7, type: 'User' }
+
+  it("is true only when the latest visible event for the label is the sender's add", () => {
+    const writer = [ev(1, 'labeled', 'ac/status:ready')]
+    expect(doorbellAddVisible(writer, 'ac/status:ready', sender)).toBe(false)
+    expect(doorbellAddVisible([], 'ac/status:ready', sender)).toBe(false)
+    const removed = [...writer, ev(2, 'unlabeled', 'ac/status:ready', mallory)]
+    expect(doorbellAddVisible(removed, 'ac/status:ready', sender)).toBe(false)
+    const readded = [...removed, ev(3, 'labeled', 'AC/STATUS:READY', mallory)]
+    expect(doorbellAddVisible(readded, 'ac/status:ready', sender)).toBe(true)
+    expect(doorbellAddVisible([...readded, ev(4, 'labeled', 'ac/status:ready')], 'ac/status:ready', sender)).toBe(false)
+  })
+
+  it('matches on the numeric id when the event carries one, else on the login', () => {
+    const add = (actor: LabelEvent['actor']) => [ev(1, 'labeled', 'ac/status:ready', actor)]
+    expect(doorbellAddVisible(add({ type: 'User', login: 'renamed', id: 7 }), 'ac/status:ready', sender)).toBe(true)
+    expect(doorbellAddVisible(add({ type: 'User', login: 'mallory', id: 8 }), 'ac/status:ready', sender)).toBe(false)
+    expect(doorbellAddVisible(add(mallory), 'ac/status:ready', sender)).toBe(true)
   })
 })
 

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { KanbanBoardRecord } from '../persistence/ports.js'
 import type { RepoPermissionLevel } from '../github/repo-permission.js'
 import type { CardIssue, LabelEvent } from './card-store.js'
-import { KanbanImporter } from './importer.js'
+import { KanbanImporter, KanbanImportInconclusiveError } from './importer.js'
 
 const board = { id: 'board', orgId: 'org' } as KanbanBoardRecord
 const repo = { installationId: 7n, repoId: 42n, repoFullName: 'acme/web' }
@@ -36,8 +36,9 @@ function harness(
     })
   }
   const log = { warn: vi.fn() }
-  const importer = new KanbanImporter({ cards, store, permissions, appSlug: APP, log })
-  return { cards, store, permissions, log, importer }
+  const clock = { now: new Date('2026-10-17T00:00:00Z') }
+  const importer = new KanbanImporter({ cards, store, permissions, appSlug: APP, log, now: () => clock.now })
+  return { cards, store, permissions, log, importer, clock }
 }
 
 const issue = (labels = ['ac/status:ready']): CardIssue => ({
@@ -373,4 +374,57 @@ describe('Kanban import event lag and identity regressions', () => {
       expect(upserted(h)).not.toHaveProperty('humanAuthority')
     }
   )
+})
+
+// The visible history shows bob's adds while a later remove+re-add is still invisible; the doorbell names its sender.
+describe('Kanban import labeled-doorbell sender', () => {
+  const events = () => [...labeled('ac/status:ready', 'bob'), ...labeled('ac/agent:worker', 'bob')]
+  const levels: Levels = { alice: 'write', bob: 'write', carol: 'write', mallory: 'triage' }
+  const doorbell = (login: string, label = 'ac/status:ready') => ({
+    action: 'labeled',
+    sender: { login, id: login.length, type: 'User' },
+    label
+  })
+
+  it.each(['ac/status:ready', 'ac/agent:worker'])(
+    "imports a non-writer sender's invisible %s re-add as unassigned triage",
+    async (label) => {
+      const h = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, events())
+      expect(await h.importer.import(board, repo, 1, doorbell('mallory', label))).toBe(true)
+      expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+      expect(h.permissions.permission).toHaveBeenCalledWith(repo, 'mallory')
+    }
+  )
+
+  it("retries a writer sender's invisible re-add, then imports triage at the bound", async () => {
+    const h = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, events())
+    await expect(h.importer.import(board, repo, 1, doorbell('carol'))).rejects.toBeInstanceOf(
+      KanbanImportInconclusiveError
+    )
+    h.clock.now = new Date(h.clock.now.getTime() + 9 * 60_000)
+    await expect(h.importer.import(board, repo, 1, doorbell('carol'))).rejects.toBeInstanceOf(
+      KanbanImportInconclusiveError
+    )
+    expect(h.cards.upsertCard).not.toHaveBeenCalled()
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    h.clock.now = new Date(h.clock.now.getTime() + 60_000)
+    expect(await h.importer.import(board, repo, 1, doorbell('carol'))).toBe(true)
+    expect(upserted(h)).toMatchObject({ status: 'triage', assigneeAgentId: null })
+    expect(h.log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'doorbell_add_not_visible' }),
+      expect.any(String)
+    )
+  })
+
+  it("imports normally once the sender's add is the latest visible event, or the named label is gone", async () => {
+    const visible = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, [
+      ...events(),
+      ...labeled('ac/status:ready', 'carol')
+    ])
+    expect(await visible.importer.import(board, repo, 1, doorbell('carol'))).toBe(true)
+    expect(upserted(visible)).toMatchObject({ status: 'ready', assigneeAgentId: 'agent' })
+    const gone = harness(issue(['ac/status:ready', 'ac/agent:worker']), levels, events())
+    expect(await gone.importer.import(board, repo, 1, doorbell('mallory', 'ac/status:blocked'))).toBe(true)
+    expect(upserted(gone)).toMatchObject({ status: 'ready', assigneeAgentId: 'agent' })
+  })
 })

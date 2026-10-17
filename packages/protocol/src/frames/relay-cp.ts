@@ -672,6 +672,15 @@ export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues'] as cons
 export const KANBAN_ISSUE_ACTIONS = ['opened', 'transferred', 'labeled', 'unlabeled', 'closed', 'reopened'] as const
 export const GithubGraphEvent = z.enum(KANBAN_DOORBELL_EVENTS)
 export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
+/** A Kanban `issues` doorbell's webhook sender: a human login beside its numeric id, matched against the events API. */
+export const RcGithubGraphSender = z
+  .object({
+    login: z.string().min(1).max(64),
+    id: GithubNumericId,
+    type: z.string().min(1).max(16) // 'User' for a rung doorbell; seen-only markers omit the sender
+  })
+  .strict()
+export type RcGithubGraphSender = z.infer<typeof RcGithubGraphSender>
 export const RcGithubGraph = z
   .object({
     deliveryKey: z.string().min(1).max(200), // X-GitHub-Delivery GUID — the redelivery landed marker
@@ -680,7 +689,10 @@ export const RcGithubGraph = z
     event: GithubGraphEvent,
     action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|labeled|… — observational only
     ids: z.array(GithubNumericId).max(4), // issue ids named by the payload (parent/sub, blocked/blocking)
-    numbers: z.array(z.number().int().positive()).max(4) // the same issues' numbers, when same-repo
+    numbers: z.array(z.number().int().positive()).max(4), // the same issues' numbers, when same-repo
+    // Optional, so an older relay's frames still parse; the CP requires a `labeled` sender's add to be the latest visible.
+    sender: RcGithubGraphSender.optional(),
+    label: z.string().min(1).max(100).optional()
   })
   .strict()
 export type RcGithubGraph = z.infer<typeof RcGithubGraph>

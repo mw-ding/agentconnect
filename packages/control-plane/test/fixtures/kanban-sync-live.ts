@@ -79,9 +79,9 @@ export async function liveSync() {
     installations: { getByInstallationId: async () => installation },
     store,
     log,
-    onCard: async (b, ref, n, action) => {
-      await dispatcher.onCardChanged(b.id, n, 'human')
-      if (action === 'closed') await graph.apply(b, ref, n, await store.readGraph(ref, n))
+    onCard: async (b, ref, n, doorbell) => {
+      await dispatcher.onCardChanged(b.id, n, 'human', doorbell)
+      if (doorbell.action === 'closed') await graph.apply(b, ref, n, await store.readGraph(ref, n))
     }
   })
   return {

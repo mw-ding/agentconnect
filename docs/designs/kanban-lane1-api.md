@@ -290,12 +290,19 @@ hold:
    - is not `isAppActor(event, appSlug)`
    - has live write access
 
-   A visible removal of the label newer than its add, or no event for that label at all (event lag), fails closed:
-   the older add can no longer authorize a re-add that has not landed in the events API yet.
+   A visible removal of the label newer than its add, or no event for that label at all (event lag), fails closed.
+   This rule only sees **visible** events: when both a removal and a re-add are still missing from the events API, the
+   older visible add would attribute the label. Step 4 closes that window from the webhook.
 
 3. The **transferrer** passes the same human + live-write check. On a `transferred` action (the webhook action passed
    through `import(…, { action })`), a **visible** `transferred` event with a live human-writer actor is required; none
    visible → triage. On any other action, a visible `transferred` event is still checked on its latest actor.
+4. The **doorbell sender** of a `labeled` delivery (`RcGithubGraph.sender` + `label`, forwarded by the relay from the
+   webhook) must own the latest visible event for that label when the label is live and managed (`ac/status:*` or
+   `ac/agent:*`). If it does not, the events API has not caught up: a non-writer sender imports as triage, and a live
+   writer sender throws `KanbanImportInconclusiveError` so the GUID stays un-landed and the redelivery sweep retries.
+   After 10 minutes of inconclusive retries (per importer process), the import lands as triage. The sync applies the
+   same check (§ Lane 1b sync below).
 
 Events come from `CardStore.readLabelEvents(repo, issueNumber)`. It returns body-free `LabelEvent`s (id, event,
 label name, actor type/login, an App flag), oldest first, using the existing newest-first pagination and page cap. A
@@ -308,8 +315,9 @@ auto-dispatched") and the existing store semantics: a triage card is visible on 
 plus an assignee, and a human must move it. The importer also writes the `ac/status:triage` label first, so GitHub
 agrees.
 
-- **Import signature.** `import(board, repo, issueNumber, options?: { action?: string }): Promise<boolean>`. The
-  container passes the webhook action through; callers that do not have an action may omit `options`.
+- **Import signature.** `import(board, repo, issueNumber, options?: KanbanIssueDoorbell): Promise<boolean>`, where
+  `KanbanIssueDoorbell` is `{ action?, sender?: { login, id, type }, label? }` from `graph-doorbell.ts`. The container
+  passes the doorbell through; callers that do not have one may omit `options`.
 - **Label attribution helper.** The per-label rule lives once in `cp/src/kanban/label-attribution.ts` for Lane 1b to
   reuse (it fixes the same bug in `statusSetByHuman`): `latestLabelEvent(events, label)`, `labelAdder(events, label,
 appSlug)`, and `labelAddedByWriter(events, label, appSlug, writer)`, plus `latestTransferEvent(events)`. The importer
@@ -333,7 +341,14 @@ appSlug)`, and `labelAddedByWriter(events, label, appSlug, writer)`, plus `lates
 - **Lookups and logs.** Permission lookups are deduplicated per login (case-insensitive) within one import. Errors are
   logged at warn level and body-free: board id, issue number, a reason (`events_unreadable` /
   `permission_lookup_failed`), the error class, and the HTTP status. Error messages are never logged.
-- **Wiring.** The container passes `appSlug: githubAppCfg?.slug`, the HTTP logger, and the webhook `action`.
+- **Wiring.** The container passes `appSlug: githubAppCfg?.slug`, the HTTP logger, and the doorbell (action, sender,
+  label).
+- **Lane 1b sync, doorbell sender.** `KanbanSync.onCardChanged(…, doorbell)` runs the step 4 check before its replay
+  deferral. A live writer sender whose add is not yet visible defers. A non-writer sender who re-added a `ready` or
+  `running` card's current status label reverts the card to `triage` at once: the label is reverted, the refusal
+  comment is posted, any lease is revoked, and the audit actor is the sender. Any other non-writer lag defers. A
+  redelivered doorbell that arrives after a writer's later visible re-add still reverts (fail closed; the writer
+  re-adds the label).
 
 ## 5. Board routes (`cp/src/http/routes/kanban.ts`)
 
@@ -409,3 +424,8 @@ lanes shouldn't reuse the `20261122*` timestamps.
     `parseStatusLabels`, and the removal filters use it.
   - **Read-after-redirect fence**: `readCard` fails closed (`null`) on a `number` or `repository.id` mismatch and
     exposes `CardIssue.repositoryFullName`; the importer refuses to import when that name isn't the board's repo.
+- 2026-10-17 v1.3, PR #194 round 3:
+  - **Doorbell sender** (§4 step 4): `RcGithubGraph` gains optional `sender` (`login` ≤ 64, numeric `id`, `type`) and
+    `label` (≤ 100). `import()` options become `KanbanIssueDoorbell`, and `KanbanSync.onCardChanged` takes the same
+    doorbell. Both require a `labeled` sender's add to be the latest visible event for the live label. The frame is
+    `.strict()`, so the CP must deploy before a relay that sends the new fields.

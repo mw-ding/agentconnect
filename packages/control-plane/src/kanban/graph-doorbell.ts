@@ -2,6 +2,7 @@
 import type { RcGithubGraph } from '@agentconnect.md/protocol'
 import type { GithubInstallationRepo, KanbanBoardRecord, KanbanBoardRepo } from '../persistence/ports.js'
 import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
+import type { DoorbellSender } from './label-attribution.js'
 
 /** Landed-GUID memory bound (flush-at-cap, the redelivery reconciler precedent). */
 const MAX_LANDED = 5_000
@@ -9,6 +10,13 @@ const MAX_LANDED = 5_000
 export interface GraphDoorbellLog {
   debug(obj: unknown, msg?: string): void
   warn(obj: unknown, msg?: string): void
+}
+
+/** What an `issues` doorbell tells a card re-read: the webhook action, plus the sender and label of a label edit. */
+export interface KanbanIssueDoorbell {
+  action?: string
+  sender?: DoorbellSender
+  label?: string
 }
 
 export interface KanbanGraphDoorbellDeps {
@@ -23,7 +31,12 @@ export interface KanbanGraphDoorbellDeps {
     graph: CardGraph
   ) => void | Promise<void>
   /** An `issues` status change: no graph read, the card itself is re-read; a throw leaves the GUID un-landed too. */
-  onCard?: (board: KanbanBoardRecord, repo: KanbanRepoRef, issueNumber: number, action?: string) => void | Promise<void>
+  onCard?: (
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    doorbell: KanbanIssueDoorbell
+  ) => void | Promise<void>
   log: GraphDoorbellLog
 }
 
@@ -93,7 +106,7 @@ export class KanbanGraphDoorbell {
       for (const issueNumber of m.numbers) {
         reads.push(
           m.event === 'issues'
-            ? (async () => this.deps.onCard?.(board, repo, issueNumber, m.action))()
+            ? (async () => this.deps.onCard?.(board, repo, issueNumber, issueDoorbell(m)))()
             : this.schedule(board, repo, issueNumber)
         )
       }
@@ -127,5 +140,13 @@ export class KanbanGraphDoorbell {
       .finally(() => this.inflight.delete(key))
     this.inflight.set(key, pending)
     return pending
+  }
+}
+
+function issueDoorbell(m: RcGithubGraph): KanbanIssueDoorbell {
+  return {
+    action: m.action,
+    ...(m.sender ? { sender: { login: m.sender.login, id: Number(m.sender.id), type: m.sender.type } } : {}),
+    ...(m.label ? { label: m.label } : {})
   }
 }

@@ -1,5 +1,4 @@
-// Per-label attribution (Lane 1a importer, reused by Lane 1b): the latest visible labeled/unlabeled event decides who may
-// have set a label currently on the issue, so a stale add never authorizes a newer removal or a lagged re-add.
+// Attributes a label to its latest VISIBLE labeled/unlabeled event; callers handle events-API lag (replay, deferral, doorbell sender).
 import {
   checkWriteAccess,
   type RepoPermissionLevel,
@@ -37,6 +36,21 @@ export function latestLabelEvent(events: readonly LabelEvent[], label: string): 
 /** The latest visible `transferred` event, or undefined. */
 export function latestTransferEvent(events: readonly LabelEvent[]): LabelEvent | undefined {
   return latestEvent(events, (event) => event.event === 'transferred')
+}
+
+/** The webhook sender of a Kanban `labeled`/`unlabeled` doorbell: a human login beside its numeric id. */
+export interface DoorbellSender {
+  login: string
+  id: number
+  type: string
+}
+
+/** Whether the latest visible event for `label` is the sender's add, i.e. the events API has caught up to a `labeled` doorbell. */
+export function doorbellAddVisible(events: readonly LabelEvent[], label: string, sender: DoorbellSender): boolean {
+  const latest = latestLabelEvent(events, label)
+  if (latest?.event !== 'labeled') return false
+  if (latest.actor?.id !== undefined) return latest.actor.id === sender.id
+  return (latest.actor?.login ?? '').toLowerCase() === sender.login.toLowerCase()
 }
 
 /**

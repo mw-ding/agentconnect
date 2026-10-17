@@ -302,6 +302,164 @@ describe('KanbanSync full pass (non-writer re-add)', () => {
   })
 })
 
+// The non-writer's removal AND re-add are both invisible to the events API, so the visible history still shows the
+// writer's add; only the `labeled` doorbell's sender says who re-added the label.
+describe('KanbanSync full pass (invisible non-writer remove+re-add, doorbell sender)', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+  const app = { type: 'Bot', login: 'agentconnect[bot]', id: 99 }
+  const doorbell = (label: string) => ({
+    action: 'labeled',
+    sender: { login: 'mallory', id: 7, type: 'User' },
+    label
+  })
+
+  async function syncFixture(status: 'ready' | 'running', leased: boolean) {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await prisma.agent.update({ where: { id: AGENT }, data: { name: 'worker' } })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'sync-invisible', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: {
+        boardId: board.id,
+        issueId: 1n,
+        issueNumber: 1,
+        status,
+        assigneeAgentId: AGENT,
+        syncEventCursor: 100n,
+        syncAgentCursor: 99n
+      }
+    })
+    const run = leased
+      ? await prisma.kanbanRun.create({
+          data: {
+            cardId: card.id,
+            attempt: 1,
+            agentId: AGENT,
+            daemonId: DAEMON,
+            dispatchRevision: card.dispatchRevision,
+            dispatchedAt: new Date(),
+            leaseId: crypto.randomUUID()
+          }
+        })
+      : null
+    const label = `ac/status:${status}`
+    const issue: CardIssue = {
+      issueId: 1n,
+      nodeId: 'I_1',
+      number: 1,
+      state: 'open',
+      labels: [label, 'ac/agent:worker']
+    }
+    // Only the writer's adds are visible; mallory's unlabeled+labeled of `label` have not reached the events API.
+    const events: LabelEvent[] = [
+      { id: 99, event: 'labeled', label: { name: 'ac/agent:worker' }, actor: bob },
+      { id: 100, event: 'labeled', label: { name: label }, actor: bob }
+    ]
+    const writes: LabelPlan[] = []
+    const revoked: unknown[] = []
+    const sync = new KanbanSync({
+      repo: new PgKanbanSyncRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      store: {
+        readCard: async () => ({ ...issue, labels: [...issue.labels] }),
+        readLabelEvents: async () => [...events],
+        applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+          writes.push(plan)
+          issue.labels = [...issue.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
+        }
+      },
+      permissions: {
+        permission: async (_r: unknown, login: string) =>
+          ['bob', 'carol'].includes(login.toLowerCase()) ? 'write' : 'triage'
+      },
+      appSlug: 'agentconnect',
+      repoRef: async () => ({ installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }),
+      revoke: async (lease: unknown) => {
+        revoked.push(lease)
+      },
+      promote: async () => {},
+      log: { warn: () => {} }
+    })
+    // The lagged events finally become visible: mallory's remove+re-add, then the App's own revert.
+    const catchUp = () => {
+      events.push(
+        { id: 101, event: 'unlabeled', label: { name: label }, actor: mallory },
+        { id: 102, event: 'labeled', label: { name: label }, actor: mallory },
+        { id: 103, event: 'unlabeled', label: { name: label }, actor: app },
+        { id: 104, event: 'labeled', label: { name: 'ac/status:triage' }, actor: app }
+      )
+    }
+    return { board, card, run, sync, writes, revoked, label, catchUp }
+  }
+
+  const claim = (boardId: string) =>
+    new PgKanbanDispatchRepo(prisma).claim(boardId, { now: new Date(), isDaemonLive: () => true })
+
+  it('a tick alone cannot see the invisible re-add (the gap the doorbell sender closes)', async () => {
+    const f = await syncFixture('ready', false)
+    await f.sync.onCardChanged(f.board.id, 1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).status).toBe('ready')
+  })
+
+  it('reverts a ready card to triage on the doorbell, refuses, and stays triage once the events are visible', async () => {
+    const f = await syncFixture('ready', false)
+    await f.sync.onCardChanged(f.board.id, 1, true, doorbell(f.label))
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row).toMatchObject({ status: 'triage', assigneeAgentId: AGENT, needsAttention: false })
+    expect(f.writes.at(-1)).toMatchObject({
+      status: 'triage',
+      addLabels: ['ac/status:triage'],
+      removeLabels: ['ac/status:ready'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    expect(await claim(f.board.id)).toHaveLength(0)
+    const audit = await prisma.auditEvent.findFirstOrThrow({ where: { kind: 'kanban_card_change' } })
+    expect(audit.details).toMatchObject({ from: 'ready', to: 'triage', source: 'human_label', actorLogin: 'mallory' })
+
+    f.catchUp()
+    const writes = f.writes.length
+    await f.sync.onCardChanged(f.board.id, 1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).status).toBe('triage')
+    expect(f.writes.slice(writes).every((w) => w.addLabels.length === 0 && w.removeLabels.length === 0)).toBe(true)
+    expect(await claim(f.board.id)).toHaveLength(0)
+  })
+
+  it('revokes the lease and reclaims the run when the invisible re-add is on a running card', async () => {
+    const f = await syncFixture('running', true)
+    await f.sync.onCardChanged(f.board.id, 1, true, doorbell(f.label))
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row.status).toBe('triage')
+    expect(row.dispatchRevision).toBe(2n)
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: f.run!.id } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'human_status',
+      endedAt: expect.any(Date)
+    })
+    expect(f.revoked).toHaveLength(1)
+    expect(f.writes.at(-1)).toMatchObject({
+      status: 'triage',
+      removeLabels: ['ac/status:running'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    f.catchUp()
+    await f.sync.onCardChanged(f.board.id, 1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).status).toBe('triage')
+    expect(await claim(f.board.id)).toHaveLength(0)
+  })
+
+  it('defers when a live writer sender re-adds the label invisibly', async () => {
+    const f = await syncFixture('ready', false)
+    const carol = { login: 'carol', id: 3, type: 'User' }
+    await f.sync.onCardChanged(f.board.id, 1, true, { ...doorbell(f.label), sender: carol })
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row).toMatchObject({ status: 'ready', syncDeferralCount: 1, syncEventCursor: 100n })
+    expect(f.writes).toHaveLength(0)
+  })
+})
+
 // Two KanbanSync replicas over the same Postgres with a shared fake GitHub: replica A commits a lease-revoking
 // reassignment while replica B applies a newer human status event. A must re-read GitHub before planning labels, so B's
 // newer state (and cursor) win instead of A re-writing the stale pre-reassignment label.
