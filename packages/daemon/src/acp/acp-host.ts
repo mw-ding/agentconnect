@@ -46,6 +46,7 @@ import { STEERING_METHOD, parseSteeringOutcome, steeringRequestParams, steeringS
 import type { SteeringIdleBehavior, SteeringOutcome } from './steering.js'
 import { RuntimeSessionFailure, SESSION_FAILURE_CAPABILITIES, sessionFailureFromMeta } from './session-failure.js'
 import { customInstructionsMeta, customInstructionsSupported } from './session-instructions.js'
+import { AcpConnectionClosedError } from './transport-error.js'
 import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 // The raw session config-option shapes (from the ACP SDK), re-exported so
@@ -1300,7 +1301,14 @@ export class AcpHost {
 
   /** Drive one prompt; managed Codex usage is a per-prompt delta, and a typed terminal failure rejects. */
   async prompt(sessionId: string, blocks: ContentBlock[]): Promise<{ stopReason: StopReason; usage?: Usage }> {
-    const res = await this.conn!.agent.request(methods.agent.session.prompt, { sessionId, prompt: blocks })
+    const conn = this.conn!
+    const res = await conn.agent
+      .request(methods.agent.session.prompt, { sessionId, prompt: blocks })
+      .catch((err: unknown) => {
+        // The SDK rejects pending requests with this exact abort reason; remote JSON-RPC errors have no such authority.
+        if (conn.signal.aborted && err === conn.signal.reason) throw new AcpConnectionClosedError(err)
+        throw err
+      })
     const failure = sessionFailureFromMeta(res._meta)
     if (failure) throw failure
     return { stopReason: res.stopReason, usage: res.usage ?? undefined }

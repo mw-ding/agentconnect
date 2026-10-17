@@ -33,3 +33,21 @@ export const handleKanbanReport: Handler = async (frame, conn, deps) => {
     conn.sendError(frame.id, 'INTERNAL', 'kanban report failed', true)
   }
 }
+
+export const handleKanbanCard: Handler = async (frame, conn, deps) => {
+  if (!isFrame('kanban/card')(frame)) return
+  if (!deps.kanbanDispatcher) {
+    conn.sendError(frame.id, 'SCOPE_DENIED', 'kanban dispatch is not enabled', false)
+    return
+  }
+  try {
+    // The fence inputs are the authenticated connection's, never the payload's.
+    conn.replyTo(
+      frame,
+      'kanban/card/ok',
+      await deps.kanbanDispatcher.onCardShow(conn.daemonId, conn.sessionEpoch, frame.payload)
+    )
+  } catch {
+    conn.sendError(frame.id, 'INTERNAL', 'kanban card read failed', true)
+  }
+}

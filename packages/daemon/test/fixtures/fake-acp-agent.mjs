@@ -238,6 +238,7 @@ rl.on('line', async (line) => {
     sessionPermissionModes.delete(params.sessionId)
     send({ jsonrpc: '2.0', id, result: {} })
   } else if (method === 'session/prompt') {
+    if (process.env.AC_EXIT_DURING_PROMPT === '1') process.exit(1)
     if (promptCounter++ === 0 && process.env.AC_FIRST_PROMPT_FAILURE) {
       const failure = JSON.parse(process.env.AC_FIRST_PROMPT_FAILURE)
       const air = clientCapabilities?._meta?.jetbrains?.air
