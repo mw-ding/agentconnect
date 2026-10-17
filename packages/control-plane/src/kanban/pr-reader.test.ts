@@ -70,7 +70,10 @@ describe('GithubPrReader', () => {
         expect(url.searchParams.get('filter')).toBe('latest')
         return {
           status: 200,
-          body: { total_count: 150, check_runs: Array.from({ length: page === 1 ? 100 : 50 }, (_, i) => run(i)) }
+          body: {
+            total_count: 150,
+            check_runs: Array.from({ length: page === 1 ? 100 : 50 }, (_, i) => run((page - 1) * 100 + i))
+          }
         }
       }
     })
@@ -87,11 +90,38 @@ describe('GithubPrReader', () => {
         status: 200,
         body: {
           total_count: 1000,
-          check_runs: Array.from({ length: 100 }, () => ({ status: 'completed', conclusion: 'success' }))
+          check_runs: Array.from({ length: 100 }, (_, i) => ({
+            id: i,
+            name: `c${i}`,
+            status: 'completed',
+            conclusion: 'success'
+          }))
         }
       })
     })
     expect((await h.reader.readCheckRuns(REPO, SHA)).complete).toBe(false)
     expect(h.urls).toHaveLength(3)
+  })
+
+  it('keeps only the newest run of each check, so a green re-run in a new suite supersedes the old failure', async () => {
+    const h = harness({
+      [`/repositories/42/commits/${SHA}/check-runs`]: () => ({
+        status: 200,
+        body: {
+          total_count: 4,
+          check_runs: [
+            { id: 20, name: 'Conventional PR', app: { id: 15368 }, status: 'completed', conclusion: 'success' },
+            { id: 10, name: 'Conventional PR', app: { id: 15368 }, status: 'completed', conclusion: 'failure' },
+            { id: 11, name: 'Conventional PR', app: { id: 999 }, status: 'completed', conclusion: 'failure' },
+            { id: 12, name: 'lint', app: { id: 15368 }, status: 'in_progress', conclusion: null }
+          ]
+        }
+      })
+    })
+    expect((await h.reader.readCheckRuns(REPO, SHA)).runs).toEqual([
+      { status: 'completed', conclusion: 'success' },
+      { status: 'completed', conclusion: 'failure' },
+      { status: 'in_progress', conclusion: null }
+    ])
   })
 })

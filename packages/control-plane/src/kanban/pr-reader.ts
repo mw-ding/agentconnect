@@ -11,7 +11,7 @@ const MAX_CHECK_PAGES = 3
 export interface PrReader {
   /** Null when the number is not a pull request in this repository (deleted, or an issue). */
   readPullRequest(repo: KanbanRepoRef, prNumber: number): Promise<LivePullRequest | null>
-  /** Every latest check run on `sha`; `complete` is false when the list ran past the page bound. */
+  /** The newest run of each check on `sha`; `complete` is false when the list ran past the page bound. */
   readCheckRuns(repo: KanbanRepoRef, sha: string): Promise<{ runs: CheckRunFacts[]; complete: boolean }>
 }
 
@@ -29,9 +29,30 @@ interface GhPull {
   head?: { sha?: string }
 }
 
+interface GhCheckRun {
+  id: number
+  name?: string
+  status?: string
+  conclusion?: string | null
+  app?: { id?: number } | null
+}
+
 interface GhCheckRuns {
   total_count: number
-  check_runs: Array<{ status?: string; conclusion?: string | null }>
+  check_runs: GhCheckRun[]
+}
+
+/** `filter=latest` dedupes only within a suite, so a re-run in a new suite (a new workflow run) leaves the old one listed. */
+export function newestPerCheck<T extends { id: number; name?: string; app?: { id?: number } | null }>(
+  runs: readonly T[]
+): T[] {
+  const newest = new Map<string, T>()
+  for (const run of runs) {
+    const key = `${run.app?.id ?? ''}:${run.name ?? `#${run.id}`}`
+    const seen = newest.get(key)
+    if (!seen || run.id > seen.id) newest.set(key, run)
+  }
+  return [...newest.values()]
 }
 
 export class GithubPrReader implements PrReader {
@@ -55,16 +76,18 @@ export class GithubPrReader implements PrReader {
   }
 
   async readCheckRuns(repo: KanbanRepoRef, sha: string): Promise<{ runs: CheckRunFacts[]; complete: boolean }> {
-    const runs: CheckRunFacts[] = []
+    const all: GhCheckRun[] = []
+    const facts = () =>
+      newestPerCheck(all).map((r) => ({ status: r.status ?? 'queued', conclusion: r.conclusion ?? null }))
     for (let page = 1; page <= MAX_CHECK_PAGES; page++) {
       const res = await this.get<GhCheckRuns>(
         repo,
         `/commits/${encodeURIComponent(sha)}/check-runs?filter=latest&per_page=${PAGE}&page=${page}`
       )
-      runs.push(...res.check_runs.map((r) => ({ status: r.status ?? 'queued', conclusion: r.conclusion ?? null })))
-      if (runs.length >= res.total_count || res.check_runs.length < PAGE) return { runs, complete: true }
+      all.push(...res.check_runs)
+      if (all.length >= res.total_count || res.check_runs.length < PAGE) return { runs: facts(), complete: true }
     }
-    return { runs, complete: false }
+    return { runs: facts(), complete: false }
   }
 
   private async get<T>(repo: KanbanRepoRef, path: string): Promise<T> {
