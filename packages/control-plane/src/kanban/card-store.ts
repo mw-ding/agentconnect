@@ -53,6 +53,8 @@ export interface CardStore {
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
   /** Body-free issue events, oldest first; throws when the history runs past the page bound, so callers fail closed. */
   readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]>
+  /** The repository's current `owner/name`, read by numeric id (it follows a rename); null when GitHub omits it. */
+  readRepositoryFullName(repo: KanbanRepoRef): Promise<string | null>
   /** The newest visible issue-event id (0 for none): the pre-POST cursor bounding which events can be our write. */
   lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number>
   /** Judge a pending promotion from the events after `cursor`; an unreadable window is inconclusive. */
@@ -207,9 +209,8 @@ export class GithubCardStore implements CardStore {
       if (err instanceof GithubApiError && (err.status === 404 || err.status === 410)) return null
       throw err
     }
-    // A transfer redirect can land on another issue: refuse a different number or a different numeric repository.
+    // A transfer redirect can land on another issue: refuse a different number; the importer fences the repository name.
     if (issue.pull_request !== undefined || issue.number !== issueNumber) return null
-    if (issue.repository?.id !== undefined && BigInt(issue.repository.id) !== repo.repoId) return null
     const labels = (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean)
     return {
       issueId: BigInt(issue.id),
@@ -223,6 +224,11 @@ export class GithubCardStore implements CardStore {
       authorViaGithubApp: !!issue.performed_via_github_app,
       repositoryFullName: repoFullNameOf(issue.repository_url)
     }
+  }
+
+  async readRepositoryFullName(repo: KanbanRepoRef): Promise<string | null> {
+    const repository = await this.get<{ full_name?: string }>(repo, '')
+    return typeof repository.full_name === 'string' && repository.full_name.includes('/') ? repository.full_name : null
   }
 
   async readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph> {

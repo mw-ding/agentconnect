@@ -1778,6 +1778,7 @@ export function buildContainer(
     kanbanCardStore && kanbanTokens
       ? new KanbanImporter({
           cards: repos.kanbanCard,
+          boards: repos.kanbanBoard,
           store: kanbanCardStore,
           permissions: new GithubRepoPermission({
             tokens: kanbanTokens,

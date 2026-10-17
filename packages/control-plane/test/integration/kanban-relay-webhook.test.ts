@@ -14,7 +14,7 @@ const WEBHOOK_SECRET = 'kanban-webhook-secret-0123456789'
 const INSTALLATION_ID = 77
 const REPO_ID = 4242
 const ISSUE = { id: 70007, number: 7 }
-const HUMAN = { type: 'User', login: 'alice' }
+const HUMAN = { type: 'User', login: 'alice', id: 1001 }
 
 interface GithubCall {
   method: string
@@ -179,7 +179,9 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
         event: 'issues',
         action: 'labeled',
         ids: [String(ISSUE.id)],
-        numbers: [ISSUE.number]
+        numbers: [ISSUE.number],
+        sender: { login: 'alice', id: '1001', type: 'User' },
+        label: 'ac/status:ready'
       }
     ])
 

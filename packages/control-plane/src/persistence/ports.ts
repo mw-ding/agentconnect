@@ -7926,6 +7926,8 @@ export interface KanbanBoardRepo {
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
   /** Distinct repository ids any enabled board watches (redelivery sieve). */
   listEnabledRepoIds(): Promise<bigint[]>
+  /** Adopt GitHub's renamed `owner/name` for a board still watching `repoId`; audited with no user actor. */
+  refreshRepoFullName(boardId: string, repoId: bigint, repoFullName: string): Promise<boolean>
 }
 
 // ── Kanban dispatch (issue #2 M2) — claim, lease fence, heartbeat, and reaper reads; still body-free ──

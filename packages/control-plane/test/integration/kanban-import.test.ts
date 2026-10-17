@@ -348,3 +348,52 @@ describe('issue import doorbells (Postgres)', () => {
     })
   })
 })
+
+describe('repository rename (Postgres)', () => {
+  it('refreshes the board name once, audited without a user, and imports under the new name', async () => {
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'renamed', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const boards = new PgKanbanBoardRepo(prisma)
+    const record = (await boards.listEnabledByRepoId(42n)).find((b) => b.id === board.id)!
+    const issue: CardIssue = {
+      issueId: 900n,
+      nodeId: 'I_900',
+      number: 9,
+      state: 'open',
+      labels: ['ac/status:todo'],
+      authorLogin: 'alice',
+      authorType: 'User',
+      authorViaGithubApp: false,
+      repositoryFullName: 'acme/web-renamed'
+    }
+    const plans: Array<{ repoFullName: string }> = []
+    const store = {
+      readCard: async () => issue,
+      applyPlan: async (r: { repoFullName: string }) => {
+        plans.push(r)
+      },
+      readLabelEvents: async () => [labeled(1, 'ac/status:todo', 'alice')],
+      readRepositoryFullName: async () => 'acme/web-renamed'
+    }
+    const importer = new KanbanImporter({
+      cards: new PgKanbanCardRepo(prisma),
+      boards,
+      store,
+      permissions: { permission: async () => 'write' as const }
+    })
+    expect(await importer.import(record, repo, 9)).toBe(true)
+    const row = await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: board.id } })
+    expect(row.repoFullName).toBe('acme/web-renamed')
+    expect(plans[0]).toMatchObject({ repoFullName: 'acme/web-renamed' })
+    // A second replica observing the same rename does not audit it twice.
+    expect(await boards.refreshRepoFullName(board.id, 42n, 'acme/web-renamed')).toBe(true)
+    const audits = await prisma.auditEvent.findMany({
+      where: { kind: 'kanban_board_change', message: `kanban board ${board.id} repo_renamed` }
+    })
+    expect(audits).toHaveLength(1)
+    expect(audits[0]!.actorUserId).toBeNull()
+    // A board that no longer watches this repository id is never renamed.
+    expect(await boards.refreshRepoFullName(board.id, 43n, 'evil/web')).toBe(false)
+  })
+})

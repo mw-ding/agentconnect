@@ -295,6 +295,24 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     return rows.map((r) => ({ ...r, orgId: OrgId(r.orgId) }))
   }
 
+  async refreshRepoFullName(boardId: string, repoId: bigint, repoFullName: string): Promise<boolean> {
+    return withAmbientTx(this.db, async (tx) => {
+      const current = await tx.kanbanBoard.findFirst({
+        where: { id: boardId, repoId },
+        select: { orgId: true, repoFullName: true }
+      })
+      if (!current) return false
+      if (current.repoFullName === repoFullName) return true
+      // Compare-and-set on the name read above, so two replicas observing one rename audit it once.
+      const { count } = await tx.kanbanBoard.updateMany({
+        where: { id: boardId, repoId, repoFullName: current.repoFullName },
+        data: { repoFullName }
+      })
+      if (count === 1) await auditBoard(tx, current.orgId, null, boardId, 'repo_renamed', ['repoFullName'], repoId)
+      return count === 1
+    })
+  }
+
   async listEnabledRepoIds(): Promise<bigint[]> {
     const rows = await this.db.kanbanBoard.findMany({
       where: { enabled: true },
@@ -714,9 +732,9 @@ function sameValue(a: unknown, b: unknown): boolean {
 async function auditBoard(
   tx: Prisma.TransactionClient,
   orgId: string,
-  userId: string,
+  userId: string | null,
   boardId: string,
-  change: 'created' | 'updated' | 'deleted',
+  change: 'created' | 'updated' | 'deleted' | 'repo_renamed',
   fields: string[],
   repoId: bigint
 ): Promise<void> {

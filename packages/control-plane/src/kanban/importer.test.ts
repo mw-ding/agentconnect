@@ -77,6 +77,31 @@ describe('Kanban issue import', () => {
         expect.any(String)
       )
   })
+  it('refreshes the board name after a repository rename and imports under the new name', async () => {
+    const h = harness({ ...issue(), repositoryFullName: 'acme/web-renamed' })
+    const boards = { refreshRepoFullName: vi.fn(async () => true) }
+    const store = { ...h.store, readRepositoryFullName: vi.fn(async () => 'acme/web-renamed') }
+    const importer = new KanbanImporter({ cards: h.cards, boards, store, permissions: h.permissions, appSlug: APP })
+    expect(await importer.import(board, repo, 1)).toBe(true)
+    expect(store.readRepositoryFullName).toHaveBeenCalledWith(repo)
+    expect(boards.refreshRepoFullName).toHaveBeenCalledWith('board', 42n, 'acme/web-renamed')
+    expect(h.store.applyPlan.mock.calls[0]![0]).toMatchObject({ repoFullName: 'acme/web-renamed' })
+  })
+
+  it.each([
+    ['a redirect to another repository', 'acme/web'],
+    ['an unreadable repository name', null],
+    ['a lost rename compare-and-set', 'other/web']
+  ] as const)('refuses the import on %s', async (_case, current) => {
+    const h = harness({ ...issue(), repositoryFullName: 'other/web' })
+    const boards = { refreshRepoFullName: vi.fn(async () => false) }
+    const store = { ...h.store, readRepositoryFullName: vi.fn(async () => current) }
+    const importer = new KanbanImporter({ cards: h.cards, boards, store, permissions: h.permissions, appSlug: APP })
+    expect(await importer.import(board, repo, 1)).toBe(false)
+    expect(h.cards.upsertCard).not.toHaveBeenCalled()
+    if (current !== 'other/web') expect(boards.refreshRepoFullName).not.toHaveBeenCalled()
+  })
+
   it.each(['admin', 'maintain', 'write', 'triage', 'read', 'none', new Error('offline')] as const)(
     'gates the author using live permission %s',
     async (level) => {

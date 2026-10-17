@@ -2,6 +2,7 @@
 import { checkWriteAccess, type RepoPermissionLevel, type RepoPermissionLookup } from '../github/repo-permission.js'
 import type {
   KanbanBoardRecord,
+  KanbanBoardRepo,
   KanbanCardRepo,
   KanbanHumanAuthority,
   KanbanInitialStatus
@@ -22,7 +23,10 @@ import {
 
 export interface KanbanImporterDeps {
   cards: Pick<KanbanCardRepo, 'findByIssueNumber' | 'upsertCard' | 'resolveAgentSlug'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'readLabelEvents'>
+  /** Without it (or without the store's repository read) a renamed repository refuses imports, as before. */
+  boards?: Pick<KanbanBoardRepo, 'refreshRepoFullName'>
+  store: Pick<CardStore, 'readCard' | 'applyPlan' | 'readLabelEvents'> &
+    Partial<Pick<CardStore, 'readRepositoryFullName'>>
   permissions: RepoPermissionLookup
   /** This deployment's App slug: its writes are the agents' too, so they never attribute a label. */
   appSlug?: string
@@ -54,24 +58,15 @@ export class KanbanImporter {
   // Returns true when this delivery imported a candidate, including a concurrent create winner.
   async import(
     board: KanbanBoardRecord,
-    repo: KanbanRepoRef,
+    boardRepo: KanbanRepoRef,
     issueNumber: number,
     options: KanbanIssueDoorbell = {}
   ): Promise<boolean> {
     if (await this.deps.cards.findByIssueNumber(board.id, issueNumber)) return false
-    const issue = await this.deps.store.readCard(repo, issueNumber)
+    const issue = await this.deps.store.readCard(boardRepo, issueNumber)
     if (!issue || !issue.labels.some(isStatusLabel)) return false
-    // Import only from the board's repository by name too; a redirect or a not-yet-refreshed rename imports nothing.
-    if (
-      issue.repositoryFullName !== undefined &&
-      issue.repositoryFullName?.toLowerCase() !== repo.repoFullName.toLowerCase()
-    ) {
-      this.deps.log?.warn(
-        { boardId: board.id, issueNumber, reason: 'repository_mismatch' },
-        'kanban import: issue read resolved outside the board repository; not importing'
-      )
-      return false
-    }
+    const repo = await this.boardRepository(board, boardRepo, issueNumber, issue)
+    if (!repo) return false
     // TRD §7: an unattributed card is still imported, but as triage, which a claim never takes (it needs ready + assignee).
     const checks = new Map<string, Promise<WriteCheck>>()
     const writer = (login: string | null | undefined): Promise<WriteCheck> => {
@@ -103,6 +98,30 @@ export class KanbanImporter {
       ...(kept ? { humanAuthority: authority.human } : {})
     })
     return true
+  }
+
+  // Import only from the board's repository by name too: a rename (same id, new name) refreshes the board, a redirect refuses.
+  private async boardRepository(
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    issue: CardIssue
+  ): Promise<KanbanRepoRef | null> {
+    const name = issue.repositoryFullName
+    if (name === undefined || name?.toLowerCase() === repo.repoFullName.toLowerCase()) return repo
+    const current =
+      name && this.deps.boards && this.deps.store.readRepositoryFullName
+        ? await this.deps.store.readRepositoryFullName(repo)
+        : null
+    if (!name || !current || current.toLowerCase() !== name.toLowerCase()) {
+      this.deps.log?.warn(
+        { boardId: board.id, issueNumber, reason: 'repository_mismatch' },
+        'kanban import: issue read resolved outside the board repository; not importing'
+      )
+      return null
+    }
+    if (!(await this.deps.boards!.refreshRepoFullName(board.id, repo.repoId, current))) return null
+    return { ...repo, repoFullName: current }
   }
 
   // The author, the latest transferrer, and the adder of the one current status label must all be live human writers.

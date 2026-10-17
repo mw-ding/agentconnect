@@ -111,13 +111,20 @@ describe('GithubCardStore reads', () => {
     expect(await h.store.readCard(REPO, 8)).toBeNull()
   })
 
-  it.each([{ number: 8 }, { repository: { id: 99 } }])(
-    'refuses a redirected issue outside the requested identity: %j',
-    async (over) => {
-      const h = harness({ 'GET /repositories/42/issues/7': () => json(issue(over)) })
-      expect(await h.store.readCard(REPO, 7)).toBeNull()
-    }
-  )
+  // The issue GET carries repository_url, not repository.id, so the number is the only identity fenced here.
+  it('refuses a redirected issue with a different number', async () => {
+    const h = harness({ 'GET /repositories/42/issues/7': () => json(issue({ number: 8 })) })
+    expect(await h.store.readCard(REPO, 7)).toBeNull()
+  })
+
+  it.each([
+    [{ full_name: 'acme/web-renamed' }, 'acme/web-renamed'],
+    [{}, null],
+    [{ full_name: 'no-slash' }, null]
+  ])('reads the repository current name by numeric id: %j', async (body, name) => {
+    const h = harness({ 'GET /repositories/42': () => json(body) })
+    expect(await h.store.readRepositoryFullName(REPO)).toBe(name)
+  })
 
   // Repo-id addressing survives a rename, so a new name still reads; only the importer fences on the name.
   it.each([
