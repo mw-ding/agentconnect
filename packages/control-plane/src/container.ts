@@ -1774,7 +1774,9 @@ export function buildContainer(
           permissions: new GithubRepoPermission({
             tokens: kanbanTokens,
             ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
-          })
+          }),
+          appSlug: githubAppCfg?.slug,
+          log: { warn: (o, m) => http.log.warn(o, m) }
         })
       : undefined
 

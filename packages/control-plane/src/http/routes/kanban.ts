@@ -24,12 +24,28 @@ import {
   UpdateKanbanBoardBody
 } from '../dto/index.js'
 
-const notFound = { error: 'Not Found', statusCode: 404 } as const
+declare module 'fastify' {
+  interface FastifyContextConfig {
+    /** Kanban routes are owner-gated by default; `viewer` opts a read route out, and its handler must check `canView`. */
+    kanbanAccess?: 'viewer'
+  }
+}
+
+const notFound = { error: 'Not Found', statusCode: 404, code: 'not_found' } as const
 
 // Credentials an agent could hold never reach configuration handlers, and neither do collaborators or viewers.
 async function interactiveOwner(req: FastifyRequest, reply: FastifyReply) {
   if (denyNonInteractive(req, reply)) return reply
   if (denyNonOwner(req, reply)) return reply
+}
+
+// Owner-gated by default, so a route a later lane adds here cannot ship ungated; read routes opt out explicitly.
+export function ownerGateByDefault(app: FastifyInstance): void {
+  app.addHook('onRoute', (route) => {
+    if (route.config?.kanbanAccess === 'viewer') return
+    const existing = route.preValidation
+    route.preValidation = [interactiveOwner, ...(existing ? (Array.isArray(existing) ? existing : [existing]) : [])]
+  })
 }
 
 function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT {
@@ -61,35 +77,59 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
   }
 }
 
-const REFUSALS: Record<KanbanBoardWriteRefusal, { statusCode: 400 | 404 | 409; error: string; message: string }> = {
-  not_found: { statusCode: 404, error: 'Not Found', message: 'board not found' },
+// `code` is the stable, machine-readable reason clients branch on; the message is for people.
+const REFUSALS: Record<
+  KanbanBoardWriteRefusal,
+  { statusCode: 400 | 404 | 409; error: string; message: string; code: KanbanBoardWriteRefusal }
+> = {
+  not_found: { statusCode: 404, error: 'Not Found', message: 'board not found', code: 'not_found' },
   repo_taken: {
     statusCode: 409,
     error: 'Conflict',
-    message: 'this organization already has a board for that repository'
+    message: 'this organization already has a board for that repository',
+    code: 'repo_taken'
   },
   agent_not_in_org: {
     statusCode: 400,
     error: 'Bad Request',
-    message: 'orchestrator and verifier must be agents of this organization'
+    message: 'orchestrator and verifier must be agents of this organization',
+    code: 'agent_not_in_org'
   },
   empty_audience: {
     statusCode: 400,
     error: 'Bad Request',
-    message: 'a restricted board must be shared with at least one current member'
+    message: 'a restricted board must be shared with at least one current member',
+    code: 'empty_audience'
   },
-  repo_has_cards: { statusCode: 409, error: 'Conflict', message: 'a board with cards cannot change repository' },
+  repo_has_cards: {
+    statusCode: 409,
+    error: 'Conflict',
+    message: 'a board with cards cannot change repository',
+    code: 'repo_has_cards'
+  },
   active_runs: {
     statusCode: 409,
     error: 'Conflict',
-    message: 'board has active runs; disable it and let them end first'
+    message: 'board has active runs; disable it and let them end first',
+    code: 'active_runs'
   }
 }
 
-const UPSTREAM_ERRORS = { 400: 'Bad Request', 409: 'Conflict', 429: 'Too Many Requests', 502: 'Bad Gateway' } as const
+/** Repository-resolver refusals by status, each with a stable code. */
+const UPSTREAM_ERRORS = {
+  400: { error: 'Bad Request', code: 'repo_not_covered' },
+  409: { error: 'Conflict', code: 'github_app_not_configured' },
+  429: { error: 'Too Many Requests', code: 'github_rate_limited' },
+  502: { error: 'Bad Gateway', code: 'github_unavailable' }
+} as const
+
+function upstreamError(status: keyof typeof UPSTREAM_ERRORS, message: string) {
+  return { ...UPSTREAM_ERRORS[status], statusCode: status, message }
+}
 
 export function kanbanRoutes(deps: HttpDeps) {
   return async function kanbanRoutesPlugin(app: FastifyInstance): Promise<void> {
+    ownerGateByDefault(app)
     const r = app.withTypeProvider<ZodTypeProvider>()
     const resolver =
       deps.kanbanRepoResolver ??
@@ -104,6 +144,7 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.get(
       '/kanban/boards',
       {
+        config: { kanbanAccess: 'viewer' },
         schema: {
           tags: [Tag.Kanban],
           summary: 'List Kanban boards',
@@ -123,6 +164,7 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.get(
       '/kanban/boards/:boardId',
       {
+        config: { kanbanAccess: 'viewer' },
         schema: {
           tags: [Tag.Kanban],
           summary: 'Get a Kanban board',
@@ -143,7 +185,6 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.post(
       '/kanban/boards',
       {
-        preValidation: interactiveOwner,
         schema: {
           tags: [Tag.Kanban],
           summary: 'Create a Kanban board',
@@ -167,9 +208,7 @@ export function kanbanRoutes(deps: HttpDeps) {
         const { orgId, userId } = req.orgCtx!
         const resolved = await resolver.resolve(orgId, req.body.repoFullName)
         if (!resolved.ok) {
-          return reply
-            .code(resolved.status)
-            .send({ error: UPSTREAM_ERRORS[resolved.status], statusCode: resolved.status, message: resolved.message })
+          return reply.code(resolved.status).send(upstreamError(resolved.status, resolved.message))
         }
         const sharedWith = await resolveShareSet(deps.repos.user, orgId, req.body.sharedWith)
         const result = await deps.repos.kanbanBoards.createBoard(orgId, userId, {
@@ -186,7 +225,6 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.patch(
       '/kanban/boards/:boardId',
       {
-        preValidation: interactiveOwner,
         schema: {
           tags: [Tag.Kanban],
           summary: 'Update a Kanban board',
@@ -218,15 +256,14 @@ export function kanbanRoutes(deps: HttpDeps) {
         if (recheck !== undefined) {
           const resolved = await resolver.resolve(orgId, recheck)
           if (!resolved.ok) {
-            return reply
-              .code(resolved.status)
-              .send({ error: UPSTREAM_ERRORS[resolved.status], statusCode: resolved.status, message: resolved.message })
+            return reply.code(resolved.status).send(upstreamError(resolved.status, resolved.message))
           }
           if (repoFullName === undefined && resolved.repoId !== current.repoId) {
             return reply.code(409).send({
               error: 'Conflict',
               statusCode: 409,
-              message: 'the repository behind this board changed; set repoFullName explicitly'
+              message: 'the repository behind this board changed; set repoFullName explicitly',
+              code: 'repo_changed'
             })
           }
           repo = { repoId: resolved.repoId, repoFullName: resolved.repoFullName }
@@ -246,7 +283,6 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.delete(
       '/kanban/boards/:boardId',
       {
-        preValidation: interactiveOwner,
         schema: {
           tags: [Tag.Kanban],
           summary: 'Delete a Kanban board',
@@ -268,7 +304,6 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.put(
       '/kanban/boards/:boardId/mode',
       {
-        preValidation: interactiveOwner,
         schema: {
           tags: [Tag.Kanban],
           summary: 'Set a board’s default run mode',
@@ -292,7 +327,6 @@ export function kanbanRoutes(deps: HttpDeps) {
     r.put(
       '/kanban/boards/:boardId/cards/:cardId/mode',
       {
-        preValidation: interactiveOwner,
         schema: {
           tags: [Tag.Kanban],
           summary: 'Set or clear a card’s run-mode override',

@@ -11,6 +11,7 @@
  */
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type { KanbanStatus } from '../kanban/card-state.js'
+import type { RepoPermissionLevel } from '../github/repo-permission.js'
 import type {
   AccountingBoard,
   AccountingCard,
@@ -8122,24 +8123,33 @@ export interface KanbanCardRow {
   createdAt: Date
 }
 
+/** The live-verified human whose label set an imported card's status; only the import path may carry one. */
+export interface KanbanHumanAuthority {
+  login: string
+  permission: RepoPermissionLevel
+}
+
+/** Run mode is never an input: a new card inherits the board default, and only `setCardMode` overrides it. */
 export interface KanbanCardUpsertInput {
   boardId: string
+  /** The repository the issue was read from; a board retargeted since then refuses with `repo_mismatch`. */
+  expectedRepoId: bigint
   issueId: bigint
   issueNumber: number
   issueNodeId?: string | null
   /** Re-plans reuse the card filed under the same key instead of filing another. */
   idempotencyKey?: string | null
-  /** Only applied when the row is created; an existing card keeps its status. Defaults to `triage`. */
+  /** Create-only, default `triage`; anything but `triage`/`todo` needs an import-sourced, agent-free write-level `humanAuthority`. */
   status?: KanbanInitialStatus
-  /** Must be an agent of the board's org; only applied on create. */
+  /** Must be an assignable (non-restricted) agent of the board's org; only applied on create. */
   assigneeAgentId?: string | null
   priority?: number
-  mode?: 'read' | 'write' | null
   /** Who filed it, for the body-free audit row, e.g. `import` or `orchestrator`. */
   source: string
   actorUserId?: string | null
   /** The agent that filed it, when an orchestrator did. */
   actorAgentId?: string | null
+  humanAuthority?: KanbanHumanAuthority | null
 }
 
 export interface KanbanCardUpsertResult {
@@ -8149,9 +8159,17 @@ export interface KanbanCardUpsertResult {
   matchedBy: 'created' | 'issue' | 'idempotency_key'
 }
 
-export type KanbanCardUpsertErrorCode = 'board_not_found' | 'agent_not_in_org' | 'invalid_status' | 'key_conflict'
+export type KanbanCardUpsertErrorCode =
+  | 'board_not_found'
+  | 'agent_not_in_org'
+  | 'agent_not_assignable'
+  | 'invalid_status'
+  | 'status_not_allowed'
+  | 'key_conflict'
+  | 'repo_mismatch'
+  | 'issue_mismatch'
 
-/** `key_conflict`: the issue already has a card filed under a different idempotency key. */
+/** `key_conflict`: a different key on the issue's card; `issue_mismatch`: its number matched under another issue id. */
 export class KanbanCardUpsertError extends Error {
   constructor(readonly code: KanbanCardUpsertErrorCode) {
     super(`kanban card upsert refused: ${code}`)
@@ -8192,7 +8210,7 @@ export type KanbanSetAssigneeResult =
       /** The lease this write ended as `reclaimed`; the caller cancels its turns and posts the reassign comment. */
       revokedLease: KanbanLeaseRef | null
     }
-  | { ok: false; reason: 'not_found' | 'stale' | 'agent_not_in_org' }
+  | { ok: false; reason: 'not_found' | 'stale' | 'agent_not_in_org' | 'agent_not_assignable' }
   | { ok: false; reason: 'leased'; lease: KanbanLeaseRef }
 
 export interface KanbanCardRepo {
@@ -8201,7 +8219,7 @@ export interface KanbanCardRepo {
   upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult>
   findByIdempotencyKey(boardId: string, idempotencyKey: string): Promise<KanbanCardRow | null>
   getCard(cardId: string): Promise<KanbanCardRow | null>
-  /** The org-scoped agent whose slug (`Agent.name`) an `ac/agent:<slug>` label names; null when none. */
+  /** The org-scoped, non-restricted agent an `ac/agent:<slug>` label names; null when none (paused still resolves). */
   resolveAgentSlug(orgId: string, slug: string): Promise<string | null>
   /** Change the assignee under the reassign rule: a live lease is refused, or killed (never transferred) on `revoke`. */
   setAssignee(input: KanbanSetAssigneeInput): Promise<KanbanSetAssigneeResult>

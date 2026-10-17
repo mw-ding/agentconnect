@@ -323,6 +323,33 @@ describe('status label attribution', () => {
     await expect(harness({}).store.statusSetByHuman(REPO, 7, 'ready')).rejects.toThrow()
   })
 
+  it('reads every event oldest first, keeping only body-free attribution fields', async () => {
+    const h = harness({
+      [EVENTS]: () =>
+        eventsPage([
+          ev(3, human, 'ac/agent:worker', {
+            performed_via_github_app: { slug: 'other' },
+            actor: { ...human, email: 'x' }
+          }),
+          { id: 2, event: 'renamed', rename: { from: 'Secret roadmap', to: 'SECRET-BODY' }, actor: human },
+          ev(1, human)
+        ])
+    })
+    const events = await h.store.readLabelEvents(REPO, 7)
+    expect(events).toEqual([
+      { id: 1, event: 'labeled', label: { name: 'ac/status:ready' }, actor: human },
+      { id: 2, event: 'renamed', actor: human },
+      { id: 3, event: 'labeled', label: { name: 'ac/agent:worker' }, actor: human, performed_via_github_app: true }
+    ])
+    expect(JSON.stringify(events)).not.toMatch(/SECRET|roadmap|email/)
+  })
+
+  it('refuses a history past the page bound instead of answering from part of it', async () => {
+    const routes: Record<string, () => Response> = { [EVENTS]: () => eventsPage([ev(1, human)], 12) }
+    for (let page = 2; page <= 12; page++) routes[`GET ${eventsPath(page)}`] = () => eventsPage([ev(page, human)], 12)
+    await expect(harness(routes).store.readLabelEvents(REPO, 7)).rejects.toThrow(/page bound/)
+  })
+
   it('classifies actors', () => {
     expect(isHumanActor({ actor: human })).toBe(true)
     expect(isHumanActor({ actor: { type: 'User' } })).toBe(false)
