@@ -187,6 +187,18 @@ export class InstallationTokenService {
     )
   }
 
+  // CP-only read of a card's linked pull request and its head checks (PR completion contracts); never handed to a daemon.
+  async mintKanbanPr(installationId: bigint, repoFullName: string, repoId: bigint): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(
+      installationId,
+      repoFullName,
+      { pull_requests: 'read', checks: 'read' },
+      repoId,
+      false,
+      'kanban_pr'
+    )
+  }
+
   // Daemon grant for one Kanban run: read clamps contents/issues/PRs to read; write follows contents with workflows.
   async mintKanbanRun(
     installationId: bigint,
@@ -218,7 +230,7 @@ export class InstallationTokenService {
     levels: InternalPermissionLevels,
     repoId?: bigint,
     forceRefresh = false,
-    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run'
+    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run' | 'kanban_pr'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =

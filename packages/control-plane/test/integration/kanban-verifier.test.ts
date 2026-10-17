@@ -9,13 +9,13 @@ import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { planRunEnd } from '../../src/kanban/run-accounting.js'
 import type {
+  CardGraph,
   CardIssue,
   KanbanRepoRef,
   LabelEvent,
-  LabelPlan,
   LabelWriteObserver
 } from '../../src/kanban/card-store.js'
-import type { ObservedIssue } from '../../src/kanban/card-state.js'
+import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { OrgId } from '../../src/domain/ids.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -50,6 +50,15 @@ class FakeStore {
   }
   async readLabelEvents(): Promise<LabelEvent[]> {
     return []
+  }
+  async readGraph(): Promise<CardGraph> {
+    return { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
+  }
+  async statusSetByHuman(): Promise<boolean> {
+    return true
+  }
+  async promotionVerdict(): Promise<'inconclusive'> {
+    return 'inconclusive'
   }
 }
 

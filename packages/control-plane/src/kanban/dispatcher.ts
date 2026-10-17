@@ -61,6 +61,8 @@ export interface KanbanDispatcherDeps {
   >
   /** Live write check for the human whose status label un-parks a card (the comment-command gate); the container always wires it. */
   humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
+  /** PR completion contracts: the tick's bounded backstop sweep, and a re-check when a run leaves its card in review. */
+  contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -217,7 +219,12 @@ export class KanbanDispatcher {
 
   async reconcileBoard(boardId: string): Promise<void> {
     // Recovery reads GitHub, so only the periodic tick runs it, never a doorbell or report poke.
-    if (this.recoveryDue.delete(boardId)) await this.recoverMismatches(boardId)
+    if (this.recoveryDue.delete(boardId)) {
+      await this.recoverMismatches(boardId)
+      await this.deps.contracts
+        ?.sweep(boardId)
+        .catch((err: unknown) => this.deps.log.warn({ err, boardId }, 'kanban: contract sweep failed'))
+    }
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
@@ -603,7 +610,17 @@ export class KanbanDispatcher {
       const repo = await this.repoRef(result.card)
       if (repo) this.writeStatus(result.card, repo, result.card.to)
     }
+    // A verifier's approval, or a worker whose PR already finished, completes the contract now rather than on the next event.
+    if (result.accepted && result.card.to === 'review' && this.deps.contracts) this.recheckContract(result.card.cardId)
     return result
+  }
+
+  private recheckContract(cardId: string): void {
+    const task = this.deps
+      .contracts!.onReview(cardId)
+      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
+      .finally(() => this.background.delete(task))
+    this.background.add(task)
   }
 
   /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
@@ -628,6 +645,11 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  /** The board's repository with its installation resolved live; null when the board or installation is gone. */
+  boardRepo(boardId: string): Promise<KanbanRepoRef | null> {
+    return this.boardRepoRef(boardId)
   }
 
   private async boardRepoRef(boardId: string): Promise<KanbanRepoRef | null> {

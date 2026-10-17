@@ -1003,6 +1003,22 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     expect(calls()).toBe(3)
   })
 
+  it('mints the CP-only Kanban PR-contract reader as pull_requests:read + checks:read, apart from the reporter grant', async () => {
+    const clock = new FakeClock(1_700_000_000_000)
+    const { svc, bodies, calls } = levelsService(clock)
+
+    const grant = await svc.mintKanbanPr(IID, 'acme/tools', 777n)
+    expect(grant.access).toBe('read')
+    expect(bodies[0]).toEqual({
+      repository_ids: [777],
+      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read' }
+    })
+    await svc.mintKanbanPr(IID, 'acme/tools', 777n)
+    expect(calls()).toBe(1)
+    await svc.mintChecks(IID, 'acme/tools', 777n)
+    expect(calls()).toBe(2)
+  })
+
   it('mints Kanban run and poster tokens with a valid App JWT, then refreshes after the fresh window', async () => {
     const clock = new FakeClock(1_700_000_000_000)
     const bodies: unknown[] = []

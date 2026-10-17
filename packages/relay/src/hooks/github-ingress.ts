@@ -1147,6 +1147,49 @@ export function githubCommentDoorbell(
   }
 }
 
+const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const MAX_SUITE_PRS = 10
+
+/** Reduce a closed PR or a completed check suite to a body-free Kanban doorbell; the CP re-reads both live. */
+export function githubPullRequestDoorbell(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcGithubGraph | undefined {
+  const closedPr = event === 'pull_request' && payload.action === 'closed'
+  const suiteDone = event === 'check_suite' && payload.action === 'completed'
+  if (!closedPr && !suiteDone) return undefined
+  const installationId = githubNumericId(payload.installation?.id)
+  const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId) return undefined
+  const seen: RcGithubGraph = {
+    deliveryKey,
+    installationId,
+    repoId,
+    event,
+    action: payload.action!,
+    ids: [],
+    numbers: []
+  }
+  if (closedPr) {
+    const pr = payload.pull_request
+    const number = pr?.number
+    const headSha = pr?.head?.sha
+    if (!Number.isSafeInteger(number) || number! <= 0 || !headSha || !GIT_SHA.test(headSha)) return seen
+    return { ...seen, pullRequest: { number: number!, merged: pr?.merged === true, headSha } }
+  }
+  const suite = payload.check_suite
+  const headSha = suite?.head_sha
+  if (!headSha || !GIT_SHA.test(headSha)) return seen
+  const prNumbers = [
+    ...new Set(
+      (suite?.pull_requests ?? []).map((p) => p.number).filter((n): n is number => Number.isSafeInteger(n) && n! > 0)
+    )
+  ].slice(0, MAX_SUITE_PRS)
+  const conclusion = typeof suite?.conclusion === 'string' ? suite.conclusion.slice(0, 32) || null : null
+  return { ...seen, checkSuite: { headSha, conclusion, prNumbers } }
+}
+
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
   const deliveries = new GithubDeliveryDedup(deps.clock)
   // Own plugin scope so the raw-body parser does not leak onto the relay's other JSON surfaces.
@@ -1208,7 +1251,8 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         const poke =
           githubGraphDoorbell(event, payload, deliveryKey) ??
           githubIssueDoorbell(event, payload, deliveryKey) ??
-          githubCommentDoorbell(event, payload, deliveryKey)
+          githubCommentDoorbell(event, payload, deliveryKey) ??
+          githubPullRequestDoorbell(event, payload, deliveryKey)
         if (poke) deps.graphDoorbell?.(poke)
         if (INSTALLATION_EVENTS.has(event) && payload.installation?.id !== undefined) {
           deps.doorbell({ installationId: String(payload.installation.id), action: payload.action ?? 'unknown' })
@@ -1280,12 +1324,20 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         return reply.code(202).send({ deliveryKey })
       }
 
+      // PR completion contracts: a completed check suite matches no hook, so it rings here or nowhere.
+      if (event === 'check_suite') {
+        const poke = githubPullRequestDoorbell(event, payload, deliveryKey)
+        if (poke) ring(deps.graphDoorbell?.(poke))
+      }
+
       if (!SUBSCRIPTION_EVENTS.has(event) && !GITHUB_ROUTED_THREAD_EVENTS.has(event))
         return reply.code(202).send({ deliveryKey })
 
       // A card-status change also rings the Kanban doorbell; hook matching below still runs for the same delivery.
       const issuePoke =
-        githubIssueDoorbell(event, payload, deliveryKey) ?? githubCommentDoorbell(event, payload, deliveryKey)
+        githubIssueDoorbell(event, payload, deliveryKey) ??
+        githubCommentDoorbell(event, payload, deliveryKey) ??
+        githubPullRequestDoorbell(event, payload, deliveryKey)
       if (issuePoke) {
         ring(deps.graphDoorbell?.(issuePoke))
         if (issuePoke.numbers.length > 0) {

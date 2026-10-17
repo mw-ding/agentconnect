@@ -1181,6 +1181,42 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(isKanbanDoorbellDelivery('issue_comment', 'edited')).toBe(false)
     expect(isKanbanDoorbellDelivery('issue_comment', null)).toBe(false)
     expect(isKanbanDoorbellDelivery('push', null)).toBe(false)
+    expect(isKanbanDoorbellDelivery('pull_request', 'closed')).toBe(true)
+    expect(isKanbanDoorbellDelivery('pull_request', 'opened')).toBe(false)
+    expect(isKanbanDoorbellDelivery('check_suite', 'completed')).toBe(true)
+    expect(isKanbanDoorbellDelivery('check_suite', 'rerequested')).toBe(false)
+    expect(isKanbanDoorbellDelivery('check_run', 'completed')).toBe(false)
+  })
+
+  it('rc/github-graph carries body-free pull request and check suite facts for PR contracts', () => {
+    const sha = 'a'.repeat(40)
+    const base = { deliveryKey: 'g', installationId: '1', repoId: '42', ids: [], numbers: [] }
+    const pr = {
+      ...base,
+      event: 'pull_request',
+      action: 'closed',
+      pullRequest: { number: 12, merged: true, headSha: sha }
+    }
+    expect(RcGithubGraph.safeParse(pr).success).toBe(true)
+    const suite = {
+      ...base,
+      event: 'check_suite',
+      action: 'completed',
+      checkSuite: { headSha: 'b'.repeat(64), conclusion: 'success', prNumbers: [12, 13] }
+    }
+    expect(RcGithubGraph.safeParse(suite).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...suite, checkSuite: { ...suite.checkSuite, conclusion: null } }).success).toBe(
+      true
+    )
+    const bad = (value: unknown) => RcGithubGraph.safeParse(value).success
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, title: 'secret' } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, headSha: 'main' } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, headSha: 'A'.repeat(40) } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, number: 0 } })).toBe(false)
+    expect(
+      bad({ ...suite, checkSuite: { ...suite.checkSuite, prNumbers: Array.from({ length: 11 }, (_, i) => i + 1) } })
+    ).toBe(false)
+    expect(bad({ ...suite, checkSuite: { ...suite.checkSuite, output: 'logs' } })).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {

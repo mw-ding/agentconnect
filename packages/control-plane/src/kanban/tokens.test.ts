@@ -3,7 +3,7 @@ import { kanbanTokenSource } from './tokens.js'
 
 describe('kanbanTokenSource', () => {
   it('keeps the App token service when it is configured', () => {
-    const app = { mintKanbanCard: vi.fn(), mintKanbanRun: vi.fn() }
+    const app = { mintKanbanCard: vi.fn(), mintKanbanRun: vi.fn(), mintKanbanPr: vi.fn() }
     const log = { warn: vi.fn() }
     expect(kanbanTokenSource({ app, injectedToken: 'ghp_test', log })).toBe(app)
     expect(log.warn).not.toHaveBeenCalled()
@@ -22,6 +22,7 @@ describe('kanbanTokenSource', () => {
       token: 'ghp_test',
       access: 'read'
     })
+    await expect(tokens!.mintKanbanPr(1n, 'acme/web', 7n)).resolves.toMatchObject({ token: 'ghp_test', access: 'read' })
   })
 
   it('is absent when neither source is configured', () => {

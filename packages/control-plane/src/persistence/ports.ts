@@ -8268,6 +8268,39 @@ export interface KanbanCardRepo {
   settleCommand(id: string): Promise<void>
 }
 
+/** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */
+export interface KanbanContractCard {
+  cardId: string
+  boardId: string
+  issueNumber: number
+  status: KanbanStatus
+  stateRevision: bigint
+  linkedPrNumber: number | null
+  verifiedAt: Date | null
+  completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  verifierAgentId: string | null
+}
+
+export interface KanbanContractSettleInput {
+  cardId: string
+  expectedStateRevision: bigint
+  to: 'done' | 'triage'
+  /** The contract that completed it, or why it went to triage; recorded on the audit row and attention flag. */
+  reason: string
+  prNumber: number
+}
+
+export interface KanbanContractRepo {
+  /** Unleased `review` cards with a linked PR on an enabled board under a PR contract, by issue number. */
+  listContractCards(
+    boardId: string,
+    opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
+  ): Promise<KanbanContractCard[]>
+  getContractCard(cardId: string): Promise<KanbanContractCard | null>
+  /** CAS review → done/triage (no open lease) with an audit row; false when the card moved, was leased, or vanished. */
+  settleContract(input: KanbanContractSettleInput): Promise<boolean>
+}
+
 /** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */
 export interface KanbanCommandRecord {
   id: string

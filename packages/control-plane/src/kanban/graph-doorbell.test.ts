@@ -50,12 +50,15 @@ function make(
     onGraph?: () => void | Promise<void>
     onCard?: () => void | Promise<void>
     onCommand?: () => void | Promise<void>
+    onPullRequest?: () => void | Promise<void>
   } = {}
 ) {
   const readGraph = vi.fn(opts.readGraph ?? (async () => EMPTY))
   const onGraph = vi.fn()
   const onCard = vi.fn(opts.onCard ?? (() => {}))
   const onCommand = vi.fn(opts.onCommand ?? (() => {}))
+  const onPullRequest = vi.fn(opts.onPullRequest ?? (() => {}))
+  const onCheckSuite = vi.fn()
   const log = { debug: vi.fn(), warn: vi.fn() }
   const listEnabledByRepoId = vi.fn(async () => opts.boards ?? [BOARD])
   const doorbell = new KanbanGraphDoorbell({
@@ -67,9 +70,11 @@ function make(
     onGraph: opts.onGraph ?? onGraph,
     onCard,
     onCommand,
+    onPullRequest,
+    onCheckSuite,
     log
   })
-  return { doorbell, readGraph, onGraph, onCard, onCommand, log, listEnabledByRepoId }
+  return { doorbell, readGraph, onGraph, onCard, onCommand, onPullRequest, onCheckSuite, log, listEnabledByRepoId }
 }
 
 describe('KanbanGraphDoorbell', () => {
@@ -131,6 +136,31 @@ describe('KanbanGraphDoorbell', () => {
     })
     const command = { name: 'ready' as const, commentId: '1', sender: { login: 'alice', type: 'User' } }
     failed.doorbell.poke(poke({ event: 'issue_comment', action: 'created', ids: ['5'], numbers: [7], command }))
+    await failed.doorbell.settle()
+    expect(failed.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
+  })
+
+  it('hands a closed PR and a completed suite to their contract handlers once per board, landing only on success', async () => {
+    const h = make()
+    const repo = { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }
+    const pullRequest = { number: 12, merged: true, headSha: 'a'.repeat(40) }
+    h.doorbell.poke(poke({ event: 'pull_request', action: 'closed', ids: [], numbers: [], pullRequest }))
+    const checkSuite = { headSha: 'a'.repeat(40), conclusion: 'success', prNumbers: [12] }
+    h.doorbell.poke(
+      poke({ deliveryKey: 'guid-2', event: 'check_suite', action: 'completed', ids: [], numbers: [], checkSuite })
+    )
+    await h.doorbell.settle()
+    expect(h.onPullRequest).toHaveBeenCalledWith(BOARD, repo, pullRequest)
+    expect(h.onCheckSuite).toHaveBeenCalledWith(BOARD, repo, checkSuite)
+    expect(h.readGraph).not.toHaveBeenCalled()
+    expect(h.doorbell.landedDeliveryKeys(['guid-1', 'guid-2'])).toEqual(new Set(['guid-1', 'guid-2']))
+
+    const failed = make({
+      onPullRequest: () => {
+        throw new Error('github 502')
+      }
+    })
+    failed.doorbell.poke(poke({ event: 'pull_request', action: 'closed', ids: [], numbers: [], pullRequest }))
     await failed.doorbell.settle()
     expect(failed.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set())
   })

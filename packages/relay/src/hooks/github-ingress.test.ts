@@ -35,6 +35,7 @@ import {
   githubGraphDoorbell,
   githubIssueDoorbell,
   githubCommentDoorbell,
+  githubPullRequestDoorbell,
   parseKanbanCommand,
   GITHUB_BODY_EXCERPT_MAX,
   type GithubMatchCtx
@@ -1055,6 +1056,108 @@ describe('github ingress', () => {
       expect(h.graphDoorbells).toEqual([
         expect.objectContaining({ command: expect.objectContaining({ name: 'unblock' }) })
       ])
+    })
+  })
+
+  describe('Kanban PR-contract doorbells (TRD 4.7)', () => {
+    const SHA = 'c'.repeat(40)
+    const closed = (over: Record<string, unknown> = {}) =>
+      pullPayload({
+        action: 'closed',
+        pull_request: {
+          number: 77,
+          title: 'secret title',
+          body: 'secret body',
+          merged: true,
+          head: { sha: SHA, ref: 'ac/card-42', repo: { full_name: 'acme/infra' } },
+          base: { sha: 'b'.repeat(40), repo: { full_name: 'acme/infra' } }
+        },
+        ...over
+      })
+    const suite = (over: Record<string, unknown> = {}) => ({
+      action: 'completed',
+      installation: { id: INSTALLATION },
+      repository: { id: REPO_ID, full_name: 'acme/infra' },
+      sender: { login: 'github-actions[bot]', type: 'Bot' },
+      check_suite: {
+        id: 5,
+        head_sha: SHA,
+        conclusion: 'success',
+        app: { id: 15368 },
+        pull_requests: [{ number: 77 }, { number: 78 }, { number: 77 }],
+        ...over
+      }
+    })
+    const seen = (event: string, action: string) => ({
+      deliveryKey: 'g',
+      installationId: String(INSTALLATION),
+      repoId: String(REPO_ID),
+      event,
+      action,
+      ids: [],
+      numbers: []
+    })
+
+    it('forwards a closed PR as number, merged, and head sha only, for any sender', () => {
+      const poke = githubPullRequestDoorbell('pull_request', closed(), 'g')
+      expect(poke).toEqual({
+        ...seen('pull_request', 'closed'),
+        pullRequest: { number: 77, merged: true, headSha: SHA }
+      })
+      expect(JSON.stringify(poke)).not.toMatch(/secret|ac\/card/)
+      const unmerged = githubPullRequestDoorbell(
+        'pull_request',
+        closed({ sender: { login: 'x[bot]', type: 'Bot' } }),
+        'g'
+      )
+      expect(unmerged?.pullRequest?.number).toBe(77)
+      const notMerged = closed()
+      ;(notMerged.pull_request as Record<string, unknown>).merged = false
+      expect(githubPullRequestDoorbell('pull_request', notMerged, 'g')?.pullRequest?.merged).toBe(false)
+    })
+
+    it('forwards a completed suite as head sha, conclusion, and deduped bounded PR numbers', () => {
+      expect(githubPullRequestDoorbell('check_suite', suite() as never, 'g')).toEqual({
+        ...seen('check_suite', 'completed'),
+        checkSuite: { headSha: SHA, conclusion: 'success', prNumbers: [77, 78] }
+      })
+      const many = suite({ pull_requests: Array.from({ length: 15 }, (_, i) => ({ number: i + 1 })) })
+      expect(githubPullRequestDoorbell('check_suite', many as never, 'g')?.checkSuite?.prNumbers).toHaveLength(10)
+      expect(githubPullRequestDoorbell('check_suite', suite({ conclusion: null }) as never, 'g')?.checkSuite).toEqual({
+        headSha: SHA,
+        conclusion: null,
+        prNumbers: [77, 78]
+      })
+    })
+
+    it('sends seen markers for unprovable shas or numbers, and nothing for other actions', () => {
+      expect(githubPullRequestDoorbell('check_suite', suite({ head_sha: 'main' }) as never, 'g')).toEqual(
+        seen('check_suite', 'completed')
+      )
+      const noSha = closed()
+      ;(noSha.pull_request as Record<string, unknown>).head = {}
+      expect(githubPullRequestDoorbell('pull_request', noSha, 'g')).toEqual(seen('pull_request', 'closed'))
+      expect(githubPullRequestDoorbell('pull_request', closed({ action: 'opened' }), 'g')).toBeUndefined()
+      expect(
+        githubPullRequestDoorbell('check_suite', { ...suite(), action: 'requested' } as never, 'g')
+      ).toBeUndefined()
+      expect(githubPullRequestDoorbell('check_run', suite() as never, 'g')).toBeUndefined()
+      expect(githubPullRequestDoorbell('pull_request', closed({ installation: undefined }), 'g')).toBeUndefined()
+    })
+
+    it('rings over HTTP for a closed PR and a completed suite without any hook rule, replaying duplicates', async () => {
+      const headers = { 'x-github-delivery': 'gh-pr-1' }
+      expect((await post('pull_request', closed(), { headers })).statusCode).toBe(202)
+      expect((await post('pull_request', closed(), { headers })).statusCode).toBe(202)
+      expect((await post('check_suite', suite())).statusCode).toBe(202)
+      await flush()
+      expect(h.graphDoorbells.map((p) => [p.event, p.deliveryKey])).toEqual([
+        ['pull_request', 'gh-pr-1'],
+        ['pull_request', 'gh-pr-1'],
+        ['check_suite', expect.any(String)]
+      ])
+      expect(h.graphDoorbells[2]?.checkSuite?.prNumbers).toEqual([77, 78])
+      expect(h.sent).toHaveLength(0)
     })
   })
 

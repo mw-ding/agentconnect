@@ -126,7 +126,12 @@ class FakeStore {
   }
 }
 
-async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk> } = {}) {
+async function harness(
+  opts: {
+    reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk>
+    contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
+  } = {}
+) {
   await seedDaemon(prisma, D1, { sessionEpoch: 4n })
   await seedDaemon(prisma, D2, { sessionEpoch: 1n })
   await seedAgent(prisma, A1, { daemonId: D1 })
@@ -169,7 +174,8 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
     },
     isDaemonLive: () => true,
     clock,
-    log
+    log,
+    ...(opts.contracts ? { contracts: opts.contracts } : {})
   })
   let issue = 1
   const addCard = async (labels: string[] = ['ac/status:ready'], mode: 'read' | 'write' | null = null) => {
@@ -251,6 +257,31 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
       reason: 'superseded'
     })
     expect((await h.card(c.id)).consecutiveFailures).toBe(0)
+  })
+
+  it('re-checks the PR contract when a run leaves its card in review, and sweeps contracts on the tick only', async () => {
+    const contracts = { sweep: vi.fn(async () => {}), onReview: vi.fn(async () => null) }
+    const h = await harness({ contracts })
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { completionContract: 'pr_merged' } })
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(contracts.sweep).not.toHaveBeenCalled()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { prNumber: 12 }))
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('review')
+    expect(contracts.onReview).toHaveBeenCalledWith(c.id)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(contracts.sweep).toHaveBeenCalledWith(h.board.id)
+    // A run that ends outside review never asks.
+    const d = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const lease = h.sent.find((s) => s.d.cardId === d.id)!.d
+    await h.dispatcher.onReport(D1, 4, h.reportFor(lease, { outcome: 'failed' }))
+    await h.dispatcher.settle()
+    expect(contracts.onReview).toHaveBeenCalledOnce()
   })
 
   it('replays the same report without writing again and grants a comment only for that lease', async () => {
