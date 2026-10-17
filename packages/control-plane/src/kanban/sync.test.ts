@@ -56,7 +56,6 @@ function fixture(overrides: Partial<SyncCard> = {}) {
       applyPlan: vi.fn(async () => {}),
       managedEdits: vi.fn(async () => ({ status: event(), assignee: null, cursor: 1 }))
     },
-    permissions: { permission: vi.fn(async () => 'write' as const) },
     repoRef: vi.fn(async () => target),
     revoke: vi.fn(async () => {}),
     promote: vi.fn(async () => {}),
@@ -107,20 +106,15 @@ describe('human label synchronization', () => {
     )
   })
 
-  it.each(['bot', 'app', 'unknown', 'read', 'permission_error', 'consumed'])(
-    'does not adopt a %s edit',
-    async (kind) => {
-      const f = fixture({ syncEventCursor: kind === 'consumed' ? 1n : 0n })
-      const e = event(1, kind !== 'bot')
-      if (kind === 'app') e.performed_via_github_app = { id: 1 }
-      if (kind === 'unknown') e.actor = null
-      vi.mocked(f.deps.store.managedEdits).mockResolvedValue({ status: e, assignee: null, cursor: 1 })
-      if (kind === 'read') vi.mocked(f.deps.permissions.permission).mockResolvedValue('read')
-      if (kind === 'permission_error') vi.mocked(f.deps.permissions.permission).mockRejectedValue(new Error('offline'))
-      await f.sync.onCardChanged('board', 1, true)
-      expect(f.card().status).toBe('todo')
-    }
-  )
+  it.each(['bot', 'app', 'unknown', 'consumed'])('does not adopt a %s edit', async (kind) => {
+    const f = fixture({ syncEventCursor: kind === 'consumed' ? 1n : 0n })
+    const e = event(1, kind !== 'bot')
+    if (kind === 'app') e.performed_via_github_app = { id: 1 }
+    if (kind === 'unknown') e.actor = null
+    vi.mocked(f.deps.store.managedEdits).mockResolvedValue({ status: e, assignee: null, cursor: 1 })
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('todo')
+  })
 
   it('projects a pending CP transition instead of adopting its old label on the tick', async () => {
     const f = fixture({ status: 'review', labelWritePending: true })

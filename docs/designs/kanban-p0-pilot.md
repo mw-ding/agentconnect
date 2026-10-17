@@ -374,6 +374,20 @@ PAT as the injected installation-token source; production uses the App token.
 Known gaps update (M1 board CRUD): board writes now use the shared membership
 locks and member-removal audience repair. A repository rename keeps its numeric
 identity; changing that identity is refused while the board has cards, so old
-issue numbers cannot silently refer to another repository. Human status and
-assignment synchronization beyond mismatch-parked cards and periodic drift repair
-remain for the stacked M1 follow-up.
+issue numbers cannot silently refer to another repository.
+
+Human status and assignment edits now synchronize on every card, not only
+mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
+labels, unlabels, closes, or reopens the issue is adopted through
+`planLabelReconcile`: one legal status moves the card, several status labels are
+drift repaired to one with an explanatory comment, and a missing label restores
+the committed status. A leased card accepts only `blocked`, `triage`, and
+`archived`; every other edit reverts with the explanatory comment. An
+`ac/agent:<slug>` change maps to an assignee through the organization's agents;
+on a leased card it kills the lease (never transfers it), bumps the dispatch
+revision, posts a "reassigned from X to Y" comment, and the next dispatch opens
+a fresh session. Reopening a `done` card via a label moves it back through the
+state machine. A periodic drift reconciler, driven by the same 60-second tick,
+repairs a CP status write that failed (a card left with `labelWritePending` is
+re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
+Every transition writes one body-free `kanban_card_change` audit row.

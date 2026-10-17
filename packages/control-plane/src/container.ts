@@ -1794,10 +1794,6 @@ export function buildContainer(
           repo: new PgKanbanSyncRepo(prisma),
           cards: repos.kanbanCard,
           store: kanbanCardStore,
-          permissions: new GithubRepoPermission({
-            tokens: kanbanTokens,
-            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
-          }),
           repoRef: async (boardId) => {
             const board = await repos.kanbanDispatch.getBoardRef(boardId)
             if (!board) return null

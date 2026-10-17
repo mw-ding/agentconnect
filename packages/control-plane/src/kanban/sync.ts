@@ -2,9 +2,15 @@
 import type { KanbanCardRepo, KanbanLeaseRef } from '../persistence/ports.js'
 import type { CardStore, KanbanRepoRef, ManagedEdits } from './card-store.js'
 import { isHumanActor } from './card-store.js'
-import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
 import { parseAgentLabel } from './agent-label.js'
-import { planLabelReconcile, planStatusWrite, parseStatusLabels, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
+import {
+  planLabelReconcile,
+  planStatusWrite,
+  parseStatusLabels,
+  statusLabel,
+  type KanbanStatus,
+  type LabelPlan
+} from './card-state.js'
 import { planReassign } from './reassign.js'
 
 export interface SyncCard {
@@ -41,7 +47,6 @@ export interface KanbanSyncDeps {
   repo: KanbanSyncRepo
   cards: Pick<KanbanCardRepo, 'resolveAgentSlug' | 'setAssignee'>
   store: Pick<CardStore, 'readCard' | 'applyPlan' | 'managedEdits' | 'statusSetByHuman'>
-  permissions: RepoPermissionLookup
   repoRef(boardId: string): Promise<KanbanRepoRef | null>
   revoke(lease: KanbanLeaseRef, cardId: string): Promise<void>
   promote(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<void>
@@ -91,10 +96,8 @@ export class KanbanSync {
     await this.deps.repo.ack(card, BigInt(edits.status?.id ?? 0), BigInt(edits.assignee?.id ?? 0))
   }
 
-  private async authorized(repo: KanbanRepoRef, event: ManagedEdits['status']): Promise<boolean> {
-    return (
-      !!event && isHumanActor(event) && (await checkWriteAccess(this.deps.permissions, repo, event.actor!.login!)).write
-    )
+  private async authorized(event: ManagedEdits['status']): Promise<boolean> {
+    return !!event && isHumanActor(event)
   }
 
   private async reconcile(boardId: string, issueNumber: number, humanDoorbell: boolean): Promise<boolean> {
@@ -110,10 +113,9 @@ export class KanbanSync {
     const newStatus = !!edits.status && BigInt(edits.status.id) > card.syncEventCursor
     const newAgent = !!edits.assignee && BigInt(edits.assignee.id) > card.syncAgentCursor
     // A periodic retry of a committed transition must not adopt the label that its failed write was replacing.
-    let acceptStatus =
-      (!card.labelWritePending || humanDoorbell) && newStatus && (await this.authorized(repo, edits.status))
+    let acceptStatus = (!card.labelWritePending || humanDoorbell) && newStatus && (await this.authorized(edits.status))
     let changed = false
-    if (newAgent && (await this.authorized(repo, edits.assignee))) {
+    if (newAgent && (await this.authorized(edits.assignee))) {
       const parsed = parseAgentLabel(issue.labels)
       const target =
         parsed.kind === 'agent'
@@ -144,7 +146,10 @@ export class KanbanSync {
               lease: result.revokedLease
             },
             { agentId: target ?? 'unassigned', daemonId: '' },
-            { fromName: card.assigneeName ?? card.assigneeAgentId ?? 'unassigned', toName: parsed.kind === 'agent' ? parsed.slug : 'unassigned' }
+            {
+              fromName: card.assigneeName ?? card.assigneeAgentId ?? 'unassigned',
+              toName: parsed.kind === 'agent' ? parsed.slug : 'unassigned'
+            }
           )
           await this.deps.revoke(result.revokedLease, card.id)
           const comment = planned.steps.find((step) => step.kind === 'post_comment')

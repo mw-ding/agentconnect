@@ -27058,7 +27058,10 @@ export class Daemon {
             this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
           )
         }
+        // A revoked lease is reassignment (issue #2 §5): the next dispatch opens a fresh session, never resumes the dead one.
+        await this.forgetKanbanSession(agentId, lease.sessionKey)
       },
+      forget: (agentId, sessionKey) => this.forgetKanbanSession(agentId, sessionKey),
       probe: {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: async (agentId, _sessionId, sessionKey) => {
@@ -27132,6 +27135,20 @@ export class Daemon {
     return undefined
   }
 
+  // A revoked or superseded lease never resumes: drop the host's claim and clear the row so the next dispatch opens fresh.
+  private async forgetKanbanSession(agentId: string, sessionKey: string): Promise<void> {
+    const session = await this.store.getSession(sessionKey)
+    if (!session?.acpSessionId) return
+    this.hostForOwner(this.sessionOwnerKey(agentId, sessionKey))?.forgetSession(session.acpSessionId)
+    await this.store.upsertSession({
+      ...session,
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: this.clock.now()
+    })
+  }
+
   // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.
   private async startKanban(
     d: KanbanDispatch,
@@ -27139,19 +27156,6 @@ export class Daemon {
   ): Promise<KanbanStartResult> {
     const msg = buildKanbanMessage(d, randomUUID())
     const key = sessionKey(msg.platform, msg.channel, msg.thread!, d.agentId, msg.transportScope)
-    if (d.attempt > 1) {
-      const previous = await this.store.getSession(key)
-      if (previous) {
-        this.hostForOwner(this.sessionOwnerKey(d.agentId, key))?.forgetSession(previous.acpSessionId ?? '')
-        await this.store.upsertSession({
-          ...previous,
-          acpSessionId: null,
-          state: 'idle',
-          lastDeliveredTs: null,
-          updatedAt: this.clock.now()
-        })
-      }
-    }
     let admitted!: (result: { accepted: boolean; reason?: string }) => void
     const admission = new Promise<{ accepted: boolean; reason?: string }>((resolve) => (admitted = resolve))
     const done = this.dispatch(d.agentId, msg, undefined, undefined, undefined, {

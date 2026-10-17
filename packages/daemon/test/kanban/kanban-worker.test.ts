@@ -39,12 +39,14 @@ function harness() {
     return { accepted: true as const, sessionKey: 'session-42', done }
   })
   const cancel = vi.fn()
+  const forget = vi.fn(async () => {})
   const worker = new KanbanWorker({
     clock,
     log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
     cp: () => cp,
     start,
     cancel,
+    forget,
     gate: async () => state.refusal,
     probe: { turnActive: () => state.active, liveBackgroundTasks: () => state.tasks },
     outbox: {
@@ -86,7 +88,7 @@ function harness() {
     await Promise.resolve()
     await worker.tick()
   }
-  return { worker, cp, start, cancel, state, clock, settle, reject, reports, terminals, comments }
+  return { worker, cp, start, cancel, forget, state, clock, settle, reject, reports, terminals, comments }
 }
 
 describe('Kanban worker leases', () => {

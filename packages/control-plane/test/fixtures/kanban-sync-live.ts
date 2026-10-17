@@ -3,7 +3,6 @@ import { expect } from 'vitest'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { systemClock } from '../../src/domain/clock.js'
-import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
@@ -46,7 +45,6 @@ export async function liveSync() {
     repo,
     cards,
     store,
-    permissions: new GithubRepoPermission({ tokens, ttlMs: 0 }),
     repoRef: async () => repoRef,
     revoke: async (lease) => {
       revoked.push(lease)

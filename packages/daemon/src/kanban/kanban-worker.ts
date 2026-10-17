@@ -99,6 +99,8 @@ export interface KanbanWorkerDeps {
   /** Admit the turn; resolves once the serial gate settles admission. `onSessionReady` fires once the ACP session exists. */
   start(d: KanbanDispatch, onSessionReady: (sessionId: string) => void): Promise<KanbanStartResult>
   cancel(lease: KanbanLease): void | Promise<void>
+  /** Forget the session for a revoked lease even when the lease has already finalized; the next dispatch opens fresh. */
+  forget(agentId: string, sessionKey: string): Promise<void>
   probe: KanbanLivenessProbe
   comments?: KanbanFinalComments
   heartbeatMs?: number
@@ -113,6 +115,8 @@ export class KanbanWorker {
   private readonly leases = new Map<string, KanbanLease>()
   // A CP retry of an in-flight admission joins it instead of racing the outbox reservation.
   private readonly admitting = new Map<string, Promise<KanbanDispatchOk>>()
+  // Last known session key per card, kept after finalize so a late revoke can still forget the session.
+  private readonly sessionsByCard = new Map<string, { agentId: string; sessionKey: string }>()
   private timer: TimerHandle | undefined
   private stopped = true
   private flushing = false
@@ -151,11 +155,19 @@ export class KanbanWorker {
   async revoke(leaseId: string, cardId: string): Promise<void> {
     await this.admitting.get(leaseId)?.catch(() => undefined)
     const lease = this.leases.get(leaseId)
-    if (!lease || lease.dispatch.cardId !== cardId) return
-    await this.deps.cancel(lease)
-    this.leases.delete(leaseId)
-    this.deps.onLeaseChanged?.(lease.dispatch)
-    await this.deps.outbox.release(leaseId)
+    if (lease && lease.dispatch.cardId === cardId) {
+      await this.deps.cancel(lease)
+      this.leases.delete(leaseId)
+      this.deps.onLeaseChanged?.(lease.dispatch)
+      await this.deps.outbox.release(leaseId)
+      this.sessionsByCard.delete(cardId)
+      return
+    }
+    const remembered = this.sessionsByCard.get(cardId)
+    if (remembered) {
+      await this.deps.forget(remembered.agentId, remembered.sessionKey)
+      this.sessionsByCard.delete(cardId)
+    }
   }
 
   private async admit(d: KanbanDispatch): Promise<KanbanDispatchOk> {
@@ -200,6 +212,7 @@ export class KanbanWorker {
       turnSettled: false
     }
     this.leases.set(d.leaseId, lease)
+    this.sessionsByCard.set(d.cardId, { agentId: d.agentId, sessionKey: started.sessionKey })
     this.deps.onLeaseChanged?.(d)
     started.done.then(
       (sessionId) => this.settleTurn(d.leaseId, sessionId ?? undefined),
