@@ -1,4 +1,6 @@
 // Kanban repos (issue #2 M1): PgKanbanBoardRepo serves the doorbell and redelivery sweep; PgKanbanCardRepo the graph reconciler.
+import { insertKanbanNotification } from './kanban-notify.repo.js'
+import { planNotification } from '../../kanban/notifier.js'
 import { randomUUID } from 'node:crypto'
 import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
@@ -436,30 +438,57 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     startedAt: Date,
     assigneeAgentId: string
   ): Promise<boolean> {
-    // One write for the ready CAS, the synthesizer assignment, and the intent — same shape as beginPromotion.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: {
-        id: cardId,
-        stateRevision: expectedStateRevision,
-        status: 'todo',
-        promotionPending: false,
-        needsAttention: false
-      },
-      data: {
-        status: 'ready',
-        assigneeAgentId,
-        stateRevision: { increment: 1 },
-        githubSyncedAt: new Date(),
-        ...PROMOTION_CLEARED,
-        promotionPending: true,
-        promotionEventCursor: eventCursor,
-        promotionStartedAt: startedAt,
-        promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
-        recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
-        recoveryChecks: 0
-      }
+    return withAmbientTx(this.db, async (tx) => {
+      const [row] = await tx.$queryRaw<
+        Array<{ boardId: string; issueNumber: number; targetChannel: string | null }>
+      >(Prisma.sql`
+        SELECT c."boardId", c."issueNumber", b."targetChannel"
+        FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+        WHERE c."id" = ${cardId}::uuid AND c."stateRevision" = ${expectedStateRevision}
+          AND c."status" = 'todo' AND NOT c."promotionPending" AND NOT c."needsAttention"
+        FOR UPDATE OF c
+      `)
+      if (!row) return false
+      const { count } = await tx.kanbanCard.updateMany({
+        where: {
+          id: cardId,
+          stateRevision: expectedStateRevision,
+          status: 'todo',
+          promotionPending: false,
+          needsAttention: false
+        },
+        data: {
+          status: 'ready',
+          assigneeAgentId,
+          stateRevision: { increment: 1 },
+          githubSyncedAt: new Date(),
+          ...PROMOTION_CLEARED,
+          promotionPending: true,
+          promotionEventCursor: eventCursor,
+          promotionStartedAt: startedAt,
+          promotionWatchUntil: new Date(startedAt.getTime() + PROMOTION_WATCH_MS),
+          recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
+          recoveryChecks: 0
+        }
+      })
+      if (count !== 1) return false
+      const transition = {
+        cardId,
+        boardId: row.boardId,
+        issueNumber: row.issueNumber,
+        from: 'todo',
+        to: 'ready',
+        reasonCode: 'synthesis'
+      } as const
+      const decision = planNotification(transition, row)
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          ...transition,
+          stateRevision: expectedStateRevision + 1n,
+          mention: decision.mention
+        })
+      return true
     })
-    return count === 1
   }
 
   async clearPromotionIntent(cardId: string): Promise<boolean> {
@@ -716,10 +745,19 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     return withAmbientTx(this.db, async (tx) => {
       // The card lock orders this write against a claim (which skips locked cards) and against run ends.
       const [row] = await tx.$queryRaw<
-        Array<{ id: string; status: string; issueNumber: number; orgId: string; repoId: bigint; repoFullName: string }>
+        Array<{
+          id: string
+          status: string
+          stateRevision: bigint
+          issueNumber: number
+          orgId: string
+          repoId: bigint
+          repoFullName: string
+          targetChannel: string | null
+        }>
       >(
         Prisma.sql`
-          SELECT c."id", c."status", c."issueNumber", b."orgId", b."repoId", b."repoFullName"
+          SELECT c."id", c."status", c."stateRevision", c."issueNumber", b."orgId", b."repoId", b."repoFullName", b."targetChannel"
           FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
           WHERE c."id" = ${input.cardId}::uuid AND c."boardId" = ${input.boardId}::uuid AND b."orgId" = ${input.orgId}
           FOR UPDATE OF c
@@ -763,6 +801,21 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           ...(to === 'ready' ? reset : {})
         }
       })
+      const transition = {
+        cardId: row.id,
+        boardId: input.boardId,
+        issueNumber: row.issueNumber,
+        from: row.status,
+        to,
+        reasonCode
+      }
+      const decision = planNotification(transition, row)
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          ...transition,
+          stateRevision: row.stateRevision + 1n,
+          mention: decision.mention
+        })
       await tx.auditEvent.create({
         data: {
           kind: auditKind,
