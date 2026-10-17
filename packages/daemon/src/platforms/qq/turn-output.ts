@@ -4,6 +4,7 @@ import { AgentMessageRun, WorkBoundary } from '../../messages/message-boundary.j
 import { isNoResponseBody, isNoResponsePrefix } from '../../session/no-response.js'
 import { QQPrivateStream } from './private-stream.js'
 import type { QQReplyPort } from './sender.js'
+import type { Logger } from '../../log.js'
 import { QQGroupOutput } from './group-output.js'
 import type { WorkspaceFileLinkResolver } from '../../messages/workspace-file-links.js'
 import type { TurnAdmissionStatus, TurnOutputContext } from '../turn-output.js'
@@ -122,6 +123,8 @@ export interface QQTurnState {
   replyId?: string
   outputAbort?: AbortController
   lastProgress?: string
+  /** Debug-only: the C2C stream reports a final that rewrites its delivered preview. */
+  log?: Pick<Logger, 'debug'>
 }
 
 export function QQImageUploader(state: QQTurnState): ImageUploader | undefined {
@@ -155,7 +158,7 @@ export async function applyQQAction(
   if (action.kind !== 'post' && action.kind !== 'qq-stream') return
   if (action.kind === 'qq-stream') {
     if (!action.recordOnly && state.conn && state.replyId) {
-      state.stream ??= new QQPrivateStream(state.conn, state.channel, state.replyId)
+      state.stream ??= new QQPrivateStream(state.conn, state.channel, state.replyId, state.log)
       state.stream.update(action.text)
     }
     return
