@@ -6,7 +6,8 @@ import type { HttpDeps } from '../deps.js'
 import { ctxOf, denyNonInteractive, denyNonOwner, orgOf } from '../rbac.js'
 import { Tag } from '../plugins/openapi.js'
 import { canView } from '../../authorization/policy.js'
-import { githubKanbanRepoResolver } from '../../kanban/repo-resolver.js'
+import { githubKanbanProjectVerifier, PROJECT_REFUSALS, type ProjectVerdict } from '../../kanban/project-guard.js'
+import { githubKanbanRepoResolver, type KanbanRepoResolution } from '../../kanban/repo-resolver.js'
 import type { KanbanBoardView, KanbanBoardWriteRefusal } from '../../persistence/ports.js'
 import { resolveShareSet } from '../sharing.js'
 import {
@@ -73,6 +74,8 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
     lastModifiedBy: board.lastModifiedByUserId,
     lastModifiedAt: board.lastModifiedAt.toISOString(),
     createdAt: board.createdAt.toISOString(),
+    projectNodeId: board.projectNodeId,
+    statusFieldId: board.statusFieldId,
     canEdit: ctxOf(req).role === 'owner'
   }
 }
@@ -127,6 +130,12 @@ function upstreamError(status: keyof typeof UPSTREAM_ERRORS, message: string) {
   return { ...UPSTREAM_ERRORS[status], statusCode: status, message }
 }
 
+function projectRefusal(verdict: Extract<ProjectVerdict, { ok: false }>) {
+  const { status, message } = PROJECT_REFUSALS[verdict.code]
+  const error = { 400: 'Bad Request', 409: 'Conflict', 429: 'Too Many Requests', 502: 'Bad Gateway' }[status]
+  return { statusCode: status, error, message, code: verdict.code }
+}
+
 export function kanbanRoutes(deps: HttpDeps) {
   return async function kanbanRoutesPlugin(app: FastifyInstance): Promise<void> {
     ownerGateByDefault(app)
@@ -134,6 +143,31 @@ export function kanbanRoutes(deps: HttpDeps) {
     const resolver =
       deps.kanbanRepoResolver ??
       githubKanbanRepoResolver({ installations: deps.repos.githubInstallation, github: deps.github })
+
+    const projectVerifier =
+      deps.kanbanProjectVerifier ??
+      (deps.github ? githubKanbanProjectVerifier({ tokens: deps.github.tokens }) : undefined)
+
+    // Org-only guard for a Status projection: null means accepted; a refusal body is already shaped for the client.
+    const checkProject = async (
+      req: FastifyRequest,
+      resolved: Extract<KanbanRepoResolution, { ok: true }>,
+      projectNodeId: string,
+      statusFieldId: string
+    ) => {
+      if (!projectVerifier) return projectRefusal({ ok: false, code: 'github_app_not_configured' })
+      const verdict = await projectVerifier.verify({
+        installationId: resolved.installationId,
+        repoId: resolved.repoId,
+        repoFullName: resolved.repoFullName,
+        ownerType: resolved.ownerType,
+        projectNodeId,
+        statusFieldId
+      })
+      if (verdict.ok) return null
+      if (verdict.reason) req.log.info({ reason: verdict.reason }, 'kanban project guard')
+      return projectRefusal(verdict)
+    }
 
     // Visible boards only: a restricted board outside the caller's audience is indistinguishable from a missing one.
     const visibleBoard = async (req: FastifyRequest, boardId: string) => {
@@ -210,6 +244,10 @@ export function kanbanRoutes(deps: HttpDeps) {
         if (!resolved.ok) {
           return reply.code(resolved.status).send(upstreamError(resolved.status, resolved.message))
         }
+        if (req.body.projectNodeId !== undefined && req.body.statusFieldId !== undefined) {
+          const refused = await checkProject(req, resolved, req.body.projectNodeId, req.body.statusFieldId)
+          if (refused) return reply.code(refused.statusCode).send(refused)
+        }
         const sharedWith = await resolveShareSet(deps.repos.user, orgId, req.body.sharedWith)
         const result = await deps.repos.kanbanBoards.createBoard(orgId, userId, {
           ...req.body,
@@ -253,6 +291,7 @@ export function kanbanRoutes(deps: HttpDeps) {
         // Re-enabling re-proves coverage too, so an uninstalled or suspended App cannot be revived by a toggle.
         const recheck = repoFullName ?? current.repoFullName
         let repo: { repoId: bigint; repoFullName: string } | undefined
+        let resolvedRepo: Extract<KanbanRepoResolution, { ok: true }> | undefined
         if (recheck !== undefined) {
           const resolved = await resolver.resolve(orgId, recheck)
           if (!resolved.ok) {
@@ -267,6 +306,17 @@ export function kanbanRoutes(deps: HttpDeps) {
             })
           }
           repo = { repoId: resolved.repoId, repoFullName: resolved.repoFullName }
+          resolvedRepo = resolved
+        }
+        // A new project pair, or a repository change under an existing pair, re-proves the org-only guard.
+        const finalProject =
+          rest.projectNodeId !== undefined
+            ? { projectNodeId: rest.projectNodeId, statusFieldId: rest.statusFieldId ?? null }
+            : { projectNodeId: current.projectNodeId, statusFieldId: current.statusFieldId }
+        const projectTouched = rest.projectNodeId !== undefined || (repoFullName !== undefined && repo !== undefined)
+        if (projectTouched && resolvedRepo && finalProject.projectNodeId && finalProject.statusFieldId) {
+          const refused = await checkProject(req, resolvedRepo, finalProject.projectNodeId, finalProject.statusFieldId)
+          if (refused) return reply.code(refused.statusCode).send(refused)
         }
         const result = await deps.repos.kanbanBoards.updateBoard(orgId, req.params.boardId, userId, {
           ...rest,

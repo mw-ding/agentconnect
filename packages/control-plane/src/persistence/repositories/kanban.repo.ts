@@ -61,6 +61,8 @@ const BOARD_VIEW_SELECT = {
   blockRecurrenceLimit: true,
   defaultMode: true,
   completionContract: true,
+  projectNodeId: true,
+  statusFieldId: true,
   enabled: true,
   configRevision: true,
   visibility: true,

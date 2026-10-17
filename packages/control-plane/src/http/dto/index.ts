@@ -4408,6 +4408,9 @@ const KanbanRepoFullName = z
   .string()
   .regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'repoFullName must be "owner/repo"')
   .max(200)
+// Projects v2 GraphQL node ids are opaque base64-ish strings; bound the length, never parse them.
+const KanbanProjectId = z.string().min(1).max(200)
+const KANBAN_PROJECT_PAIR = 'projectNodeId and statusFieldId must be set together (or cleared together with null)'
 const KanbanBoardConfigFields = {
   name: z.string().trim().min(1).max(100),
   orchestratorAgentId: z.string().uuid().nullable(),
@@ -4442,17 +4445,31 @@ export const CreateKanbanBoardBody = z
     protocolRetryLimit: KanbanBoardConfigFields.protocolRetryLimit.optional(),
     blockRecurrenceLimit: KanbanBoardConfigFields.blockRecurrenceLimit.optional(),
     completionContract: KanbanBoardConfigFields.completionContract.optional(),
+    projectNodeId: KanbanProjectId.optional(),
+    statusFieldId: KanbanProjectId.optional(),
     enabled: KanbanBoardConfigFields.enabled.optional(),
     visibility: KanbanBoardConfigFields.visibility.default('org'),
     sharedWith: KanbanBoardConfigFields.sharedWith.default([])
   })
   .strict()
+  .refine((body) => (body.projectNodeId === undefined) === (body.statusFieldId === undefined), KANBAN_PROJECT_PAIR)
 export type CreateKanbanBoardBodyT = z.infer<typeof CreateKanbanBoardBody>
 export const UpdateKanbanBoardBody = z
-  .object({ repoFullName: KanbanRepoFullName, ...KanbanBoardConfigFields })
+  .object({
+    repoFullName: KanbanRepoFullName,
+    ...KanbanBoardConfigFields,
+    projectNodeId: KanbanProjectId.nullable(),
+    statusFieldId: KanbanProjectId.nullable()
+  })
   .partial()
   .strict()
   .refine((body) => Object.keys(body).length > 0, 'at least one field is required')
+  .refine(
+    (body) =>
+      (body.projectNodeId === undefined) === (body.statusFieldId === undefined) &&
+      (body.projectNodeId === null) === (body.statusFieldId === null),
+    KANBAN_PROJECT_PAIR
+  )
 export type UpdateKanbanBoardBodyT = z.infer<typeof UpdateKanbanBoardBody>
 export const KanbanBoardDto = z.object({
   id: z.string(),
@@ -4470,6 +4487,10 @@ export const KanbanBoardDto = z.object({
   blockRecurrenceLimit: z.number().int(),
   defaultMode: KanbanRunModeDto,
   completionContract: z.enum(['close', 'pr_merged', 'pr_checks_green']),
+  /** Projects v2 node id of the org-owned project mirrored from card status; null when no projection is configured. */
+  projectNodeId: z.string().nullable(),
+  /** Node id of that project's single-select Status field; set exactly when `projectNodeId` is. */
+  statusFieldId: z.string().nullable(),
   enabled: z.boolean(),
   configRevision: z.string(),
   visibility: ResourceVisibilityEnum,

@@ -7866,6 +7866,9 @@ export interface KanbanBoardView {
   blockRecurrenceLimit: number
   defaultMode: 'read' | 'write'
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  /** Projects v2 Status projection target (org-owned project); both set or both null. */
+  projectNodeId: string | null
+  statusFieldId: string | null
   enabled: boolean
   configRevision: bigint
   visibility: 'org' | 'restricted'
@@ -7890,6 +7893,8 @@ export interface KanbanBoardConfigInput {
   protocolRetryLimit?: number
   blockRecurrenceLimit?: number
   completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+  projectNodeId?: string | null
+  statusFieldId?: string | null
   enabled?: boolean
   visibility?: 'org' | 'restricted'
   sharedWith?: string[]

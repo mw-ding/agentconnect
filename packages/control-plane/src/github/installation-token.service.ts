@@ -31,7 +31,7 @@ export type GitAccess = 'read' | 'write'
  *  agent capabilities are granted; `workflows: write` follows
  *  `contents: write`, and `metadata: read` always rides along. */
 export type CapabilityLevels = Partial<Record<GitCredCapability, GitAccess>>
-type InternalPermission = GitCredCapability | 'checks' | 'workflows'
+type InternalPermission = GitCredCapability | 'checks' | 'workflows' | 'organization_projects'
 type InternalPermissionLevels = Partial<Record<InternalPermission, GitAccess>>
 
 /** Absent `capabilities` on the wire ⇒ the pre-P2.5 contents-only grant. */
@@ -187,6 +187,18 @@ export class InstallationTokenService {
     )
   }
 
+  // CP-only Kanban Projects v2 token (org-owned projects): organization_projects write plus issues read on one repo id.
+  async mintKanbanProject(installationId: bigint, repoFullName: string, repoId: bigint): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(
+      installationId,
+      repoFullName,
+      { organization_projects: 'write', issues: 'read' },
+      repoId,
+      false,
+      'kanban_project'
+    )
+  }
+
   // Daemon grant for one Kanban run: read clamps contents/issues/PRs to read; write follows contents with workflows.
   async mintKanbanRun(
     installationId: bigint,
@@ -218,7 +230,7 @@ export class InstallationTokenService {
     levels: InternalPermissionLevels,
     repoId?: bigint,
     forceRefresh = false,
-    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run'
+    purpose?: 'kanban_card' | 'kanban_card_write' | 'kanban_run' | 'kanban_project'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =
@@ -315,7 +327,8 @@ export class InstallationTokenService {
         ...(levels.pull_requests ? { pull_requests: levels.pull_requests } : {}),
         ...(levels.actions ? { actions: levels.actions } : {}),
         ...(levels.checks ? { checks: levels.checks } : {}),
-        ...(levels.workflows ? { workflows: levels.workflows } : {})
+        ...(levels.workflows ? { workflows: levels.workflows } : {}),
+        ...(levels.organization_projects ? { organization_projects: levels.organization_projects } : {})
       }
     })
   }
