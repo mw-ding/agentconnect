@@ -91,7 +91,11 @@ function rule(
 
 /** A minimal `issues` payload; override to shape other events. */
 function issuesPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  const sender = (overrides.sender as Record<string, unknown> | undefined) ?? { login: 'alice', type: 'User' }
+  const sender = (overrides.sender as Record<string, unknown> | undefined) ?? {
+    login: 'alice',
+    id: 12345,
+    type: 'User'
+  }
   const issue = {
     number: 42,
     title: 'db down',
@@ -835,11 +839,54 @@ describe('github ingress', () => {
           event: 'issues',
           action: 'labeled',
           ids: ['5042'],
-          numbers: [42]
+          numbers: [42],
+          sender: { login: 'alice', id: '12345', type: 'User' },
+          label: 'ac/status:ready'
         }
       ])
       expect(JSON.stringify(h.graphDoorbells)).not.toMatch(/db down|primary is unreachable/)
       expect(h.sent).toHaveLength(1)
+    })
+
+    it('forwards the webhook sender and the edited label name, bounded, on a human label doorbell', () => {
+      const ring = (payload: Record<string, unknown>) => githubIssueDoorbell('issues', payload as never, 'g')
+      const sender = { login: 'alice', id: '12345', type: 'User' }
+      expect(ring(labeled('ac/status:ready'))).toMatchObject({ sender, label: 'ac/status:ready' })
+      expect(ring(labeled('ac/agent:worker'))).toMatchObject({ sender, label: 'ac/agent:worker' })
+      expect(ring({ ...labeled('ac/status:ready'), action: 'unlabeled' })).toMatchObject({
+        action: 'unlabeled',
+        sender,
+        label: 'ac/status:ready'
+      })
+      // Close/reopen carry the sender but no label; an unbounded login or label is dropped, never a rejected frame.
+      const closed = ring(issuesPayload({ action: 'closed', issue: { id: 5042 } }))
+      expect(closed).toMatchObject({ sender })
+      expect(closed).not.toHaveProperty('label')
+      const long = ring(
+        labeled(`ac/status:${'x'.repeat(100)}`, { sender: { login: 'a'.repeat(65), id: 1, type: 'User' } })
+      )
+      expect(long).toMatchObject({ numbers: [42] })
+      expect(long).not.toHaveProperty('sender')
+      expect(long).not.toHaveProperty('label')
+      // A seen-only marker (bot sender or an unmanaged label) carries neither.
+      const bot = ring(labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', id: 9, type: 'Bot' } }))
+      expect(bot).toMatchObject({ numbers: [] })
+      expect(bot).not.toHaveProperty('sender')
+      expect(ring(labeled('bug'))).not.toHaveProperty('label')
+    })
+
+    it('rings a destination transfer (opened with changes.old_issue) as transferred; a plain open stays opened', async () => {
+      const opened = (overrides: Record<string, unknown> = {}) =>
+        issuesPayload({ action: 'opened', issue: { id: 5042 }, ...overrides })
+      const moved = opened({
+        changes: { old_issue: { id: 9000, number: 7 }, old_repository: { id: 77, full_name: 'acme/old' } }
+      })
+      expect((await post('issues', moved)).statusCode).toBe(202)
+      await flush()
+      expect(h.graphDoorbells).toEqual([
+        expect.objectContaining({ action: 'transferred', ids: ['5042'], numbers: [42] })
+      ])
+      expect(githubIssueDoorbell('issues', opened() as never, 'g')).toMatchObject({ action: 'opened', numbers: [42] })
     })
 
     it('deduplicates hook dispatch while replaying metadata doorbells for the same delivery', async () => {
@@ -931,7 +978,7 @@ describe('github ingress', () => {
       // A seen marker names no issue, so the CP re-reads nothing but its redelivery sweep knows the GUID landed.
       const seen = { deliveryKey: 'g', installationId: String(INSTALLATION), repoId: String(REPO_ID), event: 'issues' }
       expect(ring('issues', labeled('bug'))).toEqual({ ...seen, action: 'labeled', ids: [], numbers: [] })
-      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([])
+      expect(ring('issues', labeled('ac/agent:worker'))?.numbers).toEqual([42])
       expect(
         ring('issues', labeled('ac/status:ready', { sender: { login: 'agentconnect[bot]', type: 'Bot' } }))?.numbers
       ).toEqual([])

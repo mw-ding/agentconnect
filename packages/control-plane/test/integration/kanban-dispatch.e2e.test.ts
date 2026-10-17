@@ -18,6 +18,7 @@ import { mintAppJwt } from '../../src/github/api.js'
 import { resolveGithubAppConfig, type GithubAppConfig } from '../../src/github/config.js'
 import { InstallationTokenService } from '../../src/github/installation-token.service.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
@@ -162,7 +163,13 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     createdAt: new Date(0)
   }
   // App minting when GITHUB_APP_* is complete; otherwise the PAT, logged as injected.
-  let store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+  let store = new GithubCardStore({
+    tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+    permissions: new GithubRepoPermission({
+      tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+      ttlMs: 0
+    })
+  })
   const ref = { installationId: 1n, repoId: REPO_ID, repoFullName: FULL }
   let host: any = {
     start: vi.fn(async () => {}),
@@ -302,9 +309,11 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     }
     const githubApp = githubAppFromEnv()
     if (githubApp) {
+      const appTokens = new InstallationTokenService(githubApp, systemClock)
       store = new GithubCardStore({
-        tokens: new InstallationTokenService(githubApp, systemClock),
-        appSlug: process.env.GITHUB_APP_SLUG
+        tokens: appTokens,
+        appSlug: process.env.GITHUB_APP_SLUG,
+        permissions: new GithubRepoPermission({ tokens: appTokens, ttlMs: 0 })
       })
     }
     webhookSecret = randomBytes(32).toString('hex')

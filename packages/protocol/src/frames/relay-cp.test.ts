@@ -1140,6 +1140,26 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, ids: ['1', '2', '3', '4', '5'] }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, repoId: 'acme/web' }).success).toBe(false)
+    // Optional sender+label: carried by a human label/close doorbell, absent from graph events and seen-only markers.
+    const withSender = {
+      ...poke,
+      event: 'issues',
+      action: 'labeled',
+      sender: { login: 'alice', id: '42', type: 'User' },
+      label: 'ac/status:ready'
+    }
+    expect(RcGithubGraph.safeParse(withSender).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...withSender, label: undefined }).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...withSender, sender: { login: 'alice', type: 'User' } }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...withSender, sender: { ...withSender.sender, id: 'alice' } }).success).toBe(
+      false
+    )
+    expect(RcGithubGraph.safeParse({ ...withSender, sender: { ...withSender.sender, extra: 1 } }).success).toBe(false)
+    expect(
+      RcGithubGraph.safeParse({ ...withSender, sender: { ...withSender.sender, login: 'a'.repeat(65) } }).success
+    ).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...withSender, label: '' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...withSender, label: 'x'.repeat(101) }).success).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {

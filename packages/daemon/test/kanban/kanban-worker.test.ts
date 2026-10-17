@@ -54,6 +54,7 @@ function harness() {
     return { accepted: true as const, sessionKey: 'session-42', done: nudgeDone }
   })
   const cancel = vi.fn()
+  const forget = vi.fn(async () => {})
   const worker = new KanbanWorker({
     clock,
     log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
@@ -61,6 +62,7 @@ function harness() {
     start,
     nudge,
     cancel,
+    forget,
     gate: async () => state.refusal,
     probe: { turnActive: () => state.active, liveBackgroundTasks: () => state.tasks },
     outbox: {
@@ -120,6 +122,7 @@ function harness() {
     start,
     nudge,
     cancel,
+    forget,
     state,
     clock,
     settle,
@@ -224,6 +227,22 @@ describe('Kanban worker leases', () => {
     expect(h.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reasonCode: 'turn_error' }))
     expect(h.nudge).not.toHaveBeenCalled()
     expect(JSON.stringify(h.cp.report.mock.calls)).not.toContain('sensitive')
+  })
+
+  it('revokes only the addressed lease and leaves its replacement untouched on replay', async () => {
+    const h = harness()
+    await h.worker.dispatch(dispatch)
+    await h.worker.revoke(dispatch.leaseId, 'other-card')
+    expect(h.cancel).not.toHaveBeenCalled()
+    await h.worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(h.cancel).toHaveBeenCalledOnce()
+    expect(h.worker.get(dispatch.leaseId)).toBeUndefined()
+    const next = { ...dispatch, leaseId: '55555555-5555-4555-8555-555555555555', attempt: 2, dispatchRevision: '4' }
+    await h.worker.dispatch(next)
+    await h.worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(h.worker.get(next.leaseId)).toBeDefined()
+    expect(h.cancel).toHaveBeenCalledOnce()
+    expect(h.reports.has(dispatch.leaseId)).toBe(false)
   })
 
   it('cancels superseded turns and stops beating or reporting them', async () => {
@@ -348,6 +367,52 @@ describe('Kanban worker leases', () => {
     expect(r.cp.report).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'review_requested' }))
     expect(r.terminals.get(dispatch.leaseId)?.state).toBe('comment')
     r.worker.stop()
+  })
+
+  it("a late revoke forgets the addressed lease's session, not its replacement on the same card", async () => {
+    const forget = vi.fn(async () => {})
+    const worker = new KanbanWorker({
+      clock: new FakeClock(),
+      log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
+      cp: () => ({
+        ready: () => false,
+        heartbeat: async () => ({ superseded: [] as string[] }),
+        report: async () => ({ leaseId: '', accepted: true })
+      }),
+      start: vi.fn(async (d: KanbanDispatch, ready: (id: string) => void) => {
+        ready('acp-1')
+        return { accepted: true as const, sessionKey: `session-${d.leaseId}`, done: new Promise<string>(() => {}) }
+      }),
+      nudge: vi.fn(async () => ({ accepted: false as const, reason: 'busy' as const })),
+      cancel: vi.fn(),
+      forget,
+      gate: async () => undefined,
+      probe: { turnActive: () => false, liveBackgroundTasks: () => 0 },
+      outbox: {
+        has: async () => false,
+        reserve: async () => {},
+        release: async () => {},
+        put: async () => {},
+        list: async () => [],
+        remove: async () => {},
+        recordTerminal: async () => false,
+        orphanedTerminals: async () => [],
+        settleTerminal: async () => {}
+      }
+    })
+    const replacement = {
+      ...dispatch,
+      leaseId: '55555555-5555-4555-8555-555555555555',
+      attempt: 2,
+      dispatchRevision: '4'
+    }
+    await worker.dispatch(dispatch)
+    await worker.dispatch(replacement)
+    // The first lease is superseded by the replacement for the same card; a late revoke must forget only the first session.
+    await worker.revoke(dispatch.leaseId, dispatch.cardId)
+    expect(forget).toHaveBeenCalledWith(dispatch.agentId, `session-${dispatch.leaseId}`)
+    expect(forget).toHaveBeenCalledTimes(1)
+    expect(worker.get(replacement.leaseId)).toBeDefined()
   })
 })
 

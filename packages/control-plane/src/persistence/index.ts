@@ -123,3 +123,5 @@ export { PgDeploymentConfigRepository, PgDeploymentConfigStore } from './reposit
 export { PgAgentMemoryTransactionRepo } from './repositories/agent-memory-transaction.repo.js'
 
 export { PgProviderKeyStore } from './repositories/provider-key.repo.js'
+
+export { PgKanbanSyncRepo } from './repositories/kanban-sync.repo.js'

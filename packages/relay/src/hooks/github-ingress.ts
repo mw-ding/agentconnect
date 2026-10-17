@@ -86,12 +86,12 @@ export interface GithubIngressDeps {
 /** The payload slice the matcher reads: untrusted filter input; authorization is the compiled `installationIds` set. */
 interface GithubPayload {
   action?: string
-  changes?: { base?: unknown }
+  changes?: { base?: unknown; old_issue?: { id?: number; number?: number } }
   /** The label a `labeled` action just applied, or an `unlabeled` action removed. */
   label?: { name?: string }
   installation?: { id?: number }
   repository?: GithubRepositoryRef
-  sender?: { login?: string; type?: string; avatar_url?: string }
+  sender?: { login?: string; type?: string; id?: number; avatar_url?: string }
   requested_reviewer?: { login?: string; type?: string }
   requested_action?: { identifier?: string }
   issue?: GithubSubject
@@ -1074,6 +1074,7 @@ export function githubGraphDoorbell(
 /** Card-status changes the Kanban recovery re-reads at once instead of on its backed-off tick. */
 const KANBAN_ISSUE_ACTION_SET: ReadonlySet<string> = new Set(KANBAN_ISSUE_ACTIONS)
 const KANBAN_STATUS_LABEL_PREFIX = 'ac/status:'
+const KANBAN_AGENT_LABEL_PREFIX = 'ac/agent:'
 
 /** Reduce human creation, transfer, status relabel, or close/reopen to a body-free Kanban doorbell. */
 export function githubIssueDoorbell(
@@ -1085,24 +1086,39 @@ export function githubIssueDoorbell(
   const installationId = githubNumericId(payload.installation?.id)
   const repoId = githubNumericId(payload.repository?.id)
   if (!installationId || !repoId) return undefined
+  // A transfer's destination gets `issues.opened` with `changes.old_issue` (only the source gets `transferred`): ring it as one.
+  const action = payload.action === 'opened' && payload.changes?.old_issue ? 'transferred' : payload.action
   const seen: RcGithubGraph = {
     deliveryKey,
     installationId,
     repoId,
     event,
-    action: payload.action,
+    action,
     ids: [],
     numbers: []
   }
+  const labelEdit = action === 'labeled' || action === 'unlabeled'
   const statusLabel =
-    (payload.action !== 'labeled' && payload.action !== 'unlabeled') ||
-    !!payload.label?.name?.toLowerCase().startsWith(KANBAN_STATUS_LABEL_PREFIX)
+    !labelEdit ||
+    !!payload.label?.name?.toLowerCase().startsWith(KANBAN_STATUS_LABEL_PREFIX) ||
+    !!payload.label?.name?.toLowerCase().startsWith(KANBAN_AGENT_LABEL_PREFIX)
   // Only a human status edit rings; anything else is a seen-only marker so the CP's redelivery sweep knows it landed.
   if (!statusLabel || payload.sender?.type !== 'User') return seen
   const id = githubNumericId(payload.issue?.id)
   const number = payload.issue?.number
   if (!id || !Number.isSafeInteger(number) || number! <= 0) return seen
-  return { ...seen, ids: [id], numbers: [number!] }
+  // The sender and edited label let the CP require this edit to be the latest visible event before adopting a label.
+  const senderId = githubNumericId(payload.sender.id)
+  const login = payload.sender.login
+  const sender = senderId && login && login.length <= 64 ? { login, id: senderId, type: 'User' } : undefined
+  const name = labelEdit ? payload.label?.name : undefined
+  return {
+    ...seen,
+    ids: [id],
+    numbers: [number!],
+    ...(sender ? { sender } : {}),
+    ...(name && name.length <= 100 ? { label: name } : {})
+  }
 }
 
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {

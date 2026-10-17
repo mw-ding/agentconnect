@@ -1,7 +1,8 @@
-import type { AnyFrame, KanbanDispatch, KanbanDispatchOk } from '@agentconnect.md/protocol'
+import type { AnyFrame, KanbanDispatch, KanbanDispatchOk, KanbanRevoke } from '@agentconnect.md/protocol'
 import type { ControlHandler } from './context.js'
 
 export interface KanbanControlDeps {
+  kanbanRevoke?: (req: KanbanRevoke) => Promise<void>
   /** Admit one leased Kanban card (issue #2 M2); absent ⇒ every dispatch is refused as `no_agent`. */
   kanbanDispatch?: (dispatch: KanbanDispatch) => Promise<KanbanDispatchOk>
 }
@@ -17,5 +18,16 @@ export const kanbanDispatch: ControlHandler<KanbanControlDeps> = async (frame: A
     )
   } catch {
     wire.sendError(frame.id, 'INTERNAL', 'kanban admission failed', true)
+  }
+}
+
+export const kanbanRevoke: ControlHandler<KanbanControlDeps> = async (frame, deps, wire) => {
+  const req = frame.payload as KanbanRevoke
+  try {
+    if (!deps.kanbanRevoke) return wire.sendError(frame.id, 'INTERNAL', 'kanban revocation unavailable', true)
+    await deps.kanbanRevoke(req)
+    wire.reply(frame, 'kanban/revoke/ok', { leaseId: req.leaseId })
+  } catch {
+    wire.sendError(frame.id, 'INTERNAL', 'kanban revocation failed', true)
   }
 }

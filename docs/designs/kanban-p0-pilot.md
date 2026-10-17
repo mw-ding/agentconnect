@@ -541,3 +541,40 @@ identity; changing that identity is refused while the board has cards, so old
 issue numbers cannot silently refer to another repository. Human status and
 assignment synchronization beyond mismatch-parked cards and periodic drift repair
 remain for the stacked M1 follow-up.
+
+Human status and assignment edits now synchronize on every card, not only
+mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
+labels, unlabels, closes, or reopens the issue is adopted through
+`planLabelReconcile`: one legal status moves the card, several status labels are
+drift repaired to one with an explanatory comment, and a missing label restores
+the committed status. A leased card accepts only `blocked`, `triage`, and
+`archived`; every other edit reverts with the explanatory comment. An
+`ac/agent:<slug>` change maps to an assignee through the organization's agents;
+on a leased card it kills the lease (never transfers it), bumps the dispatch
+revision, posts a "reassigned from X to Y" comment, and the next dispatch opens
+a fresh session. Reopening a `done` card via a label moves it back through the
+state machine. A periodic drift reconciler, driven by the same 60-second tick,
+repairs a CP status write that failed (a card left with `labelWritePending` is
+re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
+Every transition writes one body-free `kanban_card_change` audit row.
+
+Known gaps update (M1 label sync permission): a human edit is adopted only after
+a live, uncached check that the actor holds `admin`, `maintain`, or `write` on
+the repository; a failed lookup counts as no access. An edit by a `triage`,
+`read`, or non-collaborator actor is consumed without a transition: the status
+label (or a closed issue) is restored to the committed status, a refused
+`ac/agent:<slug>` add or removal is undone, and one fixed-template comment
+explains the revert. Edits by the deployment App bot, any other bot, an App
+acting on a user's behalf, or an unknown actor are ignored without a lookup.
+Agents have no GitHub identity of their own: they write only through App
+installation tokens, so the App check covers them.
+
+Known gaps update (M1 label sync attribution): an edit is adopted only when the
+visible issue events attribute the live label to a human writer; when the events
+API lags the live labels, the pass is deferred and neither adopts, reverts, nor
+advances the cursor. A deferred card is retried on later passes and fails closed
+to `needsAttention` 10 minutes after its first deferral, reverting the live
+status label to the committed status with a comment.
+An agent using a writer's own host `gh` credentials is indistinguishable from
+that human (the shared-GitHub-login limit): label attribution trusts the events
+API's actor, which reports the credential's login, not the process behind it.
