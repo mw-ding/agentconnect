@@ -46,6 +46,7 @@ import { STEERING_METHOD, parseSteeringOutcome, steeringRequestParams, steeringS
 import type { SteeringIdleBehavior, SteeringOutcome } from './steering.js'
 import { RuntimeSessionFailure, SESSION_FAILURE_CAPABILITIES, sessionFailureFromMeta } from './session-failure.js'
 import { customInstructionsMeta, customInstructionsSupported } from './session-instructions.js'
+import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 // The raw session config-option shapes (from the ACP SDK), re-exported so
 // sessionConfigOptions() consumers can type the option tree without importing
@@ -739,7 +740,7 @@ export class AcpHost {
   async start(): Promise<void> {
     if (this.spawned) throw new Error('AcpHost: already started')
     const env: NodeJS.ProcessEnv = {
-      ...(this.opts.inheritProcessEnv === false ? {} : process.env),
+      ...(this.opts.inheritProcessEnv === false ? {} : agentBaseEnvironment(process.env)),
       ...Object.fromEntries(this.runtime.env.map((e) => [e.name, e.value])),
       ...(this.opts.env ?? {})
     }

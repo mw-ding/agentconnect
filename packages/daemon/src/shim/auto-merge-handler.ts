@@ -4,6 +4,7 @@ import { MAX_AUTO_MERGE_DETAIL } from '@agentconnect.md/protocol'
 import { z } from 'zod'
 import { GITCRED_CAPABILITY_ENV, GITCRED_SOCKET_ENV } from '../gitcred/env.js'
 import { DEFAULT_SHIM_PATHS, type ShimPaths } from './sandbox-paths.js'
+import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 /**
  * The `automerge` capability, served IN THE POD: one watcher process per armed pull request.
@@ -126,7 +127,7 @@ export function createAutoMergeHandler(
     }
 
     const child = spawnChild([p.agentId, p.repoFullName, String(p.prNumber)], {
-      ...process.env,
+      ...agentBaseEnvironment(),
       [GITCRED_CAPABILITY_ENV]: p.capability,
       [GITCRED_SOCKET_ENV]: process.env[GITCRED_SOCKET_ENV] ?? paths.tunnels.gitcred
     })

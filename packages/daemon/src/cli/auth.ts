@@ -27,6 +27,7 @@ import {
 } from '../slack/render.js'
 import { resolveRuntimeCatalog, type ResolvedRuntimeCatalog } from '../runtimes/registry.js'
 import type { RuntimeDef } from '../config/config-schema.js'
+import { agentBaseEnvironment } from '../runtimes/agent-env.js'
 
 /**
  * Interactive login for one runtime, run by the operator ON the daemon host.
@@ -104,7 +105,7 @@ function spawnTerminalAuth(runtime: RuntimeDef, method: AuthMethod): Promise<num
   const extra = isTerminalMethod(method) ? { args: method.args, env: method.env } : {}
   const args = [...runtime.args, ...(extra.args ?? [])]
   const env = {
-    ...process.env,
+    ...agentBaseEnvironment(),
     ...Object.fromEntries(runtime.env.map((entry) => [entry.name, entry.value])),
     ...(extra.env ?? {})
   }
