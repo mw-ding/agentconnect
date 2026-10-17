@@ -2,7 +2,14 @@
 // orchestrator agent. Every GitHub write goes through CardStore; every card write through the Lane 1 repo API.
 import type { KanbanOrchestrate, KanbanOrchestrateOk, KanbanOrchestrateRefusalCode } from '@agentconnect.md/protocol'
 import { cardIdempotencyKey } from './card-key.js'
-import { statusLabel, planStatusWrite, isKanbanStatus, type KanbanStatus, type LabelPlan } from './card-state.js'
+import {
+  statusLabel,
+  planStatusWrite,
+  isKanbanStatus,
+  canTransition,
+  type KanbanStatus,
+  type LabelPlan
+} from './card-state.js'
 import { agentLabel, AGENT_LABEL_PREFIX } from './agent-label.js'
 import { GithubApiError } from '../github/api.js'
 import type { OrgId } from '../domain/ids.js'
@@ -77,11 +84,10 @@ export class KanbanOrchestrator {
   ): Promise<KanbanOrchestrateOk> {
     const board = await this.deps.orchestrator.boardForOrchestrator(agentId, orgId, req.boardId)
     if (!board.ok) return refuse('prepare_create', board.reason)
-    // Resolve the epic before anything else: it must be a card on this board.
+    // Resolve the epic first: it must be a card on this board (existence, not the budget yet).
     if (req.epicIssueNumber !== undefined) {
-      const budget = await this.deps.orchestrator.epicBudget(req.boardId, req.epicIssueNumber)
-      if (budget === 'epic_not_found') return refuse('prepare_create', 'epic_not_found')
-      if (budget === 'epic_budget_exhausted') return refuse('prepare_create', 'epic_budget_exhausted')
+      const epic = await this.deps.orchestrator.cardByIssueNumber(req.boardId, req.epicIssueNumber)
+      if (!epic) return refuse('prepare_create', 'epic_not_found')
     }
     const key = cardIdempotencyKey({
       epic: String(req.epicIssueNumber ?? `board:${req.boardId}`),
@@ -91,6 +97,15 @@ export class KanbanOrchestrator {
     const existing = await this.deps.cards.findByIdempotencyKey(req.boardId, key)
     if (existing) {
       return { ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: existing.issueNumber }
+    }
+    // B2 is checked before anything is filed; the epic's budget never blocks a replay of an existing key.
+    if (req.epicIssueNumber !== undefined) {
+      const budget = await this.deps.orchestrator.epicBudget(req.boardId, req.epicIssueNumber)
+      if (budget === 'epic_not_found') return refuse('prepare_create', 'epic_not_found')
+      if (budget === 'epic_budget_exhausted') {
+        await this.moveEpicToTriage(board.board, req.epicIssueNumber)
+        return refuse('prepare_create', 'epic_budget_exhausted')
+      }
     }
     // Resolve the assignee slug up front so a bad one refuses before anything is filed.
     if (req.assignee !== undefined) {
@@ -145,8 +160,11 @@ export class KanbanOrchestrator {
       }
     })
     if (!result.ok) {
-      // B2 tripped at commit: the issue was already filed, so close it and refuse.
+      // B2 tripped at commit: the issue was already filed, so close it and move the epic to triage.
       await this.deps.store.closeIssue(repo, req.issueNumber).catch(() => undefined)
+      if (result.reason === 'epic_budget_exhausted' && req.epicIssueNumber !== undefined) {
+        await this.moveEpicToTriage(board.board, req.epicIssueNumber)
+      }
       return refuse('commit_create', result.reason)
     }
     const card = result.card
@@ -346,5 +364,19 @@ export class KanbanOrchestrator {
       removeLabels: []
     }
     await this.deps.store.applyPlan(repo, issue.number, issue, plan)
+  }
+
+  /** B2 exhausted: move the epic to triage (todo→triage is allowed) if it is unleased; promotion stays with humans. */
+  private async moveEpicToTriage(
+    board: { id: string; orgId: OrgId; repoId: bigint; repoFullName: string },
+    epicIssueNumber: number
+  ): Promise<void> {
+    const epic = await this.deps.orchestrator.cardByIssueNumber(board.id, epicIssueNumber)
+    if (!epic || epic.leased || !canTransition(epic.status, 'triage')) return
+    if (!(await this.deps.cards.casStatus(epic.cardId, epic.stateRevision, 'triage'))) return
+    const repo = await this.repoRef(board)
+    if (!repo) return
+    const observed = await this.deps.store.readCard(repo, epicIssueNumber)
+    if (observed) await this.deps.store.applyPlan(repo, epicIssueNumber, observed, planStatusWrite('triage', observed))
   }
 }
