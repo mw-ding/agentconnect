@@ -9,6 +9,7 @@ import {
   GITHUB_REQUEST_REVIEW_ACTION,
   KANBAN_ISSUE_ACTIONS,
   HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
+  isRetryableHookDeliveryReason,
   isGithubPullRequestRevisionEvent,
   type RcGithubCommentAuthz,
   type RcGithubRerequest,
@@ -63,12 +64,12 @@ export interface GithubIngressDeps {
   daemons: () => Pick<RelayDaemonServer, 'get'> | undefined
   /** Emit one delivery-stage `rc/run-report` EVT to the CP (fire-and-forget). */
   report: (report: RcRunReport) => void
-  /** Emit one `rc/github-installation` doorbell EVT to the CP (fire-and-forget). */
-  doorbell: (poke: RcGithubInstallation) => void
+  /** Emit one `rc/github-installation` doorbell EVT to the CP (fire-and-forget); `false` means the emit was dropped. */
+  doorbell: (poke: RcGithubInstallation) => boolean | void
   /** Persist body-free PR feedback before the signed webhook is acknowledged. */
   reportPullRequestFeedback?: (signal: RcPullRequestFeedback) => Promise<boolean>
-  /** Emit one body-free `rc/github-graph` Kanban doorbell EVT to the CP (fire-and-forget). */
-  graphDoorbell?: (poke: RcGithubGraph) => void
+  /** Emit one body-free `rc/github-graph` Kanban doorbell EVT to the CP (fire-and-forget); `false` means the emit was dropped. */
+  graphDoorbell?: (poke: RcGithubGraph) => boolean | void
   /** Resolve every issue/PR actor's live write authority: metadata only, delegated to the CP's GitHub App. */
   authorizeComment: (request: RcGithubCommentAuthz) => Promise<boolean>
   /** Resolve a signed review control through CP-owned durable metadata. */
@@ -1007,6 +1008,11 @@ function reportReviewRequestRequired(deps: GithubIngressDeps, rule: RcHookAssign
   })
 }
 
+/** Delivery failures the CP answers with a redelivery of the same GUID, which the relay must then accept. */
+function forgetsDelivery(reason: string | undefined): boolean {
+  return isRetryableHookDeliveryReason(reason) || reason === HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED
+}
+
 function githubNumericId(value: number | undefined): string | undefined {
   return Number.isSafeInteger(value) && value! > 0 ? String(value) : undefined
 }
@@ -1132,6 +1138,9 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         return reply.code(400).send({ error: 'Bad Request', statusCode: 400 })
       }
 
+      // Tracked from the start: GitHub may hang up during the feedback write, before any claim or close listener exists.
+      let closed = false
+      reply.raw.once('close', () => (closed = true))
       const feedbackSignals = pullRequestFeedbackSignals(event, payload, deliveryKey)
       try {
         if (deps.reportPullRequestFeedback) {
@@ -1141,8 +1150,19 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         deps.log.warn(`github ingress: PR feedback persistence unavailable ${deliveryKey}`)
         return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
       }
+      // A caller gone during the write never claims the id, so GitHub's redelivery of the GUID is processed.
+      if (closed || reply.raw.destroyed) {
+        deps.log.info(`github ingress: delivery ${deliveryKey} disconnected before it was claimed`)
+        return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
+      }
 
-      if (deliveries.seenDelivery(deliveryHeader)) {
+      const claim = deliveries.claim(deliveryHeader)
+      if (claim === 'in-flight') {
+        // The first copy may still fail and be forgotten; a 503 keeps this one from being the delivery GitHub counts as done.
+        deps.log.info(`github ingress: delivery ${deliveryKey} still in flight`)
+        return reply.code(503).header('retry-after', '1').send({ error: 'Service Unavailable', statusCode: 503 })
+      }
+      if (claim === 'committed') {
         // Metadata doorbells must survive redelivery when an earlier control-plane hop was lost.
         const poke =
           githubGraphDoorbell(event, payload, deliveryKey) ?? githubIssueDoorbell(event, payload, deliveryKey)
@@ -1153,13 +1173,31 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         deps.log.info(`github ingress: duplicate delivery ${deliveryKey}`)
         return reply.code(202).send({ deliveryKey })
       }
+      // The id stays deduped only after the forward worked: a dropped CP emit or a retryable pre-admission failure forgets it, so GitHub's redelivery of the same GUID is processed.
+      let forwardDropped = false
+      const ring = (rung: boolean | void): void => {
+        if (rung === false) forwardDropped = true
+      }
+      const hookDeps: GithubIngressDeps = {
+        ...deps,
+        report: (report) => {
+          if (report.status === 'failed' && forgetsDelivery(report.reason)) deliveries.forget(deliveryHeader)
+          deps.report(report)
+        }
+      }
+      const settle = (): void => {
+        if (forwardDropped || reply.statusCode >= 500) deliveries.forget(deliveryHeader)
+        else deliveries.commit(deliveryHeader)
+      }
+      if (closed || reply.raw.destroyed) settle()
+      else reply.raw.once('close', settle)
 
       if (event === 'check_run' && payload.action === 'rerequested') {
-        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_run', 'rerequested')
+        void dispatchGithubRerequest(hookDeps, payload, deliveryKey, 'check_run', 'rerequested')
         return reply.code(202).send({ deliveryKey })
       }
       if (event === 'check_suite' && payload.action === 'rerequested') {
-        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_suite', 'rerequested')
+        void dispatchGithubRerequest(hookDeps, payload, deliveryKey, 'check_suite', 'rerequested')
         return reply.code(202).send({ deliveryKey })
       }
       if (
@@ -1167,7 +1205,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         payload.action === 'requested_action' &&
         payload.requested_action?.identifier === GITHUB_REQUEST_REVIEW_ACTION
       ) {
-        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_run', 'requested_action')
+        void dispatchGithubRerequest(hookDeps, payload, deliveryKey, 'check_run', 'requested_action')
         return reply.code(202).send({ deliveryKey })
       }
       if (
@@ -1175,7 +1213,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         payload.action === 'in_progress' &&
         payload.workflow_run?.event === 'pull_request'
       ) {
-        void dispatchGithubRerequest(deps, payload, deliveryKey, 'workflow_run', 'in_progress')
+        void dispatchGithubRerequest(hookDeps, payload, deliveryKey, 'workflow_run', 'in_progress')
         return reply.code(202).send({ deliveryKey })
       }
 
@@ -1183,7 +1221,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       if (INSTALLATION_EVENTS.has(event)) {
         const id = payload.installation?.id
         if (id !== undefined) {
-          deps.doorbell({ installationId: String(id), action: payload.action ?? 'unknown' })
+          ring(deps.doorbell({ installationId: String(id), action: payload.action ?? 'unknown' }))
           deps.log.info(`github ingress: doorbell ${deliveryKey} installation ${id} (${payload.action ?? 'unknown'})`)
         }
         return reply.code(202).send({ deliveryKey })
@@ -1193,7 +1231,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       if (GRAPH_EVENTS.has(event)) {
         const poke = githubGraphDoorbell(event, payload, deliveryKey)
         if (poke) {
-          deps.graphDoorbell?.(poke)
+          ring(deps.graphDoorbell?.(poke))
           deps.log.info(`github ingress: graph doorbell ${deliveryKey} repo ${poke.repoId} (${event}:${poke.action})`)
         }
         return reply.code(202).send({ deliveryKey })
@@ -1205,7 +1243,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       // A card-status change also rings the Kanban doorbell; hook matching below still runs for the same delivery.
       const issuePoke = githubIssueDoorbell(event, payload, deliveryKey)
       if (issuePoke) {
-        deps.graphDoorbell?.(issuePoke)
+        ring(deps.graphDoorbell?.(issuePoke))
         if (issuePoke.numbers.length > 0) {
           deps.log.info(
             `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`
@@ -1305,7 +1343,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       const dispatchDeps = {
         table: deps.table,
         daemons: deps.daemons,
-        report: deps.report,
+        report: hookDeps.report,
         clock: deps.clock,
         log: deps.log
       }
@@ -1349,7 +1387,7 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         if (!cleanupEvent && notice === undefined && pullRequestNeedsMaintainer(ctx, prAuthorAuthorized)) {
           // No third-party-authored PR lifecycle payload reaches the daemon as a fire; revisions still get an actionable Check.
           if (isGithubPullRequestRevision(ctx)) {
-            reportReviewRequestRequired(deps, rule, msg)
+            reportReviewRequestRequired(hookDeps, rule, msg)
             deps.log.info(
               `github ingress: waiting for maintainer request ${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`
             )

@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Daemon } from '../src/daemon.js'
+import { sessionHostKey } from '../src/acp/host-key.js'
+import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { buildKanbanMessage } from '../src/messages/kanban-message.js'
 import { buildHookMessage } from '../src/messages/hook-message.js'
@@ -313,9 +315,23 @@ it('persists terminal reports across restarts and redacts ACKed receipts without
   await store.close()
 })
 
-it('masks a secret in the stored terminal and in the GitHub comment body', async () => {
+it('masks agent and BYOK provider secrets in the stored terminal and in the GitHub comment body', async () => {
   const secret = 'sk-kanban-secret-value'
+  const apiKey = 'sk-provider-api-key-value'
+  const header = 'provider-workspace-header-value'
   const h = await harness(false, ['read-only', 'agent'], [{ name: 'GH_TOKEN', value: secret }])
+  // What buildAcpHost records for a host launched with a BYOK provider credential.
+  ;(h.daemon as any).modelProviderSecrets.set(
+    sessionHostKey(AGENT, key()),
+    maskableSecrets({
+      runtimeOverrides: {
+        secrets: [
+          { name: 'MODEL_API_KEY', value: apiKey },
+          { name: 'MODEL_HEADER_x-workspace', value: header }
+        ]
+      }
+    })
+  )
   vi.spyOn((h.daemon as any).gitCreds, 'getKanbanCommentToken').mockResolvedValue({ token: 'ghs_test' })
   ;(h.daemon as any).cpClient = {
     state: 'READY',
@@ -357,19 +373,20 @@ it('masks a secret in the stored terminal and in the GitHub comment body', async
         blockKind: 'needs_input',
         reasonCode: 'agent_blocked',
         summary: `shipped with ${secret}`,
-        reason: `blocked on ${secret}`
+        reason: `blocked on ${secret} via ${apiKey} and ${header}`
       }
     })
     const row = (await (h.store as any).db.prepare('SELECT entry FROM kanban_terminals').get()) as { entry: string }
-    expect(row.entry).toContain('[secret:GH_TOKEN]')
-    expect(row.entry).not.toContain(secret)
+    for (const value of [secret, apiKey, header]) expect(row.entry).not.toContain(value)
     const stored = JSON.parse(row.entry) as { summary: string; reason: string }
     expect(stored.summary).toBe('shipped with [secret:GH_TOKEN]')
-    expect(stored.reason).toBe('blocked on [secret:GH_TOKEN]')
+    expect(stored.reason).toBe(
+      'blocked on [secret:GH_TOKEN] via [secret:MODEL_API_KEY] and [secret:MODEL_HEADER_x-workspace]'
+    )
     release()
     await vi.waitFor(() => expect(posted.length).toBeGreaterThan(0))
-    expect(posted.join('\n')).toContain('[secret:GH_TOKEN]')
-    expect(posted.join('\n')).not.toContain(secret)
+    expect(posted.join('\n')).toContain('[secret:MODEL_API_KEY]')
+    for (const value of [secret, apiKey, header]) expect(posted.join('\n')).not.toContain(value)
   } finally {
     release()
     fetchSpy.mockRestore()
@@ -411,8 +428,9 @@ it('records one terminal per lease and queues its comment only after the report 
   expect(await store.dueKanbanComments(0, 10)).toMatchObject([{ attempted: false, entry: { summary: entry.summary } }])
   await store.markKanbanCommentAttempt(dispatch.leaseId, 100, 40)
   await store.markKanbanCommentAttempt(dispatch.leaseId, 100, 60)
+  await store.markKanbanCommentAttempt(dispatch.leaseId, 100, null)
   expect(await store.dueKanbanComments(50, 10)).toEqual([])
-  expect((await store.dueKanbanComments(100, 10))[0]).toMatchObject({ attempted: true, attempts: 2, attemptedAt: 40 })
+  expect((await store.dueKanbanComments(100, 10))[0]).toMatchObject({ attempted: true, attempts: 3, attemptedAt: 40 })
   await store.deferKanbanCommentLookup(dispatch.leaseId, 100)
   expect((await store.dueKanbanComments(100, 10))[0]).toMatchObject({ lookupMisses: 1 })
   await store.close()

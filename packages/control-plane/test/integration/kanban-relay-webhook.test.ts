@@ -1,5 +1,5 @@
 // Signed GitHub webhook -> real relay HTTP ingress -> rc/github-graph over a real WebSocket -> CP Kanban doorbell -> Postgres.
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPublicKey, createVerify, generateKeyPairSync, randomUUID } from 'node:crypto'
 import { prisma } from '../setup.db.js'
 import { buildApp, type App } from '../../src/app.js'
@@ -23,7 +23,7 @@ interface GithubCall {
   jwtValid?: boolean
 }
 
-/** A GitHub API stand-in: one ready-labelled issue whose latest status edit is a human's, at `level` on the repo. */
+// A ready-labelled issue whose latest status edit is a human's, who holds `level` on the repository.
 function fakeGithub(publicKeyPem: string, level: string) {
   const calls: GithubCall[] = []
   const fetch = async (url: string, init?: RequestInit): Promise<Response> => {
@@ -219,6 +219,27 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     })
     const saved = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
     expect(saved).toMatchObject({ status: 'triage', syncEventCursor: 3n })
+  })
+
+  it('forwards the same GUID after a dropped CP emit and persists the redelivered doorbell', async () => {
+    const { card, link } = await boot()
+    const emit = vi.spyOn(link.client, 'emitGithubGraph').mockReturnValue(false)
+    const deliveryId = randomUUID()
+    const request = { secret: WEBHOOK_SECRET, event: 'issues', payload: issuesLabeled(HUMAN), deliveryId }
+    try {
+      expect((await postGithubWebhook(link.webhookUrl, request)).status).toBe(202)
+      expect(emit).toHaveBeenCalledOnce()
+      expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('triage')
+    } finally {
+      emit.mockRestore()
+    }
+    expect((await postGithubWebhook(link.webhookUrl, request)).status).toBe(202)
+    const landed = await until(
+      () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } }),
+      (row) => row.status === 'ready'
+    )
+    expect(landed.status).toBe('ready')
+    expect(link.graphPokes.map((poke) => poke.deliveryKey)).toEqual([deliveryId, deliveryId])
   })
 
   it('a bad signature answers 401 and puts no frame on the wire', async () => {

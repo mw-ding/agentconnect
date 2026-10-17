@@ -9,8 +9,8 @@
  * These ids are stable and exported so fixtures/tests can reference the seeded
  * tenancy without re-querying.
  */
-import { PrismaPg } from '@prisma/adapter-pg'
-import { PrismaClient } from '../src/generated/prisma/client.js'
+import type { PrismaClient } from '../src/generated/prisma/client.js'
+import { createPrisma } from '../src/persistence/prisma.js'
 import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID, DEFAULT_ORG_SLUG, DEFAULT_OWNER_EMAIL } from '../src/config/defaults.js'
 import { ensureDefaultTenant } from '../src/persistence/ensure-default-tenant.js'
 
@@ -37,9 +37,14 @@ export const seed = (prisma: PrismaClient): Promise<void> => ensureDefaultTenant
 // Guarded so importing the constants/`seed` from tests does not open a client.
 const isDirectRun = process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`
 
+/** The seed's client: built by `createPrisma`, so it carries the same UTC session pin as the server. */
+export function openSeedClient(databaseUrl: string | undefined = process.env.DATABASE_URL): PrismaClient {
+  if (!databaseUrl) throw new Error('DATABASE_URL is required to seed')
+  return createPrisma(databaseUrl)
+}
+
 if (isDirectRun) {
-  const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
-  const prisma = new PrismaClient({ adapter })
+  const prisma = openSeedClient()
   seed(prisma)
     .then(() => prisma.$disconnect())
     .catch(async (err) => {

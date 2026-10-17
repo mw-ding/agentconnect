@@ -39,7 +39,9 @@ export default defineConfig({
       'test/postgres-async-database.int.test.ts',
       'test/postgres-pool-store.int.test.ts',
       'test/postgres-transcript-org.int.test.ts',
-      'test/postgres-intake-migration.int.test.ts'
+      'test/postgres-intake-migration.int.test.ts',
+      'test/postgres-kanban-outbox-migration.int.test.ts',
+      'test/kanban-comment-outbox-store.test.ts'
     ],
     globalSetup: ['./test/tmpdir-global-setup.ts', './test/store-postgres/global-setup.ts'],
     setupFiles: ['./test/store-postgres/setup.ts'],

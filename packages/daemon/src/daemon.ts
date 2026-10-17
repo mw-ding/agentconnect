@@ -27099,7 +27099,7 @@ export class Daemon {
       )
     }
     // Mask before the row is stored: the stored terminal and the GitHub comment both post that copy.
-    const terminal = maskSecretsDeep(req.terminal, maskableSecrets(this.agents.get(req.agentId)))
+    const terminal = this.maskAgentSecrets(req.agentId, req.terminal)
     const result = await this.kanban.recordTerminal(leaseId, terminal)
     if (!result.recorded) {
       throw new Error(
