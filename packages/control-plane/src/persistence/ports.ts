@@ -186,6 +186,8 @@ export type AuditKind =
   | 'agent_repo_change'
   | 'org_invite_change'
   | 'kanban_mode_change'
+  | 'kanban_board_change'
+  | 'kanban_card_change'
   | 'protocol_error'
   | 'api_key_create'
   | 'api_key_rotate'
@@ -8022,8 +8024,110 @@ export interface KanbanCardRecord {
   needsAttention: boolean
 }
 
+/** A card may be filed in any status but `running`, which only a claim (and its lease) can produce. */
+export type KanbanInitialStatus = Exclude<KanbanStatus, 'running'>
+
+/** Body-free card metadata: GitHub ids and CP configuration only, never the issue title or body. */
+export interface KanbanCardRow {
+  id: string
+  boardId: string
+  issueId: bigint
+  issueNumber: number
+  issueNodeId: string | null
+  /** B1 key for orchestrator-filed cards (`cardIdempotencyKey`); null for human-filed or imported cards. */
+  idempotencyKey: string | null
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  priority: number
+  mode: 'read' | 'write' | null
+  stateRevision: bigint
+  dispatchRevision: bigint
+  createdAt: Date
+}
+
+export interface KanbanCardUpsertInput {
+  boardId: string
+  issueId: bigint
+  issueNumber: number
+  issueNodeId?: string | null
+  /** Re-plans reuse the card filed under the same key instead of filing another. */
+  idempotencyKey?: string | null
+  /** Only applied when the row is created; an existing card keeps its status. Defaults to `triage`. */
+  status?: KanbanInitialStatus
+  /** Must be an agent of the board's org; only applied on create. */
+  assigneeAgentId?: string | null
+  priority?: number
+  mode?: 'read' | 'write' | null
+  /** Who filed it, for the body-free audit row, e.g. `import` or `orchestrator`. */
+  source: string
+  actorUserId?: string | null
+  /** The agent that filed it, when an orchestrator did. */
+  actorAgentId?: string | null
+}
+
+export interface KanbanCardUpsertResult {
+  card: KanbanCardRow
+  created: boolean
+  /** `idempotency_key`: an earlier create under this key won; when its issue differs, the caller filed a duplicate. */
+  matchedBy: 'created' | 'issue' | 'idempotency_key'
+}
+
+export type KanbanCardUpsertErrorCode = 'board_not_found' | 'agent_not_in_org' | 'invalid_status' | 'key_conflict'
+
+/** `key_conflict`: the issue already has a card filed under a different idempotency key. */
+export class KanbanCardUpsertError extends Error {
+  constructor(readonly code: KanbanCardUpsertErrorCode) {
+    super(`kanban card upsert refused: ${code}`)
+    this.name = 'KanbanCardUpsertError'
+  }
+}
+
+/** An open run's placement, as the reassign rule (spike §5) needs it to kill the lease and cancel its turns. */
+export interface KanbanLeaseRef {
+  leaseId: string
+  runId: string
+  agentId: string
+  daemonId: string
+  dispatchRevision: bigint
+}
+
+export interface KanbanSetAssigneeInput {
+  cardId: string
+  /** Null unassigns; the card then waits in its status until someone assigns it. */
+  agentId: string | null
+  /** Optional CAS on the card's dispatch generation; a mismatch is `stale`. */
+  expectedDispatchRevision?: bigint
+  /** An open lease held by another agent is refused by default; `revoke` kills it in the same write. */
+  onLease?: 'refuse' | 'revoke'
+  now: Date
+  source: string
+  actorUserId?: string | null
+  actorAgentId?: string | null
+}
+
+export type KanbanSetAssigneeResult =
+  | {
+      ok: true
+      /** False when the card already had this assignee; nothing was written. */
+      changed: boolean
+      card: KanbanCardRow
+      previousAgentId: string | null
+      /** The lease this write ended as `reclaimed`; the caller cancels its turns and posts the reassign comment. */
+      revokedLease: KanbanLeaseRef | null
+    }
+  | { ok: false; reason: 'not_found' | 'stale' | 'agent_not_in_org' }
+  | { ok: false; reason: 'leased'; lease: KanbanLeaseRef }
+
 export interface KanbanCardRepo {
   findByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanCardRecord | null>
+  /** Create the card for this issue, or return the one that already exists; race-safe and never duplicates. */
+  upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult>
+  findByIdempotencyKey(boardId: string, idempotencyKey: string): Promise<KanbanCardRow | null>
+  getCard(cardId: string): Promise<KanbanCardRow | null>
+  /** The org-scoped agent whose slug (`Agent.name`) an `ac/agent:<slug>` label names; null when none. */
+  resolveAgentSlug(orgId: string, slug: string): Promise<string | null>
+  /** Change the assignee under the reassign rule: a live lease is refused, or killed (never transferred) on `revoke`. */
+  setAssignee(input: KanbanSetAssigneeInput): Promise<KanbanSetAssigneeResult>
   /** Move status only if stateRevision still matches; false means a racing writer won. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** CAS todo to ready and open the intent in one write; refused while an intent is open or the card awaits a human. */

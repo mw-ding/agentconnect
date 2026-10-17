@@ -3287,6 +3287,8 @@ enum AuditKind {
   agent_repo_change
   org_invite_change
   kanban_mode_change
+  kanban_board_change
+  kanban_card_change
   protocol_error
   api_key_create
   api_key_rotate

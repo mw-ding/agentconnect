@@ -9,7 +9,10 @@ export interface GraphReconcilerLog {
 
 export interface KanbanGraphReconcilerDeps {
   // No bare casStatus: a promotion's ready move and its intent land only together, through beginPromotion.
-  cards: Omit<KanbanCardRepo, 'casStatus'>
+  cards: Pick<
+    KanbanCardRepo,
+    'findByIssueNumber' | 'beginPromotion' | 'notePromotionPosted' | 'clearPromotionIntent' | 'revertPromotion'
+  >
   store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>
   log: GraphReconcilerLog
   /** Defaults to the wall clock; stamps when the promotion intent opened, for the recovery age cap. */
