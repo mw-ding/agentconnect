@@ -219,7 +219,7 @@ function actionGuides(ctx: SessionContext): Record<SendMessageAction, ActionGuid
       examples: [
         {
           use: 'Direct message a person',
-          arguments: { action: 'postMessage', toUser: '<user-id>', message: 'The deploy window moved to 3pm.' }
+          arguments: { action: 'postMessage', toUser: '<@user-id>', message: 'The deploy window moved to 3pm.' }
         },
         {
           use: 'Post at a channel root',
@@ -229,7 +229,7 @@ function actionGuides(ctx: SessionContext): Record<SendMessageAction, ActionGuid
           use: 'Mention people in one channel post',
           arguments: {
             action: 'postMessage',
-            toUser: ['<user-id-1>', '<user-id-2>'],
+            toUser: ['<@user-id-1>', '<@user-id-2>'],
             channel: '<channel-id>',
             message: 'Please review the release notes.'
           }
