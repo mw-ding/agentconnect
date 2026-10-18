@@ -580,6 +580,12 @@ and a claim neither takes the card nor clears the flag. Failed label writes
 remain eligible for repair; only a cleanly attributed human writer edit releases
 the hold.
 
+The close reason (`archived` versus `done`) comes from the live issue's
+`stateReason`, rather than the visible `closed` event's `state_reason`. A later
+close whose event is still lagging can therefore supply the reason for an earlier
+attributed close. This pre-existing gap has low impact: both outcomes are terminal
+and non-dispatchable.
+
 Roll out the CP before the relay: the strict doorbell schema on an older CP
 rejects the new fields. During the CP-before-relay window, a `labeled` doorbell
 without a sender or label imports as unassigned `triage` (fail closed). The

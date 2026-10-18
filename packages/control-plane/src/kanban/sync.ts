@@ -103,6 +103,7 @@ type EditVerdict = 'accept' | 'refuse' | 'revert' | 'ignore'
 /** A verdict and the GitHub actor whose own event was judged for it, for the audit row. */
 type Judged = { verdict: EditVerdict; actor?: GitHubActor }
 type StatusJudgement = { verdict: EditVerdict | 'pending'; actor?: GitHubActor }
+type StatusCursors = { consumed: bigint; predates: bigint }
 
 // Exactly undoes one refused `ac/agent:*` label edit against the labels the issue carries now.
 function undoLabelEdit(event: NonNullable<LabelEvent>, labels: readonly string[]): { add: string[]; remove: string[] } {
@@ -218,18 +219,17 @@ export class KanbanSync {
     writers: Map<string, Promise<boolean>>
     humanDoorbell: boolean
     consumed: bigint
+    predates: bigint
   }): Promise<StatusJudgement> {
-    const { card, edits, issue, events, repo, writers, humanDoorbell, consumed } = opts
+    const { card, edits, issue, events, repo, writers, humanDoorbell, consumed, predates } = opts
     const ignore: StatusJudgement = { verdict: 'ignore' }
     const statusEvent = edits.status
     const requested = planLabelReconcile({ status: card.status, leased: card.lease !== null }, issue).requested
-    // A fresh human edit while the CP's own label write is pending defers rather than being projected over and acked.
+    // Events seen before our reassignment restart still need attribution despite its pending label write.
+    const pendingWrite = (event: LabelEvent) =>
+      !humanDoorbell && !card.needsAttention && card.labelWritePending && BigInt(event.id) > predates
     const pending = (event: LabelEvent) =>
-      !humanDoorbell &&
-      !card.needsAttention &&
-      card.labelWritePending &&
-      isHumanActor(event) &&
-      !isAppActor(event, this.deps.appSlug)
+      pendingWrite(event) && isHumanActor(event) && !isAppActor(event, this.deps.appSlug)
     if (statusEvent?.event === 'closed' || statusEvent?.event === 'reopened') {
       if (BigInt(statusEvent.id) <= consumed) return ignore
       const verdict = await this.judgeEvent(repo, statusEvent, writers)
@@ -243,13 +243,12 @@ export class KanbanSync {
       return label.verdict === 'accept' ? own : label
     }
     if (requested === undefined) {
-      // The card already matches the live status, but a non-writer's later remove+re-add can still re-author that
-      // label. A dispatchable card (ready/running) whose current status label is no longer writer-attributed reverts.
+      // A non-writer re-authoring the current ready/running label still reverts the dispatchable card.
       if (card.status !== 'ready' && card.status !== 'running') return ignore
       const current = attributeLabel(events, statusLabel(card.status))
       if (current.kind !== 'add' || BigInt(current.event.id) <= consumed) return ignore
       if (pending(current.event)) return { verdict: 'pending' }
-      if (!humanDoorbell && !card.needsAttention && card.labelWritePending) return ignore
+      if (pendingWrite(current.event)) return ignore
       const judged = await this.judgeAdd(current, repo, writers)
       return judged.verdict === 'refuse' ? { ...judged, verdict: 'revert' } : ignore
     }
@@ -258,7 +257,7 @@ export class KanbanSync {
     if (BigInt(attribution.event.id) <= consumed) return ignore
     // A failed CP status write leaves the replaced label live; a tick projects the committed status, not that old label.
     if (pending(attribution.event)) return { verdict: 'pending' }
-    if (!humanDoorbell && !card.needsAttention && card.labelWritePending) return ignore
+    if (pendingWrite(attribution.event)) return ignore
     return this.judgeAdd(attribution, repo, writers)
   }
 
@@ -308,15 +307,15 @@ export class KanbanSync {
   ): Promise<boolean> {
     const writers = new Map<string, Promise<boolean>>()
     let changed = false
-    let consumed = 0n
+    let cursors: StatusCursors = { consumed: 0n, predates: 0n }
     for (let round = 0; round < MAX_ROUNDS; round++) {
       const pass = await this.pass(boardId, issueNumber, humanDoorbell, round === 0 ? doorbell : undefined, {
         writers,
-        consumed
+        ...cursors
       })
       changed ||= pass.changed
       if (pass.rerun === undefined) return changed
-      consumed = pass.rerun
+      cursors = pass.rerun
     }
     // Still being reassigned after the bound: nothing past the last judged snapshot was acked, so the next pass resumes.
     return changed
@@ -327,8 +326,8 @@ export class KanbanSync {
     issueNumber: number,
     humanDoorbell: boolean,
     doorbell: KanbanIssueDoorbell | undefined,
-    round: { writers: Map<string, Promise<boolean>>; consumed: bigint }
-  ): Promise<{ changed: boolean; rerun?: bigint }> {
+    round: StatusCursors & { writers: Map<string, Promise<boolean>> }
+  ): Promise<{ changed: boolean; rerun?: StatusCursors }> {
     const { writers } = round
     const done = (changed: boolean) => ({ changed })
     const card = await this.deps.repo.get(boardId, issueNumber)
@@ -368,7 +367,17 @@ export class KanbanSync {
       : 'ignore'
     const status: StatusJudgement = doorbellRefusal
       ? { verdict: 'revert', actor: { login: doorbellRefusal.login, id: doorbellRefusal.id } }
-      : await this.statusVerdict({ card, edits, issue, events, repo, writers, humanDoorbell, consumed })
+      : await this.statusVerdict({
+          card,
+          edits,
+          issue,
+          events,
+          repo,
+          writers,
+          humanDoorbell,
+          consumed,
+          predates: round.predates
+        })
     // An edit that cannot be judged yet is neither reverted nor acked: the pass defers, bounded like event lag.
     if (status.verdict === 'pending') return done(await this.defer(card, repo, issue, boardId, issueNumber))
 
@@ -426,16 +435,17 @@ export class KanbanSync {
             })
           }
         }
-        // Re-run from a fresh read: a revoking reassignment already moved the card (running → ready). Only the
-        // stale running status it superseded is consumed: when the live issue already carries another status (a
-        // writer's same-snapshot blocked/triage/archived), that edit stays unjudged so the next round adopts it
-        // instead of acking it unseen; nothing in this stale snapshot is acked either way.
+        // Consume only superseded running drift; preserve same-snapshot human edits for the fresh round.
         if (result.changed || result.revokedLease) {
           const live = parseStatusLabels(issue.labels)
           const liveStillRunning =
-            live.statuses.length === 1 && live.statuses[0] === 'running' && live.malformed.length === 0
+            issue.state === 'open' &&
+            live.statuses.length === 1 &&
+            live.statuses[0] === 'running' &&
+            live.malformed.length === 0
           const consume = result.revokedLease && cursor > round.consumed && liveStillRunning ? cursor : round.consumed
-          return { changed, rerun: consume }
+          const predates = result.revokedLease && cursor > round.predates ? cursor : round.predates
+          return { changed, rerun: { consumed: consume, predates } }
         }
       }
     }

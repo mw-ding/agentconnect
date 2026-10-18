@@ -1131,3 +1131,72 @@ describe('vera-r3: 1b re-run pin', () => {
     })
   })
 })
+
+// A close event must survive the same reassignment restart as a status-label edit.
+describe('vera-r4: same-snapshot close survives reassignment', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const lease = { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+
+  it.each(
+    (['not_planned', 'completed'] as const).flatMap((reason) =>
+      (['agent-then-close', 'close-then-agent'] as const).map((order) => ({ reason, order }))
+    )
+  )('vera-r4: reassign + close $reason ($order)', async ({ reason, order }) => {
+    const f = fixture({ status: 'running', syncEventCursor: 10n, syncAgentCursor: 10n, lease })
+    f.issue.state = 'closed'
+    f.issue.stateReason = reason
+    f.issue.labels = ['ac/agent:new', 'ac/status:running']
+    const agentFirst = order === 'agent-then-close'
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:running', bob),
+      ...(agentFirst
+        ? [labelEvent(20, 'labeled', 'ac/agent:new', bob), stateEvent(21, 'closed', bob)]
+        : [stateEvent(20, 'closed', bob), labelEvent(21, 'labeled', 'ac/agent:new', bob)])
+    )
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const previousAgentId = f.card().assigneeAgentId
+      Object.assign(f.card(), {
+        status: 'ready',
+        assigneeAgentId: agentId,
+        lease: null,
+        stateRevision: 2n,
+        dispatchRevision: 2n,
+        labelWritePending: true
+      })
+      return {
+        ok: true as const,
+        changed: true,
+        card: { status: 'ready' } as never,
+        previousAgentId,
+        revokedLease: lease
+      }
+    })
+    await f.sync.onCardChanged('board', 1, true)
+    const plan = vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]
+    if (reason === 'not_planned') {
+      expect(f.card().status).toBe('archived')
+      expect(plan).toMatchObject({ addLabels: ['ac/status:archived'], removeLabels: ['ac/status:running'] })
+      expect(plan.issueState).toBeUndefined()
+      expect(plan.comment).toBeUndefined()
+    } else {
+      expect(plan.comment).toContain('`ac/status:ready` cannot move to `ac/status:done`')
+      expect(f.card().status).toBe('ready')
+      expect(plan).toMatchObject({
+        issueState: { state: 'open' },
+        addLabels: ['ac/status:ready'],
+        removeLabels: ['ac/status:running']
+      })
+    }
+    expect(f.card()).toMatchObject({
+      syncEventCursor: agentFirst ? 21n : 20n,
+      syncAgentCursor: agentFirst ? 20n : 21n,
+      labelWritePending: false,
+      lease: null
+    })
+    expect(f.deps.revoke).toHaveBeenCalledOnce()
+    expect(f.deps.repo.defer).not.toHaveBeenCalled()
+    expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'bob', id: 1 })
+  })
+})

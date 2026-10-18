@@ -234,7 +234,7 @@ describe.skipIf(!enabled)('Kanban human sync E2E (live GitHub)', () => {
           await f.ring(issue.number)
           return f.cards.getCard(card.id)
         },
-        { timeout: 30_000, interval: 500 }
+        { timeout: 90_000, interval: 500 }
       )
       .toMatchObject({
         assigneeAgentId: NEXT,

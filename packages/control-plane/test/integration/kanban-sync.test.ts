@@ -1108,6 +1108,152 @@ describe('vera-r3: same-snapshot writer status over Postgres', () => {
     return { board, card, run, state, writes, revoked, deps, read, claim }
   }
 
+  async function pgR4(labels: string[], events: LabelEvent[]) {
+    const f = await pgRunning(labels, events)
+    const record = f.deps.store.applyPlan
+    f.deps.store.applyPlan = async (repo, number, observed, plan) => {
+      await record(repo, number, observed, plan)
+      f.state.issue.labels = [
+        ...f.state.issue.labels.filter((label) => !plan.removeLabels.includes(label)),
+        ...plan.addLabels
+      ]
+      if (plan.issueState) {
+        f.state.issue.state = plan.issueState.state
+        f.state.issue.stateReason = plan.issueState.state === 'closed' ? plan.issueState.reason : null
+      }
+    }
+    return f
+  }
+
+  it.each(
+    (['not_planned', 'completed'] as const).flatMap((reason) =>
+      (['agent-then-close', 'close-then-agent'] as const).map((order) => ({ reason, order }))
+    )
+  )('vera-r4: reassign + close $reason ($order) over Postgres', async ({ reason, order }) => {
+    const agentFirst = order === 'agent-then-close'
+    const agent: LabelEvent = {
+      id: agentFirst ? 20 : 21,
+      event: 'labeled',
+      label: { name: 'ac/agent:new' },
+      actor: bob
+    }
+    const close: LabelEvent = { id: agentFirst ? 21 : 20, event: 'closed', actor: bob }
+    const f = await pgR4(
+      ['ac/agent:new', 'ac/status:running'],
+      [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+        ...(agentFirst ? [agent, close] : [close, agent])
+      ]
+    )
+    f.state.issue.state = 'closed'
+    f.state.issue.stateReason = reason
+    await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+    const row = await f.read()
+    const projection = f.writes.at(-1)!
+    if (reason === 'not_planned') {
+      expect(row.status).toBe('archived')
+      expect(f.state.issue).toMatchObject({
+        state: 'closed',
+        stateReason: 'not_planned',
+        labels: ['ac/agent:new', 'ac/status:archived']
+      })
+      expect(projection.comment).toBeUndefined()
+      expect(await f.claim()).toHaveLength(0)
+    } else {
+      expect(projection.comment).toContain('`ac/status:ready` cannot move to `ac/status:done`')
+      expect(row.status).toBe('ready')
+      expect(f.state.issue).toMatchObject({
+        state: 'open',
+        stateReason: null,
+        labels: ['ac/agent:new', 'ac/status:ready']
+      })
+      // Refusing ready → done preserves the existing dispatchable ready state.
+      expect(await f.claim()).toHaveLength(1)
+    }
+    expect(projection).toMatchObject({
+      removeLabels: ['ac/status:running'],
+      addLabels: [reason === 'not_planned' ? 'ac/status:archived' : 'ac/status:ready']
+    })
+    expect(row).toMatchObject({
+      assigneeAgentId: NEXT,
+      syncEventCursor: BigInt(close.id),
+      syncAgentCursor: BigInt(agent.id),
+      labelWritePending: false,
+      syncDeferredAt: null,
+      syncDeferralCount: 0
+    })
+    expect(f.revoked).toHaveLength(1)
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: f.run.id } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'reassigned'
+    })
+  })
+
+  it.each(['blocked', 'triage', 'archived'] as const)(
+    'vera-r4: tick adopts same-edit writer %s without deferral over Postgres',
+    async (status) => {
+      const f = await pgR4(
+        ['ac/agent:new', `ac/status:${status}`],
+        [
+          { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+          { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+          { id: 21, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: bob },
+          { id: 22, event: 'labeled', label: { name: `ac/status:${status}` }, actor: bob }
+        ]
+      )
+      await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, false)
+      expect(await f.read()).toMatchObject({
+        status,
+        assigneeAgentId: NEXT,
+        syncEventCursor: 22n,
+        labelWritePending: false,
+        syncDeferredAt: null,
+        syncDeferralCount: 0,
+        needsAttention: false
+      })
+      expect(f.revoked).toHaveLength(1)
+      expect(f.state.issue.labels).toContain(`ac/status:${status}`)
+      expect(f.writes.some((w) => w.removeLabels.includes(`ac/status:${status}`))).toBe(false)
+      expect(f.writes.some((w) => w.addLabels.includes('ac/status:ready'))).toBe(false)
+      expect(await f.claim()).toHaveLength(0)
+      const audits = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
+      expect(
+        audits.some(
+          (a) =>
+            (a.details as { to?: string; actorLogin?: string }).to === status &&
+            (a.details as { actorLogin?: string }).actorLogin === 'bob'
+        )
+      ).toBe(true)
+    }
+  )
+
+  it('vera-r4: tick refuses same-edit non-writer blocked without deferral over Postgres', async () => {
+    const f = await pgR4(
+      ['ac/agent:new', 'ac/status:blocked'],
+      [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+        { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+        { id: 21, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: mallory },
+        { id: 22, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: mallory }
+      ]
+    )
+    await new KanbanSync(f.deps).reconcileBoard(f.board.id)
+    expect(await f.read()).toMatchObject({
+      status: 'ready',
+      assigneeAgentId: NEXT,
+      syncEventCursor: 22n,
+      labelWritePending: false,
+      syncDeferredAt: null,
+      syncDeferralCount: 0
+    })
+    expect(f.writes.at(-1)).toMatchObject({
+      removeLabels: ['ac/status:blocked'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    expect(f.state.issue.labels).toEqual(['ac/agent:new', 'ac/status:ready'])
+    expect(f.revoked).toHaveLength(1)
+  })
+
   it.each(['blocked', 'triage', 'archived'] as const)(
     'vera-r3: same-edit writer %s is adopted over Postgres and never claimable as ready (PG)',
     async (status) => {
