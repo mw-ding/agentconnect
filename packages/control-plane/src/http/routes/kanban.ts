@@ -20,6 +20,7 @@ import {
   CreateKanbanBoardBody,
   ErrorDto,
   KanbanBoardCardsDto,
+  KanbanBoardCardsQuery,
   KanbanBoardDto,
   KanbanBoardExplainDto,
   KanbanBoardListDto,
@@ -508,16 +509,30 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'List a board’s cards',
           description:
-            'CP metadata for the cards of one board, for the console board view: status, assignee, effective run mode, attention and failure counters, cooldowns and the open run. Body-free: issue titles are NOT included and are never stored; read them live with `getKanbanCardTitles`. Returns at most 500 cards (priority, then age); `total` and `truncated` say when there are more. A board in another organization, or a restricted board not shared with the caller, reads as 404.',
+            'CP metadata for the cards of one board, for the console board view: status, assignee, effective run mode, attention and failure counters, cooldowns and the open run. Body-free: issue titles are NOT included and are never stored; read them live with `getKanbanCardTitles`. Returns at most 500 cards (priority, then age); `total` and `truncated` say when there are more. With `?numbers=` only those issue numbers are returned (a by-number lookup over the viewer-visible board; never truncated). A board in another organization, or a restricted board not shared with the caller, reads as 404.',
           operationId: 'listKanbanCards',
           params: KanbanBoardParams,
-          response: { 200: KanbanBoardCardsDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+          querystring: KanbanBoardCardsQuery,
+          response: { 200: KanbanBoardCardsDto, 400: ErrorDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
         }
       },
       async (req, reply) => {
         const board = await visibleBoard(req, req.params.boardId)
         if (!board) return reply.code(404).send({ ...notFound, message: 'board not found' })
-        const { cards, total } = await deps.repos.kanbanDispatch.listBoardCards(board.id, BOARD_CARDS_CAP)
+        let filter: number[] | undefined
+        if (req.query.numbers !== undefined) {
+          const parsed = parseIssueNumbers(req.query.numbers)
+          if (!parsed) {
+            return reply.code(400).send({
+              error: 'Bad Request',
+              statusCode: 400,
+              code: 'invalid_numbers',
+              message: 'numbers must be comma-separated positive issue numbers'
+            })
+          }
+          filter = parsed
+        }
+        const { cards, total } = await deps.repos.kanbanDispatch.listBoardCards(board.id, BOARD_CARDS_CAP, filter)
         return {
           boardId: board.id,
           cards: cards.map((c) => cardMetaDto(c, board.defaultMode)),
@@ -535,7 +550,7 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'Read live issue titles for cards',
           description:
-            'Reads the titles and open/closed state of up to 100 cards from GitHub live, with the read-scoped Kanban card token for this board’s repository, and returns them with `Cache-Control: no-store`. Titles are UNTRUSTED external text: render as plain text. They are never written to the database, never logged and never cached. Numbers that are not cards of this board, or that GitHub no longer serves as an issue, come back in `missing`. GitHub failures answer 409 `github_app_not_configured`, 429 `github_rate_limited` or 502 `github_unavailable` without affecting the cards route.',
+            'Reads the titles and open/closed state of up to 100 cards from GitHub live, with the read-scoped Kanban card token for this board’s repository, and returns them with `Cache-Control: no-store`. Titles are UNTRUSTED external text: render as plain text. They are cached in memory for 60 s (bounded, single-flight per issue, revalidated with ETags), never persisted or logged. Numbers that are not cards of this board, or that GitHub no longer serves as an issue, come back in `missing`. GitHub failures answer 409 `github_app_not_configured`, 429 `github_rate_limited` or 502 `github_unavailable` without affecting the cards route.',
           operationId: 'getKanbanCardTitles',
           params: KanbanBoardParams,
           querystring: KanbanTitlesQuery,

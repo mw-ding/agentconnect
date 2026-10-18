@@ -8105,7 +8105,11 @@ export interface KanbanDispatchRepo {
   /** Read-only dry run for every non-terminal card plus the ordered ids the claim would take now; null for a missing board. */
   explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null>
   /** Body-free metadata of up to `limit` cards of one board (console board view), plus the board's total card count. */
-  listBoardCards(boardId: string, limit: number): Promise<{ cards: KanbanBoardCardRow[]; total: number }>
+  listBoardCards(
+    boardId: string,
+    limit: number,
+    numbers?: readonly number[]
+  ): Promise<{ cards: KanbanBoardCardRow[]; total: number }>
   /** Which of these issue numbers are cards of this board; the titles route reads only those. */
   cardNumbersOnBoard(boardId: string, numbers: readonly number[]): Promise<number[]>
 }

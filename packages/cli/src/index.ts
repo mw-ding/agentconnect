@@ -302,7 +302,7 @@ async function main(): Promise<void> {
     .option('--board <id>', 'Kanban board id')
     .option('--card <id>', 'explain one card by id')
     .option('--issue <n>', 'explain one card by its issue number')
-    .option('--org <id>', 'organization id or slug (default: the key’s only organization)')
+    .option('--org <id|slug>', 'organization id or slug (default: the key’s only organization)')
     .option('--json', 'print the control plane’s JSON')
     .action(async (o: { board?: string; card?: string; issue?: string; org?: string; json?: boolean }) => {
       const global = program.opts()

@@ -807,10 +807,16 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     })
   }
 
-  async listBoardCards(boardId: string, limit: number): Promise<{ cards: KanbanBoardCardRow[]; total: number }> {
+  async listBoardCards(
+    boardId: string,
+    limit: number,
+    numbers?: readonly number[]
+  ): Promise<{ cards: KanbanBoardCardRow[]; total: number }> {
+    // A by-number lookup narrows both the listing and its total, so the viewer sees exactly what was asked for.
+    const where = { boardId, ...(numbers ? { issueNumber: { in: [...numbers] } } : {}) }
     const [rows, total] = await Promise.all([
       this.db.kanbanCard.findMany({
-        where: { boardId },
+        where,
         orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
         take: limit,
         select: {
@@ -839,7 +845,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           }
         }
       }),
-      this.db.kanbanCard.count({ where: { boardId } })
+      this.db.kanbanCard.count({ where })
     ])
     return {
       total,

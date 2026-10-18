@@ -4579,6 +4579,10 @@ export const KanbanBoardCardsDto = z.object({
   total: z.number().int(),
   truncated: z.boolean()
 })
+export const KanbanBoardCardsQuery = z.object({
+  /** A by-number lookup: restrict the listing to these issue numbers (a filtered view is never truncated). */
+  numbers: z.string().min(1).max(2000).optional()
+})
 export const KanbanTitlesQuery = z.object({
   /** Comma-separated issue numbers, at most 100, each a card of this board. */
   numbers: z.string().min(1).max(2000)

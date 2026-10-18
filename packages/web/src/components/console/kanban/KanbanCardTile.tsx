@@ -83,7 +83,7 @@ export function KanbanCardTile({
 }) {
   const t = useTranslations('Kanban')
   const [explainOpen, setExplainOpen] = useState(false)
-  const [pendingWrite, setPendingWrite] = useState(false)
+  const [pendingMode, setPendingMode] = useState<KanbanRunMode | null | undefined>(undefined)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const assignee = card.assignee ? (card.assignee.displayName ?? card.assignee.name) : null
@@ -93,7 +93,7 @@ export function KanbanCardTile({
     setError(null)
     try {
       await setKanbanCardMode(boardId, card.id, mode)
-      setPendingWrite(false)
+      setPendingMode(undefined)
       onChanged()
     } catch (err) {
       setError(modeErrorMessage(err, t))
@@ -102,13 +102,16 @@ export function KanbanCardTile({
     }
   }
 
+  // The confirm guards the EFFECTIVE mode: choosing "inherit" on a write-default board becomes write too.
   const onSelect = (value: string) => {
-    if (value === 'write') {
+    const selected: KanbanRunMode | null = value === 'write' ? 'write' : value === 'read' ? 'read' : null
+    const effective: KanbanRunMode = selected ?? boardDefaultMode
+    if (effective === 'write') {
       setError(null)
-      setPendingWrite(true)
+      setPendingMode(selected)
     } else {
-      setPendingWrite(false)
-      void applyMode(value === 'read' ? 'read' : null)
+      setPendingMode(undefined)
+      void applyMode(selected)
     }
   }
 
@@ -194,14 +197,14 @@ export function KanbanCardTile({
           </select>
         </label>
       )}
-      {pendingWrite && (
+      {pendingMode !== undefined && (
         <ConfirmStrip
           prompt={t('confirmCardWrite')}
           confirm={t('confirmWrite')}
           keep={t('cancel')}
           busy={busy}
-          onConfirm={() => void applyMode('write')}
-          onKeep={() => setPendingWrite(false)}
+          onConfirm={() => void applyMode(pendingMode)}
+          onKeep={() => setPendingMode(undefined)}
         />
       )}
       {error && (

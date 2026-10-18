@@ -57,7 +57,7 @@ beforeEach(() => {
 
 describe('vera-528: title TTL cache', () => {
   it('vera-528: a repeated board view within TTL makes zero second GitHub calls', async () => {
-    let now = 1_000_000
+    const now = 1_000_000
     const fetchImpl = vi.fn(async (url: string) => issueResponse(Number(/\/issues\/(\d+)$/.exec(url)?.[1])))
     const { src, mint } = source(fetchImpl, { clock: () => now })
     const first = await src.read(BOARD, [1, 2, 3])

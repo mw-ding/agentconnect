@@ -106,10 +106,15 @@ async function getJson<T>(deps: DryRunDeps, opts: DryRunOpts, path: string): Pro
   return (await res.json()) as T
 }
 
-/** The organization to address: the flag, else the caller's only one. */
+/** The organization to address: the flag (an id or a slug), else the caller's only one. */
 async function resolveOrg(deps: DryRunDeps, opts: DryRunOpts): Promise<string> {
-  if (opts.org) return opts.org
-  const orgs = await getJson<Array<{ id: string }>>(deps, opts, '/orgs')
+  const orgs = await getJson<Array<{ id: string; slug?: string }>>(deps, opts, '/orgs')
+  if (opts.org) {
+    // The org-scope guard compares the path against the org id, so a slug must be resolved first.
+    const match = orgs.find((o) => o.id === opts.org || o.slug === opts.org)
+    if (!match) throw new DispatchDryRunError(`organization '${opts.org}' not found`, 'not_found')
+    return match.id
+  }
   if (orgs.length === 1) return orgs[0]!.id
   if (orgs.length === 0) throw new DispatchDryRunError('this key belongs to no organization')
   throw new DispatchDryRunError(`this key belongs to ${orgs.length} organizations; pass --org <id|slug>`)
@@ -143,7 +148,12 @@ export async function runDispatchDryRun(opts: DryRunOpts, deps: DryRunDeps): Pro
 
   let cardId = opts.card
   if (cardId === undefined) {
-    const listed = await getJson<{ cards: Array<{ id: string; issueNumber: number }> }>(deps, opts, `${board}/cards`)
+    // A by-number lookup, so a board holding more than the 500-card list cap can never read as "no card #N".
+    const listed = await getJson<{ cards: Array<{ id: string; issueNumber: number }> }>(
+      deps,
+      opts,
+      `${board}/cards?numbers=${opts.issue}`
+    )
     cardId = listed.cards.find((c) => c.issueNumber === opts.issue)?.id
     if (cardId === undefined) throw new DispatchDryRunError(`no card #${opts.issue} on this board`, 'not_found')
   }

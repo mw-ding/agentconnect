@@ -97,7 +97,7 @@ export interface ClaimSimulation {
   capBound: Map<string, ClaimCapGate>
 }
 
-/** The claim's candidate order: priority DESC, createdAt ASC, id ASC. */
+/** The claim's candidate order: priority DESC, createdAt ASC, id ASC (at millisecond precision, for exact values). */
 export function compareClaimOrder(a: ClaimCandidate, b: ClaimCandidate): number {
   if (a.priority !== b.priority) return b.priority - a.priority
   const byAge = a.createdAt.getTime() - b.createdAt.getTime()
@@ -105,14 +105,21 @@ export function compareClaimOrder(a: ClaimCandidate, b: ClaimCandidate): number 
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
-/** Replays `PgKanbanDispatchRepo.claim`'s loop over the cards `explainClaim` finds eligible, with caps applied cumulatively. */
+/** Replays `PgKanbanDispatchRepo.claim`'s loop over the cards `explainClaim` finds eligible, with caps applied cumulatively.
+ *  Candidates must arrive in the claim's SQL order (priority DESC, createdAt ASC, id ASC); see below for why. */
 export function simulateClaim(candidates: readonly ClaimCandidate[], caps: ClaimSimulationCaps): ClaimSimulation {
   const order: string[] = []
   const capBound = new Map<string, ClaimCapGate>()
   const perAgent = new Map(caps.openPerAgent)
   let inProgress = caps.openTotal
   const room = Math.min(caps.maxInProgress - inProgress, caps.limit ?? Number.POSITIVE_INFINITY)
-  const eligible = candidates.filter((c) => c.verdict.eligible).sort(compareClaimOrder)
+  // WHY no id tiebreak here: PG orders timestamptz(6) at microsecond precision while a JS Date carries milliseconds,
+  // so compareClaimOrder's id fallback would put a newer card with a smaller id ahead of an older one born less than
+  // a millisecond earlier. The input already arrives in exact SQL order and sort is stable, so sub-ms ties keep that
+  // order — which matches the claim exactly, including its id ASC rule for true microsecond ties.
+  const eligible = candidates
+    .filter((c) => c.verdict.eligible)
+    .sort((a, b) => b.priority - a.priority || a.createdAt.getTime() - b.createdAt.getTime())
   for (const card of eligible) {
     const agentId = card.verdict.eligible ? card.verdict.agentId : ''
     if (order.length >= room || inProgress >= caps.maxInProgress) {

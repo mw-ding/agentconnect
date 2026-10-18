@@ -6,6 +6,7 @@ import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import type { KanbanStatus } from '../../src/kanban/card-state.js'
+import type { Prisma } from '../../src/generated/prisma/client.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
 const D2 = 'd2222222-2222-4222-8222-222222222222'
@@ -208,5 +209,73 @@ describe('claim dry run parity (real Postgres)', () => {
     const repo = new PgKanbanDispatchRepo(prisma)
     expect((await repo.explainCard(b.id, c.id, opts))!.verdict).toEqual({ eligible: false, gate: 'agent_missing' })
     expect(await repo.claim(b.id, opts)).toEqual([])
+  })
+
+  it('vera-528: sub-millisecond age order matches the claim exactly', async () => {
+    await seedAgents()
+    const b = await board(1, 5)
+    // The older card carries the LARGER id and the newer one is 800µs younger: millisecond precision (plus the old id
+    // tiebreak) would order them backwards, while PG's timestamptz(6) does not. Prisma writes createdAt at ms
+    // precision, so both rows go in by raw SQL.
+    const olderId = 'f0000000-0000-4000-8000-000000000001'
+    const newerId = '10000000-0000-4000-8000-000000000001'
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO "kanban_card" ("id", "boardId", "issueId", "issueNumber", "status", "assigneeAgentId", "priority", "createdAt", "updatedAt")
+       VALUES ($1, $2, 9001, 901, 'ready', $3, 0, $4, $4),
+              ($5, $2, 9002, 902, 'ready', $3, 0, $4 + interval '800 microseconds', $4 + interval '800 microseconds')`,
+      olderId,
+      b.id,
+      A1,
+      NOW,
+      newerId
+    )
+    const repo = new PgKanbanDispatchRepo(prisma)
+    const explanation = (await repo.explainBoard(b.id, opts))!
+    expect(explanation.wouldClaimNext).toEqual([olderId])
+    expect(await repo.claim(b.id, opts)).toMatchObject([{ cardId: olderId }])
+  })
+
+  it('vera-528: the dry run takes no row locks — it runs in a read-only transaction', async () => {
+    await seedAgents()
+    const b = await board(5, 5)
+    const c = await card(b.id, 1)
+    const before = await snapshot()
+    // A refusal poisons its transaction, so each probe below gets a fresh read-only one; the sentinel rolls it back.
+    class RoDone extends Error {}
+    const readOnly = async (fn: (tx: Prisma.TransactionClient) => Promise<void>) => {
+      await prisma
+        .$transaction(async (tx) => {
+          await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+          await fn(tx)
+          throw new RoDone()
+        })
+        .catch((e: unknown) => {
+          if (!(e instanceof RoDone)) throw e
+        })
+    }
+    // (Prisma reports the Postgres code inside the P2010 message: "Raw query failed. Code: `25006`. ...".)
+    const pgCode = (e: unknown) => /Code: `(\d+)`/.exec((e as { message?: string })?.message ?? '')?.[1]
+    await readOnly(async (tx) => {
+      const repo = new PgKanbanDispatchRepo(tx)
+      expect((await repo.explainBoard(b.id, opts))!.cards.map((e) => e.cardId)).toContain(c.id)
+      expect((await repo.explainCard(b.id, c.id, opts))!.cardId).toBe(c.id)
+      expect((await repo.listBoardCards(b.id, 500)).cards.map((r) => r.id)).toContain(c.id)
+    })
+    await readOnly(async (tx) => {
+      const claimed = await new PgKanbanDispatchRepo(tx).claim(b.id, opts).then(
+        () => null,
+        (e: unknown) => e
+      )
+      expect(pgCode(claimed)).toBe('25006')
+    })
+    await readOnly(async (tx) => {
+      // Control: a row lock on the same session is refused, so a lock-taking read could not hide here.
+      const lock = await tx.$queryRawUnsafe('SELECT 1 FROM "kanban_card" WHERE "id" = $1::uuid FOR UPDATE', c.id).then(
+        () => null,
+        (e: unknown) => e
+      )
+      expect(pgCode(lock)).toBe('25006')
+    })
+    expect(await snapshot()).toEqual(before)
   })
 })

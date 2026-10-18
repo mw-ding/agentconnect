@@ -33,6 +33,12 @@ const blocked = (n: number, gate: string, hint: string, status = 'ready') =>
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
+/** `/orgs` answers the org list (the dry run always resolves the org through it); every other path gets `body`. */
+const withOrgList =
+  (body: unknown, status = 200) =>
+  async (url: string) =>
+    String(url).endsWith('/orgs') ? json([{ id: ORG, slug: 'org-1-slug', name: 'Org 1' }]) : json(body, status)
+
 let lines: string[]
 let fetchMock: ReturnType<typeof vi.fn>
 const deps = () => ({ fetch: fetchMock as unknown as typeof fetch, out: (l: string) => void lines.push(l) })
@@ -78,15 +84,18 @@ describe('formatEntry', () => {
 
 describe('board mode', () => {
   it('prints each card, then what the next claim would take', async () => {
-    fetchMock.mockImplementation(async () =>
-      json({
+    fetchMock.mockImplementation(
+      withOrgList({
         cards: [entry(1), blocked(2, 'no_assignee', 'no agent is assigned to this card'), entry(5)],
         wouldClaimNext: ['card-1', 'card-5'],
         wouldClaimNextIssueNumbers: [1, 5]
       })
     )
     await runDispatchDryRun(opts, deps())
-    expect(urls()).toEqual([`https://cp.example.com/api/v1/orgs/${ORG}/kanban/boards/${BOARD}/explain`])
+    expect(urls()).toEqual([
+      'https://cp.example.com/api/v1/orgs',
+      `https://cp.example.com/api/v1/orgs/${ORG}/kanban/boards/${BOARD}/explain`
+    ])
     expect(lines).toEqual([
       '#1 ready → ELIGIBLE (work → agent agent-1)',
       '#2 ready → blocked by no_assignee: no agent is assigned to this card',
@@ -96,15 +105,13 @@ describe('board mode', () => {
   })
 
   it('says none when nothing would be claimed', async () => {
-    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    fetchMock.mockImplementation(withOrgList({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchDryRun(opts, deps())
     expect(lines).toEqual(['would claim next: (none)'])
   })
 
   it('sends the key as a bearer header and never prints it', async () => {
-    fetchMock.mockImplementation(async () =>
-      json({ cards: [entry(1)], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] })
-    )
+    fetchMock.mockImplementation(withOrgList({ cards: [entry(1)], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchDryRun(opts, deps())
     const init = fetchMock.mock.calls[0]![1] as RequestInit
     expect((init.headers as Record<string, string>).authorization).toBe('Bearer sekret-key')
@@ -113,7 +120,7 @@ describe('board mode', () => {
 
   it('prints the control plane’s JSON with --json', async () => {
     const body = { cards: [entry(1)], wouldClaimNext: ['card-1'], wouldClaimNextIssueNumbers: [1] }
-    fetchMock.mockImplementation(async () => json(body))
+    fetchMock.mockImplementation(withOrgList(body))
     await runDispatchDryRun({ ...opts, json: true }, deps())
     expect(JSON.parse(lines.join('\n'))).toEqual(body)
   })
@@ -121,34 +128,59 @@ describe('board mode', () => {
 
 describe('card mode', () => {
   it('explains one card by id', async () => {
-    fetchMock.mockImplementation(async () => json(blocked(4, 'agent_paused', 'the assigned agent is paused')))
+    fetchMock.mockImplementation(withOrgList(blocked(4, 'agent_paused', 'the assigned agent is paused')))
     await runDispatchDryRun({ ...opts, card: 'card-4' }, deps())
-    expect(urls()).toEqual([`https://cp.example.com/api/v1/orgs/${ORG}/kanban/boards/${BOARD}/cards/card-4/explain`])
+    expect(urls()).toEqual([
+      'https://cp.example.com/api/v1/orgs',
+      `https://cp.example.com/api/v1/orgs/${ORG}/kanban/boards/${BOARD}/cards/card-4/explain`
+    ])
     expect(lines).toEqual(['#4 ready → blocked by agent_paused: the assigned agent is paused'])
   })
 
-  it('resolves an issue number through the cards list, then explains that card', async () => {
+  it('resolves an issue number through a by-number lookup, then explains that card', async () => {
     fetchMock.mockImplementation(async (url: string) =>
-      String(url).endsWith('/cards')
-        ? json({
-            cards: [
-              { id: 'card-9', issueNumber: 9 },
-              { id: 'card-12', issueNumber: 12 }
-            ]
-          })
-        : json(entry(12))
+      String(url).endsWith('/orgs')
+        ? json([{ id: ORG, slug: 'org-1-slug', name: 'Org 1' }])
+        : String(url).includes('/cards?')
+          ? json({
+              cards: [
+                { id: 'card-9', issueNumber: 9 },
+                { id: 'card-12', issueNumber: 12 }
+              ]
+            })
+          : json(entry(12))
     )
     await runDispatchDryRun({ ...opts, issue: 12 }, deps())
-    expect(urls()).toHaveLength(2)
-    expect(urls()[0]).toMatch(/\/cards$/)
-    expect(urls()[1]).toMatch(/\/cards\/card-12\/explain$/)
+    expect(urls()).toHaveLength(3)
+    expect(urls()[1]).toContain('/cards?numbers=12')
+    expect(urls()[2]).toMatch(/\/cards\/card-12\/explain$/)
     expect(lines).toEqual(['#12 ready → ELIGIBLE (work → agent agent-1)'])
   })
 
   it('reports an issue that is not a card of the board', async () => {
-    fetchMock.mockImplementation(async () => json({ cards: [{ id: 'card-9', issueNumber: 9 }] }))
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/orgs')
+        ? json([{ id: ORG, slug: 'org-1-slug', name: 'Org 1' }])
+        : json({ cards: [], total: 0, truncated: false })
+    )
     await expect(runDispatchDryRun({ ...opts, issue: 404 }, deps())).rejects.toThrow('no card #404 on this board')
     expect(lines).toEqual([])
+  })
+
+  it('vera-528: --issue looks the card up by number even when the board list is truncated', async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/orgs')
+        ? json([{ id: ORG, slug: 'org-1-slug', name: 'Org 1' }])
+        : String(url).includes('/explain')
+          ? json(entry(12))
+          : String(url).includes('numbers=')
+            ? json({ boardId: BOARD, cards: [{ id: 'card-12', issueNumber: 12 }], total: 1, truncated: false })
+            : json({ boardId: BOARD, cards: [{ id: 'card-9', issueNumber: 9 }], total: 600, truncated: true })
+    )
+    await runDispatchDryRun({ ...opts, issue: 12 }, deps())
+    expect(urls()[1]).toContain('numbers=12')
+    expect(urls()[2]).toMatch(/\/cards\/card-12\/explain$/)
+    expect(lines).toEqual(['#12 ready → ELIGIBLE (work → agent agent-1)'])
   })
 
   it('refuses both --card and --issue without calling the control plane', async () => {
@@ -178,6 +210,38 @@ describe('organization resolution', () => {
     fetchMock.mockImplementationOnce(async () => json([]))
     await expect(runDispatchDryRun(noOrg, deps())).rejects.toThrow(/no organization/)
   })
+
+  it('vera-528: --org resolves a slug to the id through /orgs', async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/orgs')
+        ? json([{ id: 'org-9', slug: 'acme', name: 'Acme' }])
+        : json({ cards: [entry(1)], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] })
+    )
+    await runDispatchDryRun({ ...opts, org: 'acme' }, deps())
+    expect(urls()[0]).toMatch(/\/orgs$/)
+    expect(urls()[1]).toContain('/orgs/org-9/kanban/boards/')
+  })
+
+  it('vera-528: --org accepts an id as-is', async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/orgs')
+        ? json([{ id: 'org-9', slug: 'acme', name: 'Acme' }])
+        : json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] })
+    )
+    await runDispatchDryRun({ ...opts, org: 'org-9' }, deps())
+    expect(urls()[1]).toContain('/orgs/org-9/kanban/boards/')
+  })
+
+  it('vera-528: an unknown --org fails without touching any board route', async () => {
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/orgs') ? json([{ id: 'org-9', slug: 'acme' }]) : json({ cards: [] })
+    )
+    const err = await runDispatchDryRun({ ...opts, org: 'nope' }, deps()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(DispatchDryRunError)
+    expect((err as DispatchDryRunError).code).toBe('not_found')
+    expect((err as Error).message).toContain("organization 'nope' not found")
+    expect(urls()).toHaveLength(1)
+  })
 })
 
 describe('errors', () => {
@@ -190,12 +254,12 @@ describe('errors', () => {
     ],
     [404, { code: 'not_found', message: 'board not found' }, '404 not_found: board not found']
   ])('reports HTTP %s with the stable code and message', async (status, body, expected) => {
-    fetchMock.mockImplementation(async () => json(body, status))
+    fetchMock.mockImplementation(withOrgList(body, status))
     await expect(runDispatchDryRun(opts, deps())).rejects.toThrow(expected)
   })
 
   it('exposes the code on the error', async () => {
-    fetchMock.mockImplementation(async () => json({ code: 'not_found', message: 'board not found' }, 404))
+    fetchMock.mockImplementation(withOrgList({ code: 'not_found', message: 'board not found' }, 404))
     const err = await runDispatchDryRun(opts, deps()).catch((e: unknown) => e)
     expect((err as DispatchDryRunError).code).toBe('not_found')
   })
@@ -238,7 +302,7 @@ describe('runDispatchCommand', () => {
 
   it('uses the stored login URL with an explicit personal key, never the stored daemon key', async () => {
     writeLogin()
-    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    fetchMock.mockImplementation(withOrgList({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchCommand({ root: dir, dryRun: true, board: BOARD, org: ORG, apiKey: 'personal-key' }, deps())
     expect(urls()[0]).toMatch(/^https:\/\/stored\.example\.com\/api\/v1\//)
     expect(((fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
@@ -248,7 +312,7 @@ describe('runDispatchCommand', () => {
 
   it('lets --api-url and --api-key override the stored login', async () => {
     writeLogin()
-    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    fetchMock.mockImplementation(withOrgList({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchCommand(
       { root: dir, dryRun: true, board: BOARD, org: ORG, apiUrl: 'ws://localhost:8080/daemon/ws', apiKey: 'flag-key' },
       deps()
@@ -310,20 +374,20 @@ describe('vera-528: personal API key rule', () => {
 
   it('vera-528: AGENTCONNECT_API_KEY supplies the personal key with no stored file', async () => {
     process.env.AGENTCONNECT_API_KEY = 'env-personal-key'
-    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    fetchMock.mockImplementation(withOrgList({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchCommand(
       { root: dir, dryRun: true, board: BOARD, org: ORG, apiUrl: 'wss://cp.example.com/daemon/ws' },
       deps()
     )
-    expect(urls()).toHaveLength(1)
-    expect(((fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
+    expect(urls()).toHaveLength(2)
+    expect(((fetchMock.mock.calls[1]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
       'Bearer env-personal-key'
     )
   })
 
   it('vera-528: --api-key wins over AGENTCONNECT_API_KEY', async () => {
     process.env.AGENTCONNECT_API_KEY = 'env-personal-key'
-    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    fetchMock.mockImplementation(withOrgList({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
     await runDispatchCommand(
       {
         root: dir,
