@@ -76,6 +76,11 @@ export const KANBAN_ORCHESTRATE_REFUSAL_TEXT: Record<KanbanOrchestrateRefusalCod
   github_partial: 'the card was registered but some GitHub metadata writes failed (safe to retry)'
 }
 
+// Entries older than this are pruned, so a journal lost longer ago can hide nothing.
+const PENDING_TTL_MS = 60 * 60 * 1000
+// GitHub's issue listing can trail a landed POST by this long.
+const MARKER_LISTING_LAG_MS = 60_000
+
 const refusalText = (code: KanbanOrchestrateRefusalCode): string => KANBAN_ORCHESTRATE_REFUSAL_TEXT[code] ?? code
 
 /** sha256 over the masked title and body; the CP keys the B1 idempotency record on this, so no spec text crosses. */
@@ -92,10 +97,13 @@ export class KanbanOrchestratorTools {
   // Retain filed issues briefly so a failed commit can retry without a second POST.
   private readonly pending: PendingCreateMap
   private readonly boardRepos = new Map<string, string>()
+  // When a corrupt journal was loaded; any POST it hid landed before this.
+  private lostJournalAt: number | undefined
 
   constructor(private readonly deps: KanbanOrchestratorToolsDeps) {
     // A restart rebuilds the toolset, so the journal restores the pending map first.
     this.pending = loadPendingJournal(deps.journalPath, deps.log, this.now())
+    if (this.pending.unknown) this.lostJournalAt = this.now()
     this.prunePending()
   }
 
@@ -166,7 +174,9 @@ export class KanbanOrchestratorTools {
           specDigest
         })
       )
-      const recovery = pending?.issueNumber === null || this.pending.unknown
+      const intent = pending?.issueNumber === null
+      const lostAge = this.lostJournalAge()
+      const recovery = intent || lostAge !== undefined
       const rejectedIssueNumbers = pending?.rejectedIssueNumbers
       this.pending.set(mapKey, {
         issueNumber: null,
@@ -175,23 +185,24 @@ export class KanbanOrchestratorTools {
       })
       this.prunePending()
       if (!this.saveJournal()) return { refused: 'could not persist the issue create intent', retryable: true }
+      let found: number | null = null
       if (recovery) {
-        issueNumber = await this.deps.findIssue(
-          req.agentId,
-          repoFullName,
-          marker,
-          prepared.appLogin,
-          rejectedIssueNumbers
-        )
-        // A POST may have landed but still be invisible; leave the intent for a later retry.
-        if (issueNumber === null) return { refused: refusalText('github_unavailable'), retryable: true }
-      } else {
-        issueNumber = await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`)
+        found = await this.deps.findIssue(req.agentId, repoFullName, marker, prepared.appLogin, rejectedIssueNumbers)
+        // A POST may have landed but still be invisible; a lost journal stops hiding one once the lag has passed.
+        if (found === null && (intent || lostAge! < MARKER_LISTING_LAG_MS)) {
+          if (!intent) {
+            this.pending.delete(mapKey)
+            this.saveJournal()
+          }
+          return { refused: refusalText('github_unavailable'), retryable: true }
+        }
       }
+      issueNumber =
+        found ?? (await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`))
       this.pending.set(mapKey, {
         issueNumber,
         filedAt: this.now(),
-        ...(recovery ? { lookedUp: true } : {}),
+        ...(found !== null ? { lookedUp: true } : {}),
         ...(rejectedIssueNumbers ? { rejectedIssueNumbers } : {})
       })
       this.saveJournal()
@@ -249,6 +260,15 @@ export class KanbanOrchestratorTools {
     return this.deps.now?.() ?? Date.now()
   }
 
+  // How long ago a corrupt journal was loaded, until its lost entries would have expired.
+  private lostJournalAge(): number | undefined {
+    if (this.lostJournalAt === undefined) return undefined
+    const age = this.now() - this.lostJournalAt
+    if (age <= PENDING_TTL_MS) return age
+    this.lostJournalAt = undefined
+    return undefined
+  }
+
   private revokeToken(agentId: string, board: string, code: KanbanOrchestrateRefusalCode): void {
     if (code !== 'not_orchestrator' && code !== 'board_disabled') return
     const repo = this.boardRepos.get(JSON.stringify([agentId, board]))
@@ -263,7 +283,7 @@ export class KanbanOrchestratorTools {
   private prunePending(): void {
     const now = this.now()
     for (const [key, entry] of this.pending) {
-      if (now - (entry.issueNumber === null ? entry.startedAt : entry.filedAt) > 60 * 60 * 1000)
+      if (now - (entry.issueNumber === null ? entry.startedAt : entry.filedAt) > PENDING_TTL_MS)
         this.pending.delete(key)
     }
     // Map insertion order keeps eviction tied to the file time, even after retries.

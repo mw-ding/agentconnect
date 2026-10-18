@@ -566,6 +566,38 @@ describe('vera-349: safe recovery', () => {
     }
   )
 
+  it('vera-349: a corrupt journal blocks fresh creates only through the listing lag, then files once', async () => {
+    const journalPath = pathFor()
+    writeFileSync(journalPath, 'lost journal contents')
+    let now = 1_000_000
+    const findIssue = vi.fn(async () => null)
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: async (p) =>
+        p.op === 'prepare_create'
+          ? { ok: true, op: p.op, verdict: 'proceed' }
+          : { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 },
+      repoFullNameFor: async () => 'acme/web',
+      findIssue,
+      fileIssue,
+      journalPath,
+      now: () => now
+    })
+    // Inside the lag a landed POST may still be unlisted, so refuse without leaving an intent that outlives it.
+    expect(await svc.create(req)).toMatchObject({ refused: expect.any(String), retryable: true })
+    expect(fileIssue).not.toHaveBeenCalled()
+    expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toEqual({})
+    now += 60_000
+    expect(await svc.create(req)).toMatchObject({ created: true, issueNumber: 42 })
+    expect(findIssue).toHaveBeenCalledTimes(2)
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    // Past the one-hour retention nothing lost can remain, so ordinary creates skip lookup again.
+    now += 60 * 60 * 1000
+    expect(await svc.create({ ...req, step: 'later' })).toMatchObject({ created: true })
+    expect(findIssue).toHaveBeenCalledTimes(2)
+    expect(fileIssue).toHaveBeenCalledTimes(2)
+  })
+
   it('vera-349: a transient commit refusal retains the filed number', async () => {
     const h = tools(async (p) =>
       p.op === 'prepare_create'

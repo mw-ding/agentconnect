@@ -298,6 +298,19 @@ describe('KanbanOrchestrator commit_create', () => {
     expect(plan.addLabels).toContain('ac/status:todo')
     expect(plan.addLabels).toContain('ac/agent:ash')
   })
+
+  it('vera-349: a label write failure after the card commits is github_partial, not github_unavailable', async () => {
+    const h = harness()
+    h.store.applyPlan.mockRejectedValueOnce(new Error('label write failed'))
+    expect(
+      await h.svc.orchestrate(
+        ORG,
+        AGENT,
+        req('commit_create', { step: 's', specDigest: 'a'.repeat(64), issueNumber: 7, blockedBy: [2] })
+      )
+    ).toEqual({ ok: false, op: 'commit_create', code: 'github_partial' })
+    expect(h.orchestrator.createEpicChild).toHaveBeenCalled()
+  })
 })
 
 describe('KanbanOrchestrator link/unblock/assign', () => {

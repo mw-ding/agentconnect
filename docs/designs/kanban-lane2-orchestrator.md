@@ -67,10 +67,13 @@ the B1 idempotency and B2 budget checks.
   looked-up issues (`issue_not_from_app`, `issue_mismatch`, `key_conflict`) are journaled as rejected and skipped
   on later lookups, including after restart.
 - An unresolved intent returns a retryable `github_unavailable` result without another POST; later calls can
-  retry lookup during the one-hour retention period. A repo with more than 300 updates in 24 hours can hide
-  the orphan outside the lookup bound, now a recovery-only limitation. After intent expiry/eviction, deleting
-  the journal, or losing its storage, a retry can still file a duplicate. That first uncommitted orphan stays
-  open and unlabelled: B1 and duplicate-close cannot retire an issue never presented to `commit_create`.
+  retry lookup during the one-hour retention period. A corrupt journal has no per-key intents, so for one hour
+  after it loads every fresh create looks up first; a miss refuses retryably without journaling an intent only
+  during the first 60 seconds (GitHub's listing lag past any POST it hid), then files normally. A repo with
+  more than 300 updates in 24 hours can hide the orphan outside the lookup bound, now a recovery-only
+  limitation. After intent expiry/eviction, deleting the journal, or losing its storage, a retry can still file
+  a duplicate. That first uncommitted orphan stays open and unlabelled: B1 and duplicate-close cannot retire an
+  issue never presented to `commit_create`.
 - `commit_create` then registers the issue through `createEpicChild`: one transaction locks the epic card
   `FOR UPDATE`, re-checks B2, and composes the Lane 1 `upsertCard` (B1 key, `source: 'orchestrator'`,
   `actorAgentId`). Labels (`ac/status:<status>`, `ac/agent:<slug>`) and the epic sub-issue / `blocked_by` edges are
