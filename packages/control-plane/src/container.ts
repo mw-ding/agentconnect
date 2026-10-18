@@ -1,3 +1,4 @@
+import { KanbanSync } from './kanban/sync.js'
 import { KanbanImporter } from './kanban/importer.js'
 import { GithubRepoPermission } from './github/repo-permission.js'
 import { CodeHostFeedbackService } from './codehost/feedback.service.js'
@@ -182,6 +183,7 @@ import {
   PgHookSecretStore,
   PgKanbanBoardRepo,
   PgKanbanDispatchRepo,
+  PgKanbanSyncRepo,
   PgKanbanCardRepo,
   PgKanbanNotifyRepo,
   PgRuntimeProfileRepo,
@@ -1764,6 +1766,12 @@ export function buildContainer(
     ? new GithubCardStore({
         tokens: kanbanTokens,
         appSlug: githubAppCfg?.slug,
+        // Uncached: the store's own human-writer gate re-checks the actor's live write grant.
+        permissions: new GithubRepoPermission({
+          tokens: kanbanTokens,
+          ttlMs: 0,
+          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+        }),
         // The same GitHub transport as the token mint, so an injected fetch covers card reads and label writes too.
         ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
       })
@@ -1773,6 +1781,7 @@ export function buildContainer(
     kanbanCardStore && kanbanTokens
       ? new KanbanImporter({
           cards: repos.kanbanCard,
+          boards: repos.kanbanBoard,
           store: kanbanCardStore,
           permissions: new GithubRepoPermission({
             tokens: kanbanTokens,
@@ -1798,10 +1807,64 @@ export function buildContainer(
       })
     : undefined
 
+  const kanbanGraphLog = {
+    debug: (o: unknown, m?: string) => http.log.debug(o, m),
+    warn: (o: unknown, m?: string) => http.log.warn(o, m)
+  }
+  const kanbanGraphReconciler = kanbanCardStore
+    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    : undefined
+
+  const kanbanSync =
+    kanbanCardStore && kanbanTokens
+      ? new KanbanSync({
+          repo: new PgKanbanSyncRepo(prisma),
+          cards: repos.kanbanCard,
+          store: kanbanCardStore,
+          // Uncached: every adopted human edit re-checks the actor's live write grant.
+          permissions: new GithubRepoPermission({
+            tokens: kanbanTokens,
+            ttlMs: 0,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          appSlug: githubAppCfg?.slug,
+          repoRef: async (boardId) => {
+            const board = await repos.kanbanDispatch.getBoardRef(boardId)
+            if (!board) return null
+            const owner = board.repoFullName.split('/')[0]!
+            const installation = await repos.githubInstallation.liveByOrgAndAccount(board.orgId, owner)
+            return installation && !installation.revokedAt && !installation.suspendedAt
+              ? { installationId: installation.installationId, repoId: board.repoId, repoFullName: board.repoFullName }
+              : null
+          },
+          revoke: async (lease, cardId) => {
+            try {
+              await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
+            } catch (err) {
+              http.log.warn(
+                { err, leaseId: lease.leaseId },
+                'kanban: immediate revocation failed; heartbeat fences the holder'
+              )
+            }
+          },
+          promote: async (boardId, repo, issueNumber) => {
+            const board = (await repos.kanbanBoard.listEnabledByRepoId(repo.repoId)).find((b) => b.id === boardId)
+            if (board)
+              await kanbanGraphReconciler?.apply(
+                board,
+                repo,
+                issueNumber,
+                await kanbanCardStore.readGraph(repo, issueNumber)
+              )
+          },
+          log: kanbanGraphLog
+        })
+      : undefined
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,
+        sync: kanbanSync,
         installations: repos.githubInstallation,
         store: kanbanCardStore,
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
@@ -1820,14 +1883,6 @@ export function buildContainer(
       })
     : undefined
 
-  const kanbanGraphLog = {
-    debug: (o: unknown, m?: string) => http.log.debug(o, m),
-    warn: (o: unknown, m?: string) => http.log.warn(o, m)
-  }
-  const kanbanGraphReconciler = kanbanCardStore
-    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
-    : undefined
-
   // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
   const kanbanGraphDoorbell = kanbanCardStore
     ? new KanbanGraphDoorbell({
@@ -1840,11 +1895,18 @@ export function buildContainer(
           kanbanDispatcher?.poke(board.id)
         },
         // A human status relabel or close/reopen re-reads the card at once instead of waiting out its backoff.
-        onCard: async (board, repo, issueNumber, action) => {
+        onCard: async (board, repo, issueNumber, doorbell) => {
           const imported =
-            ['opened', 'transferred', 'labeled'].includes(action ?? '') &&
-            (await kanbanImporter?.import(board, repo, issueNumber, { action }))
-          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human')
+            ['opened', 'transferred', 'labeled'].includes(doorbell.action ?? '') &&
+            (await kanbanImporter?.import(board, repo, issueNumber, doorbell))
+          if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human', doorbell)
+          if (doorbell.action === 'closed')
+            await kanbanGraphReconciler?.apply(
+              board,
+              repo,
+              issueNumber,
+              await kanbanCardStore.readGraph(repo, issueNumber)
+            )
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog

@@ -1,4 +1,5 @@
 // PgKanbanDispatchRepo (issue #2 D2): the board row is the claim mutex (SKIP LOCKED), card rows are skipped while another writer holds them.
+import { applyCardTransition, auditCardTransition } from '../../kanban/audit.js'
 import { randomUUID } from 'node:crypto'
 import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
@@ -227,6 +228,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
               ...(card.role === 'work' ? { verifiedAt: null } : {}),
+              // Every dispatch generation owes GitHub its status label; the sync reconciler clears the flag on write.
+              labelWritePending: true,
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -247,6 +250,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               dispatchedAt: opts.now
             },
             select: { id: true, leaseId: true }
+          })
+          // A verify claim leaves the status at review, so from equals to and the audit is a no-op.
+          await auditCardTransition(tx, {
+            cardId: card.id,
+            from: card.role === 'verify' ? 'review' : 'ready',
+            to: card.role === 'verify' ? 'review' : 'running',
+            source: 'claim',
+            leaseId: run.leaseId
           })
           const hook = await tx.hookDef.findFirst({
             where: { agentId: card.agentId, kind: 'github', repoId: board.repoId, githubSessionKey: { not: null } },
@@ -294,7 +305,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       : null
   }
 
-  async listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]> {
+  async listRecoveryDue(boardId: string, now: Date, limit: number, pendingOnly = false): Promise<KanbanRecoveryDue[]> {
     return this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
       SELECT c."id" AS "cardId", c."issueNumber",
         (c."promotionPending" AND c."status" IN ('todo', 'ready')) AS "promotion", ${PROMOTION_COLUMNS}
@@ -307,7 +318,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         AND (c."recoveryCheckAt" IS NULL OR c."recoveryCheckAt" <= ${now})
         AND (
           (c."promotionPending" AND c."status" IN ('todo', 'ready'))
-          OR (${PARKED} AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
+          OR (${!pendingOnly} AND ${PARKED} AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
         )
       ORDER BY c."recoveryCheckAt" ASC NULLS FIRST, c."issueNumber" ASC
       LIMIT ${limit}
@@ -350,6 +361,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: card.id },
         data: {
           status: to,
+          labelWritePending: true,
           stateRevision: { increment: 1 },
           cooldownUntil: null,
           blockKind: null,
@@ -358,6 +370,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           ...RECOVERY_RESET
         }
       })
+      await auditCardTransition(tx, { cardId: card.id, from, to, source: 'parked_ingest' })
       // The notification commits or rolls back with the move, as a run end's does; (cardId, stateRevision) dedupes replays.
       const stateRevision = card.stateRevision + 1n
       const decision = planNotification(
@@ -416,28 +429,30 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
     // Repair adopts the promotion that already landed; a refusal clears the intent and returns a ready card to todo.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: PENDING_UNLEASED(cardId),
-      data: repaired
+    return applyCardTransition(
+      this.db,
+      PENDING_UNLEASED(cardId),
+      repaired
         ? { status: 'ready', stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...RECOVERY_RESET }
-        : { status: 'todo', ...PROMOTION_CLEARED }
-    })
-    return count === 1
+        : { status: 'todo', ...PROMOTION_CLEARED },
+      'promotion_recovery'
+    )
   }
 
   async escalatePromotion(cardId: string, reason: string): Promise<boolean> {
     // The revision bump fences any in-flight graph CAS; only a human status edit un-parks the flagged card.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: PENDING_UNLEASED(cardId),
-      data: {
+    return applyCardTransition(
+      this.db,
+      PENDING_UNLEASED(cardId),
+      {
         status: 'todo',
         stateRevision: { increment: 1 },
         ...RECOVERY_RESET,
         needsAttention: true,
         attentionReason: reason
-      }
-    })
-    return count === 1
+      },
+      'promotion_attention'
+    )
   }
 
   async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
@@ -563,6 +578,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: row.cardId },
         data: {
           status: plan.status,
+          labelWritePending: true,
           ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
@@ -575,6 +591,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           dispatchRevision: { increment: 1 },
           stateRevision: { increment: 1 }
         }
+      })
+      await auditCardTransition(tx, {
+        cardId: row.cardId,
+        from: row.status,
+        to: plan.status,
+        source: input.reasonCode ?? input.outcome,
+        leaseId: input.leaseId
       })
       // A transition notification rides the same write; the (cardId, stateRevision) key makes a replay a no-op.
       const decision = planNotification(

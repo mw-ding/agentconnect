@@ -35,6 +35,8 @@ import {
   type ObservedIssue
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import type { KanbanSync } from './sync.js'
+import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
@@ -61,6 +63,7 @@ export interface KanbanDispatcherDeps {
   /** Drains the transition outbox (rows are written in the repo's own transactions); undefined when notifications are off. */
   notify?: { drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
+  sync?: Pick<KanbanSync, 'onCardChanged' | 'reconcileBoard' | 'projectStatus'>
   tickMs?: number
   unackedGraceMs?: number
   epochGraceMs?: number
@@ -214,7 +217,10 @@ export class KanbanDispatcher {
 
   async reconcileBoard(boardId: string): Promise<void> {
     // Recovery reads GitHub, so only the periodic tick runs it, never a doorbell or report poke.
-    if (this.recoveryDue.delete(boardId)) await this.recoverMismatches(boardId)
+    if (this.recoveryDue.delete(boardId)) {
+      await this.recoverMismatches(boardId)
+      await this.deps.sync?.reconcileBoard(boardId)
+    }
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
@@ -227,7 +233,12 @@ export class KanbanDispatcher {
 
   private async recoverMismatches(boardId: string): Promise<void> {
     const now = await this.deps.repo.now()
-    for (const card of await this.deps.repo.listRecoveryDue(boardId, now, RECOVERY_BATCH)) {
+    for (const card of await this.deps.repo.listRecoveryDue(
+      boardId,
+      now,
+      RECOVERY_BATCH,
+      ...(this.deps.sync ? ([true] as const) : [])
+    )) {
       let read: RecoveryRead = { moved: false }
       try {
         read = card.promotion
@@ -241,7 +252,12 @@ export class KanbanDispatcher {
   }
 
   /** A GitHub change to this card. A human doorbell reads now; a graph doorbell leaves a pending promotion on its backoff. */
-  async onCardChanged(boardId: string, issueNumber: number, source: 'human' | 'graph' = 'graph'): Promise<boolean> {
+  async onCardChanged(
+    boardId: string,
+    issueNumber: number,
+    source: 'human' | 'graph' = 'graph',
+    doorbell?: KanbanIssueDoorbell
+  ): Promise<boolean> {
     const pending = await this.deps.repo.getPendingPromotion(boardId, issueNumber)
     if (pending && source !== 'human') {
       const now = await this.deps.repo.now()
@@ -249,7 +265,10 @@ export class KanbanDispatcher {
     } else {
       await this.deps.repo.resetRecovery(boardId, issueNumber)
     }
-    if (!pending) return this.ingestCard(boardId, issueNumber)
+    if (!pending)
+      return this.deps.sync
+        ? this.deps.sync.onCardChanged(boardId, issueNumber, source === 'human', doorbell)
+        : this.ingestCard(boardId, issueNumber)
     const now = await this.deps.repo.now()
     let read: RecoveryRead = { moved: false }
     try {
@@ -262,7 +281,9 @@ export class KanbanDispatcher {
 
   /** Body-free ingest shared by the doorbells and tick recovery; only a human's status edit un-parks a card. */
   async ingestCard(boardId: string, issueNumber: number): Promise<boolean> {
-    return (await this.ingest(boardId, issueNumber)).moved
+    return this.deps.sync
+      ? this.deps.sync.onCardChanged(boardId, issueNumber)
+      : (await this.ingest(boardId, issueNumber)).moved
   }
 
   private async ingest(boardId: string, issueNumber: number): Promise<RecoveryRead> {
@@ -588,13 +609,14 @@ export class KanbanDispatcher {
 
   /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
   private writeStatus(
-    card: { issueNumber: number; cardId: string },
+    card: { issueNumber: number; cardId: string; boardId: string },
     repo: KanbanRepoRef,
     status: KanbanStatus,
     observed?: ObservedIssue
   ): void {
     const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
       .then(async () => {
+        if (this.deps.sync) return this.deps.sync.projectStatus(card.boardId, card.issueNumber, status)
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
         if (!current) return
         await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
