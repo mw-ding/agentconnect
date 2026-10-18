@@ -394,6 +394,7 @@ export const KanbanOrchestratePrepareCreateOk = z
     ok: z.literal(true),
     op: z.literal('prepare_create'),
     verdict: z.enum(['existing', 'proceed']),
+    appLogin: z.string().min(1).max(100).nullable().optional(),
     issueNumber: z.number().int().positive().optional()
   })
   .strict()

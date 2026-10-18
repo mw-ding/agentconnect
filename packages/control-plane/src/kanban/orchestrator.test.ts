@@ -138,7 +138,7 @@ describe('KanbanOrchestrator prepare_create', () => {
     const key = cardIdempotencyKey({ epic: `board:${BOARD}`, step: 's', spec: 'a'.repeat(64) })
     h.cards.findByIdempotencyKey.mockResolvedValue(card({ issueNumber: 99 }))
     const out = await h.svc.orchestrate(ORG, AGENT, req('prepare_create', { step: 's', specDigest: 'a'.repeat(64) }))
-    expect(out).toEqual({ ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: 99 })
+    expect(out).toEqual({ ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: 99, appLogin: null })
     expect(h.cards.findByIdempotencyKey).toHaveBeenCalledWith(BOARD, key)
   })
 
@@ -194,7 +194,8 @@ describe('KanbanOrchestrator prepare_create', () => {
     ).toEqual({
       ok: true,
       op: 'prepare_create',
-      verdict: 'proceed'
+      verdict: 'proceed',
+      appLogin: null
     })
   })
 })
@@ -462,7 +463,7 @@ describe('KanbanOrchestrator B1 key and replay (R2, S8)', () => {
     h.cards.findByIdempotencyKey.mockResolvedValue(card({ issueNumber: 99 }))
     h.orchestrator.epicBudget.mockResolvedValue('epic_budget_exhausted')
     const out = await h.svc.orchestrate(ORG, AGENT, req('prepare_create', create({ epicIssueNumber: 1 })))
-    expect(out).toEqual({ ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: 99 })
+    expect(out).toEqual({ ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: 99, appLogin: null })
     expect(h.orchestrator.epicBudget).not.toHaveBeenCalled()
     expect(h.cards.casStatus).not.toHaveBeenCalled()
   })
@@ -834,4 +835,13 @@ it('adopts a closed App crash orphan without reopening it', async () => {
     )
   ).toMatchObject({ ok: true, issueNumber: 7 })
   expect(h.store.applyPlan.mock.calls[0][3]).not.toHaveProperty('issueState')
+})
+
+it('vera-349: prepare returns the trusted deployment App login on proceed and existing', async () => {
+  const h = harness({ appSlug: 'acme-app' })
+  const prepare = req('prepare_create', { step: 's', specDigest: 'a'.repeat(64) })
+  expect(await h.svc.orchestrate(ORG, AGENT, prepare)).toMatchObject({ appLogin: 'acme-app[bot]' })
+  h.cards.findByIdempotencyKey.mockResolvedValue({ issueNumber: 7 })
+  expect(await h.svc.orchestrate(ORG, AGENT, prepare)).toMatchObject({ verdict: 'existing', appLogin: 'acme-app[bot]' })
+  expect(await harness().svc.orchestrate(ORG, AGENT, prepare)).toMatchObject({ appLogin: null })
 })

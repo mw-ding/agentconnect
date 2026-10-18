@@ -1,5 +1,4 @@
-// Kanban orchestrator service (issue #2 M3, Lane 2b): the role-gated create/link/unblock/assign surface for the
-// orchestrator agent. Every GitHub write goes through CardStore; every card write through the Lane 1 repo API.
+// Role-gated orchestrator writes use CardStore for GitHub and the Lane 1 repo API for cards.
 import {
   KANBAN_ORCHESTRATE_LIST_MAX_CARDS,
   kanbanOrchestrateCardKey,
@@ -129,7 +128,13 @@ export class KanbanOrchestrator {
     // B1 first: a re-plan of an already-filed card is answered before the epic or its budget is even looked at.
     const existing = await this.deps.cards.findByIdempotencyKey(req.boardId, kanbanOrchestrateCardKey(req))
     if (existing) {
-      return { ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: existing.issueNumber }
+      return {
+        ok: true,
+        op: 'prepare_create',
+        verdict: 'existing',
+        issueNumber: existing.issueNumber,
+        appLogin: this.appLogin()
+      }
     }
     if (req.epicIssueNumber !== undefined) {
       const budget = await this.deps.orchestrator.epicBudget(req.boardId, req.epicIssueNumber)
@@ -141,7 +146,11 @@ export class KanbanOrchestrator {
     }
     // Resolve the assignee slug up front so a bad one refuses before anything is filed.
     if (req.assignee !== undefined) await this.assigneeId(orgId, req.assignee)
-    return { ok: true, op: 'prepare_create', verdict: 'proceed' }
+    return { ok: true, op: 'prepare_create', verdict: 'proceed', appLogin: this.appLogin() }
+  }
+
+  private appLogin(): string | null {
+    return this.deps.appSlug ? `${this.deps.appSlug}[bot]` : null
   }
 
   private async commitCreate(

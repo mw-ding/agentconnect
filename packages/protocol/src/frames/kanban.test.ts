@@ -341,3 +341,15 @@ describe('kanban wire (issue #2 M2)', () => {
     ).toBe(false)
   })
 })
+
+it('vera-349: prepare advertises optional nullable App identity in a strict body-free reply', () => {
+  const reply = { ok: true, op: 'prepare_create', verdict: 'proceed' }
+  for (const appLogin of ['acme-app[bot]', null]) {
+    expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin }).success).toBe(true)
+  }
+  expect(KanbanOrchestrateOk.safeParse(reply).success).toBe(true)
+  for (const appLogin of ['', 123, {}, 'a'.repeat(101)]) {
+    expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin }).success).toBe(false)
+  }
+  expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin: 'app[bot]', body: 'secret' }).success).toBe(false)
+})

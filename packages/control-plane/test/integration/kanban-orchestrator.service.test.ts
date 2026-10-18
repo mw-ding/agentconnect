@@ -92,6 +92,7 @@ describe('KanbanOrchestrator over real Postgres', () => {
       ok: true,
       op: 'prepare_create',
       verdict: 'existing',
+      appLogin: null,
       issueNumber: 10
     })
     expect(await h.svc.orchestrate(ORG, h.agentId, h.create('child', 10))).toMatchObject({
