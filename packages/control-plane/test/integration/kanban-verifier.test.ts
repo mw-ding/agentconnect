@@ -9,6 +9,7 @@ import { FakeClock } from '../fakes/fake-clock.js'
 import { insertKanbanNotification, PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
+import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import type {
   CardGraph,
   CardIssue,
@@ -479,12 +480,101 @@ describe('Kanban transition outbox (real Postgres)', () => {
       to: 'done',
       mention: false
     })
-    const [pending] = await notify.pending(10, new Date(T0))
+    const lease = (ms: number) => new Date(T0 + ms + 1000)
+    const [pending] = await notify.claim(10, new Date(T0), lease(0))
     expect(pending).toMatchObject({ from: 'running', to: 'done', attempts: 0 })
-    await notify.markFailed(pending!.id, new Date(T0 + 60_000), 1, 'delivery_failed')
-    expect(await notify.pending(10, new Date(T0))).toEqual([])
-    expect(await notify.pending(10, new Date(T0 + 60_000))).toHaveLength(1)
-    await notify.giveUp(pending!.id, 'delivery_failed')
-    expect(await notify.pending(10, new Date(T0 + 3_600_000))).toEqual([])
+    await notify.markFailed(pending!, new Date(T0 + 60_000), 1, 'delivery_failed')
+    expect(await notify.claim(10, new Date(T0), lease(0))).toEqual([])
+    const [retry] = await notify.claim(10, new Date(T0 + 60_000), lease(60_000))
+    expect(retry).toMatchObject({ id: pending!.id, attempts: 1 })
+    await notify.giveUp(retry!, 'delivery_failed')
+    expect(await notify.claim(10, new Date(T0 + 3_600_000), lease(3_600_000))).toEqual([])
+  })
+
+  /** One pending row per new card on an anchored board, for the drain tests. */
+  async function outbox(n: number) {
+    const h = await harness()
+    const botId = randomUUID()
+    const integrationId = randomUUID()
+    await prisma.bot.create({ data: { id: botId, orgId: DEFAULT_ORG_ID, platform: 'slack', name: `vera-${botId}` } })
+    await prisma.integration.create({
+      data: { id: integrationId, orgId: DEFAULT_ORG_ID, agentId: A1, botId, platform: 'slack', name: 'vera-414' }
+    })
+    await prisma.kanbanBoard.update({
+      where: { id: h.board.id },
+      data: { targetChannel: 'C0ANCHOR', targetIntegrationId: integrationId }
+    })
+    const notify = new PgKanbanNotifyRepo(prisma)
+    for (let i = 0; i < n; i++) {
+      const c = await h.reviewCard()
+      await notify.enqueue({
+        boardId: h.board.id,
+        cardId: c.id,
+        issueNumber: c.issueNumber,
+        stateRevision: 1n,
+        from: 'running',
+        to: 'review',
+        mention: false
+      })
+    }
+    return { h, notify, integrationId }
+  }
+
+  it('vera-414: two notifiers on one outbox post each notifyId exactly once', async () => {
+    const { h, integrationId } = await outbox(6)
+    const posts: string[] = []
+    const replica = () =>
+      new KanbanNotifier({
+        repo: new PgKanbanNotifyRepo(prisma),
+        integration: { getUnscoped: async () => ({ id: integrationId, agentId: A1, status: 'active' }) as never },
+        agent: { get: async () => ({ id: A1, daemonId: D1 }) as never },
+        resolveMention: async () => null,
+        isDaemonLive: () => true,
+        send: async (_daemonId, n) => {
+          posts.push(n.notifyId)
+          // Hold the send open so the other replica's pass overlaps this one.
+          await new Promise((resolve) => setTimeout(resolve, 10))
+          return { notifyId: n.notifyId, ok: true }
+        },
+        clock: h.clock,
+        log: { warn: vi.fn(), info: vi.fn() }
+      })
+    await Promise.all([replica().drain(), replica().drain()])
+    const ids = (await prisma.kanbanNotification.findMany({ where: { boardId: h.board.id } })).map((r) => r.id)
+    expect(ids).toHaveLength(6)
+    expect([...posts].sort()).toEqual([...ids].sort())
+    expect(await prisma.kanbanNotification.count({ where: { boardId: h.board.id, sentAt: null } })).toBe(0)
+  })
+
+  it('vera-414: a claimed row is skipped until its lease lapses, and a stale claim cannot settle it', async () => {
+    const { h, notify } = await outbox(1)
+    const at = (ms: number) => new Date(T0 + ms)
+    const [first] = await notify.claim(10, at(0), at(60_000))
+    expect(first).toMatchObject({ attempts: 0, claims: 1 })
+    expect(await notify.claim(10, at(30_000), at(90_000))).toEqual([])
+    // The first holder crashed: once its lease lapses another replica takes the row under a new claim.
+    const [second] = await notify.claim(10, at(60_000), at(120_000))
+    expect(second).toMatchObject({ id: first!.id, claims: 2 })
+    await notify.markSent(first!)
+    await notify.markFailed(first!, at(0), 1, 'delivery_failed')
+    await notify.giveUp(first!, 'delivery_failed')
+    expect(await prisma.kanbanNotification.findUniqueOrThrow({ where: { id: first!.id } })).toMatchObject({
+      sentAt: null,
+      abandonedAt: null,
+      attempts: 0,
+      lastError: null
+    })
+    await notify.markSent(second!)
+    expect((await prisma.kanbanNotification.findUniqueOrThrow({ where: { id: first!.id } })).sentAt).not.toBeNull()
+    expect(await notify.claim(10, at(3_600_000), at(3_660_000))).toEqual([])
+    expect(h.sent).toEqual([])
+  })
+
+  it('vera-414: a released row is claimable by another replica at once', async () => {
+    const { notify } = await outbox(1)
+    const [held] = await notify.claim(10, new Date(T0), new Date(T0 + 60_000))
+    await notify.release(held!)
+    const [next] = await notify.claim(10, new Date(T0), new Date(T0 + 60_000))
+    expect(next).toMatchObject({ id: held!.id, claims: 2, attempts: 0 })
   })
 })

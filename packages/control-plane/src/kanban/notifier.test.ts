@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { KANBAN_STATUSES, type KanbanStatus } from './card-state.js'
 import { planNotification, type KanbanTransition } from './notifier.js'
-import { KANBAN_NOTIFY_MAX_ATTEMPTS, KanbanNotifier, notifyBackoffMs } from './notifier-sender.js'
+import {
+  KANBAN_NOTIFY_LEASE_MS,
+  KANBAN_NOTIFY_MAX_ATTEMPTS,
+  KanbanNotifier,
+  notifyBackoffMs
+} from './notifier-sender.js'
 import type { KanbanNotificationRow, KanbanNotifyRepo, KanbanNotifyTarget } from '../persistence/ports.js'
 import { FakeClock } from '../../test/fakes/fake-clock.js'
 
@@ -72,6 +77,7 @@ function row(over: Partial<KanbanNotificationRow> = {}): KanbanNotificationRow {
     mention: true,
     createdAt: new Date(T0),
     attempts: 0,
+    claims: 1,
     ...over
   }
 }
@@ -96,8 +102,12 @@ function setup(
           createdByUserId: 'u1',
           ...opts.target
         } as KanbanNotifyTarget)
+  const rows = opts.rows ?? [row()]
   const repo = {
-    pending: vi.fn(async () => opts.rows ?? [row()]),
+    claim: vi.fn(async (limit: number, _now: Date, _leaseUntil: Date, exclude: readonly string[] = []) =>
+      rows.filter((r) => !exclude.includes(r.id)).slice(0, limit)
+    ),
+    release: vi.fn(async () => {}),
     target: vi.fn(async () => target),
     markSent: vi.fn(async () => {}),
     markFailed: vi.fn(async () => {}),
@@ -133,7 +143,7 @@ describe('KanbanNotifier', () => {
       mention: { slackUserId: 'U0REQUEST1' },
       target: { platform: 'slack', channel: 'C0ANCHOR', integrationId: INTEGRATION }
     })
-    expect(h.repo.markSent).toHaveBeenCalledWith(row().id)
+    expect(h.repo.markSent).toHaveBeenCalledWith(row())
   })
 
   it('sends without a mention when none resolved (never a GitHub login)', async () => {
@@ -161,15 +171,10 @@ describe('KanbanNotifier', () => {
     const h = setup()
     h.send.mockResolvedValueOnce({ notifyId: row().id, ok: false })
     await h.notifier.drain()
-    expect(h.repo.markFailed).toHaveBeenCalledWith(row().id, new Date(T0 + notifyBackoffMs(1)), 1, 'daemon_refused')
+    expect(h.repo.markFailed).toHaveBeenCalledWith(row(), new Date(T0 + notifyBackoffMs(1)), 1, 'daemon_refused')
     h.send.mockRejectedValueOnce(new Error('boom'))
     await h.notifier.drain()
-    expect(h.repo.markFailed).toHaveBeenLastCalledWith(
-      row().id,
-      new Date(T0 + notifyBackoffMs(1)),
-      1,
-      'delivery_failed'
-    )
+    expect(h.repo.markFailed).toHaveBeenLastCalledWith(row(), new Date(T0 + notifyBackoffMs(1)), 1, 'delivery_failed')
     expect(notifyBackoffMs(2)).toBe(2 * notifyBackoffMs(1))
   })
 
@@ -177,7 +182,7 @@ describe('KanbanNotifier', () => {
     const h = setup({ rows: [row({ attempts: KANBAN_NOTIFY_MAX_ATTEMPTS - 1 })] })
     h.send.mockRejectedValueOnce(new Error('boom'))
     await h.notifier.drain()
-    expect(h.repo.giveUp).toHaveBeenCalledWith(row().id, 'delivery_failed')
+    expect(h.repo.giveUp).toHaveBeenCalledWith(row({ attempts: KANBAN_NOTIFY_MAX_ATTEMPTS - 1 }), 'delivery_failed')
     expect(h.repo.markFailed).not.toHaveBeenCalled()
     expect(h.log.warn).toHaveBeenCalled()
   })
@@ -185,6 +190,80 @@ describe('KanbanNotifier', () => {
   it('gives up at once on a board with no integration', async () => {
     const h = setup({ target: { targetIntegrationId: null } })
     await h.notifier.drain()
-    expect(h.repo.giveUp).toHaveBeenCalledWith(row().id, 'no_integration')
+    expect(h.repo.giveUp).toHaveBeenCalledWith(row(), 'no_integration')
+  })
+})
+
+describe('KanbanNotifier — claimed drain across replicas', () => {
+  function claimed(rows: KanbanNotificationRow[], opts: { live?: boolean; ok?: boolean } = {}) {
+    const repo = {
+      // Honors the exclusion list as the SQL does, so a handed-back row is not re-claimed in the same pass.
+      claim: vi.fn(async (limit: number, _now: Date, _leaseUntil: Date, exclude: readonly string[] = []) =>
+        rows
+          .filter((r) => !exclude.includes(r.id))
+          .slice(0, limit)
+          .map((r) => ({ ...r, claims: 1 }))
+      ),
+      release: vi.fn(async () => {}),
+      target: vi.fn(
+        async () =>
+          ({
+            orgId: 'org',
+            repoFullName: 'acme/web',
+            targetPlatform: 'slack',
+            targetChannel: 'C0ANCHOR',
+            targetIntegrationId: INTEGRATION,
+            createdByUserId: 'u1'
+          }) as KanbanNotifyTarget
+      ),
+      markSent: vi.fn(async () => {}),
+      markFailed: vi.fn(async () => {}),
+      giveUp: vi.fn(async () => {}),
+      enqueue: vi.fn(async () => {})
+    }
+    const send = vi.fn(async (_d: string, n: { notifyId: string }) => ({ notifyId: n.notifyId, ok: opts.ok ?? true }))
+    const notifier = new KanbanNotifier({
+      repo: repo as never,
+      integration: { getUnscoped: async () => ({ id: INTEGRATION, agentId: 'agent', status: 'active' }) as never },
+      agent: { get: async () => ({ id: 'agent', daemonId: 'daemon' }) as never },
+      resolveMention: async () => null,
+      isDaemonLive: () => opts.live ?? true,
+      send,
+      clock: new FakeClock(T0),
+      log: { warn: vi.fn(), info: vi.fn() }
+    })
+    return { repo, send, notifier }
+  }
+
+  it('vera-414: claims a row under a lease before sending, then settles it under that claim', async () => {
+    const h = claimed([row()])
+    await h.notifier.drain()
+    expect(h.repo.claim.mock.calls[0]!.slice(0, 3)).toEqual([1, new Date(T0), new Date(T0 + KANBAN_NOTIFY_LEASE_MS)])
+    expect(h.send).toHaveBeenCalledOnce()
+    expect(h.repo.claim.mock.invocationCallOrder[0]!).toBeLessThan(h.send.mock.invocationCallOrder[0]!)
+    expect(h.repo.markSent).toHaveBeenCalledWith(expect.objectContaining({ id: row().id, claims: 1 }))
+  })
+
+  it('vera-414: hands a row back when this replica has no live connection to its daemon', async () => {
+    const h = claimed([row()], { live: false })
+    await h.notifier.drain()
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.repo.release).toHaveBeenCalledWith(expect.objectContaining({ id: row().id, claims: 1 }))
+    expect(h.repo.markSent).not.toHaveBeenCalled()
+    expect(h.repo.markFailed).not.toHaveBeenCalled()
+  })
+
+  it('vera-414: tries each row at most once per pass and settles a failure under its claim', async () => {
+    const rows = ['a', 'b', 'c'].map((c) => row({ id: `66666666-6666-4666-8666-66666666666${c}` }))
+    const h = claimed(rows, { ok: false })
+    await h.notifier.drain()
+    expect(h.send.mock.calls.map(([, n]) => n.notifyId)).toEqual(rows.map((r) => r.id))
+    expect(h.repo.markFailed).toHaveBeenCalledTimes(3)
+    expect(h.repo.markFailed).toHaveBeenCalledWith(
+      expect.objectContaining({ id: rows[0]!.id, claims: 1 }),
+      new Date(T0 + notifyBackoffMs(1)),
+      1,
+      'daemon_refused'
+    )
   })
 })
