@@ -1,10 +1,10 @@
 // Kanban board view routes (issue #2 Lane 4b): card metadata from the CP, titles live from GitHub and never persisted.
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { prisma } from '../setup.db.js'
 import { buildHttpApp } from '../fakes/build-http.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { memberBearer, ownerBearer, startKanbanOidc, type KanbanOidc } from '../fixtures/kanban-oidc.js'
-import { githubKanbanTitleSource } from '../../src/kanban/card-titles.js'
+import { clearKanbanTitleCache, githubKanbanTitleSource } from '../../src/kanban/card-titles.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
@@ -21,6 +21,11 @@ beforeAll(async () => {
   oidc = await startKanbanOidc('kanban-view-test')
 })
 afterAll(() => oidc.close())
+
+// The title source caches in module memory: clear it so tests never read each other's GitHub answers.
+beforeEach(() => {
+  clearKanbanTitleCache()
+})
 
 const installation: GithubInstallationRecord = {
   id: 'view-inst',
@@ -177,6 +182,33 @@ describe('Kanban cards route', () => {
     }
   })
 
+  it('vera-528: ?numbers= looks cards up by number without the 500-cap ambiguity', async () => {
+    const board = await seedBoard()
+    await seedCard(board.id, 1)
+    await seedCard(board.id, 2)
+    await seedCard(board.id, 3)
+    const { app, close } = buildApp()
+    try {
+      const headers = await ownerBearer(prisma, oidc)
+      const res = await app.inject({ method: 'GET', url: `${BOARDS}/${board.id}/cards?numbers=2,3`, headers })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toMatchObject({ boardId: board.id, total: 2, truncated: false })
+      expect(
+        res
+          .json()
+          .cards.map((c: { issueNumber: number }) => c.issueNumber)
+          .sort()
+      ).toEqual([2, 3])
+      const none = await app.inject({ method: 'GET', url: `${BOARDS}/${board.id}/cards?numbers=404`, headers })
+      expect(none.json()).toMatchObject({ cards: [], total: 0, truncated: false })
+      const bad = await app.inject({ method: 'GET', url: `${BOARDS}/${board.id}/cards?numbers=abc`, headers })
+      expect(bad.statusCode).toBe(400)
+      expect(bad.json()).toMatchObject({ code: 'invalid_numbers' })
+    } finally {
+      await close()
+    }
+  })
+
   it('works with GitHub unreachable: it never calls it', async () => {
     const board = await seedBoard()
     await seedCard(board.id, 1)
@@ -261,6 +293,26 @@ describe('Kanban titles route', () => {
       expect(written).not.toContain('Rotate')
     } finally {
       vi.restoreAllMocks()
+      await close()
+    }
+  })
+
+  it('vera-528: a repeated titles view within TTL makes no second GitHub call', async () => {
+    const board = await seedBoard()
+    await seedCard(board.id, 1)
+    await seedCard(board.id, 2)
+    const stub = githubStub({ 1: issue(1), 2: issue(2) })
+    const { app, close } = buildApp(stub.fetchImpl)
+    try {
+      const headers = await ownerBearer(prisma, oidc)
+      const first = await app.inject({ method: 'GET', url: titlesUrl(board.id, '1,2'), headers })
+      expect(first.statusCode).toBe(200)
+      expect(stub.fetchImpl).toHaveBeenCalledTimes(2)
+      const second = await app.inject({ method: 'GET', url: titlesUrl(board.id, '2,1'), headers })
+      expect(second.statusCode).toBe(200)
+      expect(second.json()).toEqual(first.json())
+      expect(stub.fetchImpl).toHaveBeenCalledTimes(2)
+    } finally {
       await close()
     }
   })

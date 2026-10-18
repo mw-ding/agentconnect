@@ -217,6 +217,56 @@ describe('KanbanBoardView columns and titles', () => {
     await settleUntil(() => column('ready') != null)
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/cards/titles'))).toBe(false)
   })
+
+  it('vera-528: titles are fetched once per visible set, never on a timer', async () => {
+    vi.useFakeTimers()
+    try {
+      serve({ cards: [card(1)] })
+      await render(<KanbanBoardView />)
+      for (let i = 0; i < 10; i++) await act(async () => {})
+      const titleCalls = () => fetchMock.mock.calls.filter(([url]) => String(url).includes('/cards/titles'))
+      expect(titleCalls()).toHaveLength(1)
+      await act(async () => {
+        vi.advanceTimersByTime(61_000)
+      })
+      for (let i = 0; i < 10; i++) await act(async () => {})
+      expect(titleCalls()).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('vera-528: done, archived and collapsed cards are never requested', async () => {
+    serve({
+      cards: [
+        card(1),
+        card(2, { status: 'done' }),
+        card(3, { status: 'archived' }),
+        card(4, { status: 'blocked', needsAttention: true })
+      ],
+      titles: { '1': liveTitle(1, 'one'), '4': liveTitle(4, 'four') }
+    })
+    await render(<KanbanBoardView />)
+    await settleUntil(() => tile(1) !== null)
+    const titleNumbers = () =>
+      fetchMock.mock.calls
+        .filter(([url]) => String(url).includes('/cards/titles'))
+        .map(([url]) => new URL(String(url), 'http://x').searchParams.get('numbers'))
+    expect(tile(2)).toBeNull()
+    expect(tile(3)).toBeNull()
+    expect(titleNumbers()).toEqual(['1,4'])
+    // Expanding the done column renders the card but still requests no title for it.
+    await click(button('Show', column('done')))
+    await settleUntil(() => tile(2) !== null)
+    for (const numbers of titleNumbers()) {
+      expect(`;${numbers};`).not.toContain(';2;')
+      expect(`;${numbers};`).not.toContain(';3;')
+    }
+    // Filtering to needs-attention drops the other cards from the request.
+    await click(button('Needs attention', host.querySelector('h1')!.parentElement!))
+    await settleUntil(() => tile(1) === null)
+    expect(titleNumbers().at(-1)).toBe('4')
+  })
 })
 
 describe('KanbanBoardView attention and run state', () => {
@@ -344,6 +394,25 @@ describe('KanbanBoardView run-mode controls', () => {
     await click(button('Switch to write', tile(1)!))
     await settleUntil(() => puts.length === 1)
     expect(puts[0]!.body).toEqual({ mode: 'write' })
+  })
+
+  it('vera-528: choosing inherit on a write-default board asks first, then clears the override', async () => {
+    serve({
+      board: { ...BOARD, defaultMode: 'write' },
+      cards: [card(1, { mode: 'read', modeOverride: 'read' })]
+    })
+    await render(<KanbanBoardView />)
+    await settleUntil(() => tile(1) !== null)
+
+    await choose(tile(1)!.querySelector('select')!, 'inherit')
+    expect(tile(1)!.textContent).toContain('write-scoped GitHub token for this card')
+    expect(puts).toHaveLength(0)
+    await click(button('Switch to write', tile(1)!))
+    await settleUntil(() => puts.length === 1)
+    expect(puts[0]).toEqual({
+      path: expect.stringContaining('/kanban/boards/board-1/cards/card-1/mode'),
+      body: { mode: null }
+    })
   })
 
   it('asks before switching the board default to write, then sends it', async () => {

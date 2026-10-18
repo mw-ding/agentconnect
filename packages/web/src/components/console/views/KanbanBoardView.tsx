@@ -1,7 +1,7 @@
 'use client'
 
 // Kanban board (`/kanban/[boardId]`): CP metadata grouped into status columns, live titles merged in from GitHub.
-// Titles are untrusted text fetched per visit; the CP never stores them. Owners also set run modes here.
+// Titles are untrusted text fetched once per visible card set, never polled; the CP never stores them. Owners also set run modes here.
 
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
@@ -44,12 +44,24 @@ export default function KanbanBoardView() {
   const [modeError, setModeError] = useState<string | null>(null)
 
   const all = cards.data?.cards
-  const numbers = useMemo(() => titlesKey(all ?? []), [all])
+  // Titles load once per visible set and never poll: requesting only rendered, non-terminal cards keeps one open tab
+  // from draining the installation rate limit that dispatch shares. Done and archived are never requested, collapsed
+  // columns are skipped until shown, and the attention filter narrows the set further.
+  const titleCards = useMemo(() => {
+    const listed = attentionOnly ? (all ?? []).filter((c) => c.needsAttention) : (all ?? [])
+    return listed.filter(
+      (c) =>
+        c.status !== 'done' &&
+        c.status !== 'archived' &&
+        !(COLLAPSED_BY_DEFAULT.has(c.status) && !expanded.has(c.status))
+    )
+  }, [all, attentionOnly, expanded])
+  const numbers = useMemo(() => titlesKey(titleCards), [titleCards])
   // Titles load after the metadata and fail on their own: a GitHub outage leaves every card as `#n`.
   const titles = useSWR(
-    all && numbers !== '' ? consoleKeys.kanbanTitles(orgId, boardId, numbers) : null,
+    numbers !== '' ? consoleKeys.kanbanTitles(orgId, boardId, numbers) : null,
     () => getKanbanCardTitles(boardId, parseTitlesKey(numbers)),
-    { revalidateOnFocus: false, refreshInterval: REFRESH_MS * 4 }
+    { revalidateOnFocus: false }
   )
 
   if (board.error || cards.error) {
