@@ -106,6 +106,8 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
           status: plan.status,
           ...(changed ? { stateRevision: { increment: 1 }, cooldownUntil: null, blockKind: null } : {}),
           ...(human ? PROMOTION_CLEARED : {}),
+          // A human status move starts over, so an old approval never suppresses the next review.
+          ...(human && changed ? { verifiedAt: null } : {}),
           ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
           labelWritePending: repair || current.labelWritePending,
           syncEventCursor: cursor > current.syncEventCursor ? cursor : current.syncEventCursor,

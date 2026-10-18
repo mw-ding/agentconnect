@@ -227,9 +227,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             data: {
               // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
-              ...(card.role === 'work' ? { verifiedAt: null } : {}),
-              // Every dispatch generation owes GitHub its status label; the sync reconciler clears the flag on write.
-              labelWritePending: true,
+              // Only a work claim changes the status label; a verify claim leaves any label write already owed as it is.
+              ...(card.role === 'work' ? { verifiedAt: null, labelWritePending: true } : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -251,12 +250,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             },
             select: { id: true, leaseId: true }
           })
-          // A verify claim leaves the status at review, so from equals to and the audit is a no-op.
+          // Each role audits its real transition: work is ready → running, verify keeps the card at review → review.
           await auditCardTransition(tx, {
             cardId: card.id,
             from: card.role === 'verify' ? 'review' : 'ready',
             to: card.role === 'verify' ? 'review' : 'running',
             source: 'claim',
+            role: card.role,
             leaseId: run.leaseId
           })
           const hook = await tx.hookDef.findFirst({
@@ -578,7 +578,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: row.cardId },
         data: {
           status: plan.status,
-          labelWritePending: true,
+          // A run end that keeps the status (a verify approval under a PR contract) owes GitHub no label write.
+          ...(plan.status !== row.status ? { labelWritePending: true } : {}),
           ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,

@@ -121,7 +121,7 @@ function setup(
     integration: { getUnscoped: async () => ({ id: INTEGRATION, agentId: 'agent', status: 'active' }) as never },
     agent: { get: async () => ({ id: 'agent', daemonId: 'daemon' }) as never },
     resolveMention: async () => opts.mention ?? null,
-    isDaemonLive: () => opts.live ?? true,
+    liveDaemonIds: () => ((opts.live ?? true) ? ['daemon'] : []),
     send,
     clock: new FakeClock(T0),
     log
@@ -227,7 +227,7 @@ describe('KanbanNotifier — claimed drain across replicas', () => {
       integration: { getUnscoped: async () => ({ id: INTEGRATION, agentId: 'agent', status: 'active' }) as never },
       agent: { get: async () => ({ id: 'agent', daemonId: 'daemon' }) as never },
       resolveMention: async () => null,
-      isDaemonLive: () => opts.live ?? true,
+      liveDaemonIds: () => ((opts.live ?? true) ? ['daemon'] : []),
       send,
       clock: new FakeClock(T0),
       log: { warn: vi.fn(), info: vi.fn() }
@@ -265,5 +265,116 @@ describe('KanbanNotifier — claimed drain across replicas', () => {
       1,
       'daemon_refused'
     )
+  })
+})
+
+describe('vera-414-merge: KanbanNotifier lease time and liveness', () => {
+  function drainer(rows: KanbanNotificationRow[], opts: { live?: string[]; sendMs?: number; ok?: boolean } = {}) {
+    const clock = new FakeClock(T0)
+    let live = opts.live ?? ['daemon']
+    const repo = {
+      claim: vi.fn(
+        async (
+          limit: number,
+          _now: Date,
+          _leaseUntil: Date,
+          exclude: readonly string[] = [],
+          liveIds?: readonly string[]
+        ) =>
+          // Mirrors the SQL: a row whose board posts through a daemon live on no connection here is never claimed.
+          liveIds && !liveIds.includes('daemon')
+            ? []
+            : rows
+                .filter((r) => !exclude.includes(r.id))
+                .slice(0, limit)
+                .map((r) => ({ ...r, claims: 1 }))
+      ),
+      release: vi.fn(async () => {}),
+      target: vi.fn(
+        async () =>
+          ({
+            orgId: 'org',
+            repoFullName: 'acme/web',
+            targetPlatform: 'slack',
+            targetChannel: 'C0ANCHOR',
+            targetIntegrationId: INTEGRATION,
+            createdByUserId: 'u1'
+          }) as KanbanNotifyTarget
+      ),
+      markSent: vi.fn(async () => {}),
+      markFailed: vi.fn(async (_row: KanbanNotificationRow, _next: Date, _attempts: number, _error: string) => {}),
+      giveUp: vi.fn(async () => {}),
+      enqueue: vi.fn(async () => {})
+    }
+    const send = vi.fn(async (_d: string, n: { notifyId: string }) => {
+      // Each send takes real time on the CP's clock, as a slow daemon ack does.
+      clock.advance(opts.sendMs ?? 0)
+      return { notifyId: n.notifyId, ok: opts.ok ?? true }
+    })
+    const notifier = new KanbanNotifier({
+      repo: repo as never,
+      integration: { getUnscoped: async () => ({ id: INTEGRATION, agentId: 'agent', status: 'active' }) as never },
+      agent: { get: async () => ({ id: 'agent', daemonId: 'daemon' }) as never },
+      resolveMention: async () => null,
+      liveDaemonIds: () => live,
+      send,
+      clock,
+      log: { warn: vi.fn(), info: vi.fn() }
+    })
+    return { repo, send, notifier, clock, setLive: (ids: string[]) => (live = ids) }
+  }
+  const ids = ['a', 'b', 'c'].map((c) => `66666666-6666-4666-8666-66666666666${c}`)
+
+  it('vera-414-merge: 5 each row is claimed at its own claim time, with a lease measured from that moment', async () => {
+    const h = drainer(
+      ids.map((id) => row({ id })),
+      { sendMs: 4 * 60_000 }
+    )
+    await h.notifier.drain()
+    // Three 4-minute sends: a pass-start lease would already have lapsed for the second and third rows.
+    expect(h.repo.claim.mock.calls.map(([, now, leaseUntil]) => [now, leaseUntil])).toEqual([
+      [new Date(T0), new Date(T0 + KANBAN_NOTIFY_LEASE_MS)],
+      [new Date(T0 + 4 * 60_000), new Date(T0 + 4 * 60_000 + KANBAN_NOTIFY_LEASE_MS)],
+      [new Date(T0 + 8 * 60_000), new Date(T0 + 8 * 60_000 + KANBAN_NOTIFY_LEASE_MS)],
+      [new Date(T0 + 12 * 60_000), new Date(T0 + 12 * 60_000 + KANBAN_NOTIFY_LEASE_MS)]
+    ])
+    expect(h.send).toHaveBeenCalledTimes(3)
+  })
+
+  it('vera-414-merge: 5 a failed row backs off from its own claim time, not the pass start', async () => {
+    const h = drainer(
+      ids.slice(0, 2).map((id) => row({ id })),
+      { sendMs: 60_000, ok: false }
+    )
+    await h.notifier.drain()
+    expect(h.repo.markFailed.mock.calls.map(([r, next]) => [r.id, next])).toEqual([
+      [ids[0], new Date(T0 + notifyBackoffMs(1))],
+      [ids[1], new Date(T0 + 60_000 + notifyBackoffMs(1))]
+    ])
+  })
+
+  it('vera-414-merge: 6 a replica without the daemon claims nothing, so it neither releases nor bumps a claim', async () => {
+    const h = drainer([row()], { live: ['other-daemon'] })
+    for (let i = 0; i < 3; i++) await h.notifier.drain()
+    // The live set rides every claim, so the SQL can leave the row to the replica that holds the daemon.
+    expect(h.repo.claim.mock.calls.map((c) => c[4])).toEqual([['other-daemon'], ['other-daemon'], ['other-daemon']])
+    expect(h.repo.release).not.toHaveBeenCalled()
+    expect(h.send).not.toHaveBeenCalled()
+    h.setLive(['daemon'])
+    await h.notifier.drain()
+    expect(h.send).toHaveBeenCalledOnce()
+    expect(h.repo.markSent).toHaveBeenCalledOnce()
+  })
+
+  it('vera-414-merge: 6 a daemon that drops between claim and send is still handed back at once', async () => {
+    const h = drainer([row()])
+    h.repo.claim.mockImplementationOnce(async () => {
+      // The daemon disconnects from this replica right after the claim landed.
+      h.setLive([])
+      return [{ ...row(), claims: 1 }]
+    })
+    await h.notifier.drain()
+    expect(h.send).not.toHaveBeenCalled()
+    expect(h.repo.release).toHaveBeenCalledWith(expect.objectContaining({ id: row().id, claims: 1 }))
   })
 })

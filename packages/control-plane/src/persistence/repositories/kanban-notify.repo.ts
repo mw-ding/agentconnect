@@ -34,19 +34,30 @@ export class PgKanbanNotifyRepo implements KanbanNotifyRepo {
     limit: number,
     now: Date,
     leaseUntil: Date,
-    exclude: readonly string[] = []
+    exclude: readonly string[] = [],
+    liveDaemonIds?: readonly string[]
   ): Promise<KanbanNotificationRow[]> {
+    // A row for a placed daemon not live here waits for its holder; one resolving to no daemon stays claimable to settle.
+    const elsewhere = liveDaemonIds
+      ? Prisma.sql`AND NOT EXISTS (
+          SELECT 1 FROM "kanban_board" b
+          JOIN "integration" i ON i."id" = b."targetIntegrationId" AND i."status" = 'active'
+          JOIN "agent" a ON a."id" = i."agentId" AND a."orgId" = b."orgId"
+          WHERE b."id" = q."boardId" AND b."targetChannel" IS NOT NULL AND a."daemonId" IS NOT NULL
+            AND NOT (a."daemonId" = ANY(${[...liveDaemonIds]}::uuid[])))`
+      : Prisma.empty
     // One statement: SKIP LOCKED keeps a concurrent drain off rows being claimed, and the lease keeps it off them after.
     return this.db.$queryRaw<KanbanNotificationRow[]>(Prisma.sql`
       UPDATE "kanban_notification" n
       SET "claimedUntil" = ${leaseUntil}, "claims" = n."claims" + 1
       WHERE n."id" IN (
-        SELECT "id" FROM "kanban_notification"
-        WHERE "sentAt" IS NULL AND "abandonedAt" IS NULL
-          AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= ${now})
-          AND ("claimedUntil" IS NULL OR "claimedUntil" <= ${now})
-          AND NOT ("id" = ANY(${[...exclude]}::uuid[]))
-        ORDER BY "createdAt" ASC, "id" ASC
+        SELECT q."id" FROM "kanban_notification" q
+        WHERE q."sentAt" IS NULL AND q."abandonedAt" IS NULL
+          AND (q."nextAttemptAt" IS NULL OR q."nextAttemptAt" <= ${now})
+          AND (q."claimedUntil" IS NULL OR q."claimedUntil" <= ${now})
+          AND NOT (q."id" = ANY(${[...exclude]}::uuid[]))
+          ${elsewhere}
+        ORDER BY q."createdAt" ASC, q."id" ASC
         LIMIT ${limit}
         FOR UPDATE SKIP LOCKED
       )

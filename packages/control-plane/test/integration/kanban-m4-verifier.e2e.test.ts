@@ -413,7 +413,7 @@ describe.skipIf(!enabled)('kanban M4 verifier + notifier e2e (live GitHub)', () 
       integration: { getUnscoped: async () => ({ id: integrationId, agentId, status: 'active' }) as never },
       agent: { get: async () => ({ id: agentId, daemonId }) as never },
       resolveMention: async () => null,
-      isDaemonLive: (id) => id === daemonId,
+      liveDaemonIds: () => [daemonId],
       send: (_id, n) => (daemon as any).kanbanNotify(n),
       clock: systemClock,
       log: { warn: (_o: unknown, m?: string) => phase(`WARN ${m ?? ''}`), info: () => {} }

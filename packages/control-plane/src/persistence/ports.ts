@@ -8164,8 +8164,14 @@ export interface KanbanNotifyTarget {
 export interface KanbanNotifyRepo {
   /** Insert a notification unless one already exists for this card revision (replay-safe). */
   enqueue(row: KanbanNotificationInsert): Promise<void>
-  /** Claim due, unleased rows oldest first until `leaseUntil` (SKIP LOCKED, so replicas never share one), skipping `exclude`. */
-  claim(limit: number, now: Date, leaseUntil: Date, exclude?: readonly string[]): Promise<KanbanNotificationRow[]>
+  /** Claim due, unleased rows oldest first until `leaseUntil` (SKIP LOCKED), skipping `exclude` and placed daemons not in `liveDaemonIds`. */
+  claim(
+    limit: number,
+    now: Date,
+    leaseUntil: Date,
+    exclude?: readonly string[],
+    liveDaemonIds?: readonly string[]
+  ): Promise<KanbanNotificationRow[]>
   /** Hand a claimed row back unsent and unattempted, so another replica can take it now. */
   release(row: KanbanNotificationClaim): Promise<void>
   markSent(row: KanbanNotificationClaim): Promise<void>

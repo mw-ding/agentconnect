@@ -16,8 +16,8 @@ export interface KanbanNotifierDeps {
   agent: { get(orgId: string, agentId: string): Promise<AgentRecord | null> }
   /** The board owner's Slack user id, resolved through a CP linkage only; null when none exists (never a GitHub login). */
   resolveMention(orgId: string, userId: string | null): Promise<string | null>
-  /** This replica's live control connection to the daemon; without one the row is handed back unsent. */
-  isDaemonLive(daemonId: string): boolean
+  /** Daemons with a live control connection to this replica; a row for any other placed daemon is left to its holder. */
+  liveDaemonIds(): readonly string[]
   send(daemonId: string, notify: KanbanNotify): Promise<KanbanNotifyOk>
   clock: Clock
   log: { warn(obj: unknown, msg?: string): void; info(obj: unknown, msg?: string): void }
@@ -41,14 +41,15 @@ export class KanbanNotifier {
   }
 
   private async pass(): Promise<void> {
-    const now = new Date(this.deps.clock.now())
-    const leaseUntil = new Date(now.getTime() + KANBAN_NOTIFY_LEASE_MS)
     // Claim one row at a time, so each holds its lease only for its own send; a row is tried once per pass.
     const seen: string[] = []
     while (seen.length < KANBAN_NOTIFY_BATCH) {
+      // The lease runs from this row's own claim, so slow sends earlier in the pass never shorten it.
+      const now = new Date(this.deps.clock.now())
+      const leaseUntil = new Date(now.getTime() + KANBAN_NOTIFY_LEASE_MS)
       let row: KanbanNotificationRow | undefined
       try {
-        ;[row] = await this.deps.repo.claim(1, now, leaseUntil, seen)
+        ;[row] = await this.deps.repo.claim(1, now, leaseUntil, seen, this.deps.liveDaemonIds())
       } catch (err) {
         this.deps.log.warn({ err }, 'kanban: notification outbox claim failed')
         return
@@ -73,8 +74,8 @@ export class KanbanNotifier {
     const agent = await this.deps.agent.get(target.orgId, integration.agentId)
     const daemonId = agent?.daemonId
     if (!daemonId) return await this.retry(row, now, 'agent_unplaced')
-    // The daemon may be connected to another CP replica, so hand the row back for that replica to post.
-    if (!this.deps.isDaemonLive(daemonId)) return await this.deps.repo.release(row)
+    // The daemon dropped off this replica after the claim: hand the row back for whichever replica holds it now.
+    if (!this.deps.liveDaemonIds().includes(daemonId)) return await this.deps.repo.release(row)
 
     let mention: KanbanNotify['mention']
     if (row.mention) {

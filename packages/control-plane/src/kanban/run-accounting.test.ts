@@ -329,6 +329,23 @@ describe('planRunEnd — the review loop stays bounded', () => {
     ).toMatchObject({ status: 'ready', verifiedAt: null })
   })
 
+  it('vera-414-merge: 8 a human re-ready after a round-limit trip buys exactly one more verify round', () => {
+    // The trip left reviewRounds at the limit; a human move keeps it, and so does the worker's pass.
+    const tripped = { ...running, reviewRounds: KANBAN_REVIEW_ROUND_LIMIT }
+    const passed = planRunEnd(tripped, gated, { outcome: 'completed' }, NOW)
+    expect(passed).toMatchObject({ status: 'review', reviewRounds: KANBAN_REVIEW_ROUND_LIMIT })
+    expect(planRunEnd(passed, gated, { outcome: 'changes_requested' }, NOW, verify)).toMatchObject({
+      status: 'triage',
+      reviewRounds: KANBAN_REVIEW_ROUND_LIMIT + 1,
+      tripped: 'review_round_limit'
+    })
+    // An approval in that one extra round ends the loop and resets the count.
+    expect(planRunEnd(passed, gated, { outcome: 'completed' }, NOW, verify)).toMatchObject({
+      status: 'done',
+      reviewRounds: 0
+    })
+  })
+
   it('vera-414: an approval under a PR contract ends the rounds as the close contract does', () => {
     const prBoard = { ...gated, completionContract: 'pr_merged' as const }
     const plan = planRunEnd({ ...review, reviewRounds: 2 }, prBoard, { outcome: 'completed' }, NOW, verify)

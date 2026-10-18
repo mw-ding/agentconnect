@@ -106,6 +106,32 @@ only the documented human status move (a human-attributed status label the dispa
 ingests) clears the flag. Editing the board, such as fixing `verifierAgentId`, never
 releases it on its own.
 
+## The approval stamp and review rounds
+
+`verifiedAt` is the verifier's approval under `pr_merged`/`pr_checks_green`; the `verified`
+gate keeps such a card in `review` for its PR instead of verifying it again. Every path that
+starts a new review round clears the stamp:
+
+- a work claim (`claim()` in `kanban-dispatch.repo.ts`);
+- a worker's `completed` or `review_requested` run end, and a verifier's `changes_requested`
+  (`planRunEnd` in `cp/src/kanban/run-accounting.ts`);
+- a human status move, on both of its paths: a live human-attributed status label adopted by
+  the label sync (`PgKanbanSyncRepo.apply`, any accepted change of status) and the parked
+  human ingest (`PgKanbanDispatchRepo.ingestStatus`).
+
+A move the CP makes on its own (a non-writer's revert to `triage`, a fail-closed attribution
+timeout) keeps the stamp: neither moves a card into `review`, and the next work claim or human
+move clears it before another round can reach the verifier.
+
+`reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
+`triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
+approval resets it; a worker's pass and every human move keep it. So after a trip, a human
+who moves the card back to `ready` buys exactly **one more verify round**: the worker runs,
+the verifier reviews once, and a further `changes_requested` (round 4) sends the card straight
+back to `triage`, while an approval ends the loop and resets the count. This is deliberate:
+an agent can never reset the count, and a human who wants a full fresh budget must decide so
+again after each extra round.
+
 ## SQL/predicate parity rule
 
 For every card, `explainClaim` returns `eligible: true` if and only if
@@ -123,12 +149,16 @@ and vice versa.
     `verifier_unset`/`verifier_is_worker` now fire.
   - New `verified` gate (input `card.verifiedAt`): a card the verifier approved under
     `pr_merged`/`pr_checks_green` stays in `review` for the PR and is never re-verified. A work
-    claim, a worker's pass, `changes_requested`, and a human status move clear the stamp, so the
-    next review round is verifiable again.
+    claim, a worker's pass, `changes_requested`, and a human status move (the label sync's
+    `apply` and the parked ingest alike) clear the stamp, so the next review round is
+    verifiable again. See "The approval stamp and review rounds".
   - B8 compares the verifier against every work attempt on the card: input `latestWorkAgentId`
     is replaced by `workAgentIds`.
   - New `needs_attention` gate (input `card.needsAttention`): the claim no longer takes a flagged
     card, so a board edit alone cannot lift a B8 park; only the human status move clears the flag.
   - Gates are reordered to the SQL claim's order: `open_lease` joins the row filters before the
     agent gates, and `daemon_offline` follows `agent_cap`, with `verifier_is_worker` last.
+- **1.1 erratum (2026-10-18):** the 1.1 entry said every human status move clears
+  `verifiedAt`, but only the parked ingest did; after the merge with the label sync (#194), its
+  `apply` clears it too, so the statement now holds. The predicate and its inputs are unchanged.
 - **1.0 (2026-10-17):** initial frozen contract.
