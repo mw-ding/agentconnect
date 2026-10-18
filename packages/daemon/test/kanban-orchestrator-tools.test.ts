@@ -463,3 +463,49 @@ describe('pending journal', () => {
     expect(statSync(journalPath).mode & 0o777).toBe(0o600)
   })
 })
+
+describe('vera-349: partial retry', () => {
+  it('vera-349: replays labels and edges after prepare sees the partially registered card', async () => {
+    let registered = false
+    let labels = false
+    let edges = false
+    let commits = 0
+    const h = tools(async (p) => {
+      if (p.op === 'prepare_create')
+        return registered
+          ? { ok: true, op: p.op, verdict: 'existing', issueNumber: 42 }
+          : { ok: true, op: p.op, verdict: 'proceed' }
+      registered = true
+      commits++
+      if (commits === 1) return { ok: false, op: 'commit_create', code: 'github_partial' }
+      labels = true
+      edges = p.op === 'commit_create' && p.blockedBy?.[0] === 7
+      return { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+    })
+    const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY, blockedBy: [7] }
+    expect(await h.svc.create(req)).toMatchObject({ partial: true, retryable: true })
+    expect(await h.svc.create(req)).toMatchObject({ created: true, issueNumber: 42 })
+    expect({ commits, labels, edges }).toEqual({ commits: 2, labels: true, edges: true })
+    expect(h.fileIssue).toHaveBeenCalledTimes(1)
+    expect((h.svc as any).pending.size).toBe(0)
+    expect(await h.svc.create(req)).toEqual({ existing: true, issueNumber: 42 })
+    expect(commits).toBe(2)
+  })
+
+  it('vera-349: a different pending issue cannot authorize replay of an existing card', async () => {
+    let existing = false
+    const h = tools(async (p) => {
+      if (p.op === 'prepare_create')
+        return existing
+          ? { ok: true, op: p.op, verdict: 'existing', issueNumber: 99 }
+          : { ok: true, op: p.op, verdict: 'proceed' }
+      existing = true
+      return { ok: false, op: 'commit_create', code: 'github_partial' }
+    })
+    const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY }
+    await h.svc.create(req)
+    expect(await h.svc.create(req)).toEqual({ existing: true, issueNumber: 99 })
+    expect(h.fileIssue).toHaveBeenCalledTimes(1)
+    expect(h.svc).toBeDefined()
+  })
+})

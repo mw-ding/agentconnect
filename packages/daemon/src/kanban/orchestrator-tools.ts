@@ -121,12 +121,12 @@ export class KanbanOrchestratorTools {
     })
     if (!prepare.ok) return { refused: refusalText(prepare.code) }
     const prepared = prepare as OkOf<'prepare_create'>
-    if (prepared.verdict === 'existing') {
+    const mapKey = JSON.stringify([req.agentId, req.board, req.epic ?? null, req.step ?? 'default', specDigest])
+    if (prepared.verdict === 'existing' && this.pending.get(mapKey)?.issueNumber !== prepared.issueNumber) {
       return { existing: true, issueNumber: prepared.issueNumber }
     }
     const repoFullName = await this.deps.repoFullNameFor(req.agentId, req.board)
     if (!repoFullName) return { refused: 'could not resolve the board repository' }
-    const mapKey = JSON.stringify([req.agentId, req.board, req.epic ?? null, req.step ?? 'default', specDigest])
     let issueNumber = this.pending.get(mapKey)?.issueNumber
     if (issueNumber === undefined) {
       const marker = kanbanCardKeyMarker(
