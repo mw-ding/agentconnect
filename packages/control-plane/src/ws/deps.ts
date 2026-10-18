@@ -53,6 +53,7 @@ import type { countReviewCheckout } from '../observability/review-checkout.js'
 import type { CodeHostNoteProjectionService } from '../codehost/note-projection.service.js'
 import type { GiteaStatusCoordinator } from '../gitea/status-projection.js'
 import type { KanbanDispatcher } from '../kanban/dispatcher.js'
+import type { KanbanOrchestrator } from '../kanban/orchestrator.js'
 import type { ReconcileService } from '../orchestrator/placement.js'
 import type { ConnectionRegistry } from './registry.js'
 import type { Clock } from '../domain/clock.js'
@@ -235,6 +236,8 @@ export interface DaemonWsDeps {
     KanbanDispatcher,
     'onHeartbeat' | 'onReport' | 'commentGrant' | 'liveCommentGrant' | 'onCardShow'
   >
+  /** Kanban orchestrator surface (issue #2 M3); absent ⇒ `kanban/orchestrate` and the grant answer SCOPE_DENIED. */
+  kanbanOrchestrator?: KanbanOrchestrator
   /** Open Kanban runs used to clamp gitcred grants to the run mode. Absent ⇒ no clamp. */
   kanbanGrants?: {
     openScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
