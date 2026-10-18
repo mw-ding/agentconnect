@@ -4403,7 +4403,7 @@ export class Daemon {
         ),
       kanbanList: (req) => this.kanbanOrchestratorTools().list(req),
       kanbanCreate: (req) =>
-        // The issue title/body are masked before the spec digest is computed or the issue is filed, so a prompt-injected agent cannot exfiltrate a secret through a card.
+        // Mask before marker neutralization, digesting, or filing agent text.
         this.kanbanOrchestratorTools().create({
           ...req,
           title: this.maskAgentSecrets(req.agentId, req.title),
@@ -27261,7 +27261,10 @@ export class Daemon {
         return cp.kanbanOrchestrate(payload)
       },
       repoFullNameFor: (agentId, board) => this.kanbanBoardRepo(agentId, board),
-      findIssue: (agentId, repoFullName, marker) => this.findKanbanIssue(agentId, repoFullName, marker),
+      findIssue: (agentId, repoFullName, marker, appLogin, rejected) =>
+        this.findKanbanIssue(agentId, repoFullName, marker, appLogin, rejected),
+      invalidateToken: (agentId, repo) => this.gitCreds.invalidateKanbanOrchestrator(agentId, repo),
+      invalidateAllTokens: (agentId) => this.gitCreds.invalidateAllKanbanOrchestrator(agentId),
       fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body),
       journalPath: kanbanPendingCreatesPath(this.root),
       log: { warn: (m) => this.log.warn(m) }
@@ -27277,23 +27280,22 @@ export class Daemon {
     return (reply as Extract<typeof reply, { op: 'list' }>).boards[0]?.repoFullName ?? null
   }
 
-  // Listing avoids GitHub search-index lag in the crash-before-commit window; failures must not fall through to POST.
-  private async findKanbanIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null> {
+  // Recovery reads stay on the data plane and require a trusted author as well as a trailing marker.
+  private async findKanbanIssue(
+    agentId: string,
+    repoFullName: string,
+    marker: string,
+    appLogin?: string | null,
+    rejected: number[] = []
+  ): Promise<number | null> {
     const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
-    // Newest first over the last day: the orphan is minutes old, and the journal covers older ones.
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
-    for (let page = 1; page <= 3; page++) {
-      const res = await fetch(
-        `https://api.github.com/repos/${repoFullName}/issues?state=all&sort=created&direction=desc&since=${encodeURIComponent(since)}&per_page=100&page=${page}`,
-        {
-          headers: {
-            authorization: `Bearer ${grant.token}`,
-            accept: 'application/vnd.github+json',
-            'x-github-api-version': '2022-11-28'
-          },
-          signal: AbortSignal.timeout(30_000)
-        }
-      )
+    const headers = {
+      authorization: `Bearer ${grant.token}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28'
+    }
+    const read = async (url: string): Promise<unknown> => {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) })
       if (res.status === 401 || res.status === 403) {
         this.gitCreds.invalidateKanbanOrchestrator(agentId, repoFullName, grant.token)
       }
@@ -27301,13 +27303,45 @@ export class Daemon {
         await res.body?.cancel().catch(() => undefined)
         throw new Error(`GitHub issue lookup failed (${res.status})`)
       }
-      const issues = (await res.json()) as Array<{ number: number; body: string | null; pull_request?: unknown }>
-      const found = issues.find((issue) => !issue.pull_request && issue.body?.includes(marker))
-      if (found) return found.number
-      if (issues.length < 100) return null
+      return res.json()
     }
-    // Three full pages with no match: stop rather than paging the whole repo.
-    return null
+    // PAT recovery only trusts the identity authenticated by this very token.
+    const login = appLogin ?? ((await read('https://api.github.com/user')) as { login?: string }).login
+    if (typeof login !== 'string' || !login) throw new Error('GitHub recovery identity unavailable')
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    type Issue = {
+      number: number
+      body: string | null
+      pull_request?: unknown
+      user?: { type: string; login: string }
+      created_at?: string
+    }
+    let found: Issue | undefined
+    for (let page = 1; page <= 3; page++) {
+      const issues = (await read(
+        `https://api.github.com/repos/${repoFullName}/issues?state=all&sort=created&direction=desc&since=${encodeURIComponent(since)}&per_page=100&page=${page}`
+      )) as Issue[]
+      for (const issue of issues) {
+        if (
+          issue.pull_request ||
+          rejected.includes(issue.number) ||
+          (appLogin && issue.user?.type !== 'Bot') ||
+          issue.user?.login?.toLowerCase() !== login.toLowerCase() ||
+          !issue.body?.trimEnd().endsWith(marker)
+        )
+          continue
+        const time = Date.parse(issue.created_at ?? '')
+        const oldest = Date.parse(found?.created_at ?? '')
+        if (
+          !found ||
+          (Number.isFinite(time) && Number.isFinite(oldest) && time < oldest) ||
+          ((!Number.isFinite(time) || !Number.isFinite(oldest) || time === oldest) && issue.number < found.number)
+        )
+          found = issue
+      }
+      if (issues.length < 100) break
+    }
+    return found?.number ?? null
   }
 
   /** Files the issue body with the orchestrator's issues-only token; the CP writes only metadata. */

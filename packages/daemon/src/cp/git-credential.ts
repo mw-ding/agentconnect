@@ -445,11 +445,21 @@ export class GitCredentialCache {
   }
 
   // Only evict the rejected grant; a concurrent mint may already have replaced it.
-  invalidateKanbanOrchestrator(agentId: string, repo: string, presentedToken: string): void {
+  invalidateKanbanOrchestrator(agentId: string, repo: string, presentedToken?: string): void {
     const key = KANBAN_ORCH_KEY(agentId, repo)
-    if (this.entries.get(key)?.token !== presentedToken) return
+    if (presentedToken !== undefined && this.entries.get(key)?.token !== presentedToken) return
     this.entries.delete(key)
     this.refreshKanban.add(key)
+  }
+
+  // A role refusal before board resolution names no repo, so drop every orchestrator grant for the agent.
+  invalidateAllKanbanOrchestrator(agentId: string): void {
+    const prefix = `kanbanorch\0${agentId}\0`
+    for (const key of [...this.entries.keys()]) {
+      if (!key.startsWith(prefix)) continue
+      this.entries.delete(key)
+      this.refreshKanban.add(key)
+    }
   }
 
   /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */

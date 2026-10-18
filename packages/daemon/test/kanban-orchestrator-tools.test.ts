@@ -3,12 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import {
-  kanbanCardKeyMarker,
-  kanbanOrchestrateCardKey,
-  type KanbanOrchestrate,
-  type KanbanOrchestrateOk
-} from '@agentconnect.md/protocol'
+import { type KanbanOrchestrate, type KanbanOrchestrateOk } from '@agentconnect.md/protocol'
 import { KanbanOrchestratorTools, orchestratorSpecDigest } from '../src/kanban/orchestrator-tools.js'
 
 const AGENT = '11111111-1111-4111-8111-111111111111'
@@ -216,51 +211,24 @@ describe('pending creates', () => {
 })
 
 describe('durable crash recovery', () => {
-  it.each([true, false])('adopts a marker match (%s) or files a marked issue before committing', async (found) => {
-    const orchestrate = vi.fn(async (p: KanbanOrchestrate): Promise<KanbanOrchestrateOk> =>
-      p.op === 'prepare_create'
-        ? { ok: true, op: p.op, verdict: 'proceed' }
-        : { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
-    )
-    const findIssue = vi.fn(async () => (found ? 42 : null))
+  it('vera-349: ordinary fresh creates skip marker lookup', async () => {
+    const findIssue = vi.fn(async () => 777)
     const fileIssue = vi.fn(async () => 42)
     const svc = new KanbanOrchestratorTools({
-      orchestrate,
-      findIssue,
-      fileIssue,
-      repoFullNameFor: async () => 'acme/web'
-    })
-    await expect(
-      svc.create({ agentId: AGENT, board: BOARD, title: TITLE, body: BODY, epic: 1, step: STEP })
-    ).resolves.toMatchObject({ created: true, issueNumber: 42 })
-    const marker = kanbanCardKeyMarker(
-      kanbanOrchestrateCardKey({
-        boardId: BOARD,
-        epicIssueNumber: 1,
-        step: STEP,
-        specDigest: orchestratorSpecDigest(TITLE, BODY)
-      })
-    )
-    expect(findIssue).toHaveBeenCalledWith(AGENT, 'acme/web', marker)
-    expect(fileIssue).toHaveBeenCalledTimes(found ? 0 : 1)
-    if (!found) expect(fileIssue).toHaveBeenCalledWith(AGENT, 'acme/web', TITLE, `${BODY}\n\n${marker}`)
-    expect(orchestrate.mock.calls[1]![0]).toMatchObject({ op: 'commit_create', issueNumber: 42 })
-  })
-
-  it('never files when the durable lookup fails', async () => {
-    const fileIssue = vi.fn(async () => 42)
-    const svc = new KanbanOrchestratorTools({
-      orchestrate: async () => ({ ok: true, op: 'prepare_create', verdict: 'proceed' }),
+      orchestrate: async (p) =>
+        p.op === 'prepare_create'
+          ? { ok: true, op: p.op, verdict: 'proceed' }
+          : { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 },
       repoFullNameFor: async () => 'acme/web',
-      fileIssue,
-      findIssue: async () => {
-        throw new Error('GitHub unavailable')
-      }
+      findIssue,
+      fileIssue
     })
-    await expect(svc.create({ agentId: AGENT, board: BOARD, title: TITLE, body: BODY })).rejects.toThrow(
-      'GitHub unavailable'
-    )
-    expect(fileIssue).not.toHaveBeenCalled()
+    expect(await svc.create({ agentId: AGENT, board: BOARD, title: TITLE, body: BODY })).toMatchObject({
+      created: true,
+      issueNumber: 42
+    })
+    expect(findIssue).not.toHaveBeenCalled()
+    expect(fileIssue).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -330,7 +298,7 @@ describe('pending journal', () => {
     expect(fileIssue).not.toHaveBeenCalled()
   })
 
-  it('a corrupt file means empty', async () => {
+  it('a corrupt file requires recovery before another POST', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ac-pending-journal-'))
     journalRoots.push(root)
     const journalPath = join(root, 'journal.json')
@@ -349,9 +317,9 @@ describe('pending journal', () => {
       log: { warn }
     })
     expect(warn).toHaveBeenCalledTimes(1)
-    // Nothing usable loaded, so this files anew instead of reusing a phantom entry.
-    await expect(svc.create(req)).resolves.toMatchObject({ issueNumber: 42 })
-    expect(fileIssue).toHaveBeenCalledTimes(1)
+    // Lost state may hide a landed POST; the empty lookup leaves a retryable intent.
+    await expect(svc.create(req)).resolves.toMatchObject({ retryable: true, refused: expect.any(String) })
+    expect(fileIssue).not.toHaveBeenCalled()
   })
 
   it('a missing file means empty', async () => {
@@ -506,6 +474,123 @@ describe('vera-349: partial retry', () => {
     await h.svc.create(req)
     expect(await h.svc.create(req)).toEqual({ existing: true, issueNumber: 99 })
     expect(h.fileIssue).toHaveBeenCalledTimes(1)
-    expect(h.svc).toBeDefined()
+    expect((h.svc as any).pending.size).toBe(1)
   })
+})
+
+describe('vera-349: safe recovery', () => {
+  const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY, step: STEP }
+  const roots: string[] = []
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+  })
+  const pathFor = () => {
+    const root = mkdtempSync(join(tmpdir(), 'ac-vera-349-'))
+    roots.push(root)
+    return join(root, 'journal.json')
+  }
+  const keyFor = (r = req) =>
+    JSON.stringify([r.agentId, r.board, null, r.step, orchestratorSpecDigest(r.title, r.body)])
+
+  it('vera-349: neutralizes agent markers before filing and taking the digest', async () => {
+    const orchestrate = vi.fn(async (p: KanbanOrchestrate): Promise<KanbanOrchestrateOk> =>
+      p.op === 'prepare_create'
+        ? { ok: true, op: p.op, verdict: 'proceed' }
+        : { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+    )
+    const fileIssue = vi.fn(async (_agent: string, _repo: string, _title: string, _body: string) => 42)
+    const findIssue = vi.fn(async () => null)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate,
+      fileIssue,
+      findIssue,
+      repoFullNameFor: async () => 'acme/web'
+    })
+    const planted = '<!--  AGENTCONNECT : kanban-card-key : ' + 'd'.repeat(64) + ' -->'
+    await svc.create({ ...req, title: TITLE + planted, body: BODY + planted })
+    const [, , title, body] = fileIssue.mock.calls[0] as unknown as string[]
+    expect(title).not.toMatch(/<!--\s*agentconnect\s*:\s*kanban-card-key\s*:/i)
+    expect(body?.match(/<!--\s*agentconnect\s*:\s*kanban-card-key\s*:/gi)).toHaveLength(1)
+    const agentBody = body!.slice(0, body!.lastIndexOf('\n\n'))
+    expect(orchestrate.mock.calls[0]![0]).toMatchObject({ specDigest: orchestratorSpecDigest(title!, agentBody) })
+    expect(body?.trimEnd().endsWith(planted)).toBe(false)
+  })
+
+  it('vera-349: writes an intent before POST, and an uncertain restart never files again', async () => {
+    const journalPath = pathFor()
+    const fileIssue = vi.fn(async () => {
+      expect(JSON.parse(readFileSync(journalPath, 'utf8'))[keyFor()]).toMatchObject({
+        issueNumber: null,
+        startedAt: expect.any(Number)
+      })
+      throw new Error('POST may have landed')
+    })
+    const orchestrate = async (): Promise<KanbanOrchestrateOk> => ({
+      ok: true,
+      op: 'prepare_create',
+      verdict: 'proceed',
+      appLogin: 'acme-app[bot]'
+    })
+    const findIssue = vi.fn(async () => null)
+    const deps = { orchestrate, fileIssue, findIssue, repoFullNameFor: async () => 'acme/web', journalPath }
+    const svc = new KanbanOrchestratorTools(deps)
+    await expect(svc.create(req)).rejects.toThrow('POST may have landed')
+    expect(findIssue).not.toHaveBeenCalled()
+    const restarted = new KanbanOrchestratorTools(deps)
+    expect(await restarted.create(req)).toMatchObject({ retryable: true, refused: expect.any(String) })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    expect(findIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['issue_not_from_app', 'issue_mismatch', 'key_conflict'] as const)(
+    'vera-349: remembers a looked-up issue refused as %s across restarts',
+    async (code) => {
+      const journalPath = pathFor()
+      writeFileSync(journalPath, JSON.stringify({ [keyFor()]: { issueNumber: null, startedAt: Date.now() } }))
+      const findIssue = vi.fn(
+        async (_agent: string, _repo: string, _marker: string, _login?: string | null, rejected?: number[]) =>
+          rejected?.includes(777) ? 42 : 777
+      )
+      const fileIssue = vi.fn(async () => 43)
+      const orchestrate = async (p: KanbanOrchestrate): Promise<KanbanOrchestrateOk> => {
+        if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed', appLogin: 'acme-app[bot]' }
+        if (p.op === 'commit_create' && p.issueNumber === 777) return { ok: false, op: p.op, code }
+        return { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+      }
+      const deps = { orchestrate, fileIssue, findIssue, journalPath, repoFullNameFor: async () => 'acme/web' }
+      expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ refused: expect.any(String) })
+      expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ created: true, issueNumber: 42 })
+      expect(findIssue.mock.calls[1]?.[4]).toEqual([777])
+      expect(fileIssue).not.toHaveBeenCalled()
+      expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toEqual({})
+    }
+  )
+
+  it('vera-349: a transient commit refusal retains the filed number', async () => {
+    const h = tools(async (p) =>
+      p.op === 'prepare_create'
+        ? { ok: true, op: p.op, verdict: 'proceed' }
+        : { ok: false, op: 'commit_create', code: 'github_unavailable' }
+    )
+    expect(await h.svc.create(req)).toMatchObject({ retryable: true })
+    await h.svc.create(req)
+    expect(h.fileIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['not_orchestrator', 'board_disabled'] as const)(
+    'vera-349: a prepare %s refusal evicts every orchestrator grant before board resolution',
+    async (code) => {
+      const invalidateAllTokens = vi.fn()
+      const svc = new KanbanOrchestratorTools({
+        orchestrate: async () => ({ ok: false, op: 'prepare_create', code }),
+        repoFullNameFor: async () => 'acme/web',
+        findIssue: async () => null,
+        fileIssue: async () => 42,
+        invalidateToken: vi.fn(),
+        invalidateAllTokens
+      })
+      await expect(svc.create(req)).resolves.toMatchObject({ refused: expect.any(String) })
+      expect(invalidateAllTokens).toHaveBeenCalledWith(AGENT)
+    }
+  )
 })

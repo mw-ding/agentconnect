@@ -7,7 +7,12 @@ import {
   type KanbanOrchestrateOk,
   type KanbanOrchestrateRefusalCode
 } from '@agentconnect.md/protocol'
-import { loadPendingJournal, savePendingJournal, type PendingJournalLog } from './pending-journal.js'
+import {
+  loadPendingJournal,
+  savePendingJournal,
+  type PendingCreateMap,
+  type PendingJournalLog
+} from './pending-journal.js'
 
 export interface KanbanOrchestratorToolsDeps {
   /** D→C `kanban/orchestrate`; rejects when the CP is unreachable. */
@@ -15,7 +20,15 @@ export interface KanbanOrchestratorToolsDeps {
   /** Resolves a board id to `owner/repo` (via list), or returns the string as-is when it is already `owner/repo`. */
   repoFullNameFor(agentId: string, board: string): Promise<string | null>
   // Look up a durable B1 marker on GitHub before creating another issue after a crash.
-  findIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null>
+  findIssue(
+    agentId: string,
+    repoFullName: string,
+    marker: string,
+    appLogin?: string | null,
+    rejected?: number[]
+  ): Promise<number | null>
+  invalidateToken?(agentId: string, repoFullName: string): void
+  invalidateAllTokens?(agentId: string): void
   /** Files the issue with the orchestrator's issues-only token; returns the new issue number. */
   fileIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number>
   // Durable copy of the pending map; loaded at construction, saved on every mutation.
@@ -70,13 +83,19 @@ export function orchestratorSpecDigest(title: string, body: string): string {
   return createHash('sha256').update(`${title}\n${body}`).digest('hex')
 }
 
+// Agent text cannot impersonate a daemon-issued trailing recovery marker.
+export function neutralizeKanbanMarkers(text: string): string {
+  return text.replace(/<!--\s*agentconnect\s*:\s*kanban-card-key\s*:/gi, '[agentconnect kanban-card-key:')
+}
+
 export class KanbanOrchestratorTools {
   // Retain filed issues briefly so a failed commit can retry without a second POST.
-  private readonly pending = new Map<string, { issueNumber: number; filedAt: number }>()
+  private readonly pending: PendingCreateMap
+  private readonly boardRepos = new Map<string, string>()
 
   constructor(private readonly deps: KanbanOrchestratorToolsDeps) {
     // A restart rebuilds the toolset, so the journal restores the pending map first.
-    for (const [key, entry] of loadPendingJournal(deps.journalPath, deps.log)) this.pending.set(key, entry)
+    this.pending = loadPendingJournal(deps.journalPath, deps.log, this.now())
     this.prunePending()
   }
 
@@ -107,6 +126,7 @@ export class KanbanOrchestratorTools {
 
   async create(req: KanbanCreateReq): Promise<unknown> {
     this.prunePending()
+    req = { ...req, title: neutralizeKanbanMarkers(req.title), body: neutralizeKanbanMarkers(req.body) }
     const specDigest = orchestratorSpecDigest(req.title, req.body)
     const prepare = await this.deps.orchestrate({
       op: 'prepare_create',
@@ -119,16 +139,25 @@ export class KanbanOrchestratorTools {
       ...(req.priority !== undefined ? { priority: req.priority } : {}),
       ...(req.status !== undefined ? { status: req.status } : {})
     })
-    if (!prepare.ok) return { refused: refusalText(prepare.code) }
-    const prepared = prepare as OkOf<'prepare_create'>
     const mapKey = JSON.stringify([req.agentId, req.board, req.epic ?? null, req.step ?? 'default', specDigest])
+    if (!prepare.ok) {
+      this.revokeToken(req.agentId, req.board, prepare.code)
+      if (prepare.code !== 'github_unavailable' && prepare.code !== 'github_partial') {
+        this.pending.delete(mapKey)
+        this.saveJournal()
+      }
+      return { refused: refusalText(prepare.code) }
+    }
+    const prepared = prepare as OkOf<'prepare_create'>
     if (prepared.verdict === 'existing' && this.pending.get(mapKey)?.issueNumber !== prepared.issueNumber) {
       return { existing: true, issueNumber: prepared.issueNumber }
     }
     const repoFullName = await this.deps.repoFullNameFor(req.agentId, req.board)
     if (!repoFullName) return { refused: 'could not resolve the board repository' }
-    let issueNumber = this.pending.get(mapKey)?.issueNumber
-    if (issueNumber === undefined) {
+    this.boardRepos.set(JSON.stringify([req.agentId, req.board]), repoFullName)
+    const pending = this.pending.get(mapKey)
+    let issueNumber = pending?.issueNumber
+    if (issueNumber == null) {
       const marker = kanbanCardKeyMarker(
         kanbanOrchestrateCardKey({
           boardId: req.board,
@@ -137,11 +166,34 @@ export class KanbanOrchestratorTools {
           specDigest
         })
       )
-      issueNumber =
-        (await this.deps.findIssue(req.agentId, repoFullName, marker)) ??
-        (await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`))
-      this.pending.set(mapKey, { issueNumber, filedAt: this.deps.now?.() ?? Date.now() })
+      const recovery = pending?.issueNumber === null || this.pending.unknown
+      const rejectedIssueNumbers = pending?.rejectedIssueNumbers
+      this.pending.set(mapKey, {
+        issueNumber: null,
+        startedAt: pending?.issueNumber === null ? pending.startedAt : this.now(),
+        ...(rejectedIssueNumbers ? { rejectedIssueNumbers } : {})
+      })
       this.prunePending()
+      if (!this.saveJournal()) return { refused: 'could not persist the issue create intent', retryable: true }
+      if (recovery) {
+        issueNumber = await this.deps.findIssue(
+          req.agentId,
+          repoFullName,
+          marker,
+          prepared.appLogin,
+          rejectedIssueNumbers
+        )
+        // A POST may have landed but still be invisible; leave the intent for a later retry.
+        if (issueNumber === null) return { refused: refusalText('github_unavailable'), retryable: true }
+      } else {
+        issueNumber = await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`)
+      }
+      this.pending.set(mapKey, {
+        issueNumber,
+        filedAt: this.now(),
+        ...(recovery ? { lookedUp: true } : {}),
+        ...(rejectedIssueNumbers ? { rejectedIssueNumbers } : {})
+      })
       this.saveJournal()
     }
     try {
@@ -167,7 +219,24 @@ export class KanbanOrchestratorTools {
       if (commit.code === 'github_partial') {
         return { created: true, issueNumber, repoFullName, partial: true, retryable: true }
       }
-      this.pending.delete(mapKey)
+      this.revokeToken(req.agentId, req.board, commit.code)
+      if (commit.code === 'github_unavailable') {
+        return { filed: true, issueNumber, repoFullName, refused: refusalText(commit.code), retryable: true }
+      }
+      const entry = this.pending.get(mapKey)
+      if (
+        entry?.issueNumber !== null &&
+        entry?.lookedUp &&
+        ['issue_not_from_app', 'issue_mismatch', 'key_conflict'].includes(commit.code)
+      ) {
+        this.pending.set(mapKey, {
+          issueNumber: null,
+          startedAt: this.now(),
+          rejectedIssueNumbers: [...(entry.rejectedIssueNumbers ?? []), issueNumber].slice(-300)
+        })
+      } else {
+        this.pending.delete(mapKey)
+      }
       this.saveJournal()
       return { refused: refusalText(commit.code) }
     } catch {
@@ -176,14 +245,26 @@ export class KanbanOrchestratorTools {
     }
   }
 
-  private saveJournal(): void {
-    savePendingJournal(this.deps.journalPath, this.pending, this.deps.log)
+  private now(): number {
+    return this.deps.now?.() ?? Date.now()
+  }
+
+  private revokeToken(agentId: string, board: string, code: KanbanOrchestrateRefusalCode): void {
+    if (code !== 'not_orchestrator' && code !== 'board_disabled') return
+    const repo = this.boardRepos.get(JSON.stringify([agentId, board]))
+    if (repo) this.deps.invalidateToken?.(agentId, repo)
+    else this.deps.invalidateAllTokens?.(agentId)
+  }
+
+  private saveJournal(): boolean {
+    return savePendingJournal(this.deps.journalPath, this.pending, this.deps.log)
   }
 
   private prunePending(): void {
-    const now = this.deps.now?.() ?? Date.now()
+    const now = this.now()
     for (const [key, entry] of this.pending) {
-      if (now - entry.filedAt > 60 * 60 * 1000) this.pending.delete(key)
+      if (now - (entry.issueNumber === null ? entry.startedAt : entry.filedAt) > 60 * 60 * 1000)
+        this.pending.delete(key)
     }
     // Map insertion order keeps eviction tied to the file time, even after retries.
     while (this.pending.size > 256) this.pending.delete(this.pending.keys().next().value!)
