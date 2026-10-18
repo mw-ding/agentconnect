@@ -24,6 +24,7 @@ export const PROJECT_STATUS_OPTIONS: Record<KanbanStatus, string> = {
 export type ProjectWriteReason =
   | 'project_issue_node_missing'
   | 'project_not_org_owned'
+  | 'project_owner_mismatch'
   | 'project_option_missing'
   | 'project_item_add_failed'
   | 'project_item_missing'
@@ -37,17 +38,21 @@ export interface KanbanProjectWriterDeps {
   baseUrl?: string
   log?: { info(o: object, msg: string): void }
   now?: () => number
+  /** Field cache bound (tests shrink it); the least recently used entry is evicted past it. */
+  fieldCacheMax?: number
 }
 
-/** Short-lived field metadata per (project, field): options plus the owner type the runtime guard re-checks. */
+/** Short-lived field metadata per (installation, project, field): options plus the owner the runtime guard re-checks. */
 interface FieldCacheEntry {
   at: number
   ownerType?: string
+  ownerLogin?: string
   options: Array<{ id: string; name: string }>
 }
 
 /** Field options stay fresh for minutes; a stale entry only risks one write against a renamed option set. */
 const FIELD_CACHE_TTL_MS = 5 * 60_000
+const FIELD_CACHE_MAX = 256
 
 const ADD_ITEM_MUTATION = `mutation KanbanProjectAddItem($project: ID!, $content: ID!) {
   addProjectV2ItemById(input: { projectId: $project, contentId: $content }) { item { id } }
@@ -125,9 +130,11 @@ export class KanbanProjectWriter {
         // Mutations must not report partial data as success; the guard read must keep a denial's reason.
         strictErrors: true
       })
+    // Every part of the key is load-bearing: a cached verdict never crosses an installation, a project, or a field.
+    const fieldKey = `${args.repo.installationId}:${projectNodeId}:${statusFieldId}`
     let field: FieldCacheEntry
     try {
-      field = await this.resolveField(gql, projectNodeId, statusFieldId)
+      field = await this.resolveField(gql, fieldKey, projectNodeId, statusFieldId)
     } catch (err) {
       this.deps.log?.info({ reason: this.reason(err, 'project_field_write_failed') }, 'kanban project write')
       return null
@@ -135,6 +142,12 @@ export class KanbanProjectWriter {
     // Runtime org-only guard: a row that somehow names a user-owned project is never written to.
     if (field.ownerType !== 'Organization') {
       this.deps.log?.info({ reason: 'project_not_org_owned' satisfies ProjectWriteReason }, 'kanban project write')
+      return null
+    }
+    // Same owner as the board repo: a PAT fallback can reach other orgs' projects, an installation token cannot.
+    const repoOwner = args.repo.repoFullName.split('/')[0] ?? ''
+    if (field.ownerLogin?.toLowerCase() !== repoOwner.toLowerCase()) {
+      this.deps.log?.info({ reason: 'project_owner_mismatch' satisfies ProjectWriteReason }, 'kanban project write')
       return null
     }
     const option = field.options.find((o) => o.name.toLowerCase() === PROJECT_STATUS_OPTIONS[args.status].toLowerCase())
@@ -149,8 +162,14 @@ export class KanbanProjectWriter {
           content: issueNodeId
         })
       ).addProjectV2ItemById.item.id
+    // A failed write re-reads the field next time (e.g. a deleted option) instead of waiting out the TTL.
     const setStatus = (item: string) =>
-      gql(SET_STATUS_MUTATION, { project: projectNodeId, item, field: statusFieldId, option: option.id })
+      gql(SET_STATUS_MUTATION, { project: projectNodeId, item, field: statusFieldId, option: option.id }).catch(
+        (err: unknown) => {
+          this.fields.delete(fieldKey)
+          throw err
+        }
+      )
     // Only an item cached for this very project is reused; a re-pointed board or a legacy row re-adds (idempotent).
     const cached = args.card.projectItemProjectId === projectNodeId ? (args.card.projectItemId ?? null) : null
     if (cached) {
@@ -197,15 +216,20 @@ export class KanbanProjectWriter {
 
   private async resolveField(
     gql: <T>(query: string, variables: Record<string, unknown>) => Promise<T>,
+    key: string,
     projectNodeId: string,
     statusFieldId: string
   ): Promise<FieldCacheEntry> {
-    const key = `${projectNodeId}:${statusFieldId}`
     const now = this.deps.now?.() ?? Date.now()
     const cached = this.fields.get(key)
-    if (cached && now - cached.at < FIELD_CACHE_TTL_MS) return cached
+    this.fields.delete(key)
+    if (cached && now - cached.at < FIELD_CACHE_TTL_MS) {
+      // Re-inserting keeps the Map in least-recently-used order for eviction.
+      this.fields.set(key, cached)
+      return cached
+    }
     const readback = await gql<{
-      project?: { id?: string; owner?: { __typename?: string } | null } | null
+      project?: { id?: string; owner?: { __typename?: string; login?: string } | null } | null
       field?: {
         __typename?: string
         id?: string
@@ -213,14 +237,21 @@ export class KanbanProjectWriter {
         options?: Array<{ id?: string; name?: string }> | null
       } | null
     }>(PROJECT_READ_QUERY, { project: projectNodeId, field: statusFieldId })
+    const owner = readback.project?.id === projectNodeId ? readback.project.owner : undefined
     const entry: FieldCacheEntry = {
       at: now,
-      ownerType: readback.project?.id === projectNodeId ? readback.project.owner?.__typename : undefined,
+      ownerType: owner?.__typename,
+      ownerLogin: owner?.login,
       options: (readback.field?.project?.id === projectNodeId ? (readback.field.options ?? []) : []).flatMap((o) =>
         o.id && o.name ? [{ id: o.id, name: o.name }] : []
       )
     }
     this.fields.set(key, entry)
+    const max = this.deps.fieldCacheMax ?? FIELD_CACHE_MAX
+    for (const oldest of this.fields.keys()) {
+      if (this.fields.size <= max) break
+      this.fields.delete(oldest)
+    }
     return entry
   }
 

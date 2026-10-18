@@ -515,3 +515,132 @@ describe('vera-474 B1: the hook keeps the item cache keyed by project', () => {
     expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_same')
   })
 })
+
+describe('vera-474: the field cache key, bound and invalidation, and the owner-login guard', () => {
+  type Read = { project: string; owner: string; ownerType: string; fieldProject?: string }
+  // Answers the guard read per (project, field) and counts every mutation, so cache hits are observable.
+  function routed(readbacks: Record<string, Read>, opts: { fieldCacheMax?: number; failUpdates?: number } = {}) {
+    const calls: Call[] = []
+    let failures = opts.failUpdates ?? 0
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const call = JSON.parse(String(init?.body)) as Call
+      calls.push(call)
+      const v = call.variables as Record<string, string>
+      if (call.query.includes('addProjectV2ItemById')) return new Response(JSON.stringify(addBody('PVTI_1')))
+      if (call.query.includes('updateProjectV2ItemFieldValue')) {
+        if (failures-- > 0) {
+          return new Response(JSON.stringify({ data: null, errors: [{ message: 'option does not exist' }] }))
+        }
+        return new Response(JSON.stringify(updateBody))
+      }
+      const r = readbacks[`${v.project}:${v.field}`]!
+      return new Response(
+        JSON.stringify({
+          data: {
+            project: { id: r.project, owner: { __typename: r.ownerType, login: r.owner } },
+            field: {
+              __typename: 'ProjectV2SingleSelectField',
+              id: v.field,
+              project: { id: r.fieldProject ?? r.project },
+              options: Object.values(PROJECT_STATUS_OPTIONS).map((name) => ({ id: optionId(name), name }))
+            }
+          }
+        })
+      )
+    })
+    const logs: Array<{ reason: string }> = []
+    const mintKanbanProject = vi.fn(async () => ({
+      token: 'ghs_project',
+      ttlSec: 3600,
+      expiresAt: '',
+      repoFullName: REPO.repoFullName,
+      access: 'read' as const
+    }))
+    const writer = new KanbanProjectWriter({
+      tokens: { mintKanbanProject },
+      fetchImpl,
+      log: { info: (o: { reason: string }) => logs.push(o) },
+      now: () => 1_700_000_000_000,
+      ...(opts.fieldCacheMax ? { fieldCacheMax: opts.fieldCacheMax } : {})
+    } as ConstructorParameters<typeof KanbanProjectWriter>[0])
+    const project = (projectNodeId: string, statusFieldId: string, repo = REPO) =>
+      writer.project({
+        repo,
+        board: { projectNodeId, statusFieldId },
+        card: { issueNodeId: ISSUE_NODE },
+        status: 'ready'
+      })
+    const reads = () => calls.filter((c) => c.query.includes('KanbanProjectGuard')).length
+    const mutationsOn = (projectNodeId: string) =>
+      calls.filter((c) => !c.query.includes('KanbanProjectGuard') && c.variables.project === projectNodeId).length
+    return { calls, logs, project, reads, mutationsOn }
+  }
+  const org = (project: string, extra: Partial<Read> = {}): Read => ({
+    project,
+    owner: 'Acme',
+    ownerType: 'Organization',
+    ...extra
+  })
+
+  it('vera-474: two projects sharing a field id are read separately, so a user-owned one is refused (C1, C3)', async () => {
+    const h = routed({ 'P_ORG:F': org('P_ORG'), 'P_USER:F': org('P_USER', { owner: 'mallory', ownerType: 'User' }) })
+    expect(await h.project('P_ORG', 'F')).toEqual({ itemId: 'PVTI_1' })
+    expect(await h.project('P_USER', 'F')).toBeNull()
+    expect(h.reads()).toBe(2)
+    expect(h.mutationsOn('P_USER')).toBe(0)
+    expect(h.logs).toEqual([{ reason: 'project_not_org_owned' }])
+  })
+
+  it('vera-474: one project with two field ids reads each field, never reusing the other field options (C2)', async () => {
+    const h = routed({ 'P:F1': org('P'), 'P:F2': org('P', { fieldProject: 'P_OTHER' }) })
+    expect(await h.project('P', 'F1')).toEqual({ itemId: 'PVTI_1' })
+    const mutations = h.mutationsOn('P')
+    expect(await h.project('P', 'F2')).toBeNull()
+    expect(h.reads()).toBe(2)
+    expect(h.mutationsOn('P')).toBe(mutations)
+    expect(h.logs).toEqual([{ reason: 'project_option_missing' }])
+  })
+
+  it('vera-474: the same project and field under two installations are read once per installation', async () => {
+    const h = routed({ 'P:F': org('P') })
+    await h.project('P', 'F')
+    await h.project('P', 'F', { ...REPO, installationId: 8n })
+    await h.project('P', 'F', { ...REPO, installationId: 8n })
+    expect(h.reads()).toBe(2)
+  })
+
+  it('vera-474: the field cache is bounded and evicts the least recently used entry', async () => {
+    const h = routed({ 'A:F': org('A'), 'B:F': org('B'), 'C:F': org('C') }, { fieldCacheMax: 2 })
+    await h.project('A', 'F')
+    await h.project('B', 'F')
+    await h.project('A', 'F') // A is now the most recently used
+    expect(h.reads()).toBe(2)
+    await h.project('C', 'F') // evicts B, keeps A
+    expect(h.reads()).toBe(3)
+    await h.project('A', 'F')
+    expect(h.reads()).toBe(3)
+    await h.project('B', 'F')
+    expect(h.reads()).toBe(4)
+  })
+
+  it('vera-474: a failed status write drops the field entry so the next write re-reads the options', async () => {
+    const h = routed({ 'P:F': org('P') }, { failUpdates: 1 })
+    expect(await h.project('P', 'F')).toBeNull()
+    expect(h.logs).toEqual([{ reason: 'project_field_write_failed' }])
+    expect(await h.project('P', 'F')).toEqual({ itemId: 'PVTI_1' })
+    expect(h.reads()).toBe(2)
+  })
+
+  it('vera-474: a PAT reaching a project owned by evil-org is refused with project_owner_mismatch and zero mutations', async () => {
+    const h = routed({ 'P_EVIL:F': org('P_EVIL', { owner: 'evil-org' }) })
+    expect(await h.project('P_EVIL', 'F')).toBeNull()
+    expect(h.mutationsOn('P_EVIL')).toBe(0)
+    expect(h.calls).toHaveLength(1)
+    expect(h.logs).toEqual([{ reason: 'project_owner_mismatch' }])
+  })
+
+  it('vera-474: the owner login matches the repo owner case-insensitively', async () => {
+    const h = routed({ 'P:F': org('P', { owner: 'ACME' }) })
+    expect(await h.project('P', 'F', { ...REPO, repoFullName: 'acme/web' })).toEqual({ itemId: 'PVTI_1' })
+  })
+})
