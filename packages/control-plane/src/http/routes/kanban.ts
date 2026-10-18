@@ -7,12 +7,19 @@ import { ctxOf, denyNonInteractive, denyNonOwner, orgOf } from '../rbac.js'
 import { Tag } from '../plugins/openapi.js'
 import { canView } from '../../authorization/policy.js'
 import { githubKanbanRepoResolver } from '../../kanban/repo-resolver.js'
+import { KanbanTitleError } from '../../kanban/card-titles.js'
 import { capDeferralHint, claimFactsOf, gateHint } from '../../kanban/claim-explain.js'
-import type { KanbanBoardView, KanbanBoardWriteRefusal, KanbanCardExplanation } from '../../persistence/ports.js'
+import type {
+  KanbanBoardCardRow,
+  KanbanBoardView,
+  KanbanBoardWriteRefusal,
+  KanbanCardExplanation
+} from '../../persistence/ports.js'
 import { resolveShareSet } from '../sharing.js'
 import {
   CreateKanbanBoardBody,
   ErrorDto,
+  KanbanBoardCardsDto,
   KanbanBoardDto,
   KanbanBoardExplainDto,
   KanbanBoardListDto,
@@ -22,6 +29,8 @@ import {
   KanbanCardExplainDto,
   KanbanCardModeDto,
   KanbanCardParams,
+  KanbanTitlesDto,
+  KanbanTitlesQuery,
   SetKanbanBoardModeBody,
   SetKanbanCardModeBody,
   UpdateKanbanBoardBody
@@ -150,6 +159,62 @@ function explainDto(boardId: string, entry: KanbanCardExplanation, evaluatedAt: 
     ...(entry.capBound ? { capBound: entry.capBound } : {}),
     evaluatedAt
   }
+}
+
+/** Cards listed per board view; `total` and `truncated` say when a board holds more. */
+const BOARD_CARDS_CAP = 500
+/** Issue numbers one titles request may name. */
+const TITLES_MAX_NUMBERS = 100
+
+const TITLE_ERRORS = {
+  github_app_not_configured: { statusCode: 409, error: 'Conflict' },
+  github_rate_limited: { statusCode: 429, error: 'Too Many Requests' },
+  github_unavailable: { statusCode: 502, error: 'Bad Gateway' }
+} as const
+
+function cardMetaDto(card: KanbanBoardCardRow, boardDefaultMode: 'read' | 'write') {
+  return {
+    id: card.id,
+    issueNumber: card.issueNumber,
+    status: card.status,
+    assigneeAgentId: card.assigneeAgentId,
+    assignee: card.assigneeName === null ? null : { name: card.assigneeName, displayName: card.assigneeDisplayName },
+    priority: card.priority,
+    mode: card.mode ?? boardDefaultMode,
+    modeOverride: card.mode,
+    needsAttention: card.needsAttention,
+    attentionReason: card.attentionReason,
+    blockKind: card.blockKind,
+    consecutiveFailures: card.consecutiveFailures,
+    protocolViolations: card.protocolViolations,
+    blockRecurrence: card.blockRecurrence,
+    cooldownUntil: card.cooldownUntil?.toISOString() ?? null,
+    notBefore: card.notBefore?.toISOString() ?? null,
+    promotionPending: card.promotionPending,
+    linkedPrNumber: card.linkedPrNumber,
+    stateRevision: card.stateRevision.toString(),
+    openRun: card.openRun
+      ? {
+          attempt: card.openRun.attempt,
+          agentId: card.openRun.agentId,
+          dispatchedAt: card.openRun.dispatchedAt.toISOString(),
+          ackedAt: card.openRun.ackedAt?.toISOString() ?? null,
+          heartbeatAt: card.openRun.heartbeatAt?.toISOString() ?? null
+        }
+      : null
+  }
+}
+
+/** `1,2,3` → unique positive issue numbers; null when any item is not one. */
+function parseIssueNumbers(raw: string): number[] | null {
+  const numbers: number[] = []
+  for (const part of raw.split(',')) {
+    if (!/^[1-9][0-9]{0,9}$/.test(part)) return null
+    const n = Number(part)
+    if (n > 2_147_483_647) return null
+    if (!numbers.includes(n)) numbers.push(n)
+  }
+  return numbers
 }
 
 export function kanbanRoutes(deps: HttpDeps) {
@@ -432,6 +497,107 @@ export function kanbanRoutes(deps: HttpDeps) {
         const entry = await deps.repos.kanbanDispatch.explainCard(board.id, req.params.cardId, opts)
         if (!entry) return reply.code(404).send({ ...notFound, message: 'card not found' })
         return explainDto(board.id, entry, opts.now.toISOString())
+      }
+    )
+
+    r.get(
+      '/kanban/boards/:boardId/cards',
+      {
+        config: { kanbanAccess: 'viewer' },
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'List a board’s cards',
+          description:
+            'CP metadata for the cards of one board, for the console board view: status, assignee, effective run mode, attention and failure counters, cooldowns and the open run. Body-free: issue titles are NOT included and are never stored; read them live with `getKanbanCardTitles`. Returns at most 500 cards (priority, then age); `total` and `truncated` say when there are more. A board in another organization, or a restricted board not shared with the caller, reads as 404.',
+          operationId: 'listKanbanCards',
+          params: KanbanBoardParams,
+          response: { 200: KanbanBoardCardsDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const board = await visibleBoard(req, req.params.boardId)
+        if (!board) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        const { cards, total } = await deps.repos.kanbanDispatch.listBoardCards(board.id, BOARD_CARDS_CAP)
+        return {
+          boardId: board.id,
+          cards: cards.map((c) => cardMetaDto(c, board.defaultMode)),
+          total,
+          truncated: total > cards.length
+        }
+      }
+    )
+
+    r.get(
+      '/kanban/boards/:boardId/cards/titles',
+      {
+        config: { kanbanAccess: 'viewer' },
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Read live issue titles for cards',
+          description:
+            'Reads the titles and open/closed state of up to 100 cards from GitHub live, with the read-scoped Kanban card token for this board’s repository, and returns them with `Cache-Control: no-store`. Titles are UNTRUSTED external text: render as plain text. They are never written to the database, never logged and never cached. Numbers that are not cards of this board, or that GitHub no longer serves as an issue, come back in `missing`. GitHub failures answer 409 `github_app_not_configured`, 429 `github_rate_limited` or 502 `github_unavailable` without affecting the cards route.',
+          operationId: 'getKanbanCardTitles',
+          params: KanbanBoardParams,
+          querystring: KanbanTitlesQuery,
+          response: {
+            200: KanbanTitlesDto,
+            400: ErrorDto,
+            401: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        void reply.header('cache-control', 'no-store')
+        const board = await visibleBoard(req, req.params.boardId)
+        if (!board) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        const requested = parseIssueNumbers(req.query.numbers)
+        if (!requested) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            code: 'invalid_numbers',
+            message: 'numbers must be comma-separated positive issue numbers'
+          })
+        }
+        if (requested.length > TITLES_MAX_NUMBERS) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            code: 'too_many_numbers',
+            message: `at most ${TITLES_MAX_NUMBERS} numbers per request`
+          })
+        }
+        const onBoard = new Set(await deps.repos.kanbanDispatch.cardNumbersOnBoard(board.id, requested))
+        const cardNumbers = requested.filter((n) => onBoard.has(n))
+        const notCards = requested.filter((n) => !onBoard.has(n))
+        if (cardNumbers.length === 0) return { titles: {}, missing: notCards.sort((a, b) => a - b) }
+        try {
+          if (!deps.kanbanTitles) throw new KanbanTitleError('github_app_not_configured')
+          const live = await deps.kanbanTitles.read(
+            { orgId: board.orgId, repoId: board.repoId, repoFullName: board.repoFullName },
+            cardNumbers
+          )
+          return {
+            titles: Object.fromEntries(live.titles),
+            missing: [...live.missing, ...notCards].sort((a, b) => a - b)
+          }
+        } catch (err) {
+          if (!(err instanceof KanbanTitleError)) throw err
+          const mapped = TITLE_ERRORS[err.code]
+          return reply.code(mapped.statusCode).send({
+            ...mapped,
+            code: err.code,
+            message:
+              err.code === 'github_app_not_configured'
+                ? 'GitHub is not configured for this board'
+                : 'GitHub could not be read'
+          })
+        }
       }
     )
   }

@@ -4536,6 +4536,66 @@ export const KanbanBoardExplainDto = z.object({
   wouldClaimNextIssueNumbers: z.array(z.number().int())
 })
 
+// ── kanban board view (CP metadata; titles are a separate live pass-through and are never stored) ──
+export const KanbanCardMetaDto = z.object({
+  id: z.string(),
+  issueNumber: z.number().int(),
+  status: z.enum(['triage', 'todo', 'ready', 'running', 'blocked', 'review', 'done', 'archived']),
+  assigneeAgentId: z.string().nullable(),
+  /** Agent slug and display name, from the agent table; null when unassigned. */
+  assignee: z.object({ name: z.string(), displayName: z.string().nullable() }).nullable(),
+  priority: z.number().int(),
+  /** Effective run mode: the card's own override, else the board default. */
+  mode: KanbanRunModeDto,
+  /** The card's own override; null inherits the board default. */
+  modeOverride: KanbanRunModeDto.nullable(),
+  needsAttention: z.boolean(),
+  /** Short body-free reason code recovery recorded when it flagged the card. */
+  attentionReason: z.string().nullable(),
+  blockKind: z.enum(['dependency', 'needs_input', 'capability', 'transient']).nullable(),
+  consecutiveFailures: z.number().int(),
+  protocolViolations: z.number().int(),
+  blockRecurrence: z.number().int(),
+  cooldownUntil: z.string().nullable(),
+  notBefore: z.string().nullable(),
+  promotionPending: z.boolean(),
+  linkedPrNumber: z.number().int().nullable(),
+  stateRevision: z.string(),
+  /** The run holding the card now, if any. */
+  openRun: z
+    .object({
+      attempt: z.number().int(),
+      agentId: z.string(),
+      dispatchedAt: z.string(),
+      ackedAt: z.string().nullable(),
+      heartbeatAt: z.string().nullable()
+    })
+    .nullable()
+})
+export const KanbanBoardCardsDto = z.object({
+  boardId: z.string(),
+  cards: z.array(KanbanCardMetaDto),
+  /** Cards on the board in total; `cards` holds at most 500, in priority then age order. */
+  total: z.number().int(),
+  truncated: z.boolean()
+})
+export const KanbanTitlesQuery = z.object({
+  /** Comma-separated issue numbers, at most 100, each a card of this board. */
+  numbers: z.string().min(1).max(2000)
+})
+export const KanbanLiveTitleDto = z.object({
+  /** UNTRUSTED external text from GitHub, read live and never stored: render as plain text only. */
+  title: z.string(),
+  state: z.enum(['open', 'closed']),
+  htmlUrl: z.string()
+})
+export const KanbanTitlesDto = z.object({
+  /** Keyed by issue number. */
+  titles: z.record(z.string(), KanbanLiveTitleDto),
+  /** Requested numbers that are not cards of this board, or that GitHub no longer serves as an issue. */
+  missing: z.array(z.number().int())
+})
+
 // ── shared ────────────────────────────────────────────────────────────────
 export const IdParam = z.object({ id: z.string() })
 export const HealthDto = z.object({ status: z.literal('ok') })

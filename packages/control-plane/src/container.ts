@@ -83,6 +83,7 @@ import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
 import { kanbanTokenSource } from './kanban/tokens.js'
+import { githubKanbanTitleSource } from './kanban/card-titles.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
@@ -2126,6 +2127,15 @@ export function buildContainer(
     resolvePublicRepo: createPublicRepoResolver(),
     trustedActors,
     ...(github ? { github } : {}),
+    ...(kanbanTokens
+      ? {
+          kanbanTitles: githubKanbanTitleSource({
+            installations: repos.githubInstallation,
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          })
+        }
+      : {}),
     ...(gitlab ? { gitlab } : {}),
     gitea,
     ...(pullRequestView ? { pullRequestView } : {}),
