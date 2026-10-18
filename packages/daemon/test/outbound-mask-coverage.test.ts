@@ -654,9 +654,9 @@ describe('orchestrator outbound coverage', () => {
     })
     ;(daemon as any).cpClient = { kanbanOrchestrate: orchestrate, stop: async () => {} }
     vi.spyOn((daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+    // Fresh creates skip the lookup by design (intent-gated recovery), so the POST is the only fetch.
     const post = vi
       .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response('[]', { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
     try {
       await (daemon as any).mcp.deps.kanbanCreate({
@@ -665,8 +665,8 @@ describe('orchestrator outbound coverage', () => {
         title: `title ${API_KEY}`,
         body: `body ${HEADER}`
       })
-      expect(post).toHaveBeenCalledTimes(2)
-      const [url, init] = post.mock.calls[1]!
+      expect(post).toHaveBeenCalledTimes(1)
+      const [url, init] = post.mock.calls[0]!
       expect(url).toBe('https://api.github.com/repos/acme/web/issues')
       expect(init?.method).toBe('POST')
       const payload = JSON.parse(String(init?.body))

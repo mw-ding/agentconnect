@@ -1,5 +1,8 @@
 // Real Postgres verifies orchestrator idempotency, budgets, and adoption with a recording GitHub store.
 import { randomUUID } from 'node:crypto'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { kanbanOrchestrateCardKey, type KanbanOrchestrate } from '@agentconnect.md/protocol'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
@@ -10,7 +13,10 @@ import { PgKanbanOrchestratorRepo } from '../../src/persistence/repositories/kan
 import type { CardIssue } from '../../src/kanban/card-store.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { prisma } from '../setup.db.js'
-import { KanbanOrchestratorTools } from '../../../daemon/src/kanban/orchestrator-tools.js'
+import {
+  KANBAN_ORCHESTRATE_REFUSAL_TEXT,
+  KanbanOrchestratorTools
+} from '../../../daemon/src/kanban/orchestrator-tools.js'
 
 const ORG = OrgId(DEFAULT_ORG_ID)
 const REPO_ID = 990010n
@@ -92,7 +98,7 @@ describe('KanbanOrchestrator over real Postgres', () => {
       ok: true,
       op: 'prepare_create',
       verdict: 'existing',
-      appLogin: null,
+      appLogin: 'agentconnect[bot]',
       issueNumber: 10
     })
     expect(await h.svc.orchestrate(ORG, h.agentId, h.create('child', 10))).toMatchObject({
@@ -168,18 +174,90 @@ describe('KanbanOrchestrator over real Postgres', () => {
 })
 
 it.each(['open', 'closed'] as const)(
-  'recovers a %s crash-before-commit issue with one POST and one card',
+  'recovers a %s intent crash through the trailing-marker lookup with one POST and one card',
   async (state) => {
     const h = await setup(1)
+    const journalPath = join(mkdtempSync(join(tmpdir(), 'ac-pending-')), 'pending.json')
+    const issues: Array<{ number: number; body: string }> = []
+    let fileCrashed = true
+    const fileIssue = vi.fn(async (_agent: string, _repo: string, _title: string, body: string) => {
+      // The POST landed server-side, but the crash kept the number out of the journal.
+      issues.push({ number: 10 + issues.length, body })
+      if (fileCrashed) throw new Error('process died during file')
+      return issues.at(-1)!.number
+    })
+    let laggedOnce = false
+    const findIssue = vi.fn(
+      async (
+        _agent: string,
+        _repo: string,
+        marker: string,
+        appLogin: string | null | undefined,
+        rejected: number[] = []
+      ) => {
+        expect(appLogin).toBe('agentconnect[bot]')
+        if (!laggedOnce) {
+          laggedOnce = true
+          return null
+        }
+        return (
+          issues
+            .filter((i) => !rejected.includes(i.number) && i.body.trimEnd().endsWith(marker))
+            .sort((a, b) => a.number - b.number)[0]?.number ?? null
+        )
+      }
+    )
+    const deps = {
+      orchestrate: (p: KanbanOrchestrate) => h.svc.orchestrate(ORG, h.agentId, p),
+      repoFullNameFor: async () => 'acme/web',
+      findIssue,
+      fileIssue,
+      journalPath
+    }
+    const req = { agentId: h.agentId, board: h.board.id, epic: 1, step: 'crash', title: 'scratch', body: 'spec' }
+    await expect(new KanbanOrchestratorTools(deps).create(req)).rejects.toThrow('process died during file')
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    // Listing lag hides the landed POST, so the restart files nothing and asks for a retry.
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toEqual({
+      refused: KANBAN_ORCHESTRATE_REFUSAL_TEXT.github_unavailable,
+      retryable: true
+    })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    expect(issues).toHaveLength(1)
+    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id } })).toBe(0)
+    fileCrashed = false
+    h.store.readCard.mockImplementation(async (_repo, n) => ({
+      issueId: BigInt(5_000_000 + n),
+      nodeId: `I_${n}`,
+      number: n,
+      state,
+      stateReason: null,
+      labels: [],
+      authorType: 'Bot',
+      authorLogin: 'agentconnect[bot]'
+    }))
+    // The marker is visible now, so the retry adopts issue 10 with no second POST.
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ created: true, issueNumber: 10 })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+    expect(issues).toHaveLength(1)
+    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 10 } })).toBe(1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.epic.id } })).epicCardsCreated).toBe(1)
+    expect(await new KanbanOrchestratorTools(deps).create(req)).toEqual({ existing: true, issueNumber: 10 })
+    expect(h.store.closeIssue).not.toHaveBeenCalled()
+  }
+)
+
+it.each(['open', 'closed'] as const)(
+  'commits a %s journaled-number crash with no POST and no lookup',
+  async (state) => {
+    const h = await setup(1)
+    const journalPath = join(mkdtempSync(join(tmpdir(), 'ac-pending-')), 'pending.json')
     const issues: Array<{ number: number; body: string }> = []
     const fileIssue = vi.fn(async (_agent: string, _repo: string, _title: string, body: string) => {
       issues.push({ number: 10 + issues.length, body })
       return issues.at(-1)!.number
     })
-    const findIssue = vi.fn(
-      async (_agent: string, _repo: string, marker: string) =>
-        issues.find((i) => i.body.includes(marker))?.number ?? null
-    )
+    const findIssue = vi.fn(async () => null)
     let crash = true
     const deps = {
       orchestrate: async (p: KanbanOrchestrate) => {
@@ -188,10 +266,12 @@ it.each(['open', 'closed'] as const)(
       },
       repoFullNameFor: async () => 'acme/web',
       findIssue,
-      fileIssue
+      fileIssue,
+      journalPath
     }
     const req = { agentId: h.agentId, board: h.board.id, epic: 1, step: 'crash', title: 'scratch', body: 'spec' }
     expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ filed: true, issueNumber: 10 })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
     expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 10 } })).toBe(0)
     crash = false
     h.store.readCard.mockImplementation(async (_repo, n) => ({
@@ -204,9 +284,10 @@ it.each(['open', 'closed'] as const)(
       authorType: 'Bot',
       authorLogin: 'agentconnect[bot]'
     }))
-    // A fresh toolset has lost the process-local pending map and must recover from the durable marker.
+    // A fresh toolset reloads the journaled number and commits it directly.
     expect(await new KanbanOrchestratorTools(deps).create(req)).toMatchObject({ created: true, issueNumber: 10 })
     expect(fileIssue).toHaveBeenCalledTimes(1)
+    expect(findIssue).not.toHaveBeenCalled()
     expect(issues).toHaveLength(1)
     expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 10 } })).toBe(1)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.epic.id } })).epicCardsCreated).toBe(1)
