@@ -9,6 +9,7 @@ import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -447,7 +448,13 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
               suspendedAt: null
             }) as never
         },
-        store: new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never }),
+        store: new GithubCardStore({
+          tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+          permissions: new GithubRepoPermission({
+            tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+            ttlMs: 0
+          })
+        }),
         send: async (id, dispatch) => {
           expect(id).toBe(daemonId)
           return worker.dispatch(dispatch)

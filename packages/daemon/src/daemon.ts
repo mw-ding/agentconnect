@@ -26736,6 +26736,7 @@ export class Daemon {
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       cronReportOutbox: () => this.cronReportOutbox,
       kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
+      kanbanRevoke: (req) => this.kanbanWorker().revoke(req.leaseId, req.cardId),
       kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
@@ -27195,14 +27196,17 @@ export class Daemon {
         const agentId = lease.dispatch.agentId
         const session = await this.store.getSession(lease.sessionKey)
         const acpSessionId = session?.acpSessionId ?? undefined
-        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
+        await this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
         // SDK background work has no Pending turn for interruptTurn to cancel; stop its host before admitting another writer.
         if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), acpSessionId)) {
-          void this.stopHost(agentId).catch((err) =>
+          await this.stopHost(agentId).catch((err) =>
             this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
           )
         }
+        // A revoked lease is reassignment (issue #2 §5): the next dispatch opens a fresh session, never resumes the dead one.
+        await this.forgetKanbanSession(agentId, lease.sessionKey)
       },
+      forget: (agentId, sessionKey) => this.forgetKanbanSession(agentId, sessionKey),
       probe: {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: async (agentId, _sessionId, sessionKey) => {
@@ -27413,6 +27417,20 @@ export class Daemon {
     const rec = await this.store.getSession(key)
     if (!this.sessionSdkQuiescent(this.sessionOwnerKey(d.agentId, key), rec?.acpSessionId)) return 'busy'
     return undefined
+  }
+
+  // A revoked or superseded lease never resumes: drop the host's claim and clear the row so the next dispatch opens fresh.
+  private async forgetKanbanSession(agentId: string, sessionKey: string): Promise<void> {
+    const session = await this.store.getSession(sessionKey)
+    if (!session?.acpSessionId) return
+    this.hostForOwner(this.sessionOwnerKey(agentId, sessionKey))?.forgetSession(session.acpSessionId)
+    await this.store.upsertSession({
+      ...session,
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: this.clock.now()
+    })
   }
 
   // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.

@@ -120,6 +120,8 @@ export interface KanbanWorkerDeps {
   /** Run one more turn in the lease's session with the fixed nudge prompt; same admission machinery as `start`. */
   nudge(d: KanbanDispatch): Promise<KanbanStartResult>
   cancel(lease: KanbanLease): void | Promise<void>
+  /** Forget the session for a revoked lease even when the lease has already finalized; the next dispatch opens fresh. */
+  forget(agentId: string, sessionKey: string): Promise<void>
   probe: KanbanLivenessProbe
   comments?: KanbanFinalComments
   heartbeatMs?: number
@@ -134,6 +136,8 @@ export class KanbanWorker {
   private readonly leases = new Map<string, KanbanLease>()
   // A CP retry of an in-flight admission joins it instead of racing the outbox reservation.
   private readonly admitting = new Map<string, Promise<KanbanDispatchOk>>()
+  // Last known session key per lease, kept after finalize so a late revoke forgets exactly the addressed session.
+  private readonly sessionsByLease = new Map<string, { agentId: string; sessionKey: string }>()
   private timer: TimerHandle | undefined
   private stopped = true
   // Set only by stop(), so a worker that was never started still nudges (the daemon always starts it).
@@ -171,6 +175,35 @@ export class KanbanWorker {
     const admission = this.admit(d).finally(() => this.admitting.delete(d.leaseId))
     this.admitting.set(d.leaseId, admission)
     return admission
+  }
+
+  async revoke(leaseId: string, cardId: string): Promise<void> {
+    await this.admitting.get(leaseId)?.catch(() => undefined)
+    const lease = this.leases.get(leaseId)
+    if (lease && lease.dispatch.cardId === cardId) {
+      await this.deps.cancel(lease)
+      this.leases.delete(leaseId)
+      this.deps.onLeaseChanged?.(lease.dispatch)
+      await this.deps.outbox.release(leaseId)
+      this.sessionsByLease.delete(leaseId)
+      return
+    }
+    const remembered = this.sessionsByLease.get(leaseId)
+    if (!remembered) return
+    this.sessionsByLease.delete(leaseId)
+    // A replacement admitted on the same session key owns that session now; an admission in flight may be about to.
+    await Promise.allSettled(this.admitting.values())
+    if (this.sessionOwned(remembered.agentId, remembered.sessionKey)) return
+    await this.deps.forget(remembered.agentId, remembered.sessionKey)
+  }
+
+  // A live lease, or the remembered session of a newer lease, on this agent's session key.
+  private sessionOwned(agentId: string, sessionKey: string): boolean {
+    for (const lease of this.leases.values())
+      if (lease.dispatch.agentId === agentId && lease.sessionKey === sessionKey) return true
+    for (const session of this.sessionsByLease.values())
+      if (session.agentId === agentId && session.sessionKey === sessionKey) return true
+    return false
   }
 
   private async admit(d: KanbanDispatch): Promise<KanbanDispatchOk> {
@@ -217,6 +250,10 @@ export class KanbanWorker {
       progressNotes: 0
     }
     this.leases.set(d.leaseId, lease)
+    // The session key's newest lease owns it: an older lease's late revoke must not forget the replacement's session.
+    for (const [id, session] of this.sessionsByLease)
+      if (session.agentId === d.agentId && session.sessionKey === started.sessionKey) this.sessionsByLease.delete(id)
+    this.sessionsByLease.set(d.leaseId, { agentId: d.agentId, sessionKey: started.sessionKey })
     this.deps.onLeaseChanged?.(d)
     this.watchTurn(d.leaseId, started.done)
     return { leaseId: d.leaseId, accepted: true }

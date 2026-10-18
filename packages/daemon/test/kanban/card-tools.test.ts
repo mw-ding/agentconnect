@@ -58,6 +58,7 @@ async function worker() {
     start: async () => ({ accepted: true, sessionKey: KEY, done: new Promise(() => {}) }),
     nudge: async () => ({ accepted: false, reason: 'busy' }),
     cancel: () => {},
+    forget: async () => {},
     probe: { turnActive: () => true, liveBackgroundTasks: () => 0 },
     outbox: {
       has: async () => false,

@@ -51,9 +51,11 @@ export async function ensureLabels() {
 }
 export async function createIssue(issues: number[], scenario: string, labels: string[]) {
   const issue = await gh<{ id: number; number: number }>('POST', `/repos/${FULL}/issues`, {
-    title: `[kanban-e2e] ${scenario} ${Date.now()}`,
-    labels
+    title: `[kanban-e2e] ${scenario} ${Date.now()}`
   })
+  // Labels are applied in a second call: inline labels on creation emit their `labeled` events asynchronously with
+  // out-of-order ids, which the sync's event replay reads as a newer add and defers instead of processing the edit.
+  if (labels.length > 0) await gh('PUT', `/repos/${FULL}/issues/${issue.number}/labels`, { labels })
   issues.push(issue.number)
   return issue
 }
