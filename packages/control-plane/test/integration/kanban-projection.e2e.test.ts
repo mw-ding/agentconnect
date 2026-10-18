@@ -19,7 +19,8 @@ const blockB =
   process.env.KANBAN_PROJECT_E2E === '1' &&
   !!process.env.KANBAN_PROJECT_ORG_REPO &&
   !!process.env.KANBAN_PROJECT_NODE_ID &&
-  !!process.env.KANBAN_PROJECT_STATUS_FIELD_ID
+  !!process.env.KANBAN_PROJECT_STATUS_FIELD_ID &&
+  !!process.env.KANBAN_PROJECT_ISSUE_NODE_ID
 const OWNER = 'mw-ding'
 const FULL = `${OWNER}/agentconnect`
 const REPO_ID = 1332342098n
