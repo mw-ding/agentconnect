@@ -1,6 +1,4 @@
-// Kanban Projects v2 Status projection writer (issue #2 M5): one-way mirror of card status onto an org-owned
-// project's single-select Status field. Best-effort by contract: project() never throws, so a projection failure
-// can never block or roll back the label transition it follows.
+// Kanban Projects v2 Status projection (issue #2 M5): a best-effort, one-way mirror that never fails a transition.
 import { GithubApiError, githubGraphql, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
 import type { KanbanBoardAdminRepo, KanbanCardRepo } from '../persistence/ports.js'
@@ -42,7 +40,7 @@ export interface KanbanProjectWriterDeps {
   fieldCacheMax?: number
 }
 
-/** Short-lived field metadata per (installation, project, field): options plus the owner the runtime guard re-checks. */
+/** Field metadata per (installation, project, field): options plus the owner the runtime guard re-checks. */
 interface FieldCacheEntry {
   at: number
   ownerType?: string
@@ -83,10 +81,7 @@ export class KanbanProjectWriter {
 
   constructor(private readonly deps: KanbanProjectWriterDeps) {}
 
-  /**
-   * Mirror one status onto the board's project. Returns the item id for the caller to cache on the card, or null
-   * when skipped (no projection, no issue node) or failed (logged with a body-free reason, then swallowed).
-   */
+  /** Mirror one status; returns the item id to cache, or null when skipped or failed (logged body-free, swallowed). */
   async project(args: {
     repo: KanbanRepoRef
     board: { projectNodeId: string | null; statusFieldId: string | null }
@@ -265,48 +260,83 @@ export class KanbanProjectWriter {
   }
 }
 
-/** The dispatcher's one hook: load the board pair and the card cache, project, and remember a fresh item id. */
+/** One committed status change: the card's board and issue, plus the issue node when the caller already read it. */
+export interface CommittedCardRef {
+  boardId: string
+  issueNumber: number
+  issueNodeId?: string | null
+}
+
+/** The post-commit seam every committed card status change passes through (dispatcher, sync, graph, import). */
 export interface KanbanProjectHook {
-  /** Best-effort after a status label write; never throws, so the transition it follows cannot fail. */
-  projectAfterLabel(args: {
-    boardId: string
-    orgId: string
-    cardId: string
-    repo: KanbanRepoRef
-    status: KanbanStatus
-    issueNodeId?: string | null
-  }): Promise<void>
+  /** Queues a projection of the card's committed status on its own per-card queue; returns at once, never throws. */
+  onStatusCommitted(card: CommittedCardRef): void
+  /** Await every queued projection (tests and shutdown). */
+  settle(): Promise<void>
 }
 
 export function kanbanProjectHook(deps: {
   boards: Pick<KanbanBoardAdminRepo, 'getForOrg'>
-  cards: Pick<KanbanCardRepo, 'getCard' | 'setProjectItemId'>
+  cards: Pick<KanbanCardRepo, 'findByIssueNumber' | 'getCard' | 'setProjectItemId'>
   writer: Pick<KanbanProjectWriter, 'project'>
+  /** The board's org and live installation repo, resolved when the projection runs; null once either is gone. */
+  boardRepo(boardId: string): Promise<{ orgId: string; repo: KanbanRepoRef } | null>
 }): KanbanProjectHook {
+  const tails = new Map<string, Promise<void>>()
+  const waiting = new Map<string, { issueNodeId: string | null }>()
+  const inflight = new Set<Promise<void>>()
+
+  // Projects the card's status as committed when this run starts, so out-of-order callers still converge on the latest.
+  async function projectNow(ref: CommittedCardRef, issueNodeId: string | null): Promise<void> {
+    const target = await deps.boardRepo(ref.boardId)
+    if (!target) return
+    const board = await deps.boards.getForOrg(target.orgId, ref.boardId)
+    if (!board?.projectNodeId || !board.statusFieldId) return
+    const found = await deps.cards.findByIssueNumber(ref.boardId, ref.issueNumber)
+    const card = found ? await deps.cards.getCard(found.id) : null
+    if (!card || card.boardId !== ref.boardId) return
+    const result = await deps.writer.project({
+      repo: target.repo,
+      board: { projectNodeId: board.projectNodeId, statusFieldId: board.statusFieldId },
+      card: {
+        issueNodeId: issueNodeId ?? card.issueNodeId,
+        projectItemId: card.projectItemId,
+        projectItemProjectId: card.projectItemProjectId
+      },
+      status: card.status
+    })
+    // Overwrite on any change of id or project, so a re-added or re-pointed item replaces the stale cache.
+    const fresh = result && (result.itemId !== card.projectItemId || card.projectItemProjectId !== board.projectNodeId)
+    if (fresh) await deps.cards.setProjectItemId(card.id, board.projectNodeId, result.itemId)
+  }
+
   return {
-    async projectAfterLabel(args) {
-      try {
-        const board = await deps.boards.getForOrg(args.orgId, args.boardId)
-        if (!board?.projectNodeId || !board.statusFieldId) return
-        const card = await deps.cards.getCard(args.cardId)
-        if (!card || card.boardId !== args.boardId) return
-        const result = await deps.writer.project({
-          repo: args.repo,
-          board: { projectNodeId: board.projectNodeId, statusFieldId: board.statusFieldId },
-          card: {
-            issueNodeId: args.issueNodeId ?? card.issueNodeId,
-            projectItemId: card.projectItemId,
-            projectItemProjectId: card.projectItemProjectId
-          },
-          status: args.status
-        })
-        // Overwrite on any change of id or project, so a re-added or re-pointed item replaces the stale cache.
-        const fresh =
-          result && (result.itemId !== card.projectItemId || card.projectItemProjectId !== board.projectNodeId)
-        if (fresh) await deps.cards.setProjectItemId(args.cardId, board.projectNodeId, result.itemId)
-      } catch {
-        // Best-effort projection: the writer already logged its own reason; a loader fault stays silent.
+    onStatusCommitted(ref) {
+      const key = `${ref.boardId}#${ref.issueNumber}`
+      // A run not yet started will read the latest committed status anyway, so a burst of commits coalesces into it.
+      const queued = waiting.get(key)
+      if (queued) {
+        queued.issueNodeId = ref.issueNodeId ?? queued.issueNodeId
+        return
       }
+      const entry = { issueNodeId: ref.issueNodeId ?? null }
+      waiting.set(key, entry)
+      const task: Promise<void> = (tails.get(key) ?? Promise.resolve())
+        .then(() => {
+          waiting.delete(key)
+          return projectNow(ref, entry.issueNodeId)
+        })
+        // Best-effort projection: the writer already logged its own reason; a loader fault stays silent.
+        .catch(() => {})
+        .finally(() => {
+          inflight.delete(task)
+          if (tails.get(key) === task) tails.delete(key)
+        })
+      tails.set(key, task)
+      inflight.add(task)
+    },
+    async settle() {
+      while (inflight.size > 0) await Promise.allSettled([...inflight])
     }
   }
 }

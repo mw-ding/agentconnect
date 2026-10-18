@@ -39,6 +39,26 @@ function fakeGithub(publicKeyPem: string, level: string) {
       call.jwtValid = verifyRs256(auth.replace(/^Bearer /, ''), publicKeyPem)
       return json(201, { token: 'ghs_test_installation', expires_at: new Date(Date.now() + 3_600_000).toISOString() })
     }
+    // Projects v2 GraphQL, only reached when the board configures a projection (vera-474).
+    if (method === 'POST' && pathname === '/graphql') {
+      const { query, variables: v } = body as { query: string; variables: Record<string, string> }
+      if (query.includes('addProjectV2ItemById'))
+        return json(200, { data: { addProjectV2ItemById: { item: { id: 'PVTI_7' } } } })
+      if (query.includes('updateProjectV2ItemFieldValue')) {
+        return json(200, { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: v.item } } } })
+      }
+      return json(200, {
+        data: {
+          project: { id: v.project, owner: { __typename: 'Organization', login: 'acme' } },
+          field: {
+            __typename: 'ProjectV2SingleSelectField',
+            id: v.field,
+            project: { id: v.project },
+            options: ['Triage', 'Todo', 'Ready', 'Done'].map((name) => ({ id: `opt-${name}`, name }))
+          }
+        }
+      })
+    }
     if (pathname === `/repositories/${REPO_ID}/collaborators/${HUMAN.login}/permission`) {
       return json(200, { permission: level, role_name: level })
     }
@@ -97,7 +117,7 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot(level = 'write') {
+async function boot(level = 'write', opts: { project?: boolean } = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
   const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, level)
   await prisma.githubInstallation.create({
@@ -110,10 +130,22 @@ async function boot(level = 'write') {
     }
   })
   const board = await prisma.kanbanBoard.create({
-    data: { orgId: DEFAULT_ORG_ID, name: 'board', repoId: BigInt(REPO_ID), repoFullName: 'acme/board' }
+    data: {
+      orgId: DEFAULT_ORG_ID,
+      name: 'board',
+      repoId: BigInt(REPO_ID),
+      repoFullName: 'acme/board',
+      ...(opts.project ? { projectNodeId: 'PVT_board', statusFieldId: 'PVTSSF_board' } : {})
+    }
   })
   const card = await prisma.kanbanCard.create({
-    data: { boardId: board.id, issueId: BigInt(ISSUE.id), issueNumber: ISSUE.number, status: 'triage' }
+    data: {
+      boardId: board.id,
+      issueId: BigInt(ISSUE.id),
+      issueNumber: ISSUE.number,
+      status: 'triage',
+      ...(opts.project ? { issueNodeId: 'I_7' } : {})
+    }
   })
   // Parked by a claim that found GitHub disagreeing, which is what makes a card eligible for doorbell ingest.
   await prisma.kanbanRun.create({
@@ -197,6 +229,35 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     expect(github.calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/issues/${ISSUE.number}/events`)
     // The edit was adopted only after a live lookup of the sender's repository role.
     expect(github.calls.map((c) => c.path)).toContain(`/repositories/${REPO_ID}/collaborators/alice/permission`)
+  })
+
+  it('vera-474: B2 a human label adoption through the real container projects Ready onto the board project', async () => {
+    const { github, card, link } = await boot('write', { project: true })
+    const sent = await postGithubWebhook(link.webhookUrl, {
+      secret: WEBHOOK_SECRET,
+      event: 'issues',
+      payload: issuesLabeled(HUMAN)
+    })
+    expect(sent.status).toBe(202)
+    const projected = await until(
+      () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } }),
+      (c) => c.projectItemId !== null
+    )
+    expect(projected).toMatchObject({ status: 'ready', projectItemId: 'PVTI_7', projectItemProjectId: 'PVT_board' })
+    const writes = github.calls.filter(
+      (c) => c.path === '/graphql' && JSON.stringify(c.body).includes('updateProjectV2ItemFieldValue')
+    )
+    expect(writes.at(-1)?.body).toMatchObject({
+      variables: { project: 'PVT_board', item: 'PVTI_7', field: 'PVTSSF_board', option: 'opt-Ready' }
+    })
+    // The CP-only projection token: organization_projects write plus issues read, narrowed to the board repo id.
+    const mint = github.calls.find(
+      (c) => c.path.endsWith('/access_tokens') && JSON.stringify(c.body).includes('organization_projects')
+    )
+    expect(mint?.body).toEqual({
+      repository_ids: [REPO_ID],
+      permissions: { metadata: 'read', issues: 'read', organization_projects: 'write' }
+    })
   })
 
   it('a human without write access is refused: the card stays parked and the label reverts with a comment', async () => {

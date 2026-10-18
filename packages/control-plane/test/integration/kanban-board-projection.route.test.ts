@@ -499,10 +499,15 @@ describe('vera-474 B1: the item cache across a project re-point (PG)', () => {
     const hook = kanbanProjectHook({
       boards: new PgKanbanBoardRepo(prisma),
       cards: new PgKanbanCardRepo(prisma),
-      writer: new KanbanProjectWriter({ tokens: { mintKanbanProject: mint }, fetchImpl: gh.fetchImpl })
+      writer: new KanbanProjectWriter({ tokens: { mintKanbanProject: mint }, fetchImpl: gh.fetchImpl }),
+      boardRepo: async () => ({ orgId: DEFAULT_ORG_ID, repo: REPO })
     })
-    const transition = (status: KanbanStatus) =>
-      hook.projectAfterLabel({ boardId: board.id, orgId: DEFAULT_ORG_ID, cardId: card.id, repo: REPO, status })
+    // A committed status change: the row moves first, then the post-commit seam projects whatever is committed.
+    const transition = async (status: KanbanStatus) => {
+      await prisma.kanbanCard.update({ where: { id: card.id }, data: { status } })
+      hook.onStatusCommitted({ boardId: board.id, issueNumber: 11 })
+      await hook.settle()
+    }
     const stored = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
     return { board, card, gh, transition, stored }
   }

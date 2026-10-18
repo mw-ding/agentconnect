@@ -1775,6 +1775,34 @@ export function buildContainer(
       })
     : undefined
 
+  // A board's org and live installation repo; revoked or suspended installations resolve to null.
+  const kanbanBoardRepo = async (boardId: string) => {
+    const board = await repos.kanbanDispatch.getBoardRef(boardId)
+    if (!board) return null
+    const owner = board.repoFullName.split('/')[0]!
+    const installation = await repos.githubInstallation.liveByOrgAndAccount(board.orgId, owner)
+    return installation && !installation.revokedAt && !installation.suspendedAt
+      ? {
+          orgId: board.orgId,
+          repo: { installationId: installation.installationId, repoId: board.repoId, repoFullName: board.repoFullName }
+        }
+      : null
+  }
+  // Projects v2 projection (issue #2 M5): every committed status change queues a best-effort mirror; no token, no hook.
+  const kanbanProjectStatus =
+    kanbanTokens && kanbanCardStore
+      ? kanbanProjectHook({
+          boards: repos.kanbanBoard,
+          cards: repos.kanbanCard,
+          writer: new KanbanProjectWriter({
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}),
+            log: { info: (o, m) => http.log.info(o, m) }
+          }),
+          boardRepo: kanbanBoardRepo
+        })
+      : undefined
+
   const kanbanImporter =
     kanbanCardStore && kanbanTokens
       ? new KanbanImporter({
@@ -1786,7 +1814,8 @@ export function buildContainer(
             ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
           }),
           appSlug: githubAppCfg?.slug,
-          log: { warn: (o, m) => http.log.warn(o, m) }
+          log: { warn: (o, m) => http.log.warn(o, m) },
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
         })
       : undefined
 
@@ -1795,7 +1824,12 @@ export function buildContainer(
     warn: (o: unknown, m?: string) => http.log.warn(o, m)
   }
   const kanbanGraphReconciler = kanbanCardStore
-    ? new KanbanGraphReconciler({ cards: repos.kanbanCard, store: kanbanCardStore, log: kanbanGraphLog })
+    ? new KanbanGraphReconciler({
+        cards: repos.kanbanCard,
+        store: kanbanCardStore,
+        log: kanbanGraphLog,
+        ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
+      })
     : undefined
 
   const kanbanSync =
@@ -1811,15 +1845,7 @@ export function buildContainer(
             ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
           }),
           appSlug: githubAppCfg?.slug,
-          repoRef: async (boardId) => {
-            const board = await repos.kanbanDispatch.getBoardRef(boardId)
-            if (!board) return null
-            const owner = board.repoFullName.split('/')[0]!
-            const installation = await repos.githubInstallation.liveByOrgAndAccount(board.orgId, owner)
-            return installation && !installation.revokedAt && !installation.suspendedAt
-              ? { installationId: installation.installationId, repoId: board.repoId, repoFullName: board.repoFullName }
-              : null
-          },
+          repoRef: async (boardId) => (await kanbanBoardRepo(boardId))?.repo ?? null,
           revoke: async (lease, cardId) => {
             try {
               await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
@@ -1840,20 +1866,12 @@ export function buildContainer(
                 await kanbanCardStore.readGraph(repo, issueNumber)
               )
           },
-          log: kanbanGraphLog
+          log: kanbanGraphLog,
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
         })
       : undefined
 
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
-  // The Projects v2 projection mirrors status labels best-effort; without a token source there is no writer to hook.
-  const kanbanProjectWriter =
-    kanbanTokens && kanbanCardStore
-      ? new KanbanProjectWriter({
-          tokens: kanbanTokens,
-          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}),
-          log: { info: (o, m) => http.log.info(o, m) }
-        })
-      : undefined
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,
@@ -1868,15 +1886,7 @@ export function buildContainer(
           info: (o, m) => http.log.info(o, m),
           warn: (o, m) => http.log.warn(o, m)
         },
-        ...(kanbanProjectWriter
-          ? {
-              project: kanbanProjectHook({
-                boards: repos.kanbanBoard,
-                cards: repos.kanbanCard,
-                writer: kanbanProjectWriter
-              })
-            }
-          : {})
+        ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
       })
     : undefined
 
@@ -3330,7 +3340,8 @@ export function buildContainer(
         ...(sessionPullRequestFeedback ? [sessionPullRequestFeedback.settle()] : []),
         ...(installationDoorbell ? [installationDoorbell.settle()] : []),
         ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : []),
-        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : [])
+        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : []),
+        ...(kanbanProjectStatus ? [kanbanProjectStatus.settle()] : [])
       ])
       await rootPrisma.$disconnect()
     }

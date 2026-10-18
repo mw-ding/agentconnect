@@ -33,6 +33,7 @@ import {
   type LabelPlan
 } from './card-state.js'
 import { planReassign } from './reassign.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 export interface SyncCard {
   id: string
@@ -91,6 +92,8 @@ export interface KanbanSyncDeps {
   promote(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<void>
   log: { warn(obj: unknown, message: string): void }
   now?: () => Date
+  /** Post-commit Projects v2 seam; every status this sync commits is queued there (never throws). */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
 }
 
 const BATCH = 25
@@ -139,7 +142,14 @@ export class KanbanSync {
   private enqueue(boardId: string, issueNumber: number, run: () => Promise<boolean>): Promise<boolean> {
     const key = `${boardId}:${issueNumber}`
     const previous = this.running.get(key) ?? Promise.resolve(false)
-    const queued = previous.catch(() => false).then(run)
+    const queued = previous
+      .catch(() => false)
+      .then(run)
+      .then((changed) => {
+        // A pass that committed a status (adoption, reassignment restart, fail-closed) feeds the projection seam.
+        if (changed) this.deps.project?.onStatusCommitted({ boardId, issueNumber })
+        return changed
+      })
     this.running.set(key, queued)
     void queued
       .finally(() => {

@@ -1200,3 +1200,35 @@ describe('vera-r4: same-snapshot close survives reassignment', () => {
     expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'bob', id: 1 })
   })
 })
+
+describe('vera-474 B2: KanbanSync status commits reach the projection seam', () => {
+  it('vera-474: B2 a human label adoption through KanbanSync projects the committed status', async () => {
+    const f = fixture()
+    const project = { onStatusCommitted: vi.fn() }
+    const sync = new KanbanSync({ ...f.deps, project } as KanbanSyncDeps)
+    await sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('ready')
+    expect(project.onStatusCommitted).toHaveBeenCalledTimes(1)
+    expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'board', issueNumber: 1 })
+  })
+
+  it('vera-474: B2 a #194 reconcile that fails a card closed projects its new status', async () => {
+    const f = fixture({ status: 'ready', syncDeferredAt: new Date(Date.now() - 11 * 60_000), syncDeferralCount: 3 })
+    // The visible events cannot reproduce the live label, so the pass defers past the bound and fails closed.
+    f.events.splice(0, f.events.length)
+    const project = { onStatusCommitted: vi.fn() }
+    const sync = new KanbanSync({ ...f.deps, project } as KanbanSyncDeps)
+    await sync.reconcileBoard('board')
+    expect(f.card().status).toBe('triage')
+    expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'board', issueNumber: 1 })
+  })
+
+  it('vera-474: B2 a pass that commits no change projects nothing', async () => {
+    const f = fixture({ status: 'ready' })
+    const project = { onStatusCommitted: vi.fn() }
+    const sync = new KanbanSync({ ...f.deps, project } as KanbanSyncDeps)
+    await sync.onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('ready')
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  })
+})

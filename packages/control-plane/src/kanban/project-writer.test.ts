@@ -1,5 +1,4 @@
-// Kanban Projects v2 writer (issue #2 M5): mocked-GraphQL contract — exact queries/variables, option mapping,
-// idempotent add, cached item reuse, error mapping, and the best-effort guarantee. No real network.
+// Kanban Projects v2 writer and hook (issue #2 M5) over mocked GraphQL: exact calls, caches, errors, no network.
 import { describe, expect, it, vi } from 'vitest'
 import { KANBAN_STATUSES, type KanbanStatus } from './card-state.js'
 import {
@@ -275,11 +274,11 @@ describe('kanbanProjectHook', () => {
     boardId: 'board-1',
     issueId: 11n,
     issueNumber: 11,
-    issueNodeId: ISSUE_NODE,
+    issueNodeId: ISSUE_NODE as string | null,
     projectItemId: null as string | null,
     projectItemProjectId: null as string | null,
     idempotencyKey: null,
-    status: 'done' as const,
+    status: 'done' as KanbanStatus,
     assigneeAgentId: null,
     priority: 0,
     mode: null,
@@ -287,40 +286,47 @@ describe('kanbanProjectHook', () => {
     dispatchRevision: 1n,
     createdAt: new Date()
   }
+  const REF = { boardId: 'board-1', issueNumber: 11, issueNodeId: ISSUE_NODE }
 
   function hookHarness(
     over: {
       board?: { projectNodeId: string | null; statusFieldId: string | null } | null
       card?: typeof card | null
       write?: { itemId: string } | null
+      target?: { orgId: string; repo: typeof REPO } | null
     } = {}
   ) {
     const boards = { getForOrg: vi.fn(async () => (over.board === undefined ? board : over.board)) }
     const cards = {
+      findByIssueNumber: vi.fn(async () => (over.card === null ? null : { id: 'card-1' })),
       getCard: vi.fn(async () => (over.card === undefined ? card : over.card)),
       setProjectItemId: vi.fn(async () => {})
     }
-    const writer = { project: vi.fn(async () => (over.write === undefined ? { itemId: 'PVTI_new' } : over.write)) }
+    const writer = {
+      project: vi.fn(async (_args: unknown): Promise<{ itemId: string } | null> =>
+        over.write === undefined ? { itemId: 'PVTI_new' } : over.write
+      )
+    }
+    const boardRepo = vi.fn(async () => (over.target === undefined ? { orgId: 'org-1', repo: REPO } : over.target))
     // The fakes carry only the fields the hook reads; the cast keeps the repo-shaped production seam intact.
     const hook = kanbanProjectHook({
       boards: boards as unknown as Parameters<typeof kanbanProjectHook>[0]['boards'],
       cards: cards as unknown as Parameters<typeof kanbanProjectHook>[0]['cards'],
-      writer
+      writer,
+      boardRepo
     })
-    const args = {
-      boardId: 'board-1',
-      orgId: 'org-1',
-      cardId: 'card-1',
-      repo: REPO,
-      status: 'done' as const,
-      issueNodeId: ISSUE_NODE
+    const commit = async (ref: { boardId: string; issueNumber: number; issueNodeId?: string | null } = REF) => {
+      hook.onStatusCommitted(ref)
+      await hook.settle()
     }
-    return { boards, cards, writer, hook, args }
+    return { boards, cards, writer, hook, boardRepo, commit }
   }
 
-  it('projects with the board pair and remembers a fresh item id', async () => {
+  it('projects the committed card status with the board pair and remembers a fresh item id', async () => {
     const h = hookHarness()
-    await h.hook.projectAfterLabel(h.args)
+    await h.commit()
+    expect(h.boards.getForOrg).toHaveBeenCalledWith('org-1', 'board-1')
+    expect(h.cards.findByIssueNumber).toHaveBeenCalledWith('board-1', 11)
     expect(h.writer.project).toHaveBeenCalledWith({
       repo: REPO,
       board,
@@ -330,45 +336,90 @@ describe('kanbanProjectHook', () => {
     expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_new')
   })
 
-  it('falls back to the row issue node when the label write read none', async () => {
+  it('falls back to the row issue node when the caller read none', async () => {
     const h = hookHarness()
-    await h.hook.projectAfterLabel({ ...h.args, issueNodeId: null })
+    await h.commit({ boardId: 'board-1', issueNumber: 11 })
     expect(h.writer.project).toHaveBeenCalledWith(
       expect.objectContaining({ card: { issueNodeId: ISSUE_NODE, projectItemId: null, projectItemProjectId: null } })
     )
   })
 
+  it('projects the status committed when the run starts, not a status the caller names', async () => {
+    const h = hookHarness({ card: { ...card, status: 'review' } })
+    await h.commit()
+    expect(h.writer.project).toHaveBeenCalledWith(expect.objectContaining({ status: 'review' }))
+  })
+
   it('does nothing when the board has no projection', async () => {
     const h = hookHarness({ board: { projectNodeId: null, statusFieldId: null } })
-    await h.hook.projectAfterLabel(h.args)
-    expect(h.cards.getCard).not.toHaveBeenCalled()
+    await h.commit()
+    expect(h.cards.findByIssueNumber).not.toHaveBeenCalled()
     expect(h.writer.project).not.toHaveBeenCalled()
   })
 
-  it('does nothing when the card belongs to another board', async () => {
-    const h = hookHarness({ card: { ...card, boardId: 'board-9' } })
-    await h.hook.projectAfterLabel(h.args)
+  it('does nothing when the installation is gone', async () => {
+    const h = hookHarness({ target: null })
+    await h.commit()
+    expect(h.boards.getForOrg).not.toHaveBeenCalled()
     expect(h.writer.project).not.toHaveBeenCalled()
-    expect(h.cards.setProjectItemId).not.toHaveBeenCalled()
   })
 
-  it('does not re-store an item id the card already caches', async () => {
+  it('does nothing when the card belongs to another board or is gone', async () => {
+    const other = hookHarness({ card: { ...card, boardId: 'board-9' } })
+    await other.commit()
+    expect(other.writer.project).not.toHaveBeenCalled()
+    expect(other.cards.setProjectItemId).not.toHaveBeenCalled()
+    const gone = hookHarness({ card: null })
+    await gone.commit()
+    expect(gone.writer.project).not.toHaveBeenCalled()
+  })
+
+  it('does not re-store an item id the card already caches for this project', async () => {
     const h = hookHarness({
       card: { ...card, projectItemId: 'PVTI_old', projectItemProjectId: PROJECT },
       write: { itemId: 'PVTI_old' }
     })
-    await h.hook.projectAfterLabel(h.args)
+    await h.commit()
     expect(h.writer.project).toHaveBeenCalled()
     expect(h.cards.setProjectItemId).not.toHaveBeenCalled()
   })
 
   it('does not store when the write failed, and never throws when loaders fail', async () => {
     const failed = hookHarness({ write: null })
-    await failed.hook.projectAfterLabel(failed.args)
+    await failed.commit()
     expect(failed.cards.setProjectItemId).not.toHaveBeenCalled()
     const broken = hookHarness()
     broken.boards.getForOrg.mockRejectedValueOnce(new Error('db down'))
-    await expect(broken.hook.projectAfterLabel(broken.args)).resolves.toBeUndefined()
+    expect(() => broken.hook.onStatusCommitted(REF)).not.toThrow()
+    await expect(broken.hook.settle()).resolves.toBeUndefined()
+    // The failed run leaves the queue usable for the next commit.
+    await broken.commit()
+    expect(broken.writer.project).toHaveBeenCalledTimes(1)
+  })
+
+  it('coalesces a burst of commits behind a running projection into one queued run', async () => {
+    const h = hookHarness()
+    let release!: () => void
+    h.writer.project.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ itemId: 'PVTI_new' })))
+    )
+    h.hook.onStatusCommitted(REF)
+    await vi.waitFor(() => expect(h.writer.project).toHaveBeenCalledTimes(1))
+    h.hook.onStatusCommitted(REF)
+    h.hook.onStatusCommitted(REF)
+    h.hook.onStatusCommitted(REF)
+    release()
+    await h.hook.settle()
+    expect(h.writer.project).toHaveBeenCalledTimes(2)
+  })
+
+  it('a slow projection for one card never holds another card', async () => {
+    const h = hookHarness()
+    h.writer.project.mockImplementationOnce(() => new Promise(() => {}))
+    h.hook.onStatusCommitted(REF)
+    await vi.waitFor(() => expect(h.writer.project).toHaveBeenCalledTimes(1))
+    h.hook.onStatusCommitted({ boardId: 'board-1', issueNumber: 12 })
+    await vi.waitFor(() => expect(h.writer.project).toHaveBeenCalledTimes(2))
   })
 })
 
@@ -481,20 +532,28 @@ describe('vera-474 B1: the hook keeps the item cache keyed by project', () => {
     status: 'done' as const
   }
   function hookWith(card: typeof row, itemId: string) {
-    const cards = { getCard: vi.fn(async () => card), setProjectItemId: vi.fn(async () => {}) }
+    const cards = {
+      findByIssueNumber: vi.fn(async () => ({ id: card.id })),
+      getCard: vi.fn(async () => card),
+      setProjectItemId: vi.fn(async () => {})
+    }
     const writer = { project: vi.fn(async () => ({ itemId })) }
     const hook = kanbanProjectHook({
       boards: { getForOrg: vi.fn(async () => ({ projectNodeId: PROJECT, statusFieldId: FIELD })) } as never,
       cards: cards as never,
-      writer
+      writer,
+      boardRepo: async () => ({ orgId: 'org-1', repo: REPO })
     })
-    const args = { boardId: 'board-1', orgId: 'org-1', cardId: 'card-1', repo: REPO, status: 'done' as const }
-    return { cards, writer, hook, args }
+    const commit = async () => {
+      hook.onStatusCommitted({ boardId: 'board-1', issueNumber: 11 })
+      await hook.settle()
+    }
+    return { cards, writer, commit }
   }
 
   it('vera-474: a re-pointed board overwrites the stale item id and records the new project', async () => {
     const h = hookWith(row, 'PVTI_P2')
-    await h.hook.projectAfterLabel(h.args)
+    await h.commit()
     expect(h.writer.project).toHaveBeenCalledWith(
       expect.objectContaining({
         card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_P1', projectItemProjectId: 'PVT_P1' }
@@ -505,13 +564,13 @@ describe('vera-474 B1: the hook keeps the item cache keyed by project', () => {
 
   it('vera-474: a re-added item on the same project overwrites the cached id', async () => {
     const h = hookWith({ ...row, projectItemId: 'PVTI_gone', projectItemProjectId: PROJECT }, 'PVTI_new')
-    await h.hook.projectAfterLabel(h.args)
+    await h.commit()
     expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_new')
   })
 
   it('vera-474: a legacy id with no recorded project gains its project even when the id is unchanged', async () => {
     const h = hookWith({ ...row, projectItemId: 'PVTI_same', projectItemProjectId: null }, 'PVTI_same')
-    await h.hook.projectAfterLabel(h.args)
+    await h.commit()
     expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_same')
   })
 })

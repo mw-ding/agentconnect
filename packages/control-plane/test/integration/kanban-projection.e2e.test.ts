@@ -164,7 +164,7 @@ describe.skipIf(!blockA)('kanban projection 4a e2e (live GitHub)', () => {
       },
       { timeout: 45_000, interval: 1_000 }
     )
-    const card = await prisma.kanbanCard.create({
+    await prisma.kanbanCard.create({
       data: {
         boardId,
         issueId: BigInt(created.id),
@@ -183,18 +183,13 @@ describe.skipIf(!blockA)('kanban projection 4a e2e (live GitHub)', () => {
     const hook = kanbanProjectHook({
       boards: new PgKanbanBoardRepo(prisma),
       cards: new PgKanbanCardRepo(prisma),
-      writer: new KanbanProjectWriter({ tokens: patProject(mint), fetchImpl: spyFetch })
+      writer: new KanbanProjectWriter({ tokens: patProject(mint), fetchImpl: spyFetch }),
+      boardRepo: async () => ({ orgId: DEFAULT_ORG_ID, repo })
     })
-    await expect(
-      hook.projectAfterLabel({
-        boardId,
-        orgId: DEFAULT_ORG_ID,
-        cardId: card.id,
-        repo,
-        status: 'todo',
-        issueNodeId: created.node_id
-      })
-    ).resolves.toBeUndefined()
+    expect(() =>
+      hook.onStatusCommitted({ boardId, issueNumber: created.number, issueNodeId: created.node_id })
+    ).not.toThrow()
+    await expect(hook.settle()).resolves.toBeUndefined()
     expect(mint).not.toHaveBeenCalled()
     expect(projectCalls).toHaveLength(0)
     phase('A2 transition kept, zero project calls', { issue: created.number })
