@@ -729,10 +729,40 @@ it.each(['open', 'closed'])('finds a %s crash orphan past the first page without
     )
   try {
     await expect((h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker)).resolves.toBe(102)
-    expect(fetchSpy.mock.calls.map(([url]) => String(url))).toEqual([
-      'https://api.github.com/repos/acme/web/issues?state=all&per_page=100&page=1',
-      'https://api.github.com/repos/acme/web/issues?state=all&per_page=100&page=2'
-    ])
+    // Newest first over the last day, so a minutes-old orphan surfaces before listing lag matters.
+    const urls = fetchSpy.mock.calls.map(([url]) => new URL(String(url)))
+    expect(urls).toHaveLength(2)
+    for (const [index, url] of urls.entries()) {
+      expect(`${url.origin}${url.pathname}`).toBe('https://api.github.com/repos/acme/web/issues')
+      expect(url.searchParams.get('state')).toBe('all')
+      expect(url.searchParams.get('sort')).toBe('created')
+      expect(url.searchParams.get('direction')).toBe('desc')
+      expect(Date.now() - Date.parse(url.searchParams.get('since')!)).toBeLessThan(60 * 1000)
+      expect(url.searchParams.get('per_page')).toBe('100')
+      expect(url.searchParams.get('page')).toBe(String(index + 1))
+    }
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
+it('stops the marker lookup after 3 pages', async () => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockImplementation(
+      async () => new Response(JSON.stringify(Array.from({ length: 100 }, () => ({ number: 1, body: '' }))))
+    )
+  try {
+    await expect(
+      (h.daemon as any).findKanbanIssue(
+        AGENT,
+        'acme/web',
+        '<!-- agentconnect:kanban-card-key:' + 'b'.repeat(64) + ' -->'
+      )
+    ).resolves.toBeNull()
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
   } finally {
     fetchSpy.mockRestore()
   }

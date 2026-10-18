@@ -7,6 +7,7 @@ import {
   type KanbanOrchestrateOk,
   type KanbanOrchestrateRefusalCode
 } from '@agentconnect.md/protocol'
+import { loadPendingJournal, savePendingJournal, type PendingJournalLog } from './pending-journal.js'
 
 export interface KanbanOrchestratorToolsDeps {
   /** D→C `kanban/orchestrate`; rejects when the CP is unreachable. */
@@ -17,6 +18,9 @@ export interface KanbanOrchestratorToolsDeps {
   findIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null>
   /** Files the issue with the orchestrator's issues-only token; returns the new issue number. */
   fileIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number>
+  // Durable copy of the pending map; loaded at construction, saved on every mutation.
+  journalPath?: string
+  log?: PendingJournalLog
   // Clock for pending-create expiry, injectable for tests.
   now?: () => number
 }
@@ -70,7 +74,11 @@ export class KanbanOrchestratorTools {
   // Retain filed issues briefly so a failed commit can retry without a second POST.
   private readonly pending = new Map<string, { issueNumber: number; filedAt: number }>()
 
-  constructor(private readonly deps: KanbanOrchestratorToolsDeps) {}
+  constructor(private readonly deps: KanbanOrchestratorToolsDeps) {
+    // A restart rebuilds the toolset, so the journal restores the pending map first.
+    for (const [key, entry] of loadPendingJournal(deps.journalPath, deps.log)) this.pending.set(key, entry)
+    this.prunePending()
+  }
 
   async list(req: { agentId: string; board?: string; status?: string }): Promise<unknown> {
     const reply = await this.deps.orchestrate({
@@ -134,6 +142,7 @@ export class KanbanOrchestratorTools {
         (await this.deps.fileIssue(req.agentId, repoFullName, req.title, `${req.body}\n\n${marker}`))
       this.pending.set(mapKey, { issueNumber, filedAt: this.deps.now?.() ?? Date.now() })
       this.prunePending()
+      this.saveJournal()
     }
     try {
       const commit = (await this.deps.orchestrate({
@@ -151,6 +160,7 @@ export class KanbanOrchestratorTools {
       })) as OkOf<'commit_create'> | Extract<KanbanOrchestrateOk, { ok: false }>
       if (commit.ok) {
         this.pending.delete(mapKey)
+        this.saveJournal()
         return { created: true, cardId: commit.cardId, issueNumber: commit.issueNumber, repoFullName }
       }
       // github_partial is safe to retry: the card exists, so keep the pending map for the next commit.
@@ -158,11 +168,16 @@ export class KanbanOrchestratorTools {
         return { created: true, issueNumber, repoFullName, partial: true, retryable: true }
       }
       this.pending.delete(mapKey)
+      this.saveJournal()
       return { refused: refusalText(commit.code) }
     } catch {
       // The CP went away after the file; the pending map keeps the issue for a retry.
       return { filed: true, issueNumber, repoFullName, retryable: true }
     }
+  }
+
+  private saveJournal(): void {
+    savePendingJournal(this.deps.journalPath, this.pending, this.deps.log)
   }
 
   private prunePending(): void {

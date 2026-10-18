@@ -1,5 +1,8 @@
 // Failed commits retain the filed issue for a bounded, caller-scoped retry.
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   kanbanCardKeyMarker,
   kanbanOrchestrateCardKey,
@@ -258,5 +261,196 @@ describe('durable crash recovery', () => {
       'GitHub unavailable'
     )
     expect(fileIssue).not.toHaveBeenCalled()
+  })
+})
+
+describe('pending journal', () => {
+  const journalRoots: string[] = []
+  afterEach(() => {
+    for (const root of journalRoots.splice(0)) rmSync(root, { recursive: true, force: true })
+  })
+
+  function freshJournalPath(): string {
+    const root = mkdtempSync(join(tmpdir(), 'ac-pending-journal-'))
+    journalRoots.push(root)
+    return join(root, 'state', 'kanban-pending-creates.json')
+  }
+
+  function journaled(orchestrate: (p: KanbanOrchestrate) => Promise<KanbanOrchestrateOk>, journalPath: string) {
+    const findIssue = vi.fn(async () => null)
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: vi.fn(orchestrate),
+      repoFullNameFor: async () => 'acme/web',
+      findIssue,
+      fileIssue,
+      journalPath
+    })
+    return { svc, findIssue, fileIssue }
+  }
+
+  const req = { agentId: AGENT, board: BOARD, title: TITLE, body: BODY, step: STEP }
+
+  it('round-trips across a fresh toolset, so the retry does no POST and no lookup', async () => {
+    const journalPath = freshJournalPath()
+    let commits = 0
+    const orchestrate = async (p: KanbanOrchestrate): Promise<KanbanOrchestrateOk> => {
+      if (p.op === 'prepare_create') return { ok: true, op: 'prepare_create', verdict: 'proceed' }
+      commits += 1
+      if (commits === 1) throw new Error('CP unreachable')
+      return { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+    }
+    const first = journaled(orchestrate, journalPath)
+    await expect(first.svc.create(req)).resolves.toEqual({
+      filed: true,
+      issueNumber: 42,
+      repoFullName: 'acme/web',
+      retryable: true
+    })
+    expect(first.fileIssue).toHaveBeenCalledTimes(1)
+    // A simulated restart rebuilds the toolset over the same journal file.
+    const findIssue = vi.fn(async () => {
+      throw new Error('lookup must not run on a journal hit')
+    })
+    const fileIssue = vi.fn(async () => 43)
+    const second = new KanbanOrchestratorTools({
+      orchestrate,
+      repoFullNameFor: async () => 'acme/web',
+      findIssue,
+      fileIssue,
+      journalPath
+    })
+    await expect(second.create(req)).resolves.toEqual({
+      created: true,
+      cardId: 'c',
+      issueNumber: 42,
+      repoFullName: 'acme/web'
+    })
+    expect(findIssue).not.toHaveBeenCalled()
+    expect(fileIssue).not.toHaveBeenCalled()
+  })
+
+  it('a corrupt file means empty', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ac-pending-journal-'))
+    journalRoots.push(root)
+    const journalPath = join(root, 'journal.json')
+    writeFileSync(journalPath, 'not json{{{')
+    const warn = vi.fn()
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: async (p) => {
+        if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+        throw new Error('CP unavailable')
+      },
+      repoFullNameFor: async () => 'acme/web',
+      findIssue: async () => null,
+      fileIssue,
+      journalPath,
+      log: { warn }
+    })
+    expect(warn).toHaveBeenCalledTimes(1)
+    // Nothing usable loaded, so this files anew instead of reusing a phantom entry.
+    await expect(svc.create(req)).resolves.toMatchObject({ issueNumber: 42 })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('a missing file means empty', async () => {
+    const journalPath = freshJournalPath()
+    const warn = vi.fn()
+    const fileIssue = vi.fn(async () => 42)
+    const svc = new KanbanOrchestratorTools({
+      orchestrate: async (p) => {
+        if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+        throw new Error('CP unavailable')
+      },
+      repoFullNameFor: async () => 'acme/web',
+      findIssue: async () => null,
+      fileIssue,
+      journalPath,
+      log: { warn }
+    })
+    expect(warn).toHaveBeenCalledTimes(1)
+    await expect(svc.create(req)).resolves.toMatchObject({ issueNumber: 42 })
+    expect(fileIssue).toHaveBeenCalledTimes(1)
+  })
+
+  it('removes entries on commit success and terminal refusal, keeps them on github_partial', async () => {
+    const commitWith = (commit: (p: KanbanOrchestrate) => Promise<KanbanOrchestrateOk>) => {
+      const journalPath = freshJournalPath()
+      return {
+        ...journaled(async (p) => {
+          if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+          return commit(p)
+        }, journalPath),
+        journalPath
+      }
+    }
+
+    const success = commitWith(async () => ({ ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }))
+    await expect(success.svc.create(req)).resolves.toMatchObject({ created: true })
+    expect(JSON.parse(readFileSync(success.journalPath, 'utf8'))).toEqual({})
+
+    const refused = commitWith(async () => ({ ok: false, op: 'commit_create', code: 'epic_budget_exhausted' }))
+    await expect(refused.svc.create({ ...req, epic: 1 })).resolves.toMatchObject({
+      refused: 'the epic has reached its card budget'
+    })
+    expect(JSON.parse(readFileSync(refused.journalPath, 'utf8'))).toEqual({})
+
+    const partial = commitWith(async () => ({ ok: false, op: 'commit_create', code: 'github_partial' }))
+    await expect(partial.svc.create(req)).resolves.toMatchObject({ partial: true, retryable: true })
+    const entries = Object.values(JSON.parse(readFileSync(partial.journalPath, 'utf8')))
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ issueNumber: 42 })
+  })
+
+  it('holds the 256-entry oldest-first bound in the file', async () => {
+    const journalPath = freshJournalPath()
+    const h = journaled(async (p) => {
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      throw new Error('CP unavailable')
+    }, journalPath)
+    h.fileIssue.mockImplementation(async () => h.fileIssue.mock.calls.length)
+    for (let i = 0; i < 257; i++) {
+      await h.svc.create({ ...req, step: `step-${i}` })
+    }
+    const entries = Object.entries(JSON.parse(readFileSync(journalPath, 'utf8')))
+    expect(entries).toHaveLength(256)
+    expect(JSON.stringify(entries[0])).toContain('step-1')
+    expect(JSON.stringify(entries)).not.toContain('step-0')
+  })
+
+  it('expires file entries older than one hour on load', async () => {
+    const journalPath = freshJournalPath()
+    const h = journaled(async (p) => {
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      throw new Error('CP unavailable')
+    }, journalPath)
+    await h.svc.create(req)
+    const aged = new KanbanOrchestratorTools({
+      orchestrate: async (p) => {
+        if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+        throw new Error('CP unavailable')
+      },
+      repoFullNameFor: async () => 'acme/web',
+      findIssue: async () => null,
+      fileIssue: vi.fn(async () => 43),
+      journalPath,
+      now: () => Date.now() + 2 * 60 * 60 * 1000
+    })
+    expect((aged as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0)
+  })
+
+  it('stores only keys, never titles or bodies, at mode 0600', async () => {
+    const journalPath = freshJournalPath()
+    const h = journaled(async (p) => {
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      throw new Error('CP unavailable')
+    }, journalPath)
+    await h.svc.create(req)
+    const raw = readFileSync(journalPath, 'utf8')
+    expect(raw).not.toContain(TITLE)
+    expect(raw).not.toContain(BODY)
+    expect(raw).toContain('issueNumber')
+    expect(statSync(journalPath).mode & 0o777).toBe(0o600)
   })
 })

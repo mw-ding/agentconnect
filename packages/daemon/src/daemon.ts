@@ -200,6 +200,7 @@ import {
   resolveRoot,
   statePath,
   agentRemovalObligationsDir,
+  kanbanPendingCreatesPath,
   mcpSocketPath,
   daemonEntryForShims,
   runtimeStoreDir
@@ -27261,7 +27262,9 @@ export class Daemon {
       },
       repoFullNameFor: (agentId, board) => this.kanbanBoardRepo(agentId, board),
       findIssue: (agentId, repoFullName, marker) => this.findKanbanIssue(agentId, repoFullName, marker),
-      fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body)
+      fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body),
+      journalPath: kanbanPendingCreatesPath(this.root),
+      log: { warn: (m) => this.log.warn(m) }
     }))
   }
 
@@ -27277,9 +27280,11 @@ export class Daemon {
   // Listing avoids GitHub search-index lag in the crash-before-commit window; failures must not fall through to POST.
   private async findKanbanIssue(agentId: string, repoFullName: string, marker: string): Promise<number | null> {
     const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
-    for (let page = 1; ; page++) {
+    // Newest first over the last day: the orphan is minutes old, and the journal covers older ones.
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    for (let page = 1; page <= 3; page++) {
       const res = await fetch(
-        `https://api.github.com/repos/${repoFullName}/issues?state=all&per_page=100&page=${page}`,
+        `https://api.github.com/repos/${repoFullName}/issues?state=all&sort=created&direction=desc&since=${encodeURIComponent(since)}&per_page=100&page=${page}`,
         {
           headers: {
             authorization: `Bearer ${grant.token}`,
@@ -27301,6 +27306,8 @@ export class Daemon {
       if (found) return found.number
       if (issues.length < 100) return null
     }
+    // Three full pages with no match: stop rather than paging the whole repo.
+    return null
   }
 
   /** Files the issue body with the orchestrator's issues-only token; the CP writes only metadata. */
