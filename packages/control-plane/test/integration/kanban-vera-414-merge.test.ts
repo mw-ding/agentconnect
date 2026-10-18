@@ -8,6 +8,8 @@ import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { attestHumanAuthority } from '../../src/kanban/human-authority.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { planLabelReconcile, type KanbanStatus } from '../../src/kanban/card-state.js'
 import { planRunEnd, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
@@ -259,6 +261,67 @@ describe('vera-414-merge: 8 a human re-ready keeps the review round count (Postg
     // Only an approval resets the count, so the next changes_requested trips straight back to triage (one more round).
     expect(await f.read(live.id)).toMatchObject({ status: 'ready', reviewRounds: 3 })
     expect(await f.read(parked.id)).toMatchObject({ status: 'ready', reviewRounds: 3, needsAttention: false })
+  })
+})
+
+describe("vera-414-merge: 9 #415's contract and comment-command moves keep their own behaviour (Postgres)", () => {
+  it('vera-414-merge: 9 a pr_merged settle keeps its stamp reset and audit beside the role-aware claim', async () => {
+    const f = await fixture()
+    const c = await f.card('review', { verifiedAt: APPROVED, reviewRounds: 2, linkedPrNumber: 7 })
+    const before = await f.read(c.id)
+    expect(
+      await f.dispatch.settleContract({
+        cardId: c.id,
+        expectedStateRevision: before.stateRevision,
+        to: 'done',
+        reason: 'pr_merged',
+        prNumber: 7
+      })
+    ).toBe(true)
+    // The contract's own write: done with the approval spent and rounds reset; its label write stays its own (best effort).
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'done',
+      verifiedAt: null,
+      reviewRounds: 0,
+      labelWritePending: false,
+      stateRevision: before.stateRevision + 1n
+    })
+    expect(await f.audits(c.id)).toMatchObject([
+      { from: 'review', to: 'done', source: 'pr_contract', reason: 'pr_merged', prNumber: 7 }
+    ])
+    expect(await f.claim()).toEqual([])
+  })
+
+  it('vera-414-merge: 9 a /kanban unblock lands ready under its own audit, then claims as work with the role-aware audit', async () => {
+    const f = await fixture()
+    const c = await f.card('blocked', { linkedPrNumber: 7, linkedPrWorkStartedAt: APPROVED })
+    const before = await f.read(c.id)
+    const recorded = await new PgKanbanCardRepo(prisma).recordCommand({
+      boardId: f.board.id,
+      cardId: c.id,
+      commentId: 414_009n,
+      command: 'unblock',
+      humanAuthority: attestHumanAuthority('octocat', 'write'),
+      actorLogin: 'octocat',
+      from: 'blocked',
+      expectedStateRevision: before.stateRevision,
+      to: 'ready'
+    })
+    expect(recorded).toMatchObject({ kind: 'recorded' })
+    expect(await f.read(c.id)).toMatchObject({ status: 'ready', linkedPrNumber: 7 })
+    const [lease] = await f.claim()
+    expect(lease).toMatchObject({ cardId: c.id, role: 'work', agentId: A1 })
+    expect(await f.audits(c.id)).toMatchObject([
+      { from: 'blocked', to: 'ready', source: 'comment_command', command: 'unblock' },
+      { from: 'ready', to: 'running', source: 'claim', role: 'work', leaseId: lease!.leaseId }
+    ])
+    // The work claim owes the running label and invalidates the old PR provenance until this run reports its PR.
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'running',
+      labelWritePending: true,
+      verifiedAt: null,
+      linkedPrWorkStartedAt: null
+    })
   })
 })
 
