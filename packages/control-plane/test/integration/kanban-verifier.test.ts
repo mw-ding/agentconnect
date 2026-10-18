@@ -1,4 +1,5 @@
 // Verifier routing (M4) on real Postgres: review cards claim to the verifier, B8 refuses self-approval, changes_requested returns to the assignee.
+import { randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { KanbanDispatch, KanbanDispatchOk, KanbanReport } from '@agentconnect.md/protocol'
 import { prisma } from '../setup.db.js'
@@ -205,6 +206,39 @@ describe('Kanban verifier routing (real Postgres)', () => {
     await h.dispatcher.settle()
     expect(h.store.writes).toHaveLength(writes)
     expect(await prisma.kanbanRun.count({ where: { cardId: c.id } })).toBe(0)
+  })
+
+  it('vera-414: B8 refuses a verifier that wrote any earlier work attempt (runs [A2, A1], verifier A2)', async () => {
+    const h = await harness({ verifier: A2 })
+    const c = await h.reviewCard()
+    for (const [attempt, agentId, daemonId] of [
+      [1, A2, D2],
+      [2, A1, D1]
+    ] as const)
+      await prisma.kanbanRun.create({
+        data: {
+          cardId: c.id,
+          attempt,
+          agentId,
+          daemonId,
+          role: 'work',
+          leaseId: randomUUID(),
+          dispatchRevision: BigInt(attempt),
+          dispatchedAt: new Date(T0),
+          endedAt: new Date(T0),
+          outcome: 'completed'
+        }
+      })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect(await prisma.kanbanRun.count({ where: { cardId: c.id, role: 'verify' } })).toBe(0)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'verifier_is_worker'
+    })
+    expect(h.store.writes.filter((w) => w.comment)).toHaveLength(1)
   })
 
   it('changes_requested returns the card to ready for the original assignee and re-dispatches as work', async () => {

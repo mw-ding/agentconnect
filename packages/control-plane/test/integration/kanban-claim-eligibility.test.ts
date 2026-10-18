@@ -126,13 +126,9 @@ async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibili
     },
     assignee: await agentFor(c.assigneeAgentId),
     verifier: await agentFor(b.verifierAgentId),
-    latestWorkAgentId:
-      (
-        await prisma.kanbanRun.findFirst({
-          where: { cardId, role: 'work', endedAt: { not: null } },
-          orderBy: { attempt: 'desc' }
-        })
-      )?.agentId ?? null,
+    workAgentIds: (
+      await prisma.kanbanRun.findMany({ where: { cardId, role: 'work' }, orderBy: { attempt: 'asc' } })
+    ).map((r) => r.agentId),
     openRunCount: open.length,
     openRunCountForAssignee: open.filter((r) => r.agentId === c.assigneeAgentId).length,
     openRunCountForVerifier: open.filter((r) => r.agentId === b.verifierAgentId).length,
@@ -182,17 +178,28 @@ describe('claim eligibility parity (real Postgres)', () => {
     const live = await board(100, 100, true, A2)
     const pastWorker = await card(live.id, 3, { status: 'review' })
     await run(pastWorker.id, 1, A2)
+    // The verifier wrote attempt 1 and someone else the latest attempt: B8 still refuses it.
+    const earlierWorker = await card(live.id, 5, { status: 'review' })
+    await run(earlierWorker.id, 1, A2)
+    await run(earlierWorker.id, 2, A1)
     const claimed = await expectParity(
       live.id,
       {
         verify: await card(live.id, 1, { status: 'review' }),
         work: await card(live.id, 2),
         latest_worker: pastWorker,
+        earlier_worker: earlierWorker,
         verified: await card(live.id, 4, { status: 'review', verifiedAt: NOW })
       },
-      { verify: 'eligible', work: 'eligible', latest_worker: 'verifier_is_worker', verified: 'verified' }
+      {
+        verify: 'eligible',
+        work: 'eligible',
+        latest_worker: 'verifier_is_worker',
+        earlier_worker: 'verifier_is_worker',
+        verified: 'verified'
+      }
     )
-    expect(claimed.flaggedSelfVerify.map((f) => f.cardId)).toEqual([pastWorker.id])
+    expect(claimed.flaggedSelfVerify.map((f) => f.cardId).sort()).toEqual([pastWorker.id, earlierWorker.id].sort())
 
     const self = await board(100, 100, true, A1)
     await expectParity(

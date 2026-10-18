@@ -72,7 +72,8 @@ interface CandidateRow {
   daemonId: string
   sessionEpoch: bigint
   assigneeAgentId: string | null
-  latestWorkAgentId: string | null
+  /** The board's verifier wrote some work attempt on this card (B8 compares every attempt, not only the latest). */
+  verifierDidWork: boolean
 }
 
 interface RunEndRow {
@@ -161,9 +162,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
                a."daemonId", d."sessionEpoch", c."assigneeAgentId",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
-               (SELECT w."agentId" FROM "kanban_run" w
-                 WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."endedAt" IS NOT NULL
-                 ORDER BY w."attempt" DESC LIMIT 1) AS "latestWorkAgentId"
+               EXISTS (SELECT 1 FROM "kanban_run" w
+                 WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
+               ) AS "verifierDidWork"
         FROM "kanban_card" c
         JOIN "agent" a ON a."id" = CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END
           AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
@@ -195,10 +196,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if (!opts.isDaemonLive(card.daemonId)) continue
 
           // B8 self-approval guard: a review card whose verifier is the worker is never dispatched; flag it once.
-          if (
-            card.role === 'verify' &&
-            (board.verifierAgentId === card.assigneeAgentId || board.verifierAgentId === card.latestWorkAgentId)
-          ) {
+          if (card.role === 'verify' && (board.verifierAgentId === card.assigneeAgentId || card.verifierDidWork)) {
             const flagged = await tx.kanbanCard.updateMany({
               where: {
                 id: card.id,

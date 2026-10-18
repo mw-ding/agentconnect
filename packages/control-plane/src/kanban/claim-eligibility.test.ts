@@ -22,7 +22,7 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
     },
     assignee: liveAgent(),
     verifier: null,
-    latestWorkAgentId: null,
+    workAgentIds: [],
     openRunCount: 0,
     openRunCountForAssignee: 0,
     openRunCountForVerifier: 0,
@@ -218,7 +218,8 @@ describe('explainClaim — review routing', () => {
   it.each<[string, ClaimGate, ReturnType<typeof review>]>([
     ['the board has no verifier', 'verifier_unset', review({ board: { ...review().board, verifierAgentId: null } })],
     ['the verifier is the assignee', 'verifier_is_worker', review({}, { assigneeAgentId: A2 })],
-    ['the verifier wrote the latest work run', 'verifier_is_worker', review({ latestWorkAgentId: A2 })],
+    ['the verifier wrote the latest work run', 'verifier_is_worker', review({ workAgentIds: [A2] })],
+    ['the verifier wrote an earlier work run', 'verifier_is_worker', review({ workAgentIds: [A2, A1] })],
     ['the verifier row is gone', 'agent_missing', review({ verifier: null })],
     ['the verifier is paused', 'agent_paused', review({ verifier: { ...liveAgent(), paused: true } })],
     ['the verifier is unplaced', 'agent_unplaced', review({ verifier: { ...liveAgent(), daemonId: null } })],
@@ -279,5 +280,16 @@ describe('explainClaim — approved review cards', () => {
     expect(explainClaim(noVerifier)).toEqual({ eligible: false, gate: 'verifier_unset' })
     const cooling = review({}, { verifiedAt: NOW, cooldownUntil: new Date(NOW.getTime() + 1000) })
     expect(explainClaim(cooling)).toEqual({ eligible: false, gate: 'verified' })
+  })
+})
+
+describe('explainClaim — B8 covers every work attempt', () => {
+  it('vera-414: refuses a verifier that wrote any earlier attempt, not only the latest', () => {
+    // Attempt 1 by the verifier (A2), attempt 2 by A1: the reviewed branch still holds the verifier's work.
+    expect(explainClaim(review({ workAgentIds: [A2, A1] }))).toEqual({ eligible: false, gate: 'verifier_is_worker' })
+  })
+
+  it("vera-414: other agents' attempts do not block the verifier", () => {
+    expect(explainClaim(review({ workAgentIds: [A1, A1] }))).toEqual({ eligible: true, role: 'verify', agentId: A2 })
   })
 })

@@ -64,8 +64,8 @@ export interface ClaimEligibilityInput {
   assignee: ClaimAgentFacts | null
   /** Facts about the verifier (the verify target); null when the board has no verifier or the verifier row is gone. */
   verifier: ClaimAgentFacts | null
-  /** The agent id of the card's latest completed work run, for the B8 self-approval guard. */
-  latestWorkAgentId: string | null
+  /** The agents of every work run on the card (any attempt, any outcome), for the B8 self-approval guard. */
+  workAgentIds: readonly string[]
   /** Open runs on the board: the board-wide total and the target agent's own count. */
   openRunCount: number
   openRunCountForAssignee: number
@@ -105,7 +105,7 @@ export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   const own = role === 'verify' ? input.openRunCountForVerifier : input.openRunCountForAssignee
   if (own >= board.maxInProgressPerAgent) return { eligible: false, gate: 'agent_cap' }
   if (!facts.daemonLive) return { eligible: false, gate: 'daemon_offline' }
-  if (role === 'verify' && (agentId === card.assigneeAgentId || agentId === input.latestWorkAgentId)) {
+  if (role === 'verify' && (agentId === card.assigneeAgentId || input.workAgentIds.includes(agentId))) {
     return { eligible: false, gate: 'verifier_is_worker' }
   }
 
