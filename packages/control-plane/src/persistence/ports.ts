@@ -7928,6 +7928,8 @@ export interface KanbanBoardRepo {
   listEnabledByRepoId(repoId: bigint): Promise<KanbanBoardRecord[]>
   /** Distinct repository ids any enabled board watches (redelivery sieve). */
   listEnabledRepoIds(): Promise<bigint[]>
+  /** Adopt GitHub's renamed `owner/name` for a board still watching `repoId`; audited with no user actor. */
+  refreshRepoFullName(boardId: string, repoId: bigint, repoFullName: string): Promise<boolean>
 }
 
 // ── Kanban dispatch (issue #2 M2) — claim, lease fence, heartbeat, and reaper reads; still body-free ──
@@ -8054,7 +8056,7 @@ export interface KanbanDispatchRepo {
   now(): Promise<Date>
   getBoardRef(boardId: string): Promise<KanbanBoardRef | null>
   // Due non-terminal cards that are mismatch-parked, flagged for attention, or hold a pending promotion; most overdue first.
-  listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]>
+  listRecoveryDue(boardId: string, now: Date, limit: number, pendingOnly?: boolean): Promise<KanbanRecoveryDue[]>
   // The status a mismatch or an attention flag parked the card in; null when neither holds it.
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
@@ -8228,6 +8230,8 @@ export interface KanbanCardUpsertInput {
   /** The agent that filed it, when an orchestrator did. */
   actorAgentId?: string | null
   humanAuthority?: KanbanHumanAuthority | null
+  /** Create-only: the newest status event an import honored, so label sync never re-reads it as a new human request. */
+  syncEventCursor?: bigint
 }
 
 export interface KanbanCardUpsertResult {
@@ -8276,6 +8280,9 @@ export interface KanbanSetAssigneeInput {
   source: string
   actorUserId?: string | null
   actorAgentId?: string | null
+  /** Body-free GitHub attribution for label-driven reassignment: the login and numeric id of the label's actor. */
+  actorLogin?: string | null
+  actorGitHubId?: number | null
 }
 
 export type KanbanSetAssigneeResult =

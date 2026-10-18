@@ -15,6 +15,7 @@ import {
   KanbanReasonCode,
   KanbanReport,
   KanbanReportOk,
+  KanbanRevoke,
   buildEnvelope,
   decodeEnvelope,
   isFrame
@@ -51,6 +52,14 @@ const report = {
 }
 
 describe('kanban wire (issue #2 M2)', () => {
+  it('kanban/revoke addresses only a card lease and rejects free text', () => {
+    const req = { cardId: CARD, leaseId: LEASE }
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/revoke', req))).ok).toBe(true)
+    expect(KanbanRevoke.safeParse({ ...req, body: 'secret' }).success).toBe(false)
+    expect(KanbanRevoke.safeParse({ ...req, leaseId: 'invalid' }).success).toBe(false)
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/revoke/ok', { leaseId: LEASE }))).ok).toBe(true)
+  })
+
   it('kanban/dispatch is a body-free lease grant (ids + fence only, strict)', () => {
     const decoded = decodeEnvelope(JSON.stringify(buildEnvelope('kanban/dispatch', dispatch)))
     expect(decoded.ok).toBe(true)

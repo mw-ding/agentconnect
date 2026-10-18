@@ -11,6 +11,7 @@ import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { OrgId } from '../../src/domain/ids.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -119,7 +120,11 @@ describe.skipIf(!enabled)('kanban worker M3 e2e (live GitHub)', () => {
     revokedAt: null,
     createdAt: new Date(0)
   }
-  const store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+  const cardTokens = { mintKanbanCard: async () => ({ token: TOKEN! }) } as never
+  const store = new GithubCardStore({
+    tokens: cardTokens,
+    permissions: new GithubRepoPermission({ tokens: cardTokens, ttlMs: 0 })
+  })
 
   const issue = (number: number) => gh<Issue>('GET', `/repos/${FULL}/issues/${number}`)
   const comments = (number: number) => gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${number}/comments`)

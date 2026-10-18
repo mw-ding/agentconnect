@@ -89,8 +89,8 @@ describe('vera-528: title TTL cache', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     release()
     const [a, b] = await Promise.all(pending)
-    expect(a.titles.get(1)?.title).toBe('title 1')
-    expect(b.titles.get(2)?.title).toBe('title 2')
+    expect(a?.titles.get(1)?.title).toBe('title 1')
+    expect(b?.titles.get(2)?.title).toBe('title 2')
   })
 
   it('vera-528: stale entries revalidate with If-None-Match and a 304 refreshes the TTL', async () => {
