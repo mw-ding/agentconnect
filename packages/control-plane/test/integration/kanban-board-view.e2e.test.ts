@@ -359,6 +359,19 @@ describe.skipIf(!enabled)('kanban board view e2e (live GitHub)', () => {
     await scenario('c1 CLI dispatch --dry-run prints the expected gates', async (record) => {
       for (const i of [one, two, three]) record(i.number)
       const apiUrl = `${cpOrigin.replace('http', 'ws')}/daemon/ws`
+      // The daemon key `login` saved in config.json is never enough on its own: without an explicit personal key
+      // the command refuses with personal_api_key_required instead of sending the stored key to a 401.
+      const savedEnv = process.env.AGENTCONNECT_API_KEY
+      delete process.env.AGENTCONNECT_API_KEY
+      try {
+        const refused = await runDispatchCommand(
+          { root: root!, dryRun: true, board: boardId, apiUrl },
+          { fetch, out: () => {} }
+        ).catch((e: unknown) => e)
+        expect(refused).toMatchObject({ code: 'personal_api_key_required' })
+      } finally {
+        if (savedEnv !== undefined) process.env.AGENTCONNECT_API_KEY = savedEnv
+      }
       const lines: string[] = []
       await runDispatchCommand(
         { root: root!, dryRun: true, board: boardId, apiUrl, apiKey: userKey },

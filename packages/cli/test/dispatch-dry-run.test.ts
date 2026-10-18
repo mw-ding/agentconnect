@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { persistCredentials } from '../src/login.js'
 import {
   DispatchDryRunError,
   formatEntry,
@@ -235,13 +236,13 @@ describe('runDispatchCommand', () => {
     await expect(runDispatchCommand({ root: dir, dryRun: true }, deps())).rejects.toThrow('--board <id> is required')
   })
 
-  it('uses the stored login when no flags are given', async () => {
+  it('uses the stored login URL with an explicit personal key, never the stored daemon key', async () => {
     writeLogin()
     fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
-    await runDispatchCommand({ root: dir, dryRun: true, board: BOARD, org: ORG }, deps())
+    await runDispatchCommand({ root: dir, dryRun: true, board: BOARD, org: ORG, apiKey: 'personal-key' }, deps())
     expect(urls()[0]).toMatch(/^https:\/\/stored\.example\.com\/api\/v1\//)
     expect(((fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
-      'Bearer stored-key'
+      'Bearer personal-key'
     )
   })
 
@@ -258,18 +259,18 @@ describe('runDispatchCommand', () => {
     )
   })
 
-  it('explains the missing login instead of calling out', async () => {
-    await expect(runDispatchCommand({ root: dir, dryRun: true, board: BOARD }, deps())).rejects.toThrow(
-      /agentconnect login/
-    )
+  it('explains the missing personal key instead of calling out', async () => {
+    const err = await runDispatchCommand({ root: dir, dryRun: true, board: BOARD }, deps()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(DispatchDryRunError)
+    expect((err as DispatchDryRunError).code).toBe('personal_api_key_required')
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it.each(['0', '-3', 'abc', '1.5'])('rejects --issue %s', async (issue) => {
     writeLogin()
-    await expect(runDispatchCommand({ root: dir, dryRun: true, board: BOARD, issue }, deps())).rejects.toThrow(
-      /invalid --issue/
-    )
+    await expect(
+      runDispatchCommand({ root: dir, dryRun: true, board: BOARD, issue, apiKey: 'personal-key' }, deps())
+    ).rejects.toThrow(/invalid --issue/)
   })
 
   it('reads a stored login only when well-formed', () => {
@@ -283,5 +284,59 @@ describe('routing', () => {
   it('keeps dispatch in the CLI instead of delegating it to the daemon', () => {
     expect(classifyInvocation(['dispatch', '--dry-run', '--board', 'b'])).not.toBe('delegate')
     expect(classifyInvocation(['--root', '/x', 'dispatch', '--dry-run'])).not.toBe('delegate')
+  })
+})
+
+describe('vera-528: personal API key rule', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ac-dispatch-vera-528-'))
+  })
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.AGENTCONNECT_API_KEY
+  })
+
+  it('vera-528: stored login credentials alone are refused without any HTTP request', async () => {
+    // Written through the real login save path: `login` stores the daemon key, which the console API refuses.
+    persistCredentials({ apiUrl: 'wss://stored.example.com/daemon/ws', apiKey: 'stored-daemon-key', root: dir })
+    const err = await runDispatchCommand({ root: dir, dryRun: true, board: BOARD }, deps()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(DispatchDryRunError)
+    expect((err as DispatchDryRunError).code).toBe('personal_api_key_required')
+    expect((err as Error).message).toContain('personal API key')
+    expect((err as Error).message).not.toContain('stored-daemon-key')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('vera-528: AGENTCONNECT_API_KEY supplies the personal key with no stored file', async () => {
+    process.env.AGENTCONNECT_API_KEY = 'env-personal-key'
+    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    await runDispatchCommand(
+      { root: dir, dryRun: true, board: BOARD, org: ORG, apiUrl: 'wss://cp.example.com/daemon/ws' },
+      deps()
+    )
+    expect(urls()).toHaveLength(1)
+    expect(((fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
+      'Bearer env-personal-key'
+    )
+  })
+
+  it('vera-528: --api-key wins over AGENTCONNECT_API_KEY', async () => {
+    process.env.AGENTCONNECT_API_KEY = 'env-personal-key'
+    fetchMock.mockImplementation(async () => json({ cards: [], wouldClaimNext: [], wouldClaimNextIssueNumbers: [] }))
+    await runDispatchCommand(
+      {
+        root: dir,
+        dryRun: true,
+        board: BOARD,
+        org: ORG,
+        apiUrl: 'wss://cp.example.com/daemon/ws',
+        apiKey: 'flag-personal-key'
+      },
+      deps()
+    )
+    expect(((fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>).authorization).toBe(
+      'Bearer flag-personal-key'
+    )
   })
 })

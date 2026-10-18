@@ -296,7 +296,9 @@ async function main(): Promise<void> {
   // "Why isn't this card running?": a read-only explain against the Control Plane; dispatch itself stays server-side.
   program
     .command('dispatch')
-    .description('Explain Kanban dispatch decisions (read-only; requires --dry-run)')
+    .description(
+      'Explain Kanban dispatch decisions (read-only; requires --dry-run and a personal API key via --api-key or AGENTCONNECT_API_KEY — the daemon key saved by login is refused)'
+    )
     .option('--board <id>', 'Kanban board id')
     .option('--card <id>', 'explain one card by id')
     .option('--issue <n>', 'explain one card by its issue number')

@@ -215,6 +215,34 @@ describe('Kanban explain routes', () => {
       }
     })
 
+    it('vera-528: a daemon-principal key gets 401 on explain while a personal key gets 200', async () => {
+      await seedPlacedAgent()
+      const board = await seedBoard({ repoId: 1n })
+      await seedCard(board.id, 1)
+      // A daemon key in the exact stored shape: minted like the daemon plane mints, bound to the placed daemon.
+      const codec = new ApiKeyCodec({ API_KEY_PEPPER: TEST_API_KEY_PEPPER })
+      const daemonKey = codec.mint()
+      await prisma.apiKey.create({
+        data: {
+          principalType: 'daemon',
+          orgId: DEFAULT_ORG_ID,
+          daemonId: DAEMON,
+          hash: daemonKey.hash,
+          displayTail: daemonKey.displayTail
+        }
+      })
+      const { app, close } = buildApp()
+      try {
+        const url = `${BOARDS}/${board.id}/explain`
+        expect((await app.inject({ method: 'GET', url, headers: bearer(daemonKey.token) })).statusCode).toBe(401)
+        expect(
+          (await app.inject({ method: 'GET', url, headers: await mintUserKey(DEFAULT_OWNER_ID) })).statusCode
+        ).toBe(200)
+      } finally {
+        await close()
+      }
+    })
+
     it('rejects a malformed id before touching the database', async () => {
       const { app, close } = buildApp()
       try {

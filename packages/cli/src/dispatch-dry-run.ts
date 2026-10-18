@@ -3,8 +3,9 @@
  * read-only Kanban explain routes and prints each gate; nothing is dispatched or written. Card
  * titles never cross this path, so the output is ids, issue numbers, statuses and gate codes.
  *
- * Auth is the stored personal API key (the one `login` saved), which the viewer-readable explain
- * routes accept; the REST base is derived from the stored daemon WebSocket URL.
+ * Auth is a personal API key (`--api-key` or `AGENTCONNECT_API_KEY`), which the viewer-readable
+ * explain routes accept. `login` saves the daemon key instead, which the console API refuses, so the
+ * stored key is never used here; only the stored WebSocket URL seeds the REST base.
  */
 import { existsSync, readFileSync } from 'node:fs'
 import { configPath } from './paths.js'
@@ -163,17 +164,24 @@ export interface DispatchCommandFlags {
   json?: boolean
 }
 
-/** The `dispatch` command body: validate flags and fall back to the stored login before calling the explain routes. */
+/** The `dispatch` command body: validate flags, then call the explain routes with an explicit personal key. */
 export async function runDispatchCommand(flags: DispatchCommandFlags, deps: DryRunDeps): Promise<void> {
   if (!flags.dryRun) throw new DispatchDryRunError('only --dry-run is supported; dispatch runs in the control plane')
   if (!flags.board) throw new DispatchDryRunError('--board <id> is required')
+  // The stored `login` key is the daemon key, which the console API refuses (authenticateUser admits user/oauth
+  // principals only), so it must never be sent here. Only the stored URL seeds the REST base; the key always comes
+  // from the flag or the environment, and is never printed.
+  const apiKey = flags.apiKey ?? process.env.AGENTCONNECT_API_KEY
+  if (!apiKey) {
+    throw new DispatchDryRunError(
+      'dispatch --dry-run needs a personal API key (--api-key or AGENTCONNECT_API_KEY); the daemon key saved by `login` cannot read the console API',
+      'personal_api_key_required'
+    )
+  }
   const stored = readStoredCredentials(flags.root, flags.config)
   const apiUrl = flags.apiUrl ?? stored.apiUrl
-  const apiKey = flags.apiKey ?? stored.apiKey
-  if (!apiUrl || !apiKey) {
-    throw new DispatchDryRunError(
-      'no control plane credentials; run `agentconnect login` or pass --api-url and --api-key'
-    )
+  if (!apiUrl) {
+    throw new DispatchDryRunError('no control plane URL; run `agentconnect login` or pass --api-url')
   }
   const issue = flags.issue === undefined ? undefined : Number(flags.issue)
   if (issue !== undefined && (!Number.isInteger(issue) || issue < 1)) {
