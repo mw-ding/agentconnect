@@ -31,6 +31,7 @@ export type ClaimGate =
   | 'verifier_unset'
   | 'verifier_is_worker'
   | 'verified'
+  | 'needs_attention'
 
 export type ClaimVerdict = { eligible: true; role: ClaimRole; agentId: string } | { eligible: false; gate: ClaimGate }
 
@@ -43,7 +44,16 @@ export interface ClaimAgentFacts {
 
 export interface ClaimEligibilityInput {
   board: { enabled; verifierAgentId; maxInProgress; maxInProgressPerAgent }
-  card: { status; assigneeAgentId; promotionPending; cooldownUntil; notBefore; verifiedAt; hasOpenLease }
+  card: {
+    status
+    assigneeAgentId
+    promotionPending
+    cooldownUntil
+    notBefore
+    verifiedAt
+    needsAttention
+    hasOpenLease
+  }
   assignee: ClaimAgentFacts | null
   verifier: ClaimAgentFacts | null
   workAgentIds: readonly string[]
@@ -75,23 +85,26 @@ A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a bo
 | 2   | `status_not_claimable` | status is neither `ready` nor `review`                                                     |
 | 3   | `verifier_unset`       | status is `review` and the board has no `verifierAgentId`                                  |
 | 4   | `verified`             | status is `review` and `verifiedAt` is set: the verifier approved under a PR contract      |
-| 5   | `promotion_pending`    | the card holds a pending graph promotion                                                   |
-| 6   | `cooldown`             | `cooldownUntil` is in the future                                                           |
-| 7   | `not_before`           | `notBefore` is in the future                                                               |
-| 8   | `open_lease`           | an open (un-ended) run already holds the card                                              |
-| 9   | `no_assignee`          | no target agent id (assignee for work, verifier for verify)                                |
-| 10  | `agent_missing`        | the target agent row is gone                                                               |
-| 11  | `agent_paused`         | the target agent is paused                                                                 |
-| 12  | `agent_unplaced`       | the target agent has no daemon placement                                                   |
-| 13  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
-| 14  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
-| 15  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
-| 16  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+| 5   | `needs_attention`      | the card is flagged for a human (B8 or an escalation)                                      |
+| 6   | `promotion_pending`    | the card holds a pending graph promotion                                                   |
+| 7   | `cooldown`             | `cooldownUntil` is in the future                                                           |
+| 8   | `not_before`           | `notBefore` is in the future                                                               |
+| 9   | `open_lease`           | an open (un-ended) run already holds the card                                              |
+| 10  | `no_assignee`          | no target agent id (assignee for work, verifier for verify)                                |
+| 11  | `agent_missing`        | the target agent row is gone                                                               |
+| 12  | `agent_paused`         | the target agent is paused                                                                 |
+| 13  | `agent_unplaced`       | the target agent has no daemon placement                                                   |
+| 14  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
+| 15  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
+| 16  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
+| 17  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
 
 `verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
 its cap and liveness checks; that is also where it flags the card for a human.
-`needs_attention` is **not** a gate: escalated cards are parked in `todo` (never
-`ready`/`review`), so the status gate already excludes them.
+`needs_attention` holds a flagged card in any status: B8 leaves its card in `review`, and
+only the documented human status move (a human-attributed status label the dispatcher
+ingests) clears the flag. Editing the board, such as fixing `verifierAgentId`, never
+releases it on its own.
 
 ## SQL/predicate parity rule
 
@@ -114,6 +127,8 @@ and vice versa.
     next review round is verifiable again.
   - B8 compares the verifier against every work attempt on the card: input `latestWorkAgentId`
     is replaced by `workAgentIds`.
+  - New `needs_attention` gate (input `card.needsAttention`): the claim no longer takes a flagged
+    card, so a board edit alone cannot lift a B8 park; only the human status move clears the flag.
   - Gates are reordered to the SQL claim's order: `open_lease` joins the row filters before the
     agent gates, and `daemon_offline` follows `agent_cap`, with `verifier_is_worker` last.
 - **1.0 (2026-10-17):** initial frozen contract.

@@ -173,6 +173,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL
             -- An approval under a PR contract leaves the card in review; it waits for the PR, not another verify.
             AND c."verifiedAt" IS NULL))
+          -- A flagged card is a human's until a human status move clears the flag; a board edit alone never lifts it.
+          AND NOT c."needsAttention"
           ${
             cursor
               ? Prisma.sql`AND (c."priority" < ${cursor.priority} OR
@@ -197,11 +199,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
           // B8 self-approval guard: a review card whose verifier is the worker is never dispatched; flag it once.
           if (card.role === 'verify' && (board.verifierAgentId === card.assigneeAgentId || card.verifierDidWork)) {
+            // Flagged cards leave the candidate set, so this flags (and comments) once until a human moves the card.
             const flagged = await tx.kanbanCard.updateMany({
-              where: {
-                id: card.id,
-                OR: [{ needsAttention: false }, { attentionReason: { not: 'verifier_is_worker' } }]
-              },
+              where: { id: card.id, needsAttention: false },
               data: { needsAttention: true, attentionReason: 'verifier_is_worker', stateRevision: { increment: 1 } }
             })
             if (flagged.count === 1)

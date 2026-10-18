@@ -96,7 +96,8 @@ export function attentionComment(reason: PromotionAttention): string {
 export function verifierIsWorkerComment(): string {
   return (
     'AgentConnect Kanban: this card is in review, but its configured verifier agent is also its worker, so it ' +
-    'cannot review its own work. Configure a different verifier agent on the board, then set the card status again.'
+    'cannot review its own work. Configure a different verifier agent on the board, then move the card to another ' +
+    'status (for example ready) to release it.'
   )
 }
 

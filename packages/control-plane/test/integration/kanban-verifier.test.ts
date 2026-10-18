@@ -241,6 +241,34 @@ describe('Kanban verifier routing (real Postgres)', () => {
     expect(h.store.writes.filter((w) => w.comment)).toHaveLength(1)
   })
 
+  it('vera-414: a verifier edit alone keeps the B8 park; only the human status move lifts it', async () => {
+    const h = await harness({ verifier: A1 })
+    const c = await h.reviewCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ needsAttention: true, attentionReason: 'verifier_is_worker' })
+
+    // The admin fixes the verifier: the card stays parked, undispatched, and flagged.
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { verifierAgentId: A2 } })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent).toEqual([])
+    expect(await prisma.kanbanRun.count({ where: { cardId: c.id } })).toBe(0)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'verifier_is_worker'
+    })
+
+    // The documented human status move releases it: the flag clears and the card dispatches again.
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(true)
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', needsAttention: false, attentionReason: null })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent.map((s) => [s.d.cardId, s.d.agentId])).toEqual([[c.id, A1]])
+  })
+
   it('changes_requested returns the card to ready for the original assignee and re-dispatches as work', async () => {
     const h = await harness()
     const c = await h.reviewCard()

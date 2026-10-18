@@ -18,6 +18,7 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
       cooldownUntil: null,
       notBefore: null,
       verifiedAt: null,
+      needsAttention: false,
       hasOpenLease: false
     },
     assignee: liveAgent(),
@@ -53,6 +54,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       }
@@ -67,6 +69,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       }
@@ -81,6 +84,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: new Date(NOW.getTime() + 1000),
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       }
@@ -95,6 +99,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: new Date(NOW.getTime() + 1000),
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       }
@@ -109,6 +114,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       }
@@ -127,6 +133,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: true
         }
       }
@@ -147,6 +154,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         },
         openRunCount: 10
@@ -166,6 +174,7 @@ describe('explainClaim — gates', () => {
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
+          needsAttention: false,
           hasOpenLease: false
         }
       })
@@ -184,6 +193,7 @@ describe('explainClaim — gates', () => {
             cooldownUntil: new Date(NOW.getTime() - 1),
             notBefore: new Date(NOW.getTime() - 1),
             verifiedAt: null,
+            needsAttention: false,
             hasOpenLease: false
           }
         })
@@ -291,5 +301,20 @@ describe('explainClaim — B8 covers every work attempt', () => {
 
   it("vera-414: other agents' attempts do not block the verifier", () => {
     expect(explainClaim(review({ workAgentIds: [A1, A1] }))).toEqual({ eligible: true, role: 'verify', agentId: A2 })
+  })
+})
+
+describe('explainClaim — cards held for a human', () => {
+  it.each(['ready', 'review'] as const)('vera-414: a flagged %s card is not claimable (needs_attention)', (status) => {
+    expect(explainClaim(review({}, { status, needsAttention: true }))).toEqual({
+      eligible: false,
+      gate: 'needs_attention'
+    })
+  })
+
+  it('vera-414: fixing the verifier alone does not lift a B8 park', () => {
+    // The flag outlives the board edit: the verifier is now A2 (not the worker), yet the card stays held.
+    expect(explainClaim(review({}, { needsAttention: true }))).toEqual({ eligible: false, gate: 'needs_attention' })
+    expect(explainClaim(review({}, { needsAttention: false }))).toEqual({ eligible: true, role: 'verify', agentId: A2 })
   })
 })
