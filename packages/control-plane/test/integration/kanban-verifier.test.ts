@@ -582,7 +582,7 @@ describe('Kanban transition outbox (real Postgres)', () => {
         integration: { getUnscoped: async () => ({ id: integrationId, agentId: A1, status: 'active' }) as never },
         agent: { get: async () => ({ id: A1, daemonId: D1 }) as never },
         resolveMention: async () => null,
-        isDaemonLive: () => true,
+        liveDaemonIds: () => [D1],
         send: async (_daemonId, n) => {
           posts.push(n.notifyId)
           // Hold the send open so the other replica's pass overlaps this one.

@@ -1821,7 +1821,7 @@ export function buildContainer(
         agent: repos.agent,
         // No CP linkage maps a CP user to a Slack user id today, so needs_input posts without a ping (known gap).
         resolveMention: async () => null,
-        isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
+        liveDaemonIds: () => connReg.readyDaemonIds(),
         send: (daemonId, n) => sender.kanbanNotify(daemonId, n),
         clock,
         log: { warn: (o, m) => http.log.warn(o, m), info: (o, m) => http.log.info(o, m) }
