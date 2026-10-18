@@ -5,6 +5,8 @@
 
 Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2) §9 Phase 0 — validate board UX and worker prompts using GitHub labels and existing GitHub hooks, before Kanban MCP tools and control-plane automation land in later milestones.
 
+Consolidated as-built design: [kanban-swarm.md](kanban-swarm.md) (this pilot doc stays the history).
+
 ## What P0 is
 
 - A **board repo** whose issues are cards; **humans** move cards by adding/removing labels.
