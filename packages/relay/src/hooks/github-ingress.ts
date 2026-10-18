@@ -7,7 +7,9 @@ import {
   GITHUB_GRAPH_EVENTS,
   GITHUB_RELEASE_RESTATED_EVENTS,
   GITHUB_REQUEST_REVIEW_ACTION,
+  KANBAN_COMMENT_COMMANDS,
   KANBAN_ISSUE_ACTIONS,
+  type KanbanCommentCommand,
   HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
   isRetryableHookDeliveryReason,
   isGithubPullRequestRevisionEvent,
@@ -91,12 +93,13 @@ interface GithubPayload {
   label?: { name?: string }
   installation?: { id?: number }
   repository?: GithubRepositoryRef
-  sender?: { login?: string; type?: string; avatar_url?: string }
+  sender?: { login?: string; id?: number; type?: string; avatar_url?: string }
   requested_reviewer?: { login?: string; type?: string }
   requested_action?: { identifier?: string }
   issue?: GithubSubject
   pull_request?: GithubSubject
   comment?: {
+    performed_via_github_app?: unknown
     id?: number
     pull_request_review_id?: number
     in_reply_to_id?: number | null
@@ -1105,6 +1108,94 @@ export function githubIssueDoorbell(
   return { ...seen, ids: [id], numbers: [number!] }
 }
 
+/** `/kanban <command>` alone on a line, case-insensitive; surrounding whitespace is allowed, nothing else is. */
+const KANBAN_COMMAND_LINE = new RegExp(`^/kanban[ \\t]+(${KANBAN_COMMENT_COMMANDS.join('|')})$`, 'i')
+
+/** The command a new comment's FIRST line names, or undefined; later lines never count, so quoting one is inert. */
+export function parseKanbanCommand(body: string | undefined): KanbanCommentCommand | undefined {
+  const first = body?.split(/\r?\n/, 1)[0]?.trim()
+  const match = first ? KANBAN_COMMAND_LINE.exec(first) : null
+  return match ? (match[1]!.toLowerCase() as KanbanCommentCommand) : undefined
+}
+
+/** Reduce a new issue comment to a body-free Kanban doorbell: the parsed command and sender, never the comment text. */
+export function githubCommentDoorbell(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcGithubGraph | undefined {
+  if (event !== 'issue_comment' || payload.action !== 'created') return undefined
+  const installationId = githubNumericId(payload.installation?.id)
+  const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId) return undefined
+  const seen: RcGithubGraph = { deliveryKey, installationId, repoId, event, action: 'created', ids: [], numbers: [] }
+  // PR conversations, bots, and Apps never command a card; the CP re-checks the sender type and live write access anyway.
+  if (payload.issue?.pull_request !== undefined) return seen
+  const sender = payload.sender
+  if (sender?.type !== 'User' || !sender.login || sender.login.length > 64 || sender.login.endsWith('[bot]'))
+    return seen
+  const name = parseKanbanCommand(payload.comment?.body)
+  const commentId = githubNumericId(payload.comment?.id)
+  const id = githubNumericId(payload.issue?.id)
+  const number = payload.issue?.number
+  if (!name || !commentId || !id || !Number.isSafeInteger(number) || number! <= 0) return seen
+  const senderId = githubNumericId(sender.id)
+  return {
+    ...seen,
+    ids: [id],
+    numbers: [number!],
+    command: {
+      name,
+      commentId,
+      ...(payload.comment?.performed_via_github_app ? { viaApp: true } : {}),
+      sender: { login: sender.login, ...(senderId ? { id: senderId } : {}), type: 'User' }
+    }
+  }
+}
+
+const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const MAX_SUITE_PRS = 10
+
+/** Reduce a closed PR or a completed check suite to a body-free Kanban doorbell; the CP re-reads both live. */
+export function githubPullRequestDoorbell(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcGithubGraph | undefined {
+  const closedPr = event === 'pull_request' && payload.action === 'closed'
+  const suiteDone = event === 'check_suite' && payload.action === 'completed'
+  if (!closedPr && !suiteDone) return undefined
+  const installationId = githubNumericId(payload.installation?.id)
+  const repoId = githubNumericId(payload.repository?.id)
+  if (!installationId || !repoId) return undefined
+  const seen: RcGithubGraph = {
+    deliveryKey,
+    installationId,
+    repoId,
+    event,
+    action: payload.action!,
+    ids: [],
+    numbers: []
+  }
+  if (closedPr) {
+    const pr = payload.pull_request
+    const number = pr?.number
+    const headSha = pr?.head?.sha
+    if (!Number.isSafeInteger(number) || number! <= 0 || !headSha || !GIT_SHA.test(headSha)) return seen
+    return { ...seen, pullRequest: { number: number!, merged: pr?.merged === true, headSha } }
+  }
+  const suite = payload.check_suite
+  const headSha = suite?.head_sha
+  if (!headSha || !GIT_SHA.test(headSha)) return seen
+  const prNumbers = [
+    ...new Set(
+      (suite?.pull_requests ?? []).map((p) => p.number).filter((n): n is number => Number.isSafeInteger(n) && n! > 0)
+    )
+  ].slice(0, MAX_SUITE_PRS)
+  const conclusion = typeof suite?.conclusion === 'string' ? suite.conclusion.slice(0, 32) || null : null
+  return { ...seen, checkSuite: { headSha, conclusion, prNumbers } }
+}
+
 export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
   const deliveries = new GithubDeliveryDedup(deps.clock)
   // Own plugin scope so the raw-body parser does not leak onto the relay's other JSON surfaces.
@@ -1164,7 +1255,10 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
       if (claim === 'committed') {
         // Metadata doorbells must survive redelivery when an earlier control-plane hop was lost.
         const poke =
-          githubGraphDoorbell(event, payload, deliveryKey) ?? githubIssueDoorbell(event, payload, deliveryKey)
+          githubGraphDoorbell(event, payload, deliveryKey) ??
+          githubIssueDoorbell(event, payload, deliveryKey) ??
+          githubCommentDoorbell(event, payload, deliveryKey) ??
+          githubPullRequestDoorbell(event, payload, deliveryKey)
         if (poke) deps.graphDoorbell?.(poke)
         if (INSTALLATION_EVENTS.has(event) && payload.installation?.id !== undefined) {
           deps.doorbell({ installationId: String(payload.installation.id), action: payload.action ?? 'unknown' })
@@ -1236,16 +1330,25 @@ export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressD
         return reply.code(202).send({ deliveryKey })
       }
 
+      // PR completion contracts: a completed check suite matches no hook, so it rings here or nowhere.
+      if (event === 'check_suite') {
+        const poke = githubPullRequestDoorbell(event, payload, deliveryKey)
+        if (poke) ring(deps.graphDoorbell?.(poke))
+      }
+
       if (!SUBSCRIPTION_EVENTS.has(event) && !GITHUB_ROUTED_THREAD_EVENTS.has(event))
         return reply.code(202).send({ deliveryKey })
 
       // A card-status change also rings the Kanban doorbell; hook matching below still runs for the same delivery.
-      const issuePoke = githubIssueDoorbell(event, payload, deliveryKey)
+      const issuePoke =
+        githubIssueDoorbell(event, payload, deliveryKey) ??
+        githubCommentDoorbell(event, payload, deliveryKey) ??
+        githubPullRequestDoorbell(event, payload, deliveryKey)
       if (issuePoke) {
         ring(deps.graphDoorbell?.(issuePoke))
         if (issuePoke.numbers.length > 0) {
           deps.log.info(
-            `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (issues:${issuePoke.action})`
+            `github ingress: kanban doorbell ${deliveryKey} repo ${issuePoke.repoId} (${event}:${issuePoke.action})`
           )
         }
       }

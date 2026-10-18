@@ -8153,8 +8153,13 @@ export interface KanbanNotificationInsert {
   mention: boolean
 }
 
-export interface KanbanNotificationRow extends KanbanNotificationInsert {
+/** One drain's hold on a row: settling it requires the claim that took it, so a lapsed holder cannot. */
+export interface KanbanNotificationClaim {
   id: string
+  claims: number
+}
+
+export interface KanbanNotificationRow extends KanbanNotificationInsert, KanbanNotificationClaim {
   createdAt: Date
   attempts: number
 }
@@ -8172,12 +8177,14 @@ export interface KanbanNotifyTarget {
 export interface KanbanNotifyRepo {
   /** Insert a notification unless one already exists for this card revision (replay-safe). */
   enqueue(row: KanbanNotificationInsert): Promise<void>
-  /** Pending rows (unsent and next attempt due) oldest first, bounded. */
-  pending(limit: number, now: Date): Promise<KanbanNotificationRow[]>
-  markSent(id: string): Promise<void>
+  /** Claim due, unleased rows oldest first until `leaseUntil` (SKIP LOCKED, so replicas never share one), skipping `exclude`. */
+  claim(limit: number, now: Date, leaseUntil: Date, exclude?: readonly string[]): Promise<KanbanNotificationRow[]>
+  /** Hand a claimed row back unsent and unattempted, so another replica can take it now. */
+  release(row: KanbanNotificationClaim): Promise<void>
+  markSent(row: KanbanNotificationClaim): Promise<void>
   /** Retry later with exponential backoff; a row that exhausted its attempts is parked with lastError. */
-  markFailed(id: string, nextAttemptAt: Date, attempts: number, lastError: string): Promise<void>
-  giveUp(id: string, lastError: string): Promise<void>
+  markFailed(row: KanbanNotificationClaim, nextAttemptAt: Date, attempts: number, lastError: string): Promise<void>
+  giveUp(row: KanbanNotificationClaim, lastError: string): Promise<void>
   /** The board's notification anchor + org/repo facts for one row; null when the board is gone. */
   target(boardId: string): Promise<KanbanNotifyTarget | null>
 }
@@ -8330,6 +8337,12 @@ export interface KanbanCardRepo {
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+  /** The ledger row of one `/kanban` comment command; null when this comment was never recorded. */
+  getCommand(boardId: string, commentId: bigint): Promise<KanbanCommandRecord | null>
+  /** Record a command; an applied one moves the unleased card by stateRevision CAS with an audit row, atomically. */
+  recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult>
+  /** The command's GitHub effect landed, so a later delivery of the same comment is a no-op. */
+  settleCommand(id: string): Promise<void>
 }
 
 // ── Kanban human controls (issue #2 B5) — skip and restart; body-free, owner + interactive OIDC only ──
@@ -8366,3 +8379,74 @@ export interface KanbanCardControlRepo {
   /** Reset the card to ready and revoke its lease (issue #2 B5). The caller writes the reopen + status label + comment. */
   restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult>
 }
+
+/** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */
+export interface KanbanContractCard {
+  cardId: string
+  boardId: string
+  issueNumber: number
+  status: KanbanStatus
+  stateRevision: bigint
+  linkedPrNumber: number | null
+  linkedPrWorkStartedAt: Date | null
+  verifiedAt: Date | null
+  completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  verifierAgentId: string | null
+}
+
+export interface KanbanContractSettleInput {
+  cardId: string
+  expectedStateRevision: bigint
+  to: 'done' | 'triage'
+  /** The contract that completed it, or why it went to triage; recorded on the audit row and attention flag. */
+  reason: string
+  prNumber: number
+}
+
+export interface KanbanContractRepo {
+  /** Unleased `review` cards with a linked PR on an enabled board under a PR contract, by issue number. */
+  listContractCards(
+    boardId: string,
+    opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
+  ): Promise<KanbanContractCard[]>
+  getContractCard(cardId: string): Promise<KanbanContractCard | null>
+  /** CAS review → done/triage (no open lease) with an audit row; false when the card moved, was leased, or vanished. */
+  settleContract(input: KanbanContractSettleInput): Promise<boolean>
+}
+
+/** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */
+export interface KanbanCommandRecord {
+  id: string
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  actorLogin: string
+  /** `applied`, or the refusal reason code. */
+  outcome: string
+  fromStatus: KanbanStatus
+  toStatus: KanbanStatus | null
+  settledAt: Date | null
+}
+
+export interface KanbanCommandInput {
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  /** The live-attested human; required for an applied move, absent only on a refusal. */
+  humanAuthority?: KanbanHumanAuthority
+  actorLogin: string
+  from: KanbanStatus
+  expectedStateRevision: bigint
+  /** Present for an applied move; absent records a refusal. */
+  to?: KanbanStatus
+  refusal?: string
+}
+
+export type KanbanCommandRecordResult =
+  | { kind: 'recorded'; record: KanbanCommandRecord }
+  /** This comment was already recorded (a concurrent or earlier delivery): its row, unchanged. */
+  | { kind: 'duplicate'; record: KanbanCommandRecord }
+  /** The card moved, gained a lease, or vanished since it was read; nothing was written. */
+  | { kind: 'stale' }

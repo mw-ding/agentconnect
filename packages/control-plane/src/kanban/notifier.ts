@@ -1,7 +1,6 @@
 // Kanban transition notifier (issue #2 M4): which status transitions post to the board's anchor channel, and whether to @-mention the requester.
 import type { KanbanStatus } from './card-state.js'
 import type { KanbanBlockKind, TrippedLimit } from './run-accounting.js'
-import type { KanbanNotifyRepo } from '../persistence/ports.js'
 
 /** A card's status move, as the dispatcher, ingest, or graph promotion observed it. */
 export interface KanbanTransition {
@@ -41,28 +40,4 @@ export function planNotification(transition: KanbanTransition, board: Notificati
   if (to === 'ready' && transition.from === 'review' && transition.role === 'verify')
     return { notify: true, mention: false }
   return { notify: false, mention: false }
-}
-
-/** Enqueue a transition notification for the post-commit ingest path, replay-safe on the (cardId, stateRevision) key. */
-export async function enqueueTransition(
-  repo: KanbanNotifyRepo,
-  transition: KanbanTransition,
-  stateRevision: bigint
-): Promise<void> {
-  const target = await repo.target(transition.boardId)
-  if (!target) return
-  const decision = planNotification(transition, target)
-  if (!decision.notify) return
-  await repo.enqueue({
-    boardId: transition.boardId,
-    cardId: transition.cardId,
-    issueNumber: transition.issueNumber,
-    stateRevision,
-    from: transition.from,
-    to: transition.to,
-    blockKind: transition.blockKind,
-    reasonCode: transition.reasonCode,
-    tripped: transition.tripped,
-    mention: decision.mention
-  })
 }

@@ -34,6 +34,8 @@ CREATE TABLE "kanban_notification" (
     "attempts" INTEGER NOT NULL DEFAULT 0,
     "nextAttemptAt" TIMESTAMPTZ(6),
     "lastError" TEXT,
+    "claimedUntil" TIMESTAMPTZ(6),
+    "claims" INTEGER NOT NULL DEFAULT 0,
     CONSTRAINT "kanban_notification_pkey" PRIMARY KEY ("id")
 );
 

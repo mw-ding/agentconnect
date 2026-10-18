@@ -567,7 +567,7 @@ unattributed promotion. The skip comment names the actor's GitHub login only whe
 a linked `github_repo_identity` row exists; otherwise it omits the login. Board
 pause/resume and card skip/restart leave body-free audit rows (`board_paused`,
 `board_resumed`, `card_skipped`, `card_restarted`). The claim predicate now
-reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.1).
+reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.2).
 
 M4 controls continuation: synthesis re-evaluates the parent on an `issues.closed`
 or `issues.reopened` doorbell, assigns the configured organization agent, and
@@ -585,3 +585,33 @@ real PostgreSQL, a real daemon with a fake ACP runtime, and interactive OIDC
 fixtures. Branch creation, preserved commits, removed registrations and live
 worktree exclusion are covered by real-git daemon tests; no live remote write
 agent is provisioned. Slack delivery is tested with fakes only.
+
+Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
+
+- Label-driven unblock and reopen for non-parked cards belong to #194's label sync.
+  This lane only puts the existing parked-card label ingest behind the shared live
+  write check (`authorizeHumanKanbanAction`). A `done` card relabelled or reopened
+  by hand is not ingested until #194 lands; `/kanban reopen` covers that case today.
+- The repository's own App bot is refused as a command sender. The CP has no
+  agent-to-GitHub-user mapping, so an agent running under a person's own token could
+  not be told apart from that person. Kanban agents only receive installation tokens.
+- The CP writes labels, reopen, or close after its commit, best effort, like every CP
+  status write.
+  - A comment command whose label write fails stays unsettled and is re-applied on
+    the next delivery of that comment.
+  - A PR-contract move whose label write fails leaves label drift for the reconciler
+    (#194's projection).
+  - A tick that claims a just-unblocked card before its labels land parks it as a
+    `github_state_mismatch`.
+- `pr_checks_green` reads GitHub check runs only. Legacy commit statuses are not read,
+  because the App has no `statuses` permission. A head with no check runs, or more
+  than 300, is never green.
+- The card-to-PR link is `linkedPrNumber` from the worker's report. Matching a PR by
+  its `ac/card-<n>` head branch (3c's convention) is not implemented.
+- A missed `pull_request`/`check_suite` doorbell is recovered by the redelivery sweep
+  (24 h look-back) and the 60 s sweep: 25 review cards per board per tick, with a
+  rotating cursor. A board with hundreds of cards in review can take several minutes
+  to converge.
+- Transition notifications (3a's outbox) for comment-command and PR-contract moves are
+  not wired yet. 3a's notifier landed after this lane's commits. The move paths call
+  `onApplied` / `onSettled` hooks, which only poke the dispatcher today.

@@ -7,6 +7,8 @@ import type { AgentRecord, IntegrationRecord, KanbanNotifyRepo, KanbanNotificati
 export const KANBAN_NOTIFY_MAX_ATTEMPTS = 8
 const KANBAN_NOTIFY_BASE_MS = 15_000
 const KANBAN_NOTIFY_BATCH = 25
+/** How long one drain holds a claimed row; far past a send's ack timeout, so a live holder never loses it mid-post. */
+export const KANBAN_NOTIFY_LEASE_MS = 5 * 60_000
 
 export interface KanbanNotifierDeps {
   repo: KanbanNotifyRepo
@@ -14,7 +16,7 @@ export interface KanbanNotifierDeps {
   agent: { get(orgId: string, agentId: string): Promise<AgentRecord | null> }
   /** The board owner's Slack user id, resolved through a CP linkage only; null when none exists (never a GitHub login). */
   resolveMention(orgId: string, userId: string | null): Promise<string | null>
-  /** The daemon's live control connection; an offline daemon leaves the row pending. */
+  /** This replica's live control connection to the daemon; without one the row is handed back unsent. */
   isDaemonLive(daemonId: string): boolean
   send(daemonId: string, notify: KanbanNotify): Promise<KanbanNotifyOk>
   clock: Clock
@@ -40,21 +42,28 @@ export class KanbanNotifier {
 
   private async pass(): Promise<void> {
     const now = new Date(this.deps.clock.now())
-    let rows: KanbanNotificationRow[]
-    try {
-      rows = await this.deps.repo.pending(KANBAN_NOTIFY_BATCH, now)
-    } catch (err) {
-      this.deps.log.warn({ err }, 'kanban: notification outbox read failed')
-      return
+    const leaseUntil = new Date(now.getTime() + KANBAN_NOTIFY_LEASE_MS)
+    // Claim one row at a time, so each holds its lease only for its own send; a row is tried once per pass.
+    const seen: string[] = []
+    while (seen.length < KANBAN_NOTIFY_BATCH) {
+      let row: KanbanNotificationRow | undefined
+      try {
+        ;[row] = await this.deps.repo.claim(1, now, leaseUntil, seen)
+      } catch (err) {
+        this.deps.log.warn({ err }, 'kanban: notification outbox claim failed')
+        return
+      }
+      if (!row) return
+      seen.push(row.id)
+      await this.sendOne(row, now)
     }
-    for (const row of rows) await this.sendOne(row, now)
   }
 
   private async sendOne(row: KanbanNotificationRow, now: Date): Promise<void> {
     const target = await this.deps.repo.target(row.boardId)
     if (!target || target.targetChannel == null) {
       // The board went headless or is gone: nothing to post, and the row has no future either.
-      await this.deps.repo.markSent(row.id)
+      await this.deps.repo.markSent(row)
       return
     }
     const integrationId = target.targetIntegrationId
@@ -64,7 +73,8 @@ export class KanbanNotifier {
     const agent = await this.deps.agent.get(target.orgId, integration.agentId)
     const daemonId = agent?.daemonId
     if (!daemonId) return await this.retry(row, now, 'agent_unplaced')
-    if (!this.deps.isDaemonLive(daemonId)) return // stays pending until the daemon reconnects
+    // The daemon may be connected to another CP replica, so hand the row back for that replica to post.
+    if (!this.deps.isDaemonLive(daemonId)) return await this.deps.repo.release(row)
 
     let mention: KanbanNotify['mention']
     if (row.mention) {
@@ -86,7 +96,7 @@ export class KanbanNotifier {
         ...(mention ? { mention } : {}),
         target: { platform: target.targetPlatform, channel: target.targetChannel, integrationId }
       })
-      if (reply.ok) await this.deps.repo.markSent(row.id)
+      if (reply.ok) await this.deps.repo.markSent(row)
       else await this.retry(row, now, 'daemon_refused')
     } catch {
       await this.retry(row, now, 'delivery_failed')
@@ -96,12 +106,11 @@ export class KanbanNotifier {
   private async retry(row: KanbanNotificationRow, now: Date, lastError: string): Promise<void> {
     const attempts = row.attempts + 1
     if (attempts >= KANBAN_NOTIFY_MAX_ATTEMPTS) await this.giveUp(row, lastError)
-    else
-      await this.deps.repo.markFailed(row.id, new Date(now.getTime() + notifyBackoffMs(attempts)), attempts, lastError)
+    else await this.deps.repo.markFailed(row, new Date(now.getTime() + notifyBackoffMs(attempts)), attempts, lastError)
   }
 
   private async giveUp(row: KanbanNotificationRow, lastError: string): Promise<void> {
-    await this.deps.repo.giveUp(row.id, lastError)
+    await this.deps.repo.giveUp(row, lastError)
     this.deps.log.warn(
       { notifyId: row.id, issueNumber: row.issueNumber, attempts: row.attempts, lastError },
       'kanban: transition notification gave up'

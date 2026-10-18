@@ -2577,6 +2577,7 @@ model KanbanBoard {
   lastModifiedBy    User?        @relation("KanbanBoardModifiedBy", fields: [lastModifiedByUserId], references: [id], onDelete: SetNull)
   pausedBy          User?        @relation("KanbanBoardPausedBy", fields: [pausedByUserId], references: [id], onDelete: SetNull)
   cards             KanbanCard[]
+  commands          KanbanCommand[]
   notifications     KanbanNotification[]
 
   @@unique([orgId, repoId]) // one board per repository per org
@@ -2626,6 +2627,8 @@ model KanbanCard {
   needsAttention          Boolean   @default(false)
   attentionReason         String?
   linkedPrNumber      Int?
+  // The work run that reported this PR is its conservative creation-time boundary.
+  linkedPrWorkStartedAt DateTime? @db.Timestamptz(6)
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
@@ -2636,6 +2639,7 @@ model KanbanCard {
   board         KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
   runs          KanbanRun[]
+  commands      KanbanCommand[]
   notifications KanbanNotification[]
 
   @@unique([boardId, issueId])
@@ -2675,6 +2679,30 @@ model KanbanRun {
   @@map("kanban_run")
 }
 
+// One `/kanban` comment command per GitHub comment id (TRD 4.4): a replayed or redelivered doorbell applies it at most once.
+model KanbanCommand {
+  id         String            @id @default(uuid()) @db.Uuid
+  boardId    String            @db.Uuid
+  cardId     String            @db.Uuid
+  commentId  BigInt // GitHub numeric comment id — the idempotency key
+  command    String // unblock | reopen | ready
+  actorLogin String
+  // applied, or the refusal reason code (wrong_status | leased | illegal | no_write); body-free.
+  outcome    String
+  fromStatus KanbanCardStatus
+  toStatus   KanbanCardStatus?
+  // The GitHub effect (label/reopen write or the one refusal comment) landed; null re-runs it on the next delivery.
+  settledAt  DateTime?         @db.Timestamptz(6)
+  createdAt  DateTime          @default(now()) @db.Timestamptz(6)
+
+  board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  card  KanbanCard  @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([boardId, commentId])
+  @@index([cardId])
+  @@map("kanban_command")
+}
+
 // One body-free notification per status move (M4), drained to the board's anchor channel by the notifier.
 model KanbanNotification {
   id            String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -2694,6 +2722,8 @@ model KanbanNotification {
   attempts      Int              @default(0)
   nextAttemptAt DateTime?        @db.Timestamptz(6)
   lastError     String?
+  claimedUntil  DateTime?        @db.Timestamptz(6) // a drain's lease: no other CP replica claims the row until it lapses
+  claims        Int              @default(0) // bumped by every claim; settling a row requires the claim that took it
 
   board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   card  KanbanCard  @relation(fields: [cardId], references: [id], onDelete: Cascade)

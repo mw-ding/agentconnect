@@ -16,6 +16,9 @@ import type {
   KanbanClaimOpts,
   KanbanClaimResult,
   KanbanClaimedLease,
+  KanbanContractCard,
+  KanbanContractRepo,
+  KanbanContractSettleInput,
   KanbanDispatchRepo,
   KanbanGrantScope,
   KanbanIngestResult,
@@ -50,6 +53,13 @@ const PENDING_UNLEASED = (id: string): Prisma.KanbanCardWhereInput => ({
 const PROMOTION_COLUMNS = Prisma.sql`c."promotionEventCursor", c."promotionPostAccepted", c."promotionStartedAt",
   c."promotionWatchUntil", c."promotionChecks", c."recoveryCheckAt"`
 
+/** An unleased review card with a linked PR on an enabled board under a PR completion contract. */
+const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."linkedPrNumber" IS NOT NULL
+  AND b."completionContract" <> 'close'
+  AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
+const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
+  c."linkedPrNumber", c."linkedPrWorkStartedAt", c."verifiedAt", b."completionContract", b."verifierAgentId"`
+
 interface BoardRow {
   id: string
   orgId: string
@@ -72,7 +82,8 @@ interface CandidateRow {
   daemonId: string
   sessionEpoch: bigint
   assigneeAgentId: string | null
-  latestWorkAgentId: string | null
+  /** The board's verifier wrote some work attempt on this card (B8 compares every attempt, not only the latest). */
+  verifierDidWork: boolean
 }
 
 interface RunEndRow {
@@ -116,7 +127,7 @@ interface RunEndRow {
   verifierAgentId: string | null
 }
 
-export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
+export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractRepo {
   constructor(private readonly db: PrismaLike) {}
 
   private inTransaction<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
@@ -161,15 +172,19 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
                a."daemonId", d."sessionEpoch", c."assigneeAgentId",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
-               (SELECT w."agentId" FROM "kanban_run" w
-                 WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."endedAt" IS NOT NULL
-                 ORDER BY w."attempt" DESC LIMIT 1) AS "latestWorkAgentId"
+               EXISTS (SELECT 1 FROM "kanban_run" w
+                 WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
+               ) AS "verifierDidWork"
         FROM "kanban_card" c
         JOIN "agent" a ON a."id" = CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END
           AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
         JOIN "daemon" d ON d."id" = a."daemonId"
         WHERE c."boardId" = ${boardId}::uuid
-          AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL))
+          AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL
+            -- An approval under a PR contract leaves the card in review; it waits for the PR, not another verify.
+            AND c."verifiedAt" IS NULL))
+          -- A flagged card is a human's until a human status move clears the flag; a board edit alone never lifts it.
+          AND NOT c."needsAttention"
           ${
             cursor
               ? Prisma.sql`AND (c."priority" < ${cursor.priority} OR
@@ -193,15 +208,10 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if (!opts.isDaemonLive(card.daemonId)) continue
 
           // B8 self-approval guard: a review card whose verifier is the worker is never dispatched; flag it once.
-          if (
-            card.role === 'verify' &&
-            (board.verifierAgentId === card.assigneeAgentId || board.verifierAgentId === card.latestWorkAgentId)
-          ) {
+          if (card.role === 'verify' && (board.verifierAgentId === card.assigneeAgentId || card.verifierDidWork)) {
+            // Flagged cards leave the candidate set, so this flags (and comments) once until a human moves the card.
             const flagged = await tx.kanbanCard.updateMany({
-              where: {
-                id: card.id,
-                OR: [{ needsAttention: false }, { attentionReason: { not: 'verifier_is_worker' } }]
-              },
+              where: { id: card.id, needsAttention: false },
               data: { needsAttention: true, attentionReason: 'verifier_is_worker', stateRevision: { increment: 1 } }
             })
             if (flagged.count === 1)
@@ -224,8 +234,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           const updated = await tx.kanbanCard.update({
             where: { id: card.id },
             data: {
-              // A verify run keeps the card in `review`; a work run moves it to `running`.
+              // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
+              ...(card.role === 'work' ? { verifiedAt: null, linkedPrWorkStartedAt: null } : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -332,8 +343,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     to: KanbanStatus
   ): Promise<KanbanIngestResult> {
     return this.inTransaction(async (tx) => {
-      const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus; stateRevision: bigint }>>(Prisma.sql`
-        SELECT c."id", c."status", c."stateRevision" FROM "kanban_card" c
+      const [card] = await tx.$queryRaw<
+        Array<{ id: string; status: KanbanStatus; stateRevision: bigint; targetChannel: string | null }>
+      >(Prisma.sql`
+        SELECT c."id", c."status", c."stateRevision", b."targetChannel" FROM "kanban_card" c
+        JOIN "kanban_board" b ON b."id" = c."boardId"
         LEFT JOIN LATERAL (
           SELECT "reasonCode", "endedAt" FROM "kanban_run"
           WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
@@ -349,10 +363,28 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           stateRevision: { increment: 1 },
           cooldownUntil: null,
           blockKind: null,
+          // A human status move starts over, so an old approval never suppresses the next review.
+          verifiedAt: null,
           ...RECOVERY_RESET
         }
       })
-      return { moved: true, cardId: card.id, stateRevision: card.stateRevision + 1n }
+      // The notification commits or rolls back with the move, as a run end's does; (cardId, stateRevision) dedupes replays.
+      const stateRevision = card.stateRevision + 1n
+      const decision = planNotification(
+        { cardId: card.id, boardId, issueNumber, from, to },
+        { targetChannel: card.targetChannel }
+      )
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          boardId,
+          cardId: card.id,
+          issueNumber,
+          stateRevision,
+          from,
+          to,
+          mention: decision.mention
+        })
+      return { moved: true, cardId: card.id, stateRevision }
     })
   }
 
@@ -416,6 +448,78 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       }
     })
     return count === 1
+  }
+
+  async listContractCards(
+    boardId: string,
+    opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
+  ): Promise<KanbanContractCard[]> {
+    const prs = opts.prNumbers ? Prisma.sql`AND c."linkedPrNumber" = ANY(${[...opts.prNumbers]}::int[])` : Prisma.empty
+    return this.db.$queryRaw<KanbanContractCard[]>(Prisma.sql`
+      SELECT ${CONTRACT_COLUMNS}
+      FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE c."boardId" = ${boardId}::uuid AND ${CONTRACT_DUE} ${prs}
+        AND c."issueNumber" > ${opts.afterIssueNumber ?? 0}
+      ORDER BY c."issueNumber" ASC
+      LIMIT ${opts.limit ?? 100}
+    `)
+  }
+
+  async getContractCard(cardId: string): Promise<KanbanContractCard | null> {
+    const [card] = await this.db.$queryRaw<KanbanContractCard[]>(Prisma.sql`
+      SELECT ${CONTRACT_COLUMNS}
+      FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE c."id" = ${cardId}::uuid AND ${CONTRACT_DUE}
+    `)
+    return card ?? null
+  }
+
+  settleContract(input: KanbanContractSettleInput): Promise<boolean> {
+    return this.inTransaction(async (tx) => {
+      // Only an unleased review card at the judged revision moves; a verify run still open re-judges on its own end.
+      const { count } = await tx.kanbanCard.updateMany({
+        where: {
+          id: input.cardId,
+          stateRevision: input.expectedStateRevision,
+          status: 'review',
+          runs: { none: { endedAt: null } }
+        },
+        data: {
+          status: input.to,
+          stateRevision: { increment: 1 },
+          cooldownUntil: null,
+          blockKind: null,
+          ...RECOVERY_RESET,
+          ...(input.to === 'triage'
+            ? { needsAttention: true, attentionReason: input.reason }
+            : { reviewRounds: 0, verifiedAt: null })
+        }
+      })
+      if (count !== 1) return false
+      const card = await tx.kanbanCard.findUniqueOrThrow({
+        where: { id: input.cardId },
+        select: { boardId: true, issueNumber: true, board: { select: { orgId: true } } }
+      })
+      await tx.auditEvent.create({
+        data: {
+          kind: 'kanban_card_change',
+          orgId: card.board.orgId,
+          message: `kanban card ${input.cardId} status changed by PR contract`,
+          details: {
+            boardId: card.boardId,
+            cardId: input.cardId,
+            issueNumber: card.issueNumber,
+            change: 'status',
+            from: 'review',
+            to: input.to,
+            reason: input.reason,
+            prNumber: input.prNumber,
+            source: 'pr_contract'
+          }
+        }
+      })
+      return true
+    })
   }
 
   async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
@@ -541,7 +645,12 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: row.cardId },
         data: {
           status: plan.status,
-          ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
+          ...(row.role === 'work' && input.prNumber !== undefined
+            ? {
+                linkedPrNumber: input.prNumber,
+                linkedPrWorkStartedAt: row.dispatchedAt
+              }
+            : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,

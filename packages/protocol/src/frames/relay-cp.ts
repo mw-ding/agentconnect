@@ -667,11 +667,69 @@ export type RcCodeHostDelivery = z.infer<typeof RcCodeHostDelivery>
 // R→C EVT (fire-and-forget) — Kanban doorbell (issue #2 spike §3): a verified graph or card-status delivery, ids only
 export const GITHUB_GRAPH_EVENTS = ['sub_issues', 'issue_dependencies'] as const
 /** `issues` rings for a human status relabel or close/reopen; other such deliveries send empty `numbers`, landing only. */
-export const KANBAN_DOORBELL_EVENTS = [...GITHUB_GRAPH_EVENTS, 'issues'] as const
+export const KANBAN_DOORBELL_EVENTS = [
+  ...GITHUB_GRAPH_EVENTS,
+  'issues',
+  'issue_comment',
+  'pull_request',
+  'check_suite'
+] as const
 /** The `issues` actions the relay always forwards (rung or seen-only), so the CP's redelivery sweep can re-ask lost ones. */
 export const KANBAN_ISSUE_ACTIONS = ['opened', 'transferred', 'labeled', 'unlabeled', 'closed', 'reopened'] as const
+/** Comment commands ring only on a new comment; edits never re-run one. */
+export const KANBAN_COMMENT_ACTIONS = ['created'] as const
+/** `/kanban <command>` on the first line of a new issue comment (TRD 4.4). */
+export const KANBAN_COMMENT_COMMANDS = ['unblock', 'reopen', 'ready'] as const
+export const KanbanCommentCommand = z.enum(KANBAN_COMMENT_COMMANDS)
+export type KanbanCommentCommand = z.infer<typeof KanbanCommentCommand>
+/** PR completion contracts (TRD 4.7) ring on a closed pull request and on a completed check suite. */
+export const KANBAN_PULL_REQUEST_ACTIONS = ['closed'] as const
+export const KANBAN_CHECK_SUITE_ACTIONS = ['completed'] as const
+const KANBAN_DOORBELL_ACTIONS: Readonly<Record<string, readonly string[]>> = {
+  issues: KANBAN_ISSUE_ACTIONS,
+  issue_comment: KANBAN_COMMENT_ACTIONS,
+  pull_request: KANBAN_PULL_REQUEST_ACTIONS,
+  check_suite: KANBAN_CHECK_SUITE_ACTIONS
+}
+/** Event:action pairs the relay always forwards to the Kanban doorbell, so the CP's redelivery sweep may re-ask them. */
+export function isKanbanDoorbellDelivery(event: string, action: string | null | undefined): boolean {
+  if ((GITHUB_GRAPH_EVENTS as readonly string[]).includes(event)) return true
+  return !!action && (KANBAN_DOORBELL_ACTIONS[event] ?? []).includes(action)
+}
 export const GithubGraphEvent = z.enum(KANBAN_DOORBELL_EVENTS)
 export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
+/** A parsed comment command: the command, the comment's id, and the sender's identity; never the comment text. */
+export const KanbanDoorbellCommand = z
+  .object({
+    name: KanbanCommentCommand,
+    viaApp: z.boolean().optional(), // App-on-behalf-of-user commands are refused by the CP.
+    commentId: GithubNumericId,
+    sender: z
+      .object({
+        login: z.string().min(1).max(64),
+        id: GithubNumericId.optional(),
+        type: z.string().min(1).max(32) // User|Bot|Organization — the CP re-checks it, never trusts the relay alone
+      })
+      .strict()
+  })
+  .strict()
+export type KanbanDoorbellCommand = z.infer<typeof KanbanDoorbellCommand>
+/** A git object id: SHA-1, or SHA-256 for repositories that use it. */
+const GitSha = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+/** A closed pull request, observational only: the CP re-reads the PR live before any card moves. */
+export const KanbanDoorbellPullRequest = z
+  .object({ number: z.number().int().positive(), merged: z.boolean(), headSha: GitSha })
+  .strict()
+export type KanbanDoorbellPullRequest = z.infer<typeof KanbanDoorbellPullRequest>
+/** A completed check suite: its head and the same-repo PRs GitHub lists for it; the CP re-reads every check live. */
+export const KanbanDoorbellCheckSuite = z
+  .object({
+    headSha: GitSha,
+    conclusion: z.string().min(1).max(32).nullable(),
+    prNumbers: z.array(z.number().int().positive()).max(10)
+  })
+  .strict()
+export type KanbanDoorbellCheckSuite = z.infer<typeof KanbanDoorbellCheckSuite>
 export const RcGithubGraph = z
   .object({
     deliveryKey: z.string().min(1).max(200), // X-GitHub-Delivery GUID — the redelivery landed marker
@@ -680,7 +738,10 @@ export const RcGithubGraph = z
     event: GithubGraphEvent,
     action: z.string().min(1).max(64), // sub_issue_added|blocked_by_removed|labeled|… — observational only
     ids: z.array(GithubNumericId).max(4), // issue ids named by the payload (parent/sub, blocked/blocking)
-    numbers: z.array(z.number().int().positive()).max(4) // the same issues' numbers, when same-repo
+    numbers: z.array(z.number().int().positive()).max(4), // the same issues' numbers, when same-repo
+    command: KanbanDoorbellCommand.optional(), // `issue_comment` only; absent on a seen-only marker
+    pullRequest: KanbanDoorbellPullRequest.optional(), // `pull_request` closed only
+    checkSuite: KanbanDoorbellCheckSuite.optional() // `check_suite` completed only
   })
   .strict()
 export type RcGithubGraph = z.infer<typeof RcGithubGraph>

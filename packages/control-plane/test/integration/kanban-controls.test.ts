@@ -30,6 +30,9 @@ class FakeStore {
   async readGraph(_repo: KanbanRepoRef, _n: number): Promise<CardGraph> {
     return { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
   }
+  async readLabelEvents() {
+    return []
+  }
   async lastEventId(): Promise<number> {
     return 0
   }

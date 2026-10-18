@@ -31,6 +31,6 @@ describe('human authority provenance', () => {
       if (!file.endsWith('.ts') || file.endsWith('.test.ts') || file.startsWith('generated/')) continue
       if (/\battestHumanAuthority\b/.test(await readFile(`${root}/${file}`, 'utf8'))) references.push(file)
     }
-    expect(references.sort()).toEqual(['kanban/human-authority.ts', 'kanban/importer.ts'])
+    expect(references.sort()).toEqual(['kanban/human-action.ts', 'kanban/human-authority.ts', 'kanban/importer.ts'])
   })
 })

@@ -20,6 +20,8 @@ import {
   RcRunReport,
   RcGithubInstallation,
   RcGithubGraph,
+  isKanbanDoorbellDelivery,
+  KANBAN_ISSUE_ACTIONS,
   RcGithubRerequest,
   RcGithubRerequestResult,
   RcBotRevoked,
@@ -1137,9 +1139,84 @@ describe('relay↔CP wire — skeleton frame codec (shared-bot-relay.md §7.1)',
     expect(RcGithubGraph.safeParse({ ...poke, event: 'issues', action: 'labeled', ids: [], numbers: [] }).success).toBe(
       true
     )
-    expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(false)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'issue_comment' }).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...poke, event: 'pull_request_review' }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, ids: ['1', '2', '3', '4', '5'] }).success).toBe(false)
     expect(RcGithubGraph.safeParse({ ...poke, repoId: 'acme/web' }).success).toBe(false)
+  })
+
+  it('rc/github-graph carries a parsed comment command, never the comment text', () => {
+    const poke = {
+      deliveryKey: 'guid-c',
+      installationId: '1234567',
+      repoId: '42',
+      event: 'issue_comment',
+      action: 'created',
+      ids: ['17'],
+      numbers: [7],
+      command: { name: 'unblock', commentId: '9001', sender: { login: 'alice', id: '5', type: 'User' } }
+    }
+    const r = decodeRelayCpFrame(envelope('rc/github-graph', poke))
+    expect(r.ok).toBe(true)
+    if (!r.ok || r.frame.type !== 'rc/github-graph') throw new Error('narrow')
+    expect(r.frame.payload).toEqual(poke)
+    // A seen-only marker for a non-command comment carries no command.
+    expect(RcGithubGraph.safeParse({ ...poke, ids: [], numbers: [], command: undefined }).success).toBe(true)
+    const bad = (command: Record<string, unknown>) => RcGithubGraph.safeParse({ ...poke, command }).success
+    expect(bad({ ...poke.command, body: '/kanban unblock please' })).toBe(false)
+    expect(bad({ ...poke.command, name: 'merge' })).toBe(false)
+    expect(bad({ ...poke.command, commentId: 'abc' })).toBe(false)
+    expect(bad({ ...poke.command, sender: { ...poke.command.sender, name: 'Alice Smith' } })).toBe(false)
+    expect(bad({ ...poke.command, sender: { ...poke.command.sender, login: 'x'.repeat(65) } })).toBe(false)
+    expect(bad({ ...poke.command, sender: { login: 'alice' } })).toBe(false)
+    expect(bad({ name: 'ready', commentId: '1', sender: { login: 'bob', type: 'User' } })).toBe(true)
+  })
+
+  it('isKanbanDoorbellDelivery names exactly the forwarded event:action pairs', () => {
+    expect(isKanbanDoorbellDelivery('sub_issues', 'sub_issue_added')).toBe(true)
+    expect(isKanbanDoorbellDelivery('issue_dependencies', null)).toBe(true)
+    for (const action of KANBAN_ISSUE_ACTIONS) expect(isKanbanDoorbellDelivery('issues', action)).toBe(true)
+    expect(isKanbanDoorbellDelivery('issues', 'edited')).toBe(false)
+    expect(isKanbanDoorbellDelivery('issue_comment', 'created')).toBe(true)
+    expect(isKanbanDoorbellDelivery('issue_comment', 'edited')).toBe(false)
+    expect(isKanbanDoorbellDelivery('issue_comment', null)).toBe(false)
+    expect(isKanbanDoorbellDelivery('push', null)).toBe(false)
+    expect(isKanbanDoorbellDelivery('pull_request', 'closed')).toBe(true)
+    expect(isKanbanDoorbellDelivery('pull_request', 'opened')).toBe(false)
+    expect(isKanbanDoorbellDelivery('check_suite', 'completed')).toBe(true)
+    expect(isKanbanDoorbellDelivery('check_suite', 'rerequested')).toBe(false)
+    expect(isKanbanDoorbellDelivery('check_run', 'completed')).toBe(false)
+  })
+
+  it('rc/github-graph carries body-free pull request and check suite facts for PR contracts', () => {
+    const sha = 'a'.repeat(40)
+    const base = { deliveryKey: 'g', installationId: '1', repoId: '42', ids: [], numbers: [] }
+    const pr = {
+      ...base,
+      event: 'pull_request',
+      action: 'closed',
+      pullRequest: { number: 12, merged: true, headSha: sha }
+    }
+    expect(RcGithubGraph.safeParse(pr).success).toBe(true)
+    const suite = {
+      ...base,
+      event: 'check_suite',
+      action: 'completed',
+      checkSuite: { headSha: 'b'.repeat(64), conclusion: 'success', prNumbers: [12, 13] }
+    }
+    expect(RcGithubGraph.safeParse(suite).success).toBe(true)
+    expect(RcGithubGraph.safeParse({ ...suite, checkSuite: { ...suite.checkSuite, conclusion: null } }).success).toBe(
+      true
+    )
+    const bad = (value: unknown) => RcGithubGraph.safeParse(value).success
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, title: 'secret' } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, headSha: 'main' } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, headSha: 'A'.repeat(40) } })).toBe(false)
+    expect(bad({ ...pr, pullRequest: { ...pr.pullRequest, number: 0 } })).toBe(false)
+    expect(
+      bad({ ...suite, checkSuite: { ...suite.checkSuite, prNumbers: Array.from({ length: 11 }, (_, i) => i + 1) } })
+    ).toBe(false)
+    expect(bad({ ...suite, checkSuite: { ...suite.checkSuite, output: 'logs' } })).toBe(false)
   })
 
   it('answers an error REP on this wire (typed, correlated)', () => {
@@ -1352,4 +1429,20 @@ describe('rc/bot-tenant (google-chat-integration.md §10.3)', () => {
     expect(RcBotTenant.safeParse({ botId: BOT, tenantId: 'x'.repeat(257) }).success).toBe(false)
     expect(RcBotTenant.safeParse({ botId: 'bot', tenantId: 'domains/0000000000' }).success).toBe(false)
   })
+})
+
+it('vera-415: Kanban command viaApp is optional additive boolean metadata, never an App body', () => {
+  const poke = {
+    deliveryKey: 'g',
+    installationId: '1',
+    repoId: '42',
+    event: 'issue_comment',
+    action: 'created',
+    ids: ['7'],
+    numbers: [7],
+    command: { name: 'ready', commentId: '1', sender: { login: 'alice', type: 'User' }, viaApp: true }
+  }
+  expect(RcGithubGraph.safeParse(poke).success).toBe(true)
+  expect(RcGithubGraph.safeParse({ ...poke, command: { ...poke.command, viaApp: undefined } }).success).toBe(true)
+  expect(RcGithubGraph.safeParse({ ...poke, command: { ...poke.command, viaApp: { id: 42 } } }).success).toBe(false)
 })

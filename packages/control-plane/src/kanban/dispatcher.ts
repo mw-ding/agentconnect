@@ -36,8 +36,10 @@ import {
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planGraphPromotion } from './graph-reconciler.js'
+import type { RepoPermissionLookup } from '../github/repo-permission.js'
+import { authorizeHumanKanbanAction } from './human-action.js'
+import { labelAdder } from './label-attribution.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
-import type { KanbanTransition } from './notifier.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
 
@@ -53,14 +55,21 @@ export interface KanbanDispatcherLog {
 export interface KanbanDispatcherDeps {
   repo: KanbanDispatchRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionVerdict'>
+  store: Pick<
+    CardStore,
+    'readCard' | 'readGraph' | 'applyPlan' | 'statusSetByHuman' | 'promotionVerdict' | 'readLabelEvents'
+  >
+  /** Live write check for the human whose status label un-parks a card (the comment-command gate); the container always wires it. */
+  humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
+  /** PR completion contracts: the tick's bounded backstop sweep, and a re-check when a run leaves its card in review. */
+  contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
-  /** Enqueues a transition notification (planNotification + outbox insert); undefined when notifications are off. */
-  notify?: { enqueue(transition: KanbanTransition, stateRevision: bigint): Promise<void>; drain(): Promise<void> }
+  /** Drains the transition outbox (rows are written in the repo's own transactions); undefined when notifications are off. */
+  notify?: { drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   tickMs?: number
   unackedGraceMs?: number
@@ -96,7 +105,8 @@ export function attentionComment(reason: PromotionAttention): string {
 export function verifierIsWorkerComment(): string {
   return (
     'AgentConnect Kanban: this card is in review, but its configured verifier agent is also its worker, so it ' +
-    'cannot review its own work. Configure a different verifier agent on the board, then set the card status again.'
+    'cannot review its own work. Configure a different verifier agent on the board, then move the card to another ' +
+    'status (for example ready) to release it.'
   )
 }
 
@@ -214,7 +224,12 @@ export class KanbanDispatcher {
 
   async reconcileBoard(boardId: string): Promise<void> {
     // Recovery reads GitHub, so only the periodic tick runs it, never a doorbell or report poke.
-    if (this.recoveryDue.delete(boardId)) await this.recoverMismatches(boardId)
+    if (this.recoveryDue.delete(boardId)) {
+      await this.recoverMismatches(boardId)
+      await this.deps.contracts
+        ?.sweep(boardId)
+        .catch((err: unknown) => this.deps.log.warn({ err, boardId }, 'kanban: contract sweep failed'))
+    }
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id)
@@ -289,14 +304,33 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
-    const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
-    if (result.moved) {
-      await this.deps.notify?.enqueue(
-        { cardId: result.cardId, boardId, issueNumber, from, to: plan.to },
-        result.stateRevision
+    if (!(await this.labelWriterAuthorized(repo, issueNumber, plan.to))) {
+      this.deps.log.info(
+        { boardId, issueNumber, from, to: plan.to },
+        'kanban: recovery ignored a non-writer status label'
       )
+      return { moved: false, observed }
     }
+    // The move's notification is written in the same transaction, so a crash here can no longer drop it.
+    const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
+    if (result.moved) void this.deps.notify?.drain().catch(() => undefined)
     return { moved: result.moved, observed }
+  }
+
+  // The human who added the status label must hold live write access, as a comment command's sender must; fail closed.
+  private async labelWriterAuthorized(repo: KanbanRepoRef, issueNumber: number, to: KanbanStatus): Promise<boolean> {
+    const authz = this.deps.humanAuthz
+    if (!authz) return false
+    const login = labelAdder(await this.deps.store.readLabelEvents(repo, issueNumber), statusLabel(to), authz.appSlug)
+    if (!login) return false
+    const verdict = await authorizeHumanKanbanAction({
+      repo,
+      actor: { login, type: 'User' },
+      appSlug: authz.appSlug,
+      permissions: authz.permissions
+    })
+    if (!verdict.ok && verdict.reason === 'lookup_failed') throw verdict.error
+    return verdict.ok
   }
 
   // A failed promotion is adopted on proof, cleared once no ready label landed by its watch's end, else retried or escalated.
@@ -587,7 +621,17 @@ export class KanbanDispatcher {
       const repo = await this.repoRef(result.card)
       if (repo) this.writeStatus(result.card, repo, result.card.to)
     }
+    // A verifier's approval, or a worker whose PR already finished, completes the contract now rather than on the next event.
+    if (result.accepted && result.card.to === 'review' && this.deps.contracts) this.recheckContract(result.card.cardId)
     return result
+  }
+
+  private recheckContract(cardId: string): void {
+    const task = this.deps
+      .contracts!.onReview(cardId)
+      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
+      .finally(() => this.background.delete(task))
+    this.background.add(task)
   }
 
   /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
@@ -612,6 +656,11 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  /** The board's repository with its installation resolved live; null when the board or installation is gone. */
+  boardRepo(boardId: string): Promise<KanbanRepoRef | null> {
+    return this.boardRepoRef(boardId)
   }
 
   private async boardRepoRef(boardId: string): Promise<KanbanRepoRef | null> {
