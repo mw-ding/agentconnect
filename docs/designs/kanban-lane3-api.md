@@ -263,7 +263,7 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   - A suite doorbell whose `headSha` is not the live head is ignored (`stale_doorbell`).
 - The CP re-reads the PR and its runs live, by repository id, with
   `mintKanbanPr` (`pull_requests:read` + `checks:read` + `actions:read`, CP-only).
-- Migration `20261123200200_kanban_pr_binding` adds nullable
+- Migration `20261123200110_kanban_pr_binding` adds nullable
   `kanban_card.linkedPrWorkStartedAt`. A fenced work report commits the linked PR
   and its dispatch start together. A new work claim invalidates old provenance
   until that work reports a PR, so a report omitting its PR cannot inherit an
