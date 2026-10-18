@@ -14,6 +14,9 @@ export type ContractOutcome = ContractDecision['kind'] | 'stale_doorbell' | 'los
 export interface KanbanPrContractsDeps {
   repo: KanbanContractRepo
   prs: PrReader
+  appSlug?: string
+  // The live E2E uses PAT-authored PRs targeting a disposable base instead of touching the default branch.
+  bindingOverrideForTests?: { authorLogin: string; authorType: string; defaultBranch: string }
   store: Pick<CardStore, 'readCard' | 'applyPlan'>
   /** The board's live installation (never a webhook's word); null when it is gone or suspended. */
   repoRef(boardId: string): Promise<KanbanRepoRef | null>
@@ -76,25 +79,45 @@ export class KanbanPrContracts {
   ): Promise<ContractOutcome> {
     if (card.linkedPrNumber === null) return 'wait'
     const pr = await this.deps.prs.readPullRequest(repo, card.linkedPrNumber)
-    let checks: { headSha: string; verdict: ReturnType<typeof checksVerdict> } | undefined
-    if (pr && card.completionContract === 'pr_checks_green' && (pr.state === 'open' || pr.merged)) {
+    const input: Parameters<typeof planContract>[0] = {
+      status: card.status,
+      binding: {
+        appSlug: this.deps.appSlug,
+        repoId: repo.repoId,
+        issueNumber: card.issueNumber,
+        workStartedAt: card.linkedPrWorkStartedAt,
+        ...(this.deps.bindingOverrideForTests ? { overrideForTests: this.deps.bindingOverrideForTests } : {})
+      },
+      contract: card.completionContract,
+      verifierAgentId: card.verifierAgentId,
+      verifiedAt: card.verifiedAt,
+      linkedPrNumber: card.linkedPrNumber,
+      pr
+    }
+    let decision = planContract(input)
+    if (pr && decision.kind === 'wait' && decision.reason === 'checks_unread') {
       // A suite that finished on an older head says nothing about the PR as it stands now.
       if (doorbellSha !== undefined && doorbellSha !== pr.headSha) return 'stale_doorbell'
       const read = await this.deps.prs.readCheckRuns(repo, pr.headSha)
       const verdict = checksVerdict(read.runs)
       // An unread page could hold a failure, so a truncated list is at best pending.
-      checks = { headSha: pr.headSha, verdict: read.complete || verdict === 'failed' ? verdict : 'pending' }
+      decision = planContract({
+        ...input,
+        checks: { headSha: pr.headSha, verdict: read.complete || verdict === 'failed' ? verdict : 'pending' }
+      })
     }
-    const decision = planContract({
-      status: card.status,
-      contract: card.completionContract,
-      verifierAgentId: card.verifierAgentId,
-      verifiedAt: card.verifiedAt,
-      linkedPrNumber: card.linkedPrNumber,
-      pr,
-      ...(checks ? { checks } : {})
-    })
-    if (decision.kind === 'wait') return 'wait'
+    if (decision.kind === 'wait') {
+      this.deps.log.info(
+        {
+          boardId: card.boardId,
+          issueNumber: card.issueNumber,
+          prNumber: card.linkedPrNumber,
+          reason: decision.reason
+        },
+        'kanban: PR contract waiting'
+      )
+      return 'wait'
+    }
     const to = decision.kind
     const moved = await this.deps.repo.settleContract({
       cardId: card.cardId,

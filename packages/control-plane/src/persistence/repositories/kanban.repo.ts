@@ -494,7 +494,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
             recoveryObserved: null,
             ...PROMOTION_CLEARED,
             // A reopened card starts a new piece of work; the old PR must not complete it.
-            ...(input.from === 'done' ? { linkedPrNumber: null } : {})
+            ...(input.from === 'done' ? { linkedPrNumber: null, linkedPrWorkStartedAt: null } : {})
           }
         })
         if (count !== 1) throw STALE_COMMAND

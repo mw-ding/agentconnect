@@ -50,8 +50,13 @@ class FakeStore {
     }
     for (const label of plan.addLabels) await onLabelAdded?.(label)
   }
-  async readLabelEvents(): Promise<LabelEvent[]> {
-    return []
+  async readLabelEvents(_repo: KanbanRepoRef, n: number): Promise<LabelEvent[]> {
+    return (this.issues.get(n)?.labels ?? []).map((name, i) => ({
+      id: i + 1,
+      event: 'labeled',
+      label: { name },
+      actor: { login: 'maintainer', type: 'User' }
+    }))
   }
   async readGraph(): Promise<CardGraph> {
     return { parent: null, subIssues: [], blockedBy: [], blocking: [], truncated: false }
@@ -110,6 +115,7 @@ async function harness(
           : null
     },
     store,
+    humanAuthz: { appSlug: 'agentconnect', permissions: { permission: async () => 'write' } },
     send: async (daemonId, d) => {
       sent.push({ daemonId, d })
       return opts.reply ? opts.reply(d) : { leaseId: d.leaseId, accepted: true }
@@ -334,6 +340,40 @@ describe('Kanban verifier approval under a PR contract (real Postgres)', () => {
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
   }
+
+  it('vera-415: a new work lease invalidates an earlier PR binding until that work reports its PR', async () => {
+    const h = await harness({ completionContract: 'pr_merged' })
+    const c = await h.addCard()
+    await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: { linkedPrNumber: 12, linkedPrWorkStartedAt: new Date(T0 - 60_000) }
+    })
+    await tick(h)
+    expect((await h.run(h.sent[0]!.d.leaseId)).role).toBe('work')
+    expect((await h.card(c.id)).linkedPrWorkStartedAt).toBeNull()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested' }))
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).linkedPrWorkStartedAt).toBeNull()
+  })
+
+  it('vera-415: only the reporting work run stamps PR provenance; a verifier cannot replace it', async () => {
+    const h = await harness({ completionContract: 'pr_merged' })
+    const c = await h.addCard()
+    await tick(h)
+    const work = h.sent[0]!.d
+    h.clock.advance(60_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(work, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ linkedPrNumber: 12, linkedPrWorkStartedAt: new Date(T0) })
+    const verify = h.sent.find(({ d }) => d.role === 'verify')!.d
+    await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'completed', prNumber: 99 }))
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({
+      linkedPrNumber: 12,
+      linkedPrWorkStartedAt: new Date(T0),
+      status: 'review'
+    })
+  })
 
   it('vera-415: an approved pr_merged card on this branch gets exactly one verify lease', async () => {
     const h = await harness({ completionContract: 'pr_merged' })

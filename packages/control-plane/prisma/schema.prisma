@@ -2617,6 +2617,8 @@ model KanbanCard {
   needsAttention          Boolean   @default(false)
   attentionReason         String?
   linkedPrNumber      Int?
+  // The work run that reported this PR is its conservative creation-time boundary.
+  linkedPrWorkStartedAt DateTime? @db.Timestamptz(6)
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection

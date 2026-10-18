@@ -1430,3 +1430,19 @@ describe('rc/bot-tenant (google-chat-integration.md §10.3)', () => {
     expect(RcBotTenant.safeParse({ botId: 'bot', tenantId: 'domains/0000000000' }).success).toBe(false)
   })
 })
+
+it('vera-415: Kanban command viaApp is optional additive boolean metadata, never an App body', () => {
+  const poke = {
+    deliveryKey: 'g',
+    installationId: '1',
+    repoId: '42',
+    event: 'issue_comment',
+    action: 'created',
+    ids: ['7'],
+    numbers: [7],
+    command: { name: 'ready', commentId: '1', sender: { login: 'alice', type: 'User' }, viaApp: true }
+  }
+  expect(RcGithubGraph.safeParse(poke).success).toBe(true)
+  expect(RcGithubGraph.safeParse({ ...poke, command: { ...poke.command, viaApp: undefined } }).success).toBe(true)
+  expect(RcGithubGraph.safeParse({ ...poke, command: { ...poke.command, viaApp: { id: 42 } } }).success).toBe(false)
+})

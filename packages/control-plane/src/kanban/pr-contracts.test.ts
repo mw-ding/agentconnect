@@ -10,6 +10,15 @@ const BOARD: KanbanBoardRecord = { id: 'b1', orgId: OrgId('org'), name: 'eng', r
 const REPO = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
 const HEAD = 'a'.repeat(40)
 const OLD = 'b'.repeat(40)
+const PR_BINDING = {
+  authorLogin: 'agentconnect[bot]',
+  authorType: 'Bot',
+  headRef: 'ac/card-7',
+  headRepoId: 42n,
+  baseRef: 'main',
+  defaultBranch: 'main',
+  createdAt: new Date('2026-10-16T00:00:00Z')
+}
 
 const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   cardId: 'c1',
@@ -18,6 +27,7 @@ const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   status: 'review',
   stateRevision: 5n,
   linkedPrNumber: 12,
+  linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z'),
   verifiedAt: null,
   completionContract: 'pr_merged',
   verifierAgentId: null,
@@ -52,8 +62,17 @@ function make(
     })
   }
   const prs = {
-    readPullRequest: vi.fn(async () =>
-      opts.pr === undefined ? { number: 12, state: 'closed' as const, merged: true, headSha: HEAD } : opts.pr
+    readPullRequest: vi.fn(async (_repo: unknown, n: number) =>
+      opts.pr === undefined
+        ? {
+            ...PR_BINDING,
+            headRef: `ac/card-${cards.find((c) => c.linkedPrNumber === n)?.issueNumber}`,
+            number: n,
+            state: 'closed' as const,
+            merged: true,
+            headSha: HEAD
+          }
+        : opts.pr
     ),
     readCheckRuns: vi.fn(async () => ({ runs: opts.runs ?? [], complete: opts.complete ?? true }))
   }
@@ -72,7 +91,15 @@ function make(
   }
   const onSettled = vi.fn()
   const log = { info: vi.fn(), warn: vi.fn() }
-  const contracts = new KanbanPrContracts({ repo, prs, store, repoRef: async () => REPO, onSettled, log })
+  const contracts = new KanbanPrContracts({
+    appSlug: 'agentconnect',
+    repo,
+    prs,
+    store,
+    repoRef: async () => REPO,
+    onSettled,
+    log
+  })
   return { contracts, repo, prs, store, settles, plans, onSettled, log }
 }
 
@@ -95,7 +122,7 @@ describe('KanbanPrContracts', () => {
   })
 
   it('a PR closed unmerged sends the card to triage with one attention comment', async () => {
-    const h = make({ pr: { number: 12, state: 'closed', merged: false, headSha: HEAD } })
+    const h = make({ pr: { ...PR_BINDING, number: 12, state: 'closed', merged: false, headSha: HEAD } })
     await h.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: false, headSha: HEAD })
     expect(h.settles[0]).toMatchObject({ to: 'triage', reason: 'pr_closed_unmerged' })
     expect(h.plans[0]).toMatchObject({ addLabels: [statusLabel('triage')] })
@@ -103,7 +130,7 @@ describe('KanbanPrContracts', () => {
   })
 
   it('the live read decides, not the doorbell: a "merged" doorbell for a PR GitHub says is open moves nothing', async () => {
-    const h = make({ pr: { number: 12, state: 'open', merged: false, headSha: HEAD } })
+    const h = make({ pr: { ...PR_BINDING, number: 12, state: 'open', merged: false, headSha: HEAD } })
     await h.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
     expect(h.settles).toEqual([])
   })
@@ -122,7 +149,7 @@ describe('KanbanPrContracts', () => {
   it('a green suite on the current head completes a pr_checks_green card; pr_merged cards ignore suites', async () => {
     const h = make({
       cards: [card({ completionContract: 'pr_checks_green' }), card({ cardId: 'c2', issueNumber: 8 })],
-      pr: { number: 12, state: 'open', merged: false, headSha: HEAD },
+      pr: { ...PR_BINDING, number: 12, state: 'open', merged: false, headSha: HEAD },
       runs: [SUCCESS, { status: 'completed', conclusion: 'skipped' }]
     })
     await h.contracts.onCheckSuite(BOARD, REPO, { headSha: HEAD, conclusion: 'success', prNumbers: [12] })
@@ -134,7 +161,7 @@ describe('KanbanPrContracts', () => {
     const at = (runs: CheckRunFacts[], headSha = HEAD, complete = true) => {
       const h = make({
         cards: [card({ completionContract: 'pr_checks_green' })],
-        pr: { number: 12, state: 'open', merged: false, headSha: HEAD },
+        pr: { ...PR_BINDING, number: 12, state: 'open', merged: false, headSha: HEAD },
         runs,
         complete
       })
@@ -178,7 +205,9 @@ describe('KanbanPrContracts', () => {
   })
 
   it('the sweep judges a bounded batch, resumes after its cursor, and survives one card failing', async () => {
-    const cards = Array.from({ length: 30 }, (_, i) => card({ cardId: `c${i}`, issueNumber: i + 1 }))
+    const cards = Array.from({ length: 30 }, (_, i) =>
+      card({ cardId: `c${i}`, issueNumber: i + 1, linkedPrNumber: i + 1 })
+    )
     const h = make({ cards })
     h.prs.readPullRequest.mockRejectedValueOnce(new Error('github 502'))
     await h.contracts.sweep(BOARD.id)
@@ -192,4 +221,26 @@ describe('KanbanPrContracts', () => {
     await h.contracts.sweep(BOARD.id)
     expect(h.repo.listContractCards).toHaveBeenLastCalledWith(BOARD.id, { afterIssueNumber: 0, limit: 25 })
   })
+})
+
+it('vera-415: unbound PRs wait with body-free metadata before attempting check reads', async () => {
+  const h = make({
+    cards: [card({ completionContract: 'pr_checks_green' })],
+    pr: {
+      ...PR_BINDING,
+      number: 12,
+      state: 'closed',
+      merged: true,
+      headSha: HEAD,
+      authorLogin: 'unrelated'
+    }
+  })
+  h.prs.readCheckRuns.mockRejectedValue(new Error('checks unavailable'))
+  expect(await h.contracts.onVerified('c1')).toBe('wait')
+  expect(h.prs.readCheckRuns).not.toHaveBeenCalled()
+  expect(h.settles).toEqual([])
+  expect(h.log.info).toHaveBeenCalledWith(
+    { boardId: 'b1', issueNumber: 7, prNumber: 12, reason: 'pr_unbound' },
+    'kanban: PR contract waiting'
+  )
 })

@@ -192,7 +192,7 @@ export class InstallationTokenService {
     return this.mintPermissionLevels(
       installationId,
       repoFullName,
-      { pull_requests: 'read', checks: 'read' },
+      { pull_requests: 'read', checks: 'read', actions: 'read' },
       repoId,
       false,
       'kanban_pr'

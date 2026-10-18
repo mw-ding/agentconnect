@@ -34,7 +34,16 @@ interface PrState {
   state: 'open' | 'closed'
   merged: boolean
   headSha: string
-  runs: Array<{ status: string; conclusion: string | null }>
+  unbound?: boolean
+  headRef?: string
+  workflows?: Array<{ check_suite_id: number; path: string }>
+  runs: Array<{
+    status: string
+    conclusion: string | null
+    name?: string
+    app?: { id: number; slug: string }
+    check_suite?: { id: number }
+  }>
 }
 
 function fakeGithub(pr: PrState) {
@@ -52,11 +61,25 @@ function fakeGithub(pr: PrState) {
     if (method === 'POST' && pathname === `/app/installations/${INSTALLATION_ID}/access_tokens`) {
       return json(201, { token: 'ghs_test', expires_at: new Date(Date.now() + 3_600_000).toISOString() })
     }
+    if (pathname === `/repositories/${REPO_ID}`) return json(200, { default_branch: 'main' })
+    if (pathname === `/repositories/${REPO_ID}/actions/runs`)
+      return json(200, {
+        total_count: pr.workflows?.length ?? 0,
+        workflow_runs: pr.workflows ?? []
+      })
     if (pathname === `/repositories/${REPO_ID}/pulls/${PR}`) {
-      return json(200, { number: PR, state: pr.state, merged: pr.merged, head: { sha: pr.headSha } })
+      return json(200, {
+        number: PR,
+        state: pr.state,
+        merged: pr.merged,
+        user: { login: pr.unbound ? 'unrelated' : 'agentconnect-test[bot]', type: pr.unbound ? 'User' : 'Bot' },
+        head: { sha: pr.headSha, ref: pr.headRef ?? 'ac/card-9', repo: { id: REPO_ID } },
+        base: { ref: 'main' },
+        created_at: pr.unbound ? '2020-01-01T00:00:00Z' : '2026-10-16T00:00:00Z'
+      })
     }
     if (pathname === `/repositories/${REPO_ID}/commits/${pr.headSha}/check-runs`) {
-      // Distinct ids and names: the reader keeps the newest run per (app, name), so each listed run is its own check.
+      // Give each check an identity unless the test explicitly supplies a workflow collision.
       return json(200, {
         total_count: pr.runs.length,
         check_runs: pr.runs.map((r, i) => ({ id: i + 1, name: `check-${i}`, ...r }))
@@ -137,7 +160,8 @@ async function boot(
       issueNumber: ISSUE.number,
       status: 'review',
       linkedPrNumber: card.linkedPrNumber === undefined ? PR : card.linkedPrNumber,
-      verifiedAt: card.verifiedAt ?? null
+      verifiedAt: card.verifiedAt ?? null,
+      linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z')
     }
   })
   app = buildApp({
@@ -195,6 +219,80 @@ const settle = async () => {
 const comments = (calls: GithubCall[]) => calls.filter((c) => c.method === 'POST' && c.path.endsWith('/comments'))
 
 describe('Kanban PR completion contracts through the real relay (real ports, real Postgres)', () => {
+  it('vera-415: P2 an old unrelated merged PR leaves the card in review', async () => {
+    const { github, card, link } = await boot(
+      { state: 'closed', merged: true, headSha: HEAD, runs: [], unbound: true },
+      { completionContract: 'pr_merged' }
+    )
+    await postGithubWebhook(link.webhookUrl, { secret: WEBHOOK_SECRET, event: 'pull_request', payload: prClosed(true) })
+    await settle()
+    expect((await cardOf(card.id)).status).toBe('review')
+    expect(github.issueState().state).toBe('open')
+    expect(comments(github.calls)).toEqual([])
+  })
+
+  it('vera-415: P1 two workflows named test retain a failure; rerunning that workflow replaces it', async () => {
+    const pr: PrState = {
+      state: 'open',
+      merged: false,
+      headSha: HEAD,
+      runs: [
+        {
+          name: 'test',
+          app: { id: 15368, slug: 'github-actions' },
+          check_suite: { id: 1 },
+          status: 'completed',
+          conclusion: 'failure'
+        },
+        {
+          name: 'test',
+          app: { id: 15368, slug: 'github-actions' },
+          check_suite: { id: 2 },
+          status: 'completed',
+          conclusion: 'success'
+        }
+      ],
+      workflows: [
+        { check_suite_id: 1, path: 'ci.yml' },
+        { check_suite_id: 2, path: 'e2e.yml' }
+      ]
+    }
+    const { card, link } = await boot(pr, { completionContract: 'pr_checks_green' })
+    const ring = () =>
+      postGithubWebhook(link.webhookUrl, {
+        secret: WEBHOOK_SECRET,
+        event: 'check_suite',
+        payload: suiteCompleted(HEAD)
+      })
+    await ring()
+    await settle()
+    expect((await cardOf(card.id)).status).toBe('review')
+    pr.workflows![1]!.path = 'ci.yml'
+    await ring()
+    expect(
+      (
+        await until(
+          () => cardOf(card.id),
+          (c) => c.status === 'done'
+        )
+      ).status
+    ).toBe('done')
+  })
+
+  it('vera-415: skipped-only checks leave a pr_checks_green card in review', async () => {
+    const { card, link } = await boot(
+      { state: 'open', merged: false, headSha: HEAD, runs: [{ status: 'completed', conclusion: 'skipped' }] },
+      { completionContract: 'pr_checks_green' }
+    )
+    await postGithubWebhook(link.webhookUrl, {
+      secret: WEBHOOK_SECRET,
+      event: 'check_suite',
+      payload: suiteCompleted(HEAD)
+    })
+    await settle()
+    expect((await cardOf(card.id)).status).toBe('review')
+  })
+
   it('pr_merged: a merged linked PR moves review → done, closes the issue as completed, and audits the contract', async () => {
     const pr: PrState = { state: 'closed', merged: true, headSha: HEAD, runs: [] }
     const { github, card, link } = await boot(pr, { completionContract: 'pr_merged' })
@@ -225,7 +323,7 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
     )
     expect(mint?.body).toEqual({
       repository_ids: [REPO_ID],
-      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read' }
+      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read', actions: 'read' }
     })
     const audit = await prisma.auditEvent.findFirstOrThrow({ where: { kind: 'kanban_card_change' } })
     expect(audit.details).toMatchObject({
@@ -328,6 +426,7 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
     const { github, board, card } = await boot(pr, { completionContract: 'pr_merged', verifier: true })
     const tokens = { mintKanbanCard: async () => ({ token: 't' }), mintKanbanPr: async () => ({ token: 't' }) }
     const contracts = new KanbanPrContracts({
+      appSlug: 'agentconnect-test',
       repo: new PgKanbanDispatchRepo(prisma),
       prs: new GithubPrReader({ tokens: tokens as never, fetchImpl: github.fetch }),
       store: new GithubCardStore({ tokens: tokens as never, fetchImpl: github.fetch }),
@@ -356,9 +455,11 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
         issueNumber: 10,
         status: 'review',
         linkedPrNumber: PR,
+        linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z'),
         verifiedAt: new Date()
       }
     })
+    pr.headRef = 'ac/card-10'
     await contracts.sweep(board.id)
     expect((await cardOf(other.id)).status).toBe('done')
     // Leased and non-review cards are never listed.

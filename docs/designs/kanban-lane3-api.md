@@ -172,17 +172,17 @@ whitespace, and needs one or more spaces or tabs between the two words:
 no reply. That includes a command on a later line, a quoted command (`> /kanban …`),
 extra words, edits, deletions, and comments on pull-request conversations.
 
-| Command   | Applies to       | Effect                                               |
-| --------- | ---------------- | ---------------------------------------------------- |
-| `unblock` | `blocked`        | → `ready`, clears `blockKind`                        |
-| `reopen`  | `done`           | → `ready`, reopens the issue, drops `linkedPrNumber` |
-| `ready`   | `todo`, `triage` | → `ready`                                            |
+| Command   | Applies to       | Effect                                              |
+| --------- | ---------------- | --------------------------------------------------- |
+| `unblock` | `blocked`        | → `ready`, clears `blockKind`                       |
+| `reopen`  | `done`           | → `ready`, reopens the issue, clears the PR binding |
+| `ready`   | `todo`, `triage` | → `ready`                                           |
 
 Every applied move also clears the cooldown, recovery backoff, promotion intent, and
 `needsAttention`. A leased card refuses all three commands (`leased`). A command that
 does not fit the card's status is refused as `wrong_status`. A sender without write
-access is refused as `no_write`. Each refusal posts exactly one fixed-template comment
-that names only the command, labels, and reason code.
+access is recorded as `no_write` without a reply. Other refusals from writers post
+exactly one fixed-template comment naming only the command, labels, and reason code.
 
 ### Doorbell frame (`rc/github-graph`, still `.strict()`)
 
@@ -190,7 +190,7 @@ that names only the command, labels, and reason code.
 optional fields; at most one is present on a frame:
 
 ```ts
-command?: { name: 'unblock' | 'reopen' | 'ready'; commentId: GithubNumericId;
+command?: { name: 'unblock' | 'reopen' | 'ready'; commentId: GithubNumericId; viaApp?: boolean;
             sender: { login: string /* ≤64 */; id?: GithubNumericId; type: string /* ≤32 */ } }
 pullRequest?: { number: number; merged: boolean; headSha: GitSha }        // pull_request closed
 checkSuite?: { headSha: GitSha; conclusion: string | null; prNumbers: number[] /* ≤10 */ } // check_suite completed
@@ -203,8 +203,11 @@ and the CP redelivery sweep re-asks: graph events, the `issues` actions,
 delivery that is not a command (or has a bot sender, a PR conversation, or an
 unprovable sha) is still forwarded as a seen-only marker, so it lands.
 
-The relay drops bot senders. The CP re-checks the sender type and then runs the live
-write check.
+The relay drops bot senders. For user comments it forwards optional `command.viaApp`
+when GitHub sets `comment.performed_via_github_app`, keeping only a boolean. The CP
+refuses these App-on-behalf-of-user commands before looking up write access. It
+re-checks the sender type and then runs the live write check. Label recovery fails
+closed when its human authorization dependency is absent.
 
 ### Idempotency
 
@@ -216,7 +219,9 @@ and a `kanban_card_change` audit row. That row carries
 `source: 'comment_command'`.
 
 The GitHub effect runs after the commit: the label write and reopen, or the one
-refusal comment. `settledAt` marks it done. A redelivery of an unsettled row re-runs
+refusal comment for a writer's `wrong_status`, `leased`, or `illegal` command.
+A `no_write` refusal is recorded and settled silently, with no GitHub reply or label
+write, so untrusted comments cannot amplify into App posts. `settledAt` marks it done. A redelivery of an unsettled row re-runs
 the effect; it does not re-decide. A lost CAS is re-read up to three times.
 
 ### PR completion contracts
@@ -227,21 +232,45 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
 
 - The planner only judges cards that meet all of these: status `review`,
   `completionContract` ≠ `close`, `linkedPrNumber` set, and no open run.
-- A linked PR closed unmerged → `triage`, `needsAttention` with reason
+- Before either completion or unmerged-close triage, the live PR must be bound to
+  this card: author login `<appSlug>[bot]` with type `Bot`, head branch
+  `ac/card-<issueNumber>` in the board's repository (no fork), and base equal to
+  the repository's live default branch. Its `created_at` must be at or after
+  `linkedPrWorkStartedAt`, the start of the work run that reported this PR.
+  Missing provenance or any binding mismatch means `wait(pr_unbound)`, logged
+  with metadata only; it never completes or triages. Issue-closing references
+  alone are not authority. No PR bodies or issue text are read into CP state.
+- A bound linked PR closed unmerged → `triage`, `needsAttention` with reason
   `pr_closed_unmerged`, and one comment. This happens whether or not a verifier is set.
 - `pr_merged`: the PR is merged and no verifier is configured, or `verifiedAt` is set
   → `done`, and the issue closes as completed.
 - `pr_checks_green`: the newest run of every check on the PR's live head has
-  completed with `success`, `neutral`, or `skipped` → `done`, under the same verifier
+  completed with `success`, `neutral`, or `skipped`, including at least one
+  `success` → `done`, under the same verifier
   condition.
-  - "Newest run of every check" means the highest run id per (app, check name).
-    GitHub's `filter=latest` only dedupes within a suite, so a re-run in a new
-    workflow run would otherwise leave the superseded failure listed.
+  - "Newest run of every check" means the highest run id for GitHub Actions per
+    `(app.id, workflowPath, name)`. The reader maps `check_suite.id` to
+    a workflow path through `GET /repositories/{id}/actions/runs?head_sha=<sha>`.
+    Same-named jobs in different workflows stay independent; a new run in the
+    same workflow supersedes its earlier run. Non-Actions apps and unmapped
+    suites use `(app.id, check_suite.id, name)`, preserving `filter=latest`'s
+    suite boundary. Missing suites stay independent by check-run id.
   - A failure anywhere means `wait` (no flapping).
-  - No runs, or a list truncated past 300 runs, never counts as green.
+  - Neutral/skipped-only lists wait; at least one success is required.
+  - No runs, or a check/workflow list truncated past 300 entries, never counts as green.
+  - Configure an independent verifier for `pr_checks_green` boards: workers can
+    edit workflows, and green checks alone do not prove the card's requirements.
   - A suite doorbell whose `headSha` is not the live head is ignored (`stale_doorbell`).
 - The CP re-reads the PR and its runs live, by repository id, with
-  `mintKanbanPr` (`pull_requests:read` + `checks:read`, CP-only).
+  `mintKanbanPr` (`pull_requests:read` + `checks:read` + `actions:read`, CP-only).
+- Migration `20261123200200_kanban_pr_binding` adds nullable
+  `kanban_card.linkedPrWorkStartedAt`. A fenced work report commits the linked PR
+  and its dispatch start together. A new work claim invalidates old provenance
+  until that work reports a PR, so a report omitting its PR cannot inherit an
+  earlier completion. Verifier reports cannot replace that binding;
+  `/kanban reopen` clears both. Existing links with no provenance wait for a new
+  work report. The conservative reporting-run boundary may require a fresh PR
+  after a retry, even when a prior attempt opened one.
 - `done` resets `reviewRounds` and `verifiedAt`.
 - Triggers:
   - the `pull_request` and `check_suite` doorbells;
@@ -257,7 +286,17 @@ the frame, and keeps the link up; the redelivery sweep re-asks the delivery once
 CP is upgraded. An old relay simply never sends these frames.
 
 The App manifest already subscribes `issue_comment`, `pull_request`, `check_run`, and
-`check_suite`, and already grants `checks` and `pull_requests`. No re-consent is needed.
+`check_suite`, and already grants `checks`, `pull_requests`, and `actions`.
+No re-consent is needed. Apply the new migration before starting the new CP, and
+upgrade the CP before emitting `command.viaApp` from the relay. Its optional
+boolean is additive for new decoders; an old strict decoder rejects it, leaving
+the delivery eligible for redelivery after upgrade.
+
+The live E2E alone injects a constructor binding override for its PAT user's login
+and type and its disposable base branch; its real head still uses `ac/card-<issue>`
+in the same repository, and creation must follow the seeded work start. This
+avoids merging scratch commits into the real default branch. Production never
+reads a binding override from configuration or environment.
 
 ## Changelog
 

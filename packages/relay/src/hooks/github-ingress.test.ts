@@ -998,6 +998,15 @@ describe('github ingress', () => {
       expect(parseKanbanCommand(body)).toBe(expected)
     })
 
+    it('vera-415: forwards only a boolean for a comment performed via a GitHub App', () => {
+      const payload = commented('/kanban unblock', {
+        comment: { id: 9001, body: '/kanban unblock', performed_via_github_app: { id: 42, name: 'private app name' } }
+      })
+      const poke = githubCommentDoorbell('issue_comment', payload, 'g')
+      expect(poke?.command).toMatchObject({ viaApp: true })
+      expect(JSON.stringify(poke)).not.toContain('private app name')
+    })
+
     it('forwards the command, comment id, and sender, never the comment text', () => {
       const poke = githubCommentDoorbell('issue_comment', commented('/kanban unblock\nsecret plan'), 'g')
       expect(poke).toEqual({

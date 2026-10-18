@@ -99,6 +99,7 @@ interface GithubPayload {
   issue?: GithubSubject
   pull_request?: GithubSubject
   comment?: {
+    performed_via_github_app?: unknown
     id?: number
     pull_request_review_id?: number
     in_reply_to_id?: number | null
@@ -1143,7 +1144,12 @@ export function githubCommentDoorbell(
     ...seen,
     ids: [id],
     numbers: [number!],
-    command: { name, commentId, sender: { login: sender.login, ...(senderId ? { id: senderId } : {}), type: 'User' } }
+    command: {
+      name,
+      commentId,
+      ...(payload.comment?.performed_via_github_app ? { viaApp: true } : {}),
+      sender: { login: sender.login, ...(senderId ? { id: senderId } : {}), type: 'User' }
+    }
   }
 }
 

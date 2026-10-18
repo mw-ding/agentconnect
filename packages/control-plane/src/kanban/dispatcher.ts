@@ -320,7 +320,7 @@ export class KanbanDispatcher {
   // The human who added the status label must hold live write access, as a comment command's sender must; fail closed.
   private async labelWriterAuthorized(repo: KanbanRepoRef, issueNumber: number, to: KanbanStatus): Promise<boolean> {
     const authz = this.deps.humanAuthz
-    if (!authz) return true
+    if (!authz) return false
     const login = labelAdder(await this.deps.store.readLabelEvents(repo, issueNumber), statusLabel(to), authz.appSlug)
     if (!login) return false
     const verdict = await authorizeHumanKanbanAction({

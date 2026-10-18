@@ -58,7 +58,7 @@ const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."lin
   AND b."completionContract" <> 'close'
   AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
 const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
-  c."linkedPrNumber", c."verifiedAt", b."completionContract", b."verifierAgentId"`
+  c."linkedPrNumber", c."linkedPrWorkStartedAt", c."verifiedAt", b."completionContract", b."verifierAgentId"`
 
 interface BoardRow {
   id: string
@@ -236,7 +236,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
             data: {
               // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
-              ...(card.role === 'work' ? { verifiedAt: null } : {}),
+              ...(card.role === 'work' ? { verifiedAt: null, linkedPrWorkStartedAt: null } : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -645,7 +645,12 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         where: { id: row.cardId },
         data: {
           status: plan.status,
-          ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
+          ...(row.role === 'work' && input.prNumber !== undefined
+            ? {
+                linkedPrNumber: input.prNumber,
+                linkedPrWorkStartedAt: row.dispatchedAt
+              }
+            : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,

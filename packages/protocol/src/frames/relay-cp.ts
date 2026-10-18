@@ -702,6 +702,7 @@ export type GithubGraphEvent = z.infer<typeof GithubGraphEvent>
 export const KanbanDoorbellCommand = z
   .object({
     name: KanbanCommentCommand,
+    viaApp: z.boolean().optional(), // App-on-behalf-of-user commands are refused by the CP.
     commentId: GithubNumericId,
     sender: z
       .object({

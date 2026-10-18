@@ -163,12 +163,12 @@ describe('KanbanCommentCommands', () => {
     expect(h.plans[0]!.comment).toContain('(leased)')
   })
 
-  it.each(['triage', 'read', 'none'] as const)('refuses a %s sender with one no_write comment', async (level) => {
+  it.each(['triage', 'read', 'none'] as const)('silently records a %s sender refusal', async (level) => {
     const h = make({ status: 'blocked', level })
     expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('no_write')
     expect(h.card.status).toBe('blocked')
-    expect(h.store.readCard).toHaveBeenCalledTimes(1)
-    expect(h.plans.map((p) => p.comment)).toEqual([expect.stringContaining('(no_write)')])
+    expect(h.store.readCard).not.toHaveBeenCalled()
+    expect(h.plans).toEqual([])
   })
 
   it.each([
@@ -233,4 +233,21 @@ describe('KanbanCommentCommands', () => {
     expect(await h.handler.handle(BOARD, REPO, 8, cmd('unblock'))).toBe('not_a_card')
     expect(h.cards.recordCommand).not.toHaveBeenCalled()
   })
+})
+
+it('vera-415: an App acting on behalf of a writer is ignored without a permission lookup', async () => {
+  const h = make()
+  expect(await h.handler.handle(BOARD, REPO, 7, { ...cmd('unblock'), viaApp: true })).toBe('ignored')
+  expect(h.permission).not.toHaveBeenCalled()
+  expect(h.ledger.size).toBe(0)
+  expect(h.plans).toEqual([])
+})
+
+it('vera-415: a non-writer is silently recorded once even across duplicate deliveries', async () => {
+  const h = make({ level: 'read' })
+  expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('no_write')
+  expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('duplicate')
+  expect(h.plans).toEqual([])
+  expect(h.ledger.size).toBe(1)
+  expect(h.ledger.get(9001n)).toMatchObject({ outcome: 'no_write', settledAt: expect.any(Date) })
 })

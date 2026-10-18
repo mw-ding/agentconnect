@@ -8,6 +8,13 @@ export interface LivePullRequest {
   state: 'open' | 'closed'
   merged: boolean
   headSha: string
+  authorLogin: string | null
+  authorType: string | null
+  headRef: string | null
+  headRepoId: bigint | null
+  baseRef: string | null
+  defaultBranch: string | null
+  createdAt: Date | null
 }
 
 /** One check run on a commit, body-free: its lifecycle and result only. */
@@ -18,7 +25,7 @@ export interface CheckRunFacts {
 
 export type ChecksVerdict = 'green' | 'pending' | 'failed' | 'none'
 
-/** Conclusions that count as passing; everything else that completed (failure, cancelled, timed_out, …) fails. */
+// Neutral and skipped tolerate optional jobs, but a green head still requires at least one success.
 const PASSING: ReadonlySet<string> = new Set(['success', 'neutral', 'skipped'])
 
 /** A failure anywhere wins (no flapping on a later green), then anything unfinished; no runs at all is not green. */
@@ -26,11 +33,19 @@ export function checksVerdict(runs: readonly CheckRunFacts[]): ChecksVerdict {
   if (runs.length === 0) return 'none'
   if (runs.some((r) => r.status === 'completed' && !PASSING.has(r.conclusion ?? ''))) return 'failed'
   if (runs.some((r) => r.status !== 'completed')) return 'pending'
-  return 'green'
+  return runs.some((r) => r.conclusion === 'success') ? 'green' : 'pending'
 }
 
 export interface ContractInput {
   status: KanbanStatus
+  binding?: {
+    appSlug: string | undefined
+    repoId: bigint
+    issueNumber: number
+    workStartedAt: Date | null
+    // Only live E2E constructors supply this; production has no config or environment override.
+    overrideForTests?: { authorLogin: string; authorType: string; defaultBranch: string }
+  }
   contract: KanbanCompletionContract
   verifierAgentId: string | null
   verifiedAt: Date | null
@@ -46,6 +61,7 @@ export type ContractWait =
   | 'no_pr_contract'
   | 'no_linked_pr'
   | 'pr_missing'
+  | 'pr_unbound'
   | 'pr_open'
   | 'awaiting_verifier'
   | 'checks_unread'
@@ -57,7 +73,7 @@ export type ContractWait =
 export type ContractDecision =
   { kind: 'done' } | { kind: 'triage'; reason: 'pr_closed_unmerged' } | { kind: 'wait'; reason: ContractWait }
 
-/** Done needs the contract met and, when a verifier is configured, its approval; an unmerged close always triages. */
+// Only a bound PR may complete or triage a card; completion also needs any configured verifier approval.
 export function planContract(input: ContractInput): ContractDecision {
   const wait = (reason: ContractWait): ContractDecision => ({ kind: 'wait', reason })
   if (input.status !== 'review') return wait('not_review')
@@ -65,6 +81,28 @@ export function planContract(input: ContractInput): ContractDecision {
   if (input.linkedPrNumber === null) return wait('no_linked_pr')
   const pr = input.pr
   if (!pr || pr.number !== input.linkedPrNumber) return wait('pr_missing')
+  const binding = input.binding
+  const expected = binding?.overrideForTests ?? {
+    authorLogin: binding?.appSlug ? `${binding.appSlug}[bot]` : null,
+    authorType: 'Bot',
+    defaultBranch: pr.defaultBranch
+  }
+  if (
+    !binding ||
+    !expected.authorLogin ||
+    !expected.defaultBranch ||
+    !binding.workStartedAt ||
+    !pr.createdAt ||
+    pr.authorLogin?.toLowerCase() !== expected.authorLogin.toLowerCase() ||
+    pr.authorType !== expected.authorType ||
+    pr.headRef !== `ac/card-${binding.issueNumber}` ||
+    pr.headRepoId !== binding.repoId ||
+    pr.baseRef !== expected.defaultBranch ||
+    !Number.isFinite(pr.createdAt.getTime()) ||
+    !Number.isFinite(binding.workStartedAt.getTime()) ||
+    pr.createdAt.getTime() < binding.workStartedAt.getTime()
+  )
+    return wait('pr_unbound')
   if (pr.state === 'closed' && !pr.merged) return { kind: 'triage', reason: 'pr_closed_unmerged' }
   const verified = input.verifierAgentId === null || input.verifiedAt !== null
   if (input.contract === 'pr_merged') {

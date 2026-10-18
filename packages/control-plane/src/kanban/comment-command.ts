@@ -48,7 +48,7 @@ export class KanbanCommentCommands {
     // The CP re-checks the sender: a relay bug or an old relay must not let a bot or this App move a card (B8).
     const authz = await authorizeHumanKanbanAction({
       repo,
-      actor: { login: command.sender.login, type: command.sender.type },
+      actor: { login: command.sender.login, type: command.sender.type, viaApp: command.viaApp },
       appSlug: this.deps.appSlug,
       permissions: this.deps.permissions
     })
@@ -97,6 +97,10 @@ export class KanbanCommentCommands {
     issueNumber: number,
     record: KanbanCommandRecord
   ): Promise<void> {
+    if (record.outcome === 'no_write') {
+      await this.deps.cards.settleCommand(record.id)
+      return
+    }
     const issue = await this.deps.store.readCard(repo, issueNumber)
     if (record.outcome === 'applied') {
       const card = await this.deps.cards.findByIssueNumber(board.id, issueNumber)

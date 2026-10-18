@@ -122,7 +122,7 @@ async function boot(status: Status, permissions: Record<string, string> = { alic
       issueNumber: ISSUE.number,
       status,
       ...(status === 'blocked' ? { blockKind: 'needs_input' as const } : {}),
-      ...(status === 'done' ? { linkedPrNumber: 12 } : {})
+      ...(status === 'done' ? { linkedPrNumber: 12, linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z') } : {})
     }
   })
   app = buildApp({
@@ -220,7 +220,8 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     await settled(board.id)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
       status: 'ready',
-      linkedPrNumber: null
+      linkedPrNumber: null,
+      linkedPrWorkStartedAt: null
     })
     expect(github.state()).toBe('open')
     expect(writes(github.calls)).toContainEqual(
@@ -228,7 +229,7 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     )
   })
 
-  it('a non-writer is refused: no move, exactly one body-free refusal comment, even when the delivery repeats', async () => {
+  it('vera-415: a non-writer is silently recorded once even when the delivery repeats', async () => {
     const { github, board, card, link } = await boot('blocked', { alice: 'admin', octocat: 'read' })
     const deliveryId = randomUUID()
     const request = {
@@ -250,10 +251,7 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     await new Promise((resolve) => setTimeout(resolve, 300))
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('blocked')
     const comments = writes(github.calls).filter((c) => c.path.endsWith('/comments'))
-    expect(comments).toHaveLength(1)
-    const text = (comments[0]!.body as { body: string }).body
-    expect(text).toContain('`/kanban unblock` was not applied (no_write)')
-    expect(text).toContain('`ac/status:blocked`')
+    expect(comments).toHaveLength(0)
     expect(writes(github.calls).filter((c) => !c.path.endsWith('/comments'))).toEqual([])
     expect(await prisma.kanbanCommand.count()).toBe(1)
     expect(await prisma.auditEvent.count({ where: { kind: 'kanban_card_change' } })).toBe(0)
@@ -309,4 +307,19 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('blocked')
     expect(await prisma.kanbanCommand.count({ where: { boardId: board.id } })).toBe(0)
   })
+})
+
+it('vera-415: an App-on-behalf-of-writer comment reaches the CP with viaApp and is refused', async () => {
+  const { github, board, card, link } = await boot('blocked')
+  const payload = {
+    ...commentCreated('/kanban unblock', { login: 'alice', type: 'User' }),
+    comment: { id: 5001, body: '/kanban unblock', performed_via_github_app: { id: 42, name: 'private app name' } }
+  }
+  await postGithubWebhook(link.webhookUrl, { secret: WEBHOOK_SECRET, event: 'issue_comment', payload })
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('blocked')
+  expect(link.graphPokes[0]?.command).toMatchObject({ viaApp: true })
+  expect(JSON.stringify(link.graphPokes)).not.toContain('private app name')
+  expect(await prisma.kanbanCommand.count({ where: { boardId: board.id } })).toBe(0)
+  expect(writes(github.calls)).toEqual([])
 })

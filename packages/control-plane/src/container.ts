@@ -1790,6 +1790,7 @@ export function buildContainer(
   const kanbanPrContracts: KanbanPrContracts | undefined =
     kanbanCardStore && kanbanTokens
       ? new KanbanPrContracts({
+          appSlug: githubAppCfg?.slug,
           repo: repos.kanbanDispatch,
           prs: new GithubPrReader({
             tokens: kanbanTokens,

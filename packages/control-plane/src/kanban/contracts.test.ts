@@ -12,12 +12,25 @@ import {
 } from './contracts.js'
 
 const HEAD = 'a'.repeat(40)
-const OPEN: LivePullRequest = { number: 12, state: 'open', merged: false, headSha: HEAD }
+const OPEN: LivePullRequest = {
+  number: 12,
+  state: 'open',
+  merged: false,
+  headSha: HEAD,
+  authorLogin: 'agentconnect[bot]',
+  authorType: 'Bot',
+  headRef: 'ac/card-7',
+  headRepoId: 42n,
+  baseRef: 'main',
+  defaultBranch: 'main',
+  createdAt: new Date('2026-10-16T00:00:00Z')
+}
 const MERGED: LivePullRequest = { ...OPEN, state: 'closed', merged: true }
 const CLOSED: LivePullRequest = { ...OPEN, state: 'closed', merged: false }
 
 const input = (over: Partial<ContractInput> = {}): ContractInput => ({
   status: 'review',
+  binding: { appSlug: 'agentconnect', repoId: 42n, issueNumber: 7, workStartedAt: new Date('2026-10-15T00:00:00Z') },
   contract: 'pr_merged',
   verifierAgentId: null,
   verifiedAt: null,
@@ -30,6 +43,11 @@ const TRIAGE: ContractDecision = { kind: 'triage', reason: 'pr_closed_unmerged' 
 const wait = (reason: string): ContractDecision => ({ kind: 'wait', reason }) as ContractDecision
 
 describe('checksVerdict', () => {
+  it.each(['skipped', 'neutral'])('vera-415: %s-only checks cannot make a green contract', (conclusion) => {
+    const verdict = checksVerdict([{ status: 'completed', conclusion }])
+    expect(verdict).toBe('pending')
+  })
+
   it.each<[string, Array<[string, string | null]>, ChecksVerdict]>([
     ['no runs', [], 'none'],
     ['all success', [['completed', 'success']], 'green'],
@@ -78,6 +96,58 @@ describe('checksVerdict', () => {
 })
 
 describe('planContract', () => {
+  it.each([
+    ['author login', { authorLogin: 'unrelated[bot]' }],
+    ['author type', { authorType: 'User' }],
+    ['head branch', { headRef: 'unrelated' }],
+    ['fork', { headRepoId: 99n }],
+    ['base branch', { baseRef: 'release' }],
+    ['missing default branch', { defaultBranch: null }],
+    ['invalid creation time', { createdAt: new Date(NaN) }],
+    ['old PR', { createdAt: new Date('2026-10-14T00:00:00Z') }],
+    ['missing author', { authorLogin: null }],
+    ['missing creation', { createdAt: null }]
+  ])('vera-415: an unbound %s PR never completes or triages a card', (_name, broken) => {
+    for (const contract of ['pr_merged', 'pr_checks_green'] as const)
+      for (const pr of [MERGED, CLOSED]) {
+        const live = {
+          ...pr,
+          authorLogin: 'agentconnect[bot]',
+          authorType: 'Bot',
+          headRef: 'ac/card-7',
+          headRepoId: 42n,
+          baseRef: 'main',
+          defaultBranch: 'main',
+          createdAt: new Date('2026-10-16T00:00:00Z'),
+          ...broken
+        }
+        expect(
+          planContract(
+            input({
+              pr: live,
+              contract,
+              checks: { headSha: HEAD, verdict: 'green' },
+              binding: {
+                appSlug: 'agentconnect',
+                repoId: 42n,
+                issueNumber: 7,
+                workStartedAt: new Date('2026-10-15T00:00:00Z')
+              }
+            })
+          )
+        ).toEqual(wait('pr_unbound'))
+      }
+  })
+
+  it('vera-415: missing App identity or work provenance cannot bind a PR', () => {
+    for (const binding of [
+      undefined,
+      { appSlug: undefined, repoId: 42n, issueNumber: 7, workStartedAt: new Date(0) },
+      { appSlug: 'agentconnect', repoId: 42n, issueNumber: 7, workStartedAt: null }
+    ])
+      expect(planContract(input({ pr: MERGED, binding }))).toEqual(wait('pr_unbound'))
+  })
+
   it('only a review card under a PR contract with a linked PR is ever judged', () => {
     for (const status of KANBAN_STATUSES.filter((s) => s !== 'review')) {
       expect(planContract(input({ status, pr: MERGED }))).toEqual(wait('not_review'))

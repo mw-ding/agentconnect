@@ -8330,6 +8330,7 @@ export interface KanbanContractCard {
   status: KanbanStatus
   stateRevision: bigint
   linkedPrNumber: number | null
+  linkedPrWorkStartedAt: Date | null
   verifiedAt: Date | null
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
   verifierAgentId: string | null

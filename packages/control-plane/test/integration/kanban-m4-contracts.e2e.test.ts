@@ -6,8 +6,9 @@ import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanCommentCommands } from '../../src/kanban/comment-command.js'
 import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
+import { checksVerdict } from '../../src/kanban/contracts.js'
 import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
-import { GithubPrReader, newestPerCheck } from '../../src/kanban/pr-reader.js'
+import { GithubPrReader } from '../../src/kanban/pr-reader.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo, PgKanbanDispatchRepo } from '../../src/persistence/index.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { prisma } from '../setup.db.js'
@@ -46,6 +47,7 @@ interface GhPull {
 
 const results: Array<{ scenario: string; result: string; issue: string; ms: number; asserted: string }> = []
 const tokenSource = { mintKanbanCard: async () => ({ token: TOKEN! }), mintKanbanPr: async () => ({ token: TOKEN! }) }
+let e2eBinding: { authorLogin: string; authorType: string; defaultBranch: string }
 const log = { debug: vi.fn(), info: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
 
 function harness() {
@@ -58,6 +60,7 @@ function harness() {
     log
   })
   const contracts = new KanbanPrContracts({
+    bindingOverrideForTests: e2eBinding,
     repo: new PgKanbanDispatchRepo(prisma),
     prs: new GithubPrReader({ tokens: tokenSource as never }),
     store,
@@ -177,6 +180,8 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
   const base = `${BRANCH_PREFIX}-base-${ts}`
 
   beforeAll(async () => {
+    const user = await gh<{ login: string; type: string }>('GET', '/user')
+    e2eBinding = { authorLogin: user.login, authorType: user.type, defaultBranch: base }
     await ensureLabels()
     await createBranch(base, await headOf('main'))
     branches.push(base)
@@ -258,7 +263,7 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     pass('c2', issue.number, started, 'done→ready, issue reopened, ac/status:ready live')
   })
 
-  it('c3: a command attributed to a non-collaborator is refused with exactly one comment, even when redelivered', async () => {
+  it('c3: a non-collaborator command is silently recorded once, even when redelivered', async () => {
     const started = Date.now()
     const issue = await createIssue(issues, 'lane3b c3 refused', ['ac/status:blocked'])
     const { card } = await seed(issue, 'blocked')
@@ -273,13 +278,15 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('blocked')
     expect(await labelsOf(issue.number)).toContain('ac/status:blocked')
     const refusals = await kanbanComments(issue.number)
-    expect(refusals).toHaveLength(1)
-    expect(refusals[0]!.body).toContain('`/kanban unblock` was not applied (no_write)')
+    expect(refusals).toHaveLength(0)
+    expect(await prisma.kanbanCommand.findMany({ where: { cardId: card.id } })).toEqual([
+      expect.objectContaining({ outcome: 'no_write', settledAt: expect.any(Date) })
+    ])
     pass(
       'c3',
       issue.number,
       started,
-      'octocat (live permission none): no move, one no_write comment across 2 deliveries'
+      'octocat (live permission none): no move, no CP reply, one no_write ledger row across 2 deliveries'
     )
   })
 
@@ -306,12 +313,15 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
   it('k1: pr_merged — merging the linked scratch PR completes the review card and closes its issue as completed', async () => {
     const started = Date.now()
     const issue = await createIssue(issues, 'lane3b k1 pr_merged', ['ac/status:review'])
-    const head = `${BRANCH_PREFIX}-${ts}-k1`
+    const head = `ac/card-${issue.number}`
     branches.push(head)
     const pr = await openScratchPr(base, head, `[kanban-e2e] lane3b k1 ${ts}`)
     pulls.push(pr.number)
     const { card } = await seed(issue, 'review', { completionContract: 'pr_merged' })
-    await prisma.kanbanCard.update({ where: { id: card.id }, data: { linkedPrNumber: pr.number } })
+    await prisma.kanbanCard.update({
+      where: { id: card.id },
+      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+    })
     // Mergeability is computed asynchronously; retry the merge briefly.
     await poll(
       () =>
@@ -343,12 +353,15 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
   it('k2: a linked PR closed unmerged sends the card to triage with one attention comment', async () => {
     const started = Date.now()
     const issue = await createIssue(issues, 'lane3b k2 pr_closed_unmerged', ['ac/status:review'])
-    const head = `${BRANCH_PREFIX}-${ts}-k2`
+    const head = `ac/card-${issue.number}`
     branches.push(head)
     const pr = await openScratchPr(base, head, `[kanban-e2e] lane3b k2 ${ts}`)
     pulls.push(pr.number)
     const { card } = await seed(issue, 'review', { completionContract: 'pr_merged' })
-    await prisma.kanbanCard.update({ where: { id: card.id }, data: { linkedPrNumber: pr.number } })
+    await prisma.kanbanCard.update({
+      where: { id: card.id },
+      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+    })
     await gh('PATCH', `/repos/${FULL}/pulls/${pr.number}`, { state: 'closed' })
     const poke = githubPullRequestDoorbell('pull_request', (await pullPayload(pr.number)) as never, `k2-${ts}`)
     expect(poke?.pullRequest?.merged).toBe(false)
@@ -375,14 +388,17 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
   it('k3: pr_checks_green — a failing check keeps the card in review; a green re-run on the same head completes it', async () => {
     const started = Date.now()
     const issue = await createIssue(issues, 'lane3b k3 pr_checks_green', ['ac/status:review'])
-    const head = `${BRANCH_PREFIX}-${ts}-k3`
+    const head = `ac/card-${issue.number}`
     branches.push(head)
     // Not a conventional title, so the repository's `Conventional PR` check fails on this head.
     const pr = await openScratchPr(base, head, `[kanban-e2e] lane3b k3 ${ts}`)
     pulls.push(pr.number)
     const sha = (await gh<GhPull>('GET', `/repos/${FULL}/pulls/${pr.number}`)).head.sha
     const { card } = await seed(issue, 'review', { completionContract: 'pr_checks_green' })
-    await prisma.kanbanCard.update({ where: { id: card.id }, data: { linkedPrNumber: pr.number } })
+    await prisma.kanbanCard.update({
+      where: { id: card.id },
+      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+    })
     interface Suites {
       check_suites: Array<{
         id: number
@@ -396,10 +412,8 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     const suites = () => gh<Suites>('GET', `/repos/${FULL}/commits/${sha}/check-suites`)
     // A title edit re-runs the check in a new suite; judge the newest run per check, as the CP does.
     const runs = async () => {
-      const res = await gh<{
-        check_runs: Array<{ id: number; name: string; app: { id: number }; status: string; conclusion: string | null }>
-      }>('GET', `/repos/${FULL}/commits/${sha}/check-runs?filter=latest`)
-      return { check_runs: newestPerCheck(res.check_runs) }
+      const result = await new GithubPrReader({ tokens: tokenSource as never }).readCheckRuns(repoRef, sha)
+      return { check_runs: result.runs, complete: result.complete }
     }
     const failed = await poll(
       runs,
@@ -436,13 +450,8 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('review')
     // A conventional title re-runs the check on the same head; the latest run is now green.
     await gh('PATCH', `/repos/${FULL}/pulls/${pr.number}`, { title: `test: [kanban-e2e] lane3b k3 ${ts}` })
-    const green = await poll(
-      runs,
-      (r) =>
-        r.check_runs.length > 0 && r.check_runs.every((x) => x.status === 'completed' && x.conclusion === 'success'),
-      300_000
-    )
-    expect(green.check_runs.every((x) => x.conclusion === 'success')).toBe(true)
+    const green = await poll(runs, (r) => r.complete && checksVerdict(r.check_runs) === 'green', 300_000)
+    expect(checksVerdict(green.check_runs)).toBe('green')
     // A suite naming an older head is ignored even when the head is now green.
     const stale = { ...red!, deliveryKey: `k3s-${ts}`, checkSuite: { ...red!.checkSuite!, headSha: 'e'.repeat(40) } }
     expect(await ring(harness().doorbell, stale)).toBe(true)
