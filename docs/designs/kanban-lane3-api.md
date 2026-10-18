@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.0 (2026-10-17)
+**Version:** 1.1 (2026-10-18)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -60,32 +60,36 @@ No I/O, no Prisma, no frames.
 
 ## Gate codes and ordering
 
-A card is checked in this order; the first blocking gate wins. `board_cap` and
-`agent_cap` are evaluated last because the SQL claim only reaches them once the
-board's room and the candidate's own eligibility are established.
+A card is checked in the SQL claim's own order, and the first blocking gate wins: first
+the claim's row filters (its `WHERE`/`JOIN`), then the per-candidate checks of its loop
+(the board's room, the target agent's share, daemon liveness, and B8 last).
+
+A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a board with a
+`verifierAgentId` is a **verify** claim to that verifier, and every agent gate (8–15) reads the
+verifier's facts and `openRunCountForVerifier`.
 
 | #   | Gate                   | Condition                                                                               |
 | --- | ---------------------- | --------------------------------------------------------------------------------------- |
 | 1   | `board_disabled`       | the board is not enabled                                                                |
 | 2   | `status_not_claimable` | status is neither `ready` nor `review`                                                  |
 | 3   | `verifier_unset`       | status is `review` and the board has no `verifierAgentId`                               |
-| 4   | `verifier_is_worker`   | status is `review` and the verifier is the assignee or the latest work run's agent (B8) |
-| 5   | `promotion_pending`    | the card holds a pending graph promotion                                                |
-| 6   | `cooldown`             | `cooldownUntil` is in the future                                                        |
-| 7   | `not_before`           | `notBefore` is in the future                                                            |
+| 4   | `promotion_pending`    | the card holds a pending graph promotion                                                |
+| 5   | `cooldown`             | `cooldownUntil` is in the future                                                        |
+| 6   | `not_before`           | `notBefore` is in the future                                                            |
+| 7   | `open_lease`           | an open (un-ended) run already holds the card                                           |
 | 8   | `no_assignee`          | no target agent id (assignee for work, verifier for verify)                             |
 | 9   | `agent_missing`        | the target agent row is gone                                                            |
 | 10  | `agent_paused`         | the target agent is paused                                                              |
 | 11  | `agent_unplaced`       | the target agent has no daemon placement                                                |
-| 12  | `daemon_offline`       | the target agent's daemon has no live connection                                        |
-| 13  | `open_lease`           | an open (un-ended) run already holds the card                                           |
-| 14  | `board_cap`            | the board's open runs have reached `maxInProgress`                                      |
-| 15  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                       |
+| 12  | `board_cap`            | the board's open runs have reached `maxInProgress`                                      |
+| 13  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                       |
+| 14  | `daemon_offline`       | the target agent's daemon has no live connection                                        |
+| 15  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or the latest work run's agent (B8) |
 
-The verifier gates (3–4) only fire once review routing lands; until then a `review`
-card reports `status_not_claimable`. `needs_attention` is **not** a gate: escalated
-cards are parked in `todo` (never `ready`/`review`), so the status gate already
-excludes them.
+`verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
+its cap and liveness checks; that is also where it flags the card for a human.
+`needs_attention` is **not** a gate: escalated cards are parked in `todo` (never
+`ready`/`review`), so the status gate already excludes them.
 
 ## SQL/predicate parity rule
 
@@ -95,3 +99,12 @@ For every card, `explainClaim` returns `eligible: true` if and only if
 plus eligible cards, reads both paths against real Postgres, and asserts agreement.
 When you change a claim gate in the SQL, change `explainClaim` in the same commit —
 and vice versa.
+
+## Changelog
+
+- **1.1 (2026-10-18):** review routing lands in the predicate: a `review` card is a `verify`
+  claim to `verifierAgentId` with the verifier's agent facts and `openRunCountForVerifier`, and
+  `verifier_unset`/`verifier_is_worker` now fire. Gates are reordered to the SQL claim's order:
+  `open_lease` joins the row filters before the agent gates, and `daemon_offline` follows
+  `agent_cap`, with `verifier_is_worker` last.
+- **1.0 (2026-10-17):** initial frozen contract.

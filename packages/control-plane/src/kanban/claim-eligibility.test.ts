@@ -181,3 +181,76 @@ describe('explainClaim — gates', () => {
     ).toEqual({ eligible: true, role: 'work', agentId: A1 })
   })
 })
+
+const A2 = 'a2222222-2222-4222-8222-222222222222'
+
+/** A review card on a board whose verifier is A2, with both agents live and nothing open. */
+function review(overrides: Partial<ClaimEligibilityInput> = {}, card: Partial<ClaimEligibilityInput['card']> = {}) {
+  const base = input()
+  return {
+    ...base,
+    board: { ...base.board, verifierAgentId: A2, maxInProgress: 10 },
+    card: { ...base.card, status: 'review' as const, ...card },
+    verifier: liveAgent(),
+    ...overrides
+  }
+}
+
+describe('explainClaim — review routing', () => {
+  it('vera-414: routes a review card to the verifier as a verify claim', () => {
+    expect(explainClaim(review())).toEqual({ eligible: true, role: 'verify', agentId: A2 })
+  })
+
+  it('vera-414: a ready card still routes to its assignee when the board has a verifier', () => {
+    expect(explainClaim(review({}, { status: 'ready' }))).toEqual({ eligible: true, role: 'work', agentId: A1 })
+  })
+
+  it.each<[string, ClaimGate, ReturnType<typeof review>]>([
+    ['the board has no verifier', 'verifier_unset', review({ board: { ...review().board, verifierAgentId: null } })],
+    ['the verifier is the assignee', 'verifier_is_worker', review({}, { assigneeAgentId: A2 })],
+    ['the verifier wrote the latest work run', 'verifier_is_worker', review({ latestWorkAgentId: A2 })],
+    ['the verifier row is gone', 'agent_missing', review({ verifier: null })],
+    ['the verifier is paused', 'agent_paused', review({ verifier: { ...liveAgent(), paused: true } })],
+    ['the verifier is unplaced', 'agent_unplaced', review({ verifier: { ...liveAgent(), daemonId: null } })],
+    ['the verifier daemon is offline', 'daemon_offline', review({ verifier: { ...liveAgent(), daemonLive: false } })],
+    ['the verifier is at its cap', 'agent_cap', review({ openRunCountForVerifier: 1 })]
+  ])('vera-414: blocks a review card when %s', (_why, gate, facts) => {
+    expect(explainClaim(facts)).toEqual({ eligible: false, gate })
+  })
+
+  it("vera-414: reads the verifier's facts and count, not the assignee's", () => {
+    const facts = review({ assignee: { ...liveAgent(), paused: true }, openRunCountForAssignee: 5 })
+    expect(explainClaim(facts)).toEqual({ eligible: true, role: 'verify', agentId: A2 })
+    expect(explainClaim({ ...facts, card: { ...facts.card, status: 'ready' } })).toEqual({
+      eligible: false,
+      gate: 'agent_paused'
+    })
+  })
+
+  it('vera-414: orders gates as the SQL claim does (row filters, then board room, agent share, liveness, B8)', () => {
+    // An open lease is a WHERE filter, so it wins over an agent gate the claim loop would only reach later.
+    expect(
+      explainClaim(
+        input({ assignee: { ...liveAgent(), daemonLive: false }, card: { ...input().card, hasOpenLease: true } })
+      )
+    ).toEqual({
+      eligible: false,
+      gate: 'open_lease'
+    })
+    // The loop checks the agent's share before daemon liveness, and liveness before B8.
+    expect(
+      explainClaim(input({ assignee: { ...liveAgent(), daemonLive: false }, openRunCountForAssignee: 1 }))
+    ).toEqual({
+      eligible: false,
+      gate: 'agent_cap'
+    })
+    expect(explainClaim(review({ verifier: { ...liveAgent(), daemonLive: false } }, { assigneeAgentId: A2 }))).toEqual({
+      eligible: false,
+      gate: 'daemon_offline'
+    })
+    expect(explainClaim(review({ openRunCount: 10 }, { assigneeAgentId: A2 }))).toEqual({
+      eligible: false,
+      gate: 'board_cap'
+    })
+  })
+})
