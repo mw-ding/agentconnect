@@ -1044,3 +1044,214 @@ describe('vera-r2: KanbanSync over Postgres', () => {
     expect(await f.read()).toMatchObject({ status: 'triage', needsAttention: true })
   })
 })
+
+describe('vera-r3: same-snapshot writer status over Postgres', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+
+  async function pgRunning(labels: string[], events: LabelEvent[]) {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await seedAgent(prisma, NEXT, { daemonId: DAEMON, name: 'new' })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'vera-r3', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: {
+        boardId: board.id,
+        issueId: 1n,
+        issueNumber: 1,
+        status: 'running',
+        assigneeAgentId: AGENT,
+        syncEventCursor: 10n,
+        syncAgentCursor: 10n
+      }
+    })
+    const run = await prisma.kanbanRun.create({
+      data: {
+        cardId: card.id,
+        attempt: 1,
+        agentId: AGENT,
+        daemonId: DAEMON,
+        dispatchRevision: card.dispatchRevision,
+        dispatchedAt: new Date(),
+        leaseId: crypto.randomUUID()
+      }
+    })
+    const state = { issue: { issueId: 1n, nodeId: 'I_1', number: 1, state: 'open', labels } as CardIssue, events }
+    const writes: LabelPlan[] = []
+    const revoked: unknown[] = []
+    const cards = new PgKanbanCardRepo(prisma)
+    const deps = {
+      repo: new PgKanbanSyncRepo(prisma),
+      cards,
+      store: {
+        readCard: async () => state.issue,
+        readLabelEvents: async () => [...state.events],
+        applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+          writes.push(plan)
+        }
+      },
+      permissions: {
+        permission: async (_r: unknown, login: string) => (login.toLowerCase() === 'bob' ? 'write' : 'triage') as never
+      },
+      appSlug: 'agentconnect',
+      repoRef: async () => ({ installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }),
+      revoke: async (lease: unknown) => {
+        revoked.push(lease)
+      },
+      promote: async () => {},
+      log: { warn: () => {} }
+    }
+    const read = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
+    const claim = () => new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    return { board, card, run, state, writes, revoked, deps, read, claim }
+  }
+
+  it.each(['blocked', 'triage', 'archived'] as const)(
+    'vera-r3: same-edit writer %s is adopted over Postgres and never claimable as ready (PG)',
+    async (status) => {
+      const f = await pgRunning(
+        ['ac/agent:new', `ac/status:${status}`],
+        [
+          { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+          { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+          { id: 21, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: bob },
+          { id: 22, event: 'labeled', label: { name: `ac/status:${status}` }, actor: bob }
+        ]
+      )
+      await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+      const row = await f.read()
+      expect(row.status).toBe(status)
+      expect(row.syncEventCursor).toBe(22n)
+      expect(row.assigneeAgentId).toBe(NEXT)
+      expect(await prisma.kanbanRun.count({ where: { cardId: f.card.id, endedAt: null } })).toBe(0)
+      expect(f.revoked).toHaveLength(1)
+      expect(f.writes.some((w) => w.addLabels.includes('ac/status:ready'))).toBe(false)
+      expect(f.writes.some((w) => w.removeLabels.includes(`ac/status:${status}`))).toBe(false)
+      expect(await f.claim()).toHaveLength(0)
+      expect((await f.read()).status).toBe(status)
+    }
+  )
+
+  it('vera-r3: same-snapshot non-writer blocked is refused over Postgres, never adopted (PG)', async () => {
+    const f = await pgRunning(
+      ['ac/agent:new', 'ac/status:blocked'],
+      [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:running' }, actor: bob },
+        { id: 20, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob },
+        { id: 21, event: 'unlabeled', label: { name: 'ac/status:running' }, actor: mallory },
+        { id: 22, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: mallory }
+      ]
+    )
+    await new KanbanSync(f.deps).onCardChanged(f.board.id, 1, true)
+    const row = await f.read()
+    expect(row.status).not.toBe('blocked')
+    expect(row.status).toBe('ready')
+    expect(row.syncEventCursor).toBe(22n)
+    expect(f.writes.at(-1)).toMatchObject({
+      removeLabels: expect.arrayContaining(['ac/status:blocked']),
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+    expect(await f.claim()).toHaveLength(1)
+  })
+
+  it('vera-r3: 1b re-run judges a swap made during the reassignment in the same reconcile (PG)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await seedAgent(prisma, NEXT, { daemonId: DAEMON, name: 'new' })
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'vera-r3-rerun', repoId: 42n, repoFullName: 'acme/web' }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: {
+        boardId: board.id,
+        issueId: 1n,
+        issueNumber: 1,
+        status: 'todo',
+        assigneeAgentId: AGENT,
+        syncEventCursor: 10n,
+        syncAgentCursor: 10n
+      }
+    })
+    const f = { board, card }
+    const state = {
+      issue: {
+        issueId: 1n,
+        nodeId: 'I_1',
+        number: 1,
+        state: 'open',
+        labels: ['ac/status:blocked', 'ac/agent:new']
+      } as CardIssue,
+      events: [
+        { id: 10, event: 'labeled', label: { name: 'ac/status:todo' }, actor: bob },
+        { id: 20, event: 'unlabeled', label: { name: 'ac/status:todo' }, actor: bob },
+        { id: 21, event: 'labeled', label: { name: 'ac/status:blocked' }, actor: bob },
+        { id: 22, event: 'labeled', label: { name: 'ac/agent:new' }, actor: bob }
+      ] as LabelEvent[]
+    }
+    const writes: LabelPlan[] = []
+    const cards = new PgKanbanCardRepo(prisma)
+    let readCards = 0
+    const baseDeps = {
+      repo: new PgKanbanSyncRepo(prisma),
+      cards,
+      store: {
+        readCard: async () => {
+          readCards += 1
+          return state.issue
+        },
+        readLabelEvents: async () => [...state.events],
+        applyPlan: async (_r: unknown, _n: unknown, _o: unknown, plan: LabelPlan) => {
+          writes.push(plan)
+        }
+      },
+      permissions: {
+        permission: async (_r: unknown, login: string) =>
+          (login.toLowerCase() === 'bob' ? ('write' as const) : ('triage' as const)) as never
+      },
+      appSlug: 'agentconnect',
+      repoRef: async () => ({ installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }),
+      revoke: async () => {},
+      promote: async () => {},
+      log: { warn: () => {} }
+    }
+    let swapped = false
+    const permissionCalls: string[] = []
+    const sync = new KanbanSync({
+      ...baseDeps,
+      permissions: {
+        permission: (async (_r: unknown, login: string) => {
+          permissionCalls.push(String(login).toLowerCase())
+          return (String(login).toLowerCase() === 'bob' ? 'write' : 'triage') as never
+        }) as never
+      },
+      cards: {
+        resolveAgentSlug: cards.resolveAgentSlug.bind(cards),
+        setAssignee: async (input) => {
+          const result = await cards.setAssignee(input)
+          if (!swapped) {
+            swapped = true
+            state.issue = { ...state.issue, labels: ['ac/status:ready', 'ac/agent:new'] }
+            state.events.push(
+              { id: 30, event: 'unlabeled', label: { name: 'ac/status:blocked' }, actor: mallory },
+              { id: 31, event: 'labeled', label: { name: 'ac/status:ready' }, actor: mallory }
+            )
+          }
+          return result
+        }
+      }
+    })
+    await sync.onCardChanged(f.board.id, 1, true)
+    expect(swapped).toBe(true)
+    expect(permissionCalls).toContain('mallory')
+    expect(readCards).toBeGreaterThan(1)
+    const row = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })
+    expect(row.status).not.toBe('ready')
+    expect(row.syncEventCursor).toBe(31n)
+    expect(writes.at(-1)).toMatchObject({
+      removeLabels: expect.arrayContaining(['ac/status:ready']),
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+  })
+})

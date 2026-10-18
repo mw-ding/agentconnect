@@ -986,3 +986,148 @@ describe('vera-r2: attribution holes', () => {
     expect(f.card()).toMatchObject({ status: 'triage', needsAttention: true })
   })
 })
+
+// Vera round 3 (vera-194-r3-review 🔴1): a revoking reassignment must not silently drop a writer's
+// status change made in the SAME snapshot. Each case failed on 24ebb8670 (card ended `ready`, cursor 22).
+describe('vera-r3: same-snapshot writer status survives a revoking reassignment', () => {
+  const bob = { type: 'User', login: 'bob', id: 1 }
+  const mallory = { type: 'User', login: 'mallory', id: 7 }
+  const perms: Record<string, RepoPermissionLevel> = { bob: 'write', mallory: 'triage' }
+  const permissions = vi.fn(async (_r: unknown, login: string) => perms[login.toLowerCase()] ?? 'none')
+  const lease = { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+  const lookedUp = (f: ReturnType<typeof fixture>, login: string) =>
+    vi.mocked(f.deps.permissions.permission).mock.calls.some(([, l]) => l === login)
+
+  it.each(['blocked', 'triage', 'archived'] as const)(
+    'vera-r3: same-edit writer %s is adopted with cursor 22, lease revoked once, no ready projection',
+    async (status) => {
+      const f = fixture({ status: 'running', syncEventCursor: 10n, syncAgentCursor: 10n, lease })
+      vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+      f.issue.labels = ['ac/agent:new', `ac/status:${status}`]
+      f.events.splice(
+        0,
+        f.events.length,
+        labelEvent(10, 'labeled', 'ac/status:running', bob),
+        labelEvent(20, 'labeled', 'ac/agent:new', bob),
+        labelEvent(21, 'unlabeled', 'ac/status:running', bob),
+        labelEvent(22, 'labeled', `ac/status:${status}`, bob)
+      )
+      vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+        const previousAgentId = f.card().assigneeAgentId
+        Object.assign(f.card(), {
+          status: 'ready',
+          assigneeAgentId: agentId,
+          lease: null,
+          stateRevision: 2n,
+          dispatchRevision: 2n
+        })
+        return {
+          ok: true as const,
+          changed: true,
+          card: { status: 'ready' } as never,
+          previousAgentId,
+          revokedLease: lease
+        }
+      })
+      await f.sync.onCardChanged('board', 1, true)
+      expect(f.card()).toMatchObject({ status, syncEventCursor: 22n, lease: null })
+      expect(f.card().status).not.toBe('ready')
+      expect(f.deps.revoke).toHaveBeenCalledOnce()
+      expect(f.deps.revoke).toHaveBeenCalledWith(expect.objectContaining({ leaseId: 'lease' }), 'card')
+      expect(f.deps.cards.setAssignee).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'next-agent' }))
+      for (const call of vi.mocked(f.deps.store.applyPlan).mock.calls) {
+        expect(call[3].addLabels).not.toContain('ac/status:ready')
+        expect(call[3].removeLabels).not.toContain(`ac/status:${status}`)
+      }
+      expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'bob', id: 1 })
+      expect(lookedUp(f, 'bob')).toBe(true)
+    }
+  )
+
+  it('vera-r3: same-snapshot non-writer blocked is refused, never adopted', async () => {
+    const f = fixture({ status: 'running', syncEventCursor: 10n, syncAgentCursor: 10n, lease })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/agent:new', 'ac/status:blocked']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:running', bob),
+      labelEvent(20, 'labeled', 'ac/agent:new', bob),
+      labelEvent(21, 'unlabeled', 'ac/status:running', mallory),
+      labelEvent(22, 'labeled', 'ac/status:blocked', mallory)
+    )
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const previousAgentId = f.card().assigneeAgentId
+      Object.assign(f.card(), {
+        status: 'ready',
+        assigneeAgentId: agentId,
+        lease: null,
+        stateRevision: 2n,
+        dispatchRevision: 2n
+      })
+      return {
+        ok: true as const,
+        changed: true,
+        card: { status: 'ready' } as never,
+        previousAgentId,
+        revokedLease: lease
+      }
+    })
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).not.toBe('blocked')
+    expect(f.card()).toMatchObject({ status: 'ready', syncEventCursor: 22n })
+    expect(f.deps.revoke).toHaveBeenCalledOnce()
+    expect(lookedUp(f, 'mallory')).toBe(true)
+    expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'mallory', id: 7 })
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      removeLabels: ['ac/status:blocked'],
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+  })
+})
+
+// Vera round 3 re-run pin (vera-194-r3-review 🟢): the swap made during setAssignee must be judged
+// inside the SAME onCardChanged call. Removing the post-reassignment re-run leaves it unjudged.
+describe('vera-r3: 1b re-run pin', () => {
+  const bob = { type: 'User', login: 'bob' }
+  const mallory = { type: 'User', login: 'mallory' }
+  const perms: Record<string, RepoPermissionLevel> = { bob: 'write', mallory: 'triage' }
+  const permissions = vi.fn(async (_r: unknown, login: string) => perms[login.toLowerCase()] ?? 'none')
+  const lookedUp = (f: ReturnType<typeof fixture>, login: string) =>
+    vi.mocked(f.deps.permissions.permission).mock.calls.some(([, l]) => l === login)
+
+  it('vera-r3: 1b re-run judges a status swap made during setAssignee in the same reconcile', async () => {
+    const f = fixture({ status: 'todo', syncEventCursor: 10n, syncAgentCursor: 10n })
+    vi.mocked(f.deps.permissions.permission).mockImplementation(permissions)
+    f.issue.labels = ['ac/status:blocked', 'ac/agent:new']
+    f.events.splice(
+      0,
+      f.events.length,
+      labelEvent(10, 'labeled', 'ac/status:todo', bob),
+      labelEvent(20, 'unlabeled', 'ac/status:todo', bob),
+      labelEvent(21, 'labeled', 'ac/status:blocked', bob),
+      labelEvent(22, 'labeled', 'ac/agent:new', bob)
+    )
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      const prev = f.card().assigneeAgentId
+      f.card().assigneeAgentId = agentId
+      f.card().dispatchRevision = f.card().dispatchRevision + 1n
+      f.issue.labels = ['ac/status:ready', 'ac/agent:new']
+      f.events.push(
+        labelEvent(30, 'unlabeled', 'ac/status:blocked', mallory),
+        labelEvent(31, 'labeled', 'ac/status:ready', mallory)
+      )
+      return { ok: true as const, changed: true, card: {} as never, previousAgentId: prev, revokedLease: null }
+    })
+    const readsBefore = vi.mocked(f.deps.store.readCard).mock.calls.length
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.card().status).not.toBe('ready')
+    expect(lookedUp(f, 'mallory')).toBe(true)
+    expect(f.card().syncEventCursor).toBe(31n)
+    expect(vi.mocked(f.deps.store.readCard).mock.calls.length).toBeGreaterThan(readsBefore + 1)
+    expect(vi.mocked(f.deps.store.applyPlan).mock.calls.at(-1)![3]).toMatchObject({
+      removeLabels: expect.arrayContaining(['ac/status:ready']),
+      comment: expect.stringContaining('only collaborators with write access')
+    })
+  })
+})

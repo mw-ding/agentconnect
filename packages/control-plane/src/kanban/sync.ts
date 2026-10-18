@@ -426,10 +426,16 @@ export class KanbanSync {
             })
           }
         }
-        // Re-run from a fresh read: a revoking reassignment already moved the card (running → ready), so the status
-        // edits it saw are consumed and only later ones are judged; nothing in this stale snapshot is acked.
+        // Re-run from a fresh read: a revoking reassignment already moved the card (running → ready). Only the
+        // stale running status it superseded is consumed: when the live issue already carries another status (a
+        // writer's same-snapshot blocked/triage/archived), that edit stays unjudged so the next round adopts it
+        // instead of acking it unseen; nothing in this stale snapshot is acked either way.
         if (result.changed || result.revokedLease) {
-          return { changed, rerun: result.revokedLease && cursor > round.consumed ? cursor : round.consumed }
+          const live = parseStatusLabels(issue.labels)
+          const liveStillRunning =
+            live.statuses.length === 1 && live.statuses[0] === 'running' && live.malformed.length === 0
+          const consume = result.revokedLease && cursor > round.consumed && liveStillRunning ? cursor : round.consumed
+          return { changed, rerun: consume }
         }
       }
     }
