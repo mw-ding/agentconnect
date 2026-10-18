@@ -2575,6 +2575,7 @@ model KanbanCard {
   issueId             BigInt // GitHub numeric issue id (what graph webhooks name)
   issueNodeId         String? // GraphQL node id, filled on first GitHub read
   projectItemId       String? // cached ProjectV2Item id on the board's project, so later Status writes skip the add
+  projectItemProjectId String? // the project projectItemId belongs to; an item cached for another project is never reused
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?

@@ -6,6 +6,9 @@ import { memberBearer, ownerBearer, startKanbanOidc, type KanbanOidc } from '../
 import type { KanbanRepoResolution, KanbanRepoResolver } from '../../src/kanban/repo-resolver.js'
 import { githubKanbanProjectVerifier, type KanbanProjectVerifier } from '../../src/kanban/project-guard.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import { kanbanProjectHook, KanbanProjectWriter, PROJECT_STATUS_OPTIONS } from '../../src/kanban/project-writer.js'
+import type { KanbanStatus } from '../../src/kanban/card-state.js'
+import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 
 const BOARDS = `/api/v1/orgs/${DEFAULT_ORG_ID}/kanban/boards`
 const PROJECT = 'PVT_kwDOAbc'
@@ -409,7 +412,139 @@ describe('kanban_board projection pair CHECK', () => {
     })
     const card = await prisma.kanbanCard.create({ data: { boardId: board.id, issueId: 2n, issueNumber: 2 } })
     expect(card.projectItemId).toBeNull()
-    await cards.setProjectItemId(card.id, 'PVTI_new')
-    await expect(cards.getCard(card.id)).resolves.toMatchObject({ projectItemId: 'PVTI_new' })
+    await cards.setProjectItemId(card.id, PROJECT, 'PVTI_new')
+    await expect(cards.getCard(card.id)).resolves.toMatchObject({
+      projectItemId: 'PVTI_new',
+      projectItemProjectId: PROJECT
+    })
+  })
+})
+
+describe('vera-474 B1: the item cache across a project re-point (PG)', () => {
+  const P1 = 'PVT_P1'
+  const P2 = 'PVT_P2'
+  const REPO = { installationId: 77n, repoId: 4242n, repoFullName: 'acme/web' }
+  const mint = async () => ({
+    token: 'ghs_p',
+    ttlSec: 3600,
+    expiresAt: '',
+    repoFullName: 'acme/web',
+    access: 'read' as const
+  })
+
+  // A tiny Projects v2 fake: an item belongs to one project; an update naming it elsewhere answers NOT_FOUND.
+  function fakeProjects() {
+    const itemProject = new Map<string, string>()
+    const byContent = new Map<string, string>()
+    let seq = 0
+    const calls: Array<{ query: string; variables: Record<string, string> }> = []
+    const reply = (body: unknown) =>
+      new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const call = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, string> }
+      calls.push(call)
+      const v = call.variables
+      if (call.query.includes('addProjectV2ItemById')) {
+        const key = `${v.project}:${v.content}`
+        let id = byContent.get(key)
+        if (!id) {
+          id = `PVTI_${v.project}_${++seq}`
+          byContent.set(key, id)
+          itemProject.set(id, v.project!)
+        }
+        return reply({ data: { addProjectV2ItemById: { item: { id } } } })
+      }
+      if (call.query.includes('updateProjectV2ItemFieldValue')) {
+        if (itemProject.get(v.item!) !== v.project) {
+          return reply({ data: { updateProjectV2ItemFieldValue: null }, errors: [{ type: 'NOT_FOUND', message: 'x' }] })
+        }
+        return reply({ data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: v.item } } } })
+      }
+      return reply({
+        data: {
+          project: { id: v.project, owner: { __typename: 'Organization', login: 'acme' } },
+          field: {
+            __typename: 'ProjectV2SingleSelectField',
+            id: v.field,
+            project: { id: v.project },
+            options: Object.values(PROJECT_STATUS_OPTIONS).map((name) => ({ id: `opt-${name}`, name }))
+          }
+        }
+      })
+    })
+    const removeItem = (id: string) => {
+      itemProject.delete(id)
+      for (const [key, item] of byContent) if (item === id) byContent.delete(key)
+    }
+    const of = (mutation: string, project?: string) =>
+      calls.filter((c) => c.query.includes(mutation) && (!project || c.variables.project === project))
+    return { fetchImpl, removeItem, of }
+  }
+
+  async function seed(project: string) {
+    const board = await prisma.kanbanBoard.create({
+      data: {
+        orgId: DEFAULT_ORG_ID,
+        name: 'web',
+        repoId: 4242n,
+        repoFullName: 'acme/web',
+        projectNodeId: project,
+        statusFieldId: `F_${project}`
+      }
+    })
+    const card = await prisma.kanbanCard.create({
+      data: { boardId: board.id, issueId: 11n, issueNumber: 11, issueNodeId: 'I_11', status: 'todo' }
+    })
+    const gh = fakeProjects()
+    const hook = kanbanProjectHook({
+      boards: new PgKanbanBoardRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      writer: new KanbanProjectWriter({ tokens: { mintKanbanProject: mint }, fetchImpl: gh.fetchImpl })
+    })
+    const transition = (status: KanbanStatus) =>
+      hook.projectAfterLabel({ boardId: board.id, orgId: DEFAULT_ORG_ID, cardId: card.id, repo: REPO, status })
+    const stored = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
+    return { board, card, gh, transition, stored }
+  }
+
+  it('vera-474: PATCH P1→P2 then three transitions add the card on P2 once and store the new id', async () => {
+    const s = await seed(P1)
+    await s.transition('ready')
+    expect((await s.stored()).projectItemId).toMatch(/^PVTI_PVT_P1_/)
+    const { app, close } = build()
+    const headers = await ownerBearer(prisma, oidc)
+    try {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `${BOARDS}/${s.board.id}`,
+        headers,
+        payload: { projectNodeId: P2, statusFieldId: `F_${P2}` }
+      })
+      expect(res.statusCode).toBe(200)
+    } finally {
+      await close()
+    }
+    for (const status of ['running', 'review', 'done'] as const) await s.transition(status)
+    expect(s.gh.of('addProjectV2ItemById', P2)).toHaveLength(1)
+    const after = await s.stored()
+    expect(after.projectItemId).toMatch(/^PVTI_PVT_P2_/)
+    expect(after).toMatchObject({ projectItemProjectId: P2 })
+    const writes = s.gh.of('updateProjectV2ItemFieldValue', P2)
+    expect(writes.map((c) => c.variables.item)).toEqual([after.projectItemId, after.projectItemId, after.projectItemId])
+  })
+
+  it('vera-474: an item removed from the project by hand is re-added once and the stored id overwritten', async () => {
+    const s = await seed(P1)
+    await s.transition('ready')
+    const first = (await s.stored()).projectItemId!
+    s.gh.removeItem(first)
+    await s.transition('running')
+    expect(s.gh.of('addProjectV2ItemById')).toHaveLength(2)
+    const second = (await s.stored()).projectItemId!
+    expect(second).not.toBe(first)
+    expect(second).toMatch(/^PVTI_PVT_P1_/)
+    await s.transition('done')
+    expect(s.gh.of('addProjectV2ItemById')).toHaveLength(2)
+    expect(s.gh.of('updateProjectV2ItemFieldValue').at(-1)!.variables.item).toBe(second)
   })
 })

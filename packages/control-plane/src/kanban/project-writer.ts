@@ -26,6 +26,7 @@ export type ProjectWriteReason =
   | 'project_not_org_owned'
   | 'project_option_missing'
   | 'project_item_add_failed'
+  | 'project_item_missing'
   | 'project_field_write_failed'
   | 'project_access_denied'
   | 'project_rate_limited'
@@ -60,6 +61,18 @@ const SET_STATUS_MUTATION = `mutation KanbanProjectSetStatus($project: ID!, $ite
   }
 }`
 
+/** The card's projection cache: an item id is only meaningful together with the project it was added to. */
+export interface ProjectCardCache {
+  issueNodeId?: string | null
+  projectItemId?: string | null
+  projectItemProjectId?: string | null
+}
+
+/** GitHub answers NOT_FOUND for an item id that no longer exists in the project; FORBIDDEN stays a denial. */
+function itemMissing(err: unknown): boolean {
+  return err instanceof GithubApiError && (err.graphqlErrorTypes?.includes('NOT_FOUND') ?? false)
+}
+
 export class KanbanProjectWriter {
   private readonly fields = new Map<string, FieldCacheEntry>()
 
@@ -72,7 +85,7 @@ export class KanbanProjectWriter {
   async project(args: {
     repo: KanbanRepoRef
     board: { projectNodeId: string | null; statusFieldId: string | null }
-    card: { issueNodeId?: string | null; projectItemId?: string | null }
+    card: ProjectCardCache
     status: KanbanStatus
   }): Promise<{ itemId: string } | null> {
     try {
@@ -87,7 +100,7 @@ export class KanbanProjectWriter {
   private async write(args: {
     repo: KanbanRepoRef
     board: { projectNodeId: string | null; statusFieldId: string | null }
-    card: { issueNodeId?: string | null; projectItemId?: string | null }
+    card: ProjectCardCache
     status: KanbanStatus
   }): Promise<{ itemId: string } | null> {
     const { projectNodeId, statusFieldId } = args.board
@@ -129,21 +142,52 @@ export class KanbanProjectWriter {
       this.deps.log?.info({ reason: 'project_option_missing' satisfies ProjectWriteReason }, 'kanban project write')
       return null
     }
-    let itemId = args.card.projectItemId ?? null
-    if (!itemId) {
-      try {
-        const added = await gql<{ addProjectV2ItemById: { item: { id: string } } }>(ADD_ITEM_MUTATION, {
+    const add = async () =>
+      (
+        await gql<{ addProjectV2ItemById: { item: { id: string } } }>(ADD_ITEM_MUTATION, {
           project: projectNodeId,
           content: issueNodeId
         })
-        itemId = added.addProjectV2ItemById.item.id
+      ).addProjectV2ItemById.item.id
+    const setStatus = (item: string) =>
+      gql(SET_STATUS_MUTATION, { project: projectNodeId, item, field: statusFieldId, option: option.id })
+    // Only an item cached for this very project is reused; a re-pointed board or a legacy row re-adds (idempotent).
+    const cached = args.card.projectItemProjectId === projectNodeId ? (args.card.projectItemId ?? null) : null
+    if (cached) {
+      try {
+        await setStatus(cached)
+        return { itemId: cached }
       } catch (err) {
-        this.deps.log?.info({ reason: this.reason(err, 'project_item_add_failed') }, 'kanban project write')
+        if (!itemMissing(err)) {
+          this.deps.log?.info({ reason: this.reason(err, 'project_field_write_failed') }, 'kanban project write')
+          return null
+        }
+      }
+      // Removed from the project by hand: re-add once and hand back the new id, logging exactly one line either way.
+      let step: 'project_item_add_failed' | 'project_field_write_failed' = 'project_item_add_failed'
+      try {
+        const itemId = await add()
+        step = 'project_field_write_failed'
+        await setStatus(itemId)
+        this.deps.log?.info({ reason: 'project_item_missing', recovered: true }, 'kanban project write')
+        return { itemId }
+      } catch (err) {
+        this.deps.log?.info(
+          { reason: 'project_item_missing', recovered: false, cause: this.reason(err, step) },
+          'kanban project write'
+        )
         return null
       }
     }
+    let itemId: string
     try {
-      await gql(SET_STATUS_MUTATION, { project: projectNodeId, item: itemId, field: statusFieldId, option: option.id })
+      itemId = await add()
+    } catch (err) {
+      this.deps.log?.info({ reason: this.reason(err, 'project_item_add_failed') }, 'kanban project write')
+      return null
+    }
+    try {
+      await setStatus(itemId)
     } catch (err) {
       this.deps.log?.info({ reason: this.reason(err, 'project_field_write_failed') }, 'kanban project write')
       return null
@@ -218,10 +262,17 @@ export function kanbanProjectHook(deps: {
         const result = await deps.writer.project({
           repo: args.repo,
           board: { projectNodeId: board.projectNodeId, statusFieldId: board.statusFieldId },
-          card: { issueNodeId: args.issueNodeId ?? card.issueNodeId, projectItemId: card.projectItemId },
+          card: {
+            issueNodeId: args.issueNodeId ?? card.issueNodeId,
+            projectItemId: card.projectItemId,
+            projectItemProjectId: card.projectItemProjectId
+          },
           status: args.status
         })
-        if (result && !card.projectItemId) await deps.cards.setProjectItemId(args.cardId, result.itemId)
+        // Overwrite on any change of id or project, so a re-added or re-pointed item replaces the stale cache.
+        const fresh =
+          result && (result.itemId !== card.projectItemId || card.projectItemProjectId !== board.projectNodeId)
+        if (fresh) await deps.cards.setProjectItemId(args.cardId, board.projectNodeId, result.itemId)
       } catch {
         // Best-effort projection: the writer already logged its own reason; a loader fault stays silent.
       }

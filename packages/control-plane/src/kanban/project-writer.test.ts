@@ -110,7 +110,9 @@ describe('KanbanProjectWriter', () => {
 
   it('reuses a cached item id and skips the add', async () => {
     const h = harness({ bodies: [fieldBody(), updateBody] })
-    const result = await h.project({ card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_cached' } })
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_cached', projectItemProjectId: PROJECT }
+    })
     expect(result).toEqual({ itemId: 'PVTI_cached' })
     expect(h.calls).toHaveLength(2)
     expect(h.calls.some((c) => c.query.includes('addProjectV2ItemById'))).toBe(false)
@@ -275,6 +277,7 @@ describe('kanbanProjectHook', () => {
     issueNumber: 11,
     issueNodeId: ISSUE_NODE,
     projectItemId: null as string | null,
+    projectItemProjectId: null as string | null,
     idempotencyKey: null,
     status: 'done' as const,
     assigneeAgentId: null,
@@ -321,17 +324,17 @@ describe('kanbanProjectHook', () => {
     expect(h.writer.project).toHaveBeenCalledWith({
       repo: REPO,
       board,
-      card: { issueNodeId: ISSUE_NODE, projectItemId: null },
+      card: { issueNodeId: ISSUE_NODE, projectItemId: null, projectItemProjectId: null },
       status: 'done'
     })
-    expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', 'PVTI_new')
+    expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_new')
   })
 
   it('falls back to the row issue node when the label write read none', async () => {
     const h = hookHarness()
     await h.hook.projectAfterLabel({ ...h.args, issueNodeId: null })
     expect(h.writer.project).toHaveBeenCalledWith(
-      expect.objectContaining({ card: { issueNodeId: ISSUE_NODE, projectItemId: null } })
+      expect.objectContaining({ card: { issueNodeId: ISSUE_NODE, projectItemId: null, projectItemProjectId: null } })
     )
   })
 
@@ -350,7 +353,10 @@ describe('kanbanProjectHook', () => {
   })
 
   it('does not re-store an item id the card already caches', async () => {
-    const h = hookHarness({ card: { ...card, projectItemId: 'PVTI_old' }, write: { itemId: 'PVTI_old' } })
+    const h = hookHarness({
+      card: { ...card, projectItemId: 'PVTI_old', projectItemProjectId: PROJECT },
+      write: { itemId: 'PVTI_old' }
+    })
     await h.hook.projectAfterLabel(h.args)
     expect(h.writer.project).toHaveBeenCalled()
     expect(h.cards.setProjectItemId).not.toHaveBeenCalled()
@@ -363,5 +369,149 @@ describe('kanbanProjectHook', () => {
     const broken = hookHarness()
     broken.boards.getForOrg.mockRejectedValueOnce(new Error('db down'))
     await expect(broken.hook.projectAfterLabel(broken.args)).resolves.toBeUndefined()
+  })
+})
+
+describe('vera-474 B1: a stale cached item never sticks', () => {
+  const notFound = {
+    data: { updateProjectV2ItemFieldValue: null },
+    errors: [{ type: 'NOT_FOUND', message: 'gone [SECRET]' }]
+  }
+  const forbidden = { data: { addProjectV2ItemById: null }, errors: [{ type: 'FORBIDDEN', message: 'no [SECRET]' }] }
+
+  // Answers per mutation in order, so a test scripts the update and add sequences independently.
+  function scripted(updates: unknown[], adds: unknown[]) {
+    const h = harness()
+    let u = 0
+    let a = 0
+    h.fetchImpl.mockImplementation(async (_url: string, init?: RequestInit) => {
+      const call = JSON.parse(String(init?.body)) as Call
+      h.calls.push(call)
+      const body = call.query.includes('updateProjectV2ItemFieldValue')
+        ? updates[u++]
+        : call.query.includes('addProjectV2ItemById')
+          ? adds[a++]
+          : fieldBody()
+      return new Response(JSON.stringify(body))
+    })
+    const count = (m: string) => h.calls.filter((c) => c.query.includes(m)).length
+    return { ...h, adds: () => count('addProjectV2ItemById'), updates: () => count('updateProjectV2ItemFieldValue') }
+  }
+
+  it('vera-474: an item cached for another project is ignored and the card is added to the board project', async () => {
+    const h = scripted([updateBody], [addBody('PVTI_P2')])
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_P1', projectItemProjectId: 'PVT_P1' }
+    })
+    expect(result).toEqual({ itemId: 'PVTI_P2' })
+    expect(h.adds()).toBe(1)
+    expect(h.calls.find((c) => c.query.includes('addProjectV2ItemById'))).toMatchObject({
+      variables: { project: PROJECT, content: ISSUE_NODE }
+    })
+    expect(h.calls.find((c) => c.query.includes('updateProjectV2ItemFieldValue'))).toMatchObject({
+      variables: { project: PROJECT, item: 'PVTI_P2' }
+    })
+  })
+
+  it('vera-474: a legacy cached item with no recorded project is re-added through the idempotent add', async () => {
+    const h = scripted([updateBody], [addBody('PVTI_same')])
+    expect(await h.project({ card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_same' } })).toEqual({
+      itemId: 'PVTI_same'
+    })
+    expect(h.adds()).toBe(1)
+  })
+
+  it('vera-474: an item deleted by hand (NOT_FOUND) is re-added once, written, and its new id returned', async () => {
+    const h = scripted([notFound, updateBody], [addBody('PVTI_new')])
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_gone', projectItemProjectId: PROJECT }
+    })
+    expect(result).toEqual({ itemId: 'PVTI_new' })
+    expect(h.adds()).toBe(1)
+    expect(h.updates()).toBe(2)
+    expect(h.calls.filter((c) => c.query.includes('updateProjectV2ItemFieldValue'))[1]).toMatchObject({
+      variables: { item: 'PVTI_new' }
+    })
+    expect(h.logs).toEqual([{ reason: 'project_item_missing', recovered: true }])
+    expect(JSON.stringify(h.logs)).not.toContain('SECRET')
+  })
+
+  it('vera-474: a re-add that also fails is swallowed with a single project_item_missing line', async () => {
+    const h = scripted([notFound], [forbidden])
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_gone', projectItemProjectId: PROJECT }
+    })
+    expect(result).toBeNull()
+    expect(h.adds()).toBe(1)
+    expect(h.updates()).toBe(1)
+    expect(h.logs).toEqual([{ reason: 'project_item_missing', recovered: false, cause: 'project_access_denied' }])
+    expect(JSON.stringify(h.logs)).not.toContain('SECRET')
+  })
+
+  it('vera-474: the re-add happens only once even when the re-added item also fails NOT_FOUND', async () => {
+    const h = scripted([notFound, notFound, notFound], [addBody('PVTI_new'), addBody('PVTI_newer')])
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_gone', projectItemProjectId: PROJECT }
+    })
+    expect(result).toBeNull()
+    expect(h.adds()).toBe(1)
+    expect(h.updates()).toBe(2)
+    expect(h.logs).toEqual([{ reason: 'project_item_missing', recovered: false, cause: 'project_access_denied' }])
+  })
+
+  it('vera-474: a FORBIDDEN write on a cached item is a denial, not a missing item, and never re-adds', async () => {
+    const denied = { data: { updateProjectV2ItemFieldValue: null }, errors: [{ type: 'FORBIDDEN', message: 'x' }] }
+    const h = scripted([denied], [addBody('PVTI_new')])
+    const result = await h.project({
+      card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_cached', projectItemProjectId: PROJECT }
+    })
+    expect(result).toBeNull()
+    expect(h.adds()).toBe(0)
+    expect(h.logs).toEqual([{ reason: 'project_access_denied' }])
+  })
+})
+
+describe('vera-474 B1: the hook keeps the item cache keyed by project', () => {
+  const row = {
+    id: 'card-1',
+    boardId: 'board-1',
+    issueNodeId: ISSUE_NODE,
+    projectItemId: 'PVTI_P1' as string | null,
+    projectItemProjectId: 'PVT_P1' as string | null,
+    status: 'done' as const
+  }
+  function hookWith(card: typeof row, itemId: string) {
+    const cards = { getCard: vi.fn(async () => card), setProjectItemId: vi.fn(async () => {}) }
+    const writer = { project: vi.fn(async () => ({ itemId })) }
+    const hook = kanbanProjectHook({
+      boards: { getForOrg: vi.fn(async () => ({ projectNodeId: PROJECT, statusFieldId: FIELD })) } as never,
+      cards: cards as never,
+      writer
+    })
+    const args = { boardId: 'board-1', orgId: 'org-1', cardId: 'card-1', repo: REPO, status: 'done' as const }
+    return { cards, writer, hook, args }
+  }
+
+  it('vera-474: a re-pointed board overwrites the stale item id and records the new project', async () => {
+    const h = hookWith(row, 'PVTI_P2')
+    await h.hook.projectAfterLabel(h.args)
+    expect(h.writer.project).toHaveBeenCalledWith(
+      expect.objectContaining({
+        card: { issueNodeId: ISSUE_NODE, projectItemId: 'PVTI_P1', projectItemProjectId: 'PVT_P1' }
+      })
+    )
+    expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_P2')
+  })
+
+  it('vera-474: a re-added item on the same project overwrites the cached id', async () => {
+    const h = hookWith({ ...row, projectItemId: 'PVTI_gone', projectItemProjectId: PROJECT }, 'PVTI_new')
+    await h.hook.projectAfterLabel(h.args)
+    expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_new')
+  })
+
+  it('vera-474: a legacy id with no recorded project gains its project even when the id is unchanged', async () => {
+    const h = hookWith({ ...row, projectItemId: 'PVTI_same', projectItemProjectId: null }, 'PVTI_same')
+    await h.hook.projectAfterLabel(h.args)
+    expect(h.cards.setProjectItemId).toHaveBeenCalledWith('card-1', PROJECT, 'PVTI_same')
   })
 })
