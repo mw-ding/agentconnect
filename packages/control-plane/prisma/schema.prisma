@@ -2710,6 +2710,8 @@ model KanbanNotification {
   attempts      Int              @default(0)
   nextAttemptAt DateTime?        @db.Timestamptz(6)
   lastError     String?
+  claimedUntil  DateTime?        @db.Timestamptz(6) // a drain's lease: no other CP replica claims the row until it lapses
+  claims        Int              @default(0) // bumped by every claim; settling a row requires the claim that took it
 
   board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   card  KanbanCard  @relation(fields: [cardId], references: [id], onDelete: Cascade)

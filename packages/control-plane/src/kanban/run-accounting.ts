@@ -90,14 +90,14 @@ export function planRunEnd(
   switch (end.outcome) {
     case 'completed': {
       if (!isVerify) {
-        // A verifier or a PR contract gates done; otherwise completion closes the card. A fresh worker pass clears any verify stamp.
+        // A verifier or a PR contract gates done. A worker pass clears the verify stamp but keeps the round count bounded.
         const gated = board.verifierAgentId !== null || board.completionContract !== 'close'
         return {
           ...card,
           ...settled,
           blockRecurrence: 0,
           verifiedAt: null,
-          reviewRounds: 0,
+          reviewRounds: gated ? card.reviewRounds : 0,
           status: gated ? 'review' : 'done',
           countsAsFailure: false
         }
@@ -114,7 +114,7 @@ export function planRunEnd(
           countsAsFailure: false
         }
       }
-      return { ...card, ...settled, status: 'review', verifiedAt: now, countsAsFailure: false }
+      return { ...card, ...settled, status: 'review', verifiedAt: now, reviewRounds: 0, countsAsFailure: false }
     }
     case 'review_requested':
       // Worker-only (a verifier's request-review is refused on the daemon). A fresh review clears the verify stamp.

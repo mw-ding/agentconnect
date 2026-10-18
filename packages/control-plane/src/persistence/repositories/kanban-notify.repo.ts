@@ -1,8 +1,14 @@
-// Kanban notification outbox (issue #2 M4): insert replay-safe rows, drain pending ones to the anchor channel, and mark them.
+// Kanban notification outbox (issue #2 M4): insert replay-safe rows, claim due ones under a lease, and settle them under that claim.
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { PrismaLike } from '../prisma.js'
-import type { KanbanNotificationInsert, KanbanNotificationRow, KanbanNotifyRepo, KanbanNotifyTarget } from '../ports.js'
+import type {
+  KanbanNotificationClaim,
+  KanbanNotificationInsert,
+  KanbanNotificationRow,
+  KanbanNotifyRepo,
+  KanbanNotifyTarget
+} from '../ports.js'
 
 /** Shared raw insert: the (cardId, stateRevision) unique key makes a replay a no-op, never a duplicate. */
 export async function insertKanbanNotification(db: PrismaLike, row: KanbanNotificationInsert): Promise<void> {
@@ -24,37 +30,65 @@ export class PgKanbanNotifyRepo implements KanbanNotifyRepo {
     return insertKanbanNotification(this.db, row)
   }
 
-  async pending(limit: number, now: Date): Promise<KanbanNotificationRow[]> {
+  async claim(
+    limit: number,
+    now: Date,
+    leaseUntil: Date,
+    exclude: readonly string[] = []
+  ): Promise<KanbanNotificationRow[]> {
+    // One statement: SKIP LOCKED keeps a concurrent drain off rows being claimed, and the lease keeps it off them after.
     return this.db.$queryRaw<KanbanNotificationRow[]>(Prisma.sql`
-      SELECT "id", "boardId", "cardId", "issueNumber", "stateRevision",
-             "fromStatus" AS "from", "toStatus" AS "to", "blockKind", "reasonCode", "tripped", "mention",
-             "createdAt", "attempts"
-      FROM "kanban_notification"
-      WHERE "sentAt" IS NULL AND "abandonedAt" IS NULL AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= ${now})
-      ORDER BY "createdAt" ASC, "id" ASC
-      LIMIT ${limit}
+      UPDATE "kanban_notification" n
+      SET "claimedUntil" = ${leaseUntil}, "claims" = n."claims" + 1
+      WHERE n."id" IN (
+        SELECT "id" FROM "kanban_notification"
+        WHERE "sentAt" IS NULL AND "abandonedAt" IS NULL
+          AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= ${now})
+          AND ("claimedUntil" IS NULL OR "claimedUntil" <= ${now})
+          AND NOT ("id" = ANY(${[...exclude]}::uuid[]))
+        ORDER BY "createdAt" ASC, "id" ASC
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING n."id", n."boardId", n."cardId", n."issueNumber", n."stateRevision",
+                n."fromStatus" AS "from", n."toStatus" AS "to", n."blockKind", n."reasonCode", n."tripped", n."mention",
+                n."createdAt", n."attempts", n."claims"
     `)
   }
 
-  async markSent(id: string): Promise<void> {
+  async release(row: KanbanNotificationClaim): Promise<void> {
     await this.db.$executeRaw(Prisma.sql`
-      UPDATE "kanban_notification" SET "sentAt" = now(), "attempts" = "attempts" + 1, "lastError" = NULL
-      WHERE "id" = ${id}::uuid
+      UPDATE "kanban_notification" SET "claimedUntil" = NULL
+      WHERE "id" = ${row.id}::uuid AND "claims" = ${row.claims} AND "sentAt" IS NULL
     `)
   }
 
-  async markFailed(id: string, nextAttemptAt: Date, attempts: number, lastError: string): Promise<void> {
+  async markSent(row: KanbanNotificationClaim): Promise<void> {
     await this.db.$executeRaw(Prisma.sql`
       UPDATE "kanban_notification"
-      SET "attempts" = ${attempts}, "nextAttemptAt" = ${nextAttemptAt}, "lastError" = ${lastError}
-      WHERE "id" = ${id}::uuid
+      SET "sentAt" = now(), "attempts" = "attempts" + 1, "lastError" = NULL, "claimedUntil" = NULL
+      WHERE "id" = ${row.id}::uuid AND "claims" = ${row.claims} AND "sentAt" IS NULL
     `)
   }
 
-  async giveUp(id: string, lastError: string): Promise<void> {
+  async markFailed(
+    row: KanbanNotificationClaim,
+    nextAttemptAt: Date,
+    attempts: number,
+    lastError: string
+  ): Promise<void> {
     await this.db.$executeRaw(Prisma.sql`
-      UPDATE "kanban_notification" SET "lastError" = ${lastError}, "nextAttemptAt" = NULL, "abandonedAt" = now()
-      WHERE "id" = ${id}::uuid
+      UPDATE "kanban_notification"
+      SET "attempts" = ${attempts}, "nextAttemptAt" = ${nextAttemptAt}, "lastError" = ${lastError}, "claimedUntil" = NULL
+      WHERE "id" = ${row.id}::uuid AND "claims" = ${row.claims} AND "sentAt" IS NULL
+    `)
+  }
+
+  async giveUp(row: KanbanNotificationClaim, lastError: string): Promise<void> {
+    await this.db.$executeRaw(Prisma.sql`
+      UPDATE "kanban_notification"
+      SET "lastError" = ${lastError}, "nextAttemptAt" = NULL, "abandonedAt" = now(), "claimedUntil" = NULL
+      WHERE "id" = ${row.id}::uuid AND "claims" = ${row.claims} AND "sentAt" IS NULL
     `)
   }
 

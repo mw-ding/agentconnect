@@ -20,10 +20,13 @@ export type ClaimGate =
   | 'open_lease'
   | 'board_cap'
   | 'agent_cap'
-  // Verifier gates (review routing, added in the verifier milestone): a review card needs a configured
-  // verifier, and that verifier must not be the worker (B8 self-approval guard).
+  // Review routing: a review card needs a configured verifier that is not its worker (B8 self-approval guard).
   | 'verifier_unset'
   | 'verifier_is_worker'
+  // The verifier approved but a PR completion contract still gates done: re-verifying would loop forever.
+  | 'verified'
+  // Held for a human (B8 or an escalation); only a human status move clears the flag.
+  | 'needs_attention'
 
 /** The verdict: claimable (with the target role and agent), or the first gate in precedence order that blocks it. */
 export type ClaimVerdict = { eligible: true; role: ClaimRole; agentId: string } | { eligible: false; gate: ClaimGate }
@@ -54,6 +57,10 @@ export interface ClaimEligibilityInput {
     promotionPending: boolean
     cooldownUntil: Date | null
     notBefore: Date | null
+    /** When the verifier approved a review card under a PR contract; set ⇒ the card is not re-verified. */
+    verifiedAt: Date | null
+    /** Flagged for a human; set ⇒ the card waits for a human status move, whatever else changes. */
+    needsAttention: boolean
     /** An open (un-ended) run already holds this card. */
     hasOpenLease: boolean
   }
@@ -61,8 +68,8 @@ export interface ClaimEligibilityInput {
   assignee: ClaimAgentFacts | null
   /** Facts about the verifier (the verify target); null when the board has no verifier or the verifier row is gone. */
   verifier: ClaimAgentFacts | null
-  /** The agent id of the card's latest completed work run, for the B8 self-approval guard. */
-  latestWorkAgentId: string | null
+  /** The agents of every work run on the card (any attempt, any outcome), for the B8 self-approval guard. */
+  workAgentIds: readonly string[]
   /** Open runs on the board: the board-wide total and the target agent's own count. */
   openRunCount: number
   openRunCountForAssignee: number
@@ -70,22 +77,17 @@ export interface ClaimEligibilityInput {
   now: Date
 }
 
-/**
- * The single card-level claim verdict, mirroring `PgKanbanDispatchRepo.claim` gate for gate.
- *
- * Precedence (documented in docs/designs/kanban-lane3-api.md): a card is checked in this order, and the
- * first blocking gate wins. `board_cap` and `agent_cap` are evaluated last because the SQL claim only
- * reaches them once the board's room and the candidate's own eligibility are established.
- */
+/** The card-level claim verdict, mirroring `PgKanbanDispatchRepo.claim` gate for gate and in its order (kanban-lane3-api.md). */
 export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   const { board, card, now } = input
 
+  // The claim's row filters, in its WHERE/JOIN order.
   if (!board.enabled) return { eligible: false, gate: 'board_disabled' }
-
-  if (card.status !== 'ready') return { eligible: false, gate: 'status_not_claimable' }
-  const role: ClaimRole = 'work'
-  const agentId = card.assigneeAgentId
-
+  if (card.status !== 'ready' && card.status !== 'review') return { eligible: false, gate: 'status_not_claimable' }
+  const role: ClaimRole = card.status === 'review' ? 'verify' : 'work'
+  if (role === 'verify' && board.verifierAgentId === null) return { eligible: false, gate: 'verifier_unset' }
+  if (role === 'verify' && card.verifiedAt !== null) return { eligible: false, gate: 'verified' }
+  if (card.needsAttention) return { eligible: false, gate: 'needs_attention' }
   if (card.promotionPending) return { eligible: false, gate: 'promotion_pending' }
   if (card.cooldownUntil !== null && card.cooldownUntil.getTime() > now.getTime()) {
     return { eligible: false, gate: 'cooldown' }
@@ -93,17 +95,24 @@ export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   if (card.notBefore !== null && card.notBefore.getTime() > now.getTime()) {
     return { eligible: false, gate: 'not_before' }
   }
+  if (card.hasOpenLease) return { eligible: false, gate: 'open_lease' }
 
+  // A review card is claimed to the board's verifier, a ready card to its assignee; every agent gate reads that target.
+  const agentId = role === 'verify' ? board.verifierAgentId : card.assigneeAgentId
   if (agentId === null) return { eligible: false, gate: 'no_assignee' }
-  const facts = input.assignee
-  if (!facts) return { eligible: false, gate: 'agent_missing' }
+  const facts = role === 'verify' ? input.verifier : input.assignee
+  if (!facts?.exists) return { eligible: false, gate: 'agent_missing' }
   if (facts.paused) return { eligible: false, gate: 'agent_paused' }
   if (facts.daemonId === null) return { eligible: false, gate: 'agent_unplaced' }
-  if (!facts.daemonLive) return { eligible: false, gate: 'daemon_offline' }
 
-  if (card.hasOpenLease) return { eligible: false, gate: 'open_lease' }
+  // Then the claim loop's checks, in its order: the board's room, the target's own share, daemon liveness, B8.
   if (input.openRunCount >= board.maxInProgress) return { eligible: false, gate: 'board_cap' }
-  if (input.openRunCountForAssignee >= board.maxInProgressPerAgent) return { eligible: false, gate: 'agent_cap' }
+  const own = role === 'verify' ? input.openRunCountForVerifier : input.openRunCountForAssignee
+  if (own >= board.maxInProgressPerAgent) return { eligible: false, gate: 'agent_cap' }
+  if (!facts.daemonLive) return { eligible: false, gate: 'daemon_offline' }
+  if (role === 'verify' && (agentId === card.assigneeAgentId || input.workAgentIds.includes(agentId))) {
+    return { eligible: false, gate: 'verifier_is_worker' }
+  }
 
   return { eligible: true, role, agentId }
 }

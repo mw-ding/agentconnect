@@ -13,7 +13,6 @@ import { systemClock } from '../../src/domain/clock.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
-import { enqueueTransition } from '../../src/kanban/notifier.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -421,10 +420,7 @@ describe.skipIf(!enabled)('kanban M4 verifier + notifier e2e (live GitHub)', () 
       },
       isDaemonLive: (id) => id === daemonId,
       clock: systemClock,
-      notify: {
-        enqueue: (transition, revision) => enqueueTransition(notifyRepo, transition, revision),
-        drain: () => notifier!.drain()
-      },
+      notify: { drain: () => notifier!.drain() },
       log: { debug: () => {}, info: () => {}, warn: (_o: unknown, m?: string) => phase(`WARN ${m ?? ''}`) }
     })
     ;(worker as any).deps.cp = () => ({

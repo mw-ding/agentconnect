@@ -19,16 +19,41 @@ const REPO_ID = 987654321n
 const NOW = new Date('2026-10-15T12:00:00.000Z')
 const LIVE = new Set([D1])
 
-async function board(maxInProgress = 100, maxPerAgent = 100, enabled = true) {
+async function board(maxInProgress = 100, maxPerAgent = 100, enabled = true, verifierAgentId: string | null = null) {
   return prisma.kanbanBoard.create({
     data: {
       orgId: DEFAULT_ORG_ID,
       name: 'parity',
-      repoId: REPO_ID,
+      // One board per repository per org, so each extra board takes the next repo id.
+      repoId: REPO_ID + BigInt(await prisma.kanbanBoard.count()),
       repoFullName: 'acme/web',
       maxInProgress,
       maxInProgressPerAgent: maxPerAgent,
-      enabled
+      enabled,
+      verifierAgentId
+    }
+  })
+}
+
+/** A run on a card: an ended work run by default, or an open one when `open` is set. */
+async function run(
+  cardId: string,
+  attempt: number,
+  agentId: string,
+  opts: { open?: boolean; role?: 'work' | 'verify' } = {}
+) {
+  return prisma.kanbanRun.create({
+    data: {
+      cardId,
+      attempt,
+      agentId,
+      daemonId: D1,
+      role: opts.role ?? 'work',
+      leaseId: randomUUID(),
+      dispatchRevision: BigInt(attempt),
+      dispatchedAt: NOW,
+      endedAt: opts.open ? null : NOW,
+      mode: 'read'
     }
   })
 }
@@ -96,19 +121,136 @@ async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibili
       promotionPending: c.promotionPending,
       cooldownUntil: c.cooldownUntil,
       notBefore: c.notBefore,
+      verifiedAt: c.verifiedAt,
+      needsAttention: c.needsAttention,
       hasOpenLease: (await prisma.kanbanRun.count({ where: { cardId, endedAt: null } })) > 0
     },
     assignee: await agentFor(c.assigneeAgentId),
-    verifier: null,
-    latestWorkAgentId: null,
+    verifier: await agentFor(b.verifierAgentId),
+    workAgentIds: (
+      await prisma.kanbanRun.findMany({ where: { cardId, role: 'work' }, orderBy: { attempt: 'asc' } })
+    ).map((r) => r.agentId),
     openRunCount: open.length,
     openRunCountForAssignee: open.filter((r) => r.agentId === c.assigneeAgentId).length,
-    openRunCountForVerifier: 0,
+    openRunCountForVerifier: open.filter((r) => r.agentId === b.verifierAgentId).length,
     now: NOW
   }
 }
 
+/** Snapshot every card's facts, run one claim, and assert the predicate's verdict (and gate) matches what SQL did. */
+async function expectParity(boardId: string, cards: Record<string, { id: string }>, expected: Record<string, string>) {
+  const repo = new PgKanbanDispatchRepo(prisma)
+  const snapshots = new Map<string, ClaimEligibilityInput>()
+  for (const c of Object.values(cards)) snapshots.set(c.id, await factsFor(boardId, c.id))
+  const claimed = await repo.claim(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id) })
+  const leases = new Map(claimed.leases.map((l) => [l.cardId, l]))
+  for (const [name, c] of Object.entries(cards)) {
+    const verdict = explainClaim(snapshots.get(c.id)!)
+    const lease = leases.get(c.id)
+    expect(
+      verdict.eligible === (lease !== undefined),
+      `card ${name}: explainClaim said ${verdict.eligible ? 'eligible' : `gate ${verdict.gate}`} but SQL ${lease ? 'claimed' : 'skipped'} it`
+    ).toBe(true)
+    if (verdict.eligible) expect(verdict, name).toEqual({ eligible: true, role: lease!.role, agentId: lease!.agentId })
+    expect(verdict.eligible ? 'eligible' : verdict.gate, name).toBe(expected[name])
+  }
+  return claimed
+}
+
 describe('claim eligibility parity (real Postgres)', () => {
+  it('vera-414: agrees with the SQL claim on review cards routed to the verifier', async () => {
+    await seedDaemon(prisma, D1, { sessionEpoch: 1n })
+    await seedDaemon(prisma, D2, { sessionEpoch: 1n })
+    await seedAgent(prisma, A1, { daemonId: D1 })
+    await seedAgent(prisma, A2, { daemonId: D1 })
+    await seedAgent(prisma, A3, { daemonId: D1 })
+    await prisma.agent.update({ where: { id: A3 }, data: { status: 'paused' } })
+    await seedAgent(prisma, A4, { daemonId: D2 })
+
+    const unset = await board(100, 100, true, null)
+    await expectParity(
+      unset.id,
+      { verifier_unset: await card(unset.id, 1, { status: 'review' }) },
+      {
+        verifier_unset: 'verifier_unset'
+      }
+    )
+
+    const live = await board(100, 100, true, A2)
+    const pastWorker = await card(live.id, 3, { status: 'review' })
+    await run(pastWorker.id, 1, A2)
+    // The verifier wrote attempt 1 and someone else the latest attempt: B8 still refuses it.
+    const earlierWorker = await card(live.id, 5, { status: 'review' })
+    await run(earlierWorker.id, 1, A2)
+    await run(earlierWorker.id, 2, A1)
+    const claimed = await expectParity(
+      live.id,
+      {
+        verify: await card(live.id, 1, { status: 'review' }),
+        work: await card(live.id, 2),
+        latest_worker: pastWorker,
+        earlier_worker: earlierWorker,
+        parked_review: await card(live.id, 6, {
+          status: 'review',
+          needsAttention: true,
+          attentionReason: 'verifier_is_worker'
+        }),
+        parked_ready: await card(live.id, 7, { needsAttention: true, attentionReason: 'unresolved' }),
+        verified: await card(live.id, 4, { status: 'review', verifiedAt: NOW })
+      },
+      {
+        verify: 'eligible',
+        work: 'eligible',
+        latest_worker: 'verifier_is_worker',
+        earlier_worker: 'verifier_is_worker',
+        parked_review: 'needs_attention',
+        parked_ready: 'needs_attention',
+        verified: 'verified'
+      }
+    )
+    expect(claimed.flaggedSelfVerify.map((f) => f.cardId).sort()).toEqual([pastWorker.id, earlierWorker.id].sort())
+
+    const self = await board(100, 100, true, A1)
+    await expectParity(
+      self.id,
+      { assignee: await card(self.id, 1, { status: 'review' }) },
+      {
+        assignee: 'verifier_is_worker'
+      }
+    )
+
+    const paused = await board(100, 100, true, A3)
+    await expectParity(
+      paused.id,
+      { paused: await card(paused.id, 1, { status: 'review' }) },
+      {
+        paused: 'agent_paused'
+      }
+    )
+
+    const offline = await board(100, 100, true, A4)
+    await expectParity(
+      offline.id,
+      { offline: await card(offline.id, 1, { status: 'review' }) },
+      {
+        offline: 'daemon_offline'
+      }
+    )
+
+    // The verifier already holds its one share on this board, so a second review card waits.
+    const capped = await board(100, 1, true, A2)
+    const held = await card(capped.id, 1, { status: 'review' })
+    await run(held.id, 1, A2, { open: true, role: 'verify' })
+    await expectParity(
+      capped.id,
+      { held, at_cap: await card(capped.id, 2, { status: 'review' }) },
+      {
+        held: 'open_lease',
+        at_cap: 'agent_cap'
+      }
+    )
+  })
+
   it('agrees with the SQL claim for one card per gate plus eligible cards', async () => {
     await seedDaemon(prisma, D1, { sessionEpoch: 1n })
     await seedDaemon(prisma, D2, { sessionEpoch: 1n })

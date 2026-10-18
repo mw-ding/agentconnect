@@ -308,3 +308,30 @@ describe('planRunEnd — verify role and review cards', () => {
     expect(planRunEnd(review, board, { outcome: 'completed' }, NOW)).toEqual({ ...review, countsAsFailure: false })
   })
 })
+
+describe('planRunEnd — the review loop stays bounded', () => {
+  const verify = { trailingProviderTransients: 0, role: 'verify' as const }
+  const gated = { ...board, verifierAgentId: 'a2222222-2222-4222-8222-222222222222' }
+
+  it('vera-414: a worker completing keeps the review round count, so a changes loop still trips the limit', () => {
+    const plan = planRunEnd({ ...running, reviewRounds: 2, verifiedAt: NOW }, gated, { outcome: 'completed' }, NOW)
+    expect(plan).toMatchObject({ status: 'review', reviewRounds: 2, verifiedAt: null })
+    const next = planRunEnd(plan, gated, { outcome: 'changes_requested' }, NOW, verify)
+    expect(next).toMatchObject({ status: 'triage', tripped: 'review_round_limit' })
+  })
+
+  it('vera-414: every path back to review clears the approval stamp', () => {
+    const stamped = { ...running, verifiedAt: NOW }
+    for (const outcome of ['completed', 'review_requested'] as const)
+      expect(planRunEnd(stamped, gated, { outcome }, NOW)).toMatchObject({ status: 'review', verifiedAt: null })
+    expect(
+      planRunEnd({ ...review, verifiedAt: NOW }, gated, { outcome: 'changes_requested' }, NOW, verify)
+    ).toMatchObject({ status: 'ready', verifiedAt: null })
+  })
+
+  it('vera-414: an approval under a PR contract ends the rounds as the close contract does', () => {
+    const prBoard = { ...gated, completionContract: 'pr_merged' as const }
+    const plan = planRunEnd({ ...review, reviewRounds: 2 }, prBoard, { outcome: 'completed' }, NOW, verify)
+    expect(plan).toMatchObject({ status: 'review', verifiedAt: NOW, reviewRounds: 0 })
+  })
+})
