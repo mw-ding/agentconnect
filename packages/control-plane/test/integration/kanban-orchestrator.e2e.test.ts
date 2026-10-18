@@ -639,23 +639,55 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
         step: 'partial-retry',
         blockedBy: [aIssue]
       }
-      const apply = vi
-        .spyOn(GithubCardStore.prototype, 'applyPlan')
-        .mockRejectedValueOnce(new Error('injected label failure'))
+      // o8b left the toolset in lost-journal recovery; a restart reloads the journal its retry rewrote.
+      ;(daemon as any).kanbanOrchestratorToolset = undefined
+      const cp = (daemon as any).cpClient
+      const ops = vi.spyOn(cp, 'kanbanOrchestrate')
+      // Fail only commit_create's label write for the new issue, never a reconciler's write on another card.
+      const original = GithubCardStore.prototype.applyPlan
+      const known = new Set(issues)
+      const createWrites: number[] = []
+      const apply = vi.spyOn(GithubCardStore.prototype, 'applyPlan').mockImplementation(async function (
+        this: GithubCardStore,
+        repo,
+        issueNumber,
+        observed,
+        plan,
+        onAdded
+      ) {
+        const createWrite =
+          plan.outcome === 'accepted' &&
+          plan.addLabels.includes('ac/status:todo') &&
+          plan.removeLabels.length === 0 &&
+          !known.has(issueNumber)
+        if (createWrite) {
+          createWrites.push(issueNumber)
+          if (createWrites.length === 1) throw new Error('injected label failure')
+        }
+        return original.call(this, repo, issueNumber, observed, plan, onAdded)
+      })
       let number = 0
       try {
         const partial = await orch('kanbanCreate', req)
         number = partial.issueNumber as number
         if (number) issues.push(number)
         expect(partial).toMatchObject({ created: true, partial: true, retryable: true })
+        expect(createWrites).toEqual([number])
         expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
         expect(await labelNames(number)).not.toContain('ac/status:todo')
         expect(await blockedByNumbers(number)).not.toContain(aIssue)
+        ops.mockClear()
         expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
-        expect(apply).toHaveBeenCalledTimes(2)
+        // The retry replays commit_create on the journaled issue instead of stopping at prepare's existing verdict.
+        const createOps = ops.mock.calls.filter(([p]: any[]) => p.op !== 'list')
+        expect(createOps.map(([p]: any[]) => [p.op, p.issueNumber])).toEqual([
+          ['prepare_create', undefined],
+          ['commit_create', number]
+        ])
+        expect(createWrites).toEqual([number, number])
         await waitFor(async () => {
           expect(await labelNames(number)).toContain('ac/status:todo')
-          expect(await blockedByNumbers(number)).toContain(aIssue)
+          expect(await blockedByNumbers(number)).toEqual([aIssue])
           const listed = await gh<Issue[]>(
             'GET',
             `/repos/${FULL}/issues?state=all&sort=created&direction=desc&per_page=100`
@@ -666,6 +698,7 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
         return [number]
       } finally {
         apply.mockRestore()
+        ops.mockRestore()
       }
     })
 
