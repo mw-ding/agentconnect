@@ -32,6 +32,7 @@ export const NAV_GROUPS: NavItem[][] = [
     // The judgement a channel consults, so it sits with the work rather than with Infra.
     { href: '/decisions', label: 'Decisions', icon: 'split' },
     { href: '/crons', label: 'Schedules', icon: 'calendar-clock' },
+    { href: '/kanban', label: 'Kanban', icon: 'square-kanban' },
     { href: '/tools', label: 'Tools & Skills', icon: 'blocks' },
     { href: '/integrations', label: 'Integrations', icon: 'plug' },
     { href: '/knowledge', label: 'Knowledge', icon: 'book-open' }
@@ -53,6 +54,7 @@ export const SECTIONS: { prefix: string; label: string }[] = [
   { prefix: '/conversations', label: 'Sessions' },
   { prefix: '/decisions', label: 'Decisions' },
   { prefix: '/crons', label: 'Schedules' },
+  { prefix: '/kanban', label: 'Kanban' },
   { prefix: '/tools', label: 'Tools & Skills' },
   { prefix: '/integrations', label: 'Integrations' },
   { prefix: '/knowledge', label: 'Knowledge' },
@@ -74,6 +76,7 @@ export type ShellNavKey =
   | 'sessions'
   | 'decisions'
   | 'schedules'
+  | 'kanban'
   | 'tools'
   | 'integrations'
   | 'knowledge'
@@ -92,6 +95,7 @@ export const NAV_LABEL_KEYS: Readonly<Record<string, ShellNavKey>> = {
   '/conversations': 'sessions',
   '/decisions': 'decisions',
   '/crons': 'schedules',
+  '/kanban': 'kanban',
   '/tools': 'tools',
   '/integrations': 'integrations',
   '/knowledge': 'knowledge',
@@ -120,6 +124,7 @@ export interface ConsolePage extends NavItem {
 // like "bots" land on the page that owns that feature.
 const PAGE_KEYWORDS: Record<string, string[]> = {
   '/crons': ['cron'],
+  '/kanban': ['board', 'cards', 'issues', 'dispatch'],
   '/billing': ['balance', 'credit', 'invoice', 'payment', 'top up'],
   '/tools': ['mcp', 'connectors', 'skills'],
   '/integrations': ['bots', 'github', 'slack', 'telegram', 'discord', 'lark', 'feishu'],

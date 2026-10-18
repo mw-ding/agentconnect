@@ -17,6 +17,14 @@ export const consoleKeys = {
   /** One daemon in full — the only read carrying a runtime's model catalog. */
   daemon: (orgId: string | null | undefined, daemonId: string) => consoleKey(orgId, 'daemon', daemonId),
   crons: (orgId: string | null | undefined) => consoleKey(orgId, 'crons'),
+  kanbanBoards: (orgId: string | null | undefined) => consoleKey(orgId, 'kanban-boards'),
+  kanbanBoard: (orgId: string | null | undefined, boardId: string) => consoleKey(orgId, 'kanban-board', boardId),
+  kanbanCards: (orgId: string | null | undefined, boardId: string) => consoleKey(orgId, 'kanban-cards', boardId),
+  /** The issue numbers are part of the key: live titles are fetched per visible card set and never stored by the CP. */
+  kanbanTitles: (orgId: string | null | undefined, boardId: string, numbers: string) =>
+    consoleKey(orgId, 'kanban-titles', boardId, numbers),
+  kanbanCardExplain: (orgId: string | null | undefined, boardId: string, cardId: string) =>
+    consoleKey(orgId, 'kanban-card-explain', boardId, cardId),
   integrations: (orgId: string | null | undefined) => consoleKey(orgId, 'integrations'),
   giteaConnections: (orgId: string | null | undefined) => consoleKey(orgId, 'gitea-connections'),
   bots: (orgId: string | null | undefined) => consoleKey(orgId, 'bots'),
