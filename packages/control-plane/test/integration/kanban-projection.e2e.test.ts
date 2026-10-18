@@ -7,6 +7,7 @@ import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import type { FetchLike } from '../../src/github/api.js'
 import { githubKanbanProjectVerifier } from '../../src/kanban/project-guard.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { planStatusWrite } from '../../src/kanban/card-state.js'
 import { kanbanProjectHook, KanbanProjectWriter } from '../../src/kanban/project-writer.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
@@ -147,7 +148,12 @@ describe.skipIf(!blockA)('kanban projection 4a e2e (live GitHub)', () => {
     })
     issues.push(created.number)
     const repo = { installationId: INSTALLATION_ID, repoId: REPO_ID, repoFullName: FULL }
-    const store = new GithubCardStore({ tokens: patCard, fetchImpl: spyFetch })
+    // #194 made the human-writer gate a required dep; a live, uncached lookup like the other Kanban E2Es.
+    const store = new GithubCardStore({
+      tokens: patCard,
+      fetchImpl: spyFetch,
+      permissions: new GithubRepoPermission({ tokens: patCard, ttlMs: 0 })
+    })
     const observed = await store.readCard(repo, created.number)
     expect(observed).not.toBeNull()
     await store.applyPlan(repo, created.number, observed!, planStatusWrite('todo', observed!))

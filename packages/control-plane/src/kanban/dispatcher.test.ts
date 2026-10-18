@@ -6,14 +6,14 @@ import type { KanbanRepoRef } from './card-store.js'
 
 const REPO: KanbanRepoRef = { installationId: 7n, repoId: 4242n, repoFullName: 'acme/web' }
 
-function dispatcher(over: { project?: KanbanDispatcherDeps['project'] } = {}) {
+function dispatcher(over: { project?: KanbanDispatcherDeps['project']; sync?: KanbanDispatcherDeps['sync'] } = {}) {
   const store = {
     readCard: vi.fn(async () => ({ labels: [] as string[], state: 'open' as const, nodeId: 'I_kwDOAbc123' })),
     applyPlan: vi.fn(async () => {})
   }
   // The mock stays in a local so the assertions below never fight the optional production seam.
   const projectAfterLabel = vi.fn(async () => {})
-  const withProject = 'project' in over ? over : { project: { projectAfterLabel } }
+  const withProject = 'project' in over ? { project: over.project } : { project: { projectAfterLabel } }
   const project = withProject.project
   const log = { debug: vi.fn(), info: vi.fn(), warn: vi.fn() }
   const d = new KanbanDispatcher({
@@ -26,7 +26,8 @@ function dispatcher(over: { project?: KanbanDispatcherDeps['project'] } = {}) {
     isDaemonLive: () => false,
     clock: {},
     log,
-    project
+    project,
+    ...(over.sync ? { sync: over.sync } : {})
   } as unknown as KanbanDispatcherDeps)
   const writeStatus = (
     d as unknown as {
@@ -74,5 +75,23 @@ describe('dispatcher Projects v2 projection hook', () => {
     h.writeStatus({ issueNumber: 11, cardId: 'card-1', boardId: 'board-1', orgId: 'org-1' }, REPO, 'done')
     await h.d.settle()
     expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
+  })
+
+  // #194 routes status writes through KanbanSync in production; the projection must still follow them.
+  it('projects after a #194 sync status write too, falling back to the stored issue node', async () => {
+    const sync = { projectStatus: vi.fn(async () => {}), onCardChanged: vi.fn(), reconcileBoard: vi.fn() }
+    const h = dispatcher({ sync: sync as unknown as KanbanDispatcherDeps['sync'] })
+    h.writeStatus({ issueNumber: 11, cardId: 'card-1', boardId: 'board-1', orgId: 'org-1' }, REPO, 'done')
+    await h.d.settle()
+    expect(sync.projectStatus).toHaveBeenCalledWith('board-1', 11, 'done')
+    expect(h.store.applyPlan).not.toHaveBeenCalled()
+    expect(h.projectAfterLabel).toHaveBeenCalledWith({
+      boardId: 'board-1',
+      orgId: 'org-1',
+      cardId: 'card-1',
+      repo: REPO,
+      status: 'done',
+      issueNodeId: null
+    })
   })
 })

@@ -1,4 +1,5 @@
 // PgKanbanDispatchRepo (issue #2 D2): the board row is the claim mutex (SKIP LOCKED), card rows are skipped while another writer holds them.
+import { applyCardTransition, auditCardTransition } from '../../kanban/audit.js'
 import { randomUUID } from 'node:crypto'
 import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
@@ -155,6 +156,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               : Prisma.empty
           }
           AND NOT c."promotionPending"
+          AND NOT c."needsAttention"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
         ORDER BY c."priority" DESC, c."createdAt" ASC, c."id" ASC
@@ -178,6 +180,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             where: { id: card.id },
             data: {
               status: 'running',
+              labelWritePending: true,
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -197,6 +200,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               dispatchedAt: opts.now
             },
             select: { id: true, leaseId: true }
+          })
+          await auditCardTransition(tx, {
+            cardId: card.id,
+            from: 'ready',
+            to: 'running',
+            source: 'claim',
+            leaseId: run.leaseId
           })
           const hook = await tx.hookDef.findFirst({
             where: { agentId: card.agentId, kind: 'github', repoId: board.repoId, githubSessionKey: { not: null } },
@@ -243,7 +253,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       : null
   }
 
-  async listRecoveryDue(boardId: string, now: Date, limit: number): Promise<KanbanRecoveryDue[]> {
+  async listRecoveryDue(boardId: string, now: Date, limit: number, pendingOnly = false): Promise<KanbanRecoveryDue[]> {
     return this.db.$queryRaw<KanbanRecoveryDue[]>(Prisma.sql`
       SELECT c."id" AS "cardId", c."issueNumber",
         (c."promotionPending" AND c."status" IN ('todo', 'ready')) AS "promotion", ${PROMOTION_COLUMNS}
@@ -256,7 +266,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         AND (c."recoveryCheckAt" IS NULL OR c."recoveryCheckAt" <= ${now})
         AND (
           (c."promotionPending" AND c."status" IN ('todo', 'ready'))
-          OR (${PARKED} AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
+          OR (${!pendingOnly} AND ${PARKED} AND c."status" NOT IN ('ready', 'running', 'done', 'archived'))
         )
       ORDER BY c."recoveryCheckAt" ASC NULLS FIRST, c."issueNumber" ASC
       LIMIT ${limit}
@@ -291,12 +301,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: card.id },
         data: {
           status: to,
+          labelWritePending: true,
           stateRevision: { increment: 1 },
           cooldownUntil: null,
           blockKind: null,
           ...RECOVERY_RESET
         }
       })
+      await auditCardTransition(tx, { cardId: card.id, from, to, source: 'parked_ingest' })
       return true
     })
   }
@@ -339,28 +351,30 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   async settlePromotion(cardId: string, repaired: boolean): Promise<boolean> {
     // Repair adopts the promotion that already landed; a refusal clears the intent and returns a ready card to todo.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: PENDING_UNLEASED(cardId),
-      data: repaired
+    return applyCardTransition(
+      this.db,
+      PENDING_UNLEASED(cardId),
+      repaired
         ? { status: 'ready', stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...RECOVERY_RESET }
-        : { status: 'todo', ...PROMOTION_CLEARED }
-    })
-    return count === 1
+        : { status: 'todo', ...PROMOTION_CLEARED },
+      'promotion_recovery'
+    )
   }
 
   async escalatePromotion(cardId: string, reason: string): Promise<boolean> {
     // The revision bump fences any in-flight graph CAS; only a human status edit un-parks the flagged card.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: PENDING_UNLEASED(cardId),
-      data: {
+    return applyCardTransition(
+      this.db,
+      PENDING_UNLEASED(cardId),
+      {
         status: 'todo',
         stateRevision: { increment: 1 },
         ...RECOVERY_RESET,
         needsAttention: true,
         attentionReason: reason
-      }
-    })
-    return count === 1
+      },
+      'promotion_attention'
+    )
   }
 
   async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
@@ -479,6 +493,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         where: { id: row.cardId },
         data: {
           status: plan.status,
+          labelWritePending: true,
           ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
@@ -489,6 +504,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           dispatchRevision: { increment: 1 },
           stateRevision: { increment: 1 }
         }
+      })
+      await auditCardTransition(tx, {
+        cardId: row.cardId,
+        from: row.status,
+        to: plan.status,
+        source: input.reasonCode ?? input.outcome,
+        leaseId: input.leaseId
       })
       return {
         accepted: true,
