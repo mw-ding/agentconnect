@@ -82,6 +82,7 @@ import { githubHookRunSubject } from './github/hook-run-subject.js'
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
 import { GithubCardStore } from './kanban/card-store.js'
+import { kanbanProjectHook, KanbanProjectWriter } from './kanban/project-writer.js'
 import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
@@ -1781,6 +1782,15 @@ export function buildContainer(
       : undefined
 
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
+  // The Projects v2 projection mirrors status labels best-effort; without a token source there is no writer to hook.
+  const kanbanProjectWriter =
+    kanbanTokens && kanbanCardStore
+      ? new KanbanProjectWriter({
+          tokens: kanbanTokens,
+          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}),
+          log: { info: (o, m) => http.log.info(o, m) }
+        })
+      : undefined
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,
@@ -1793,7 +1803,16 @@ export function buildContainer(
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),
           warn: (o, m) => http.log.warn(o, m)
-        }
+        },
+        ...(kanbanProjectWriter
+          ? {
+              project: kanbanProjectHook({
+                boards: repos.kanbanBoard,
+                cards: repos.kanbanCard,
+                writer: kanbanProjectWriter
+              })
+            }
+          : {})
       })
     : undefined
 

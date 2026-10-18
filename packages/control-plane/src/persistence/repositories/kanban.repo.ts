@@ -35,6 +35,7 @@ const CARD_ROW_SELECT = {
   issueId: true,
   issueNumber: true,
   issueNodeId: true,
+  projectItemId: true,
   idempotencyKey: true,
   status: true,
   assigneeAgentId: true,
@@ -611,6 +612,11 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       }
     })
   }
+
+  // Best-effort projection cache: a lost item id only costs one more idempotent add, never a missed Status write.
+  async setProjectItemId(cardId: string, projectItemId: string): Promise<void> {
+    await this.db.kanbanCard.updateMany({ where: { id: cardId }, data: { projectItemId } })
+  }
 }
 
 function toCardRow(row: {
@@ -619,6 +625,7 @@ function toCardRow(row: {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  projectItemId: string | null
   idempotencyKey: string | null
   status: string
   assigneeAgentId: string | null

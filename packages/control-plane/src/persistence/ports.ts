@@ -8130,6 +8130,8 @@ export interface KanbanCardRow {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  /** Cached ProjectV2Item id on the board's project, so later Status writes skip the add; null until first projected. */
+  projectItemId: string | null
   /** B1 key for orchestrator-filed cards (`cardIdempotencyKey`); null for human-filed or imported cards. */
   idempotencyKey: string | null
   status: KanbanStatus
@@ -8245,4 +8247,6 @@ export interface KanbanCardRepo {
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+  /** Remember the card's ProjectV2Item id after a Status projection add, so later writes skip the add. */
+  setProjectItemId(cardId: string, projectItemId: string): Promise<void>
 }

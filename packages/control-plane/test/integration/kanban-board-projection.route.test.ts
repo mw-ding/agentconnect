@@ -400,4 +400,16 @@ describe('kanban_board projection pair CHECK', () => {
     })
     expect(card.projectItemId).toBe('PVTI_x')
   })
+
+  it('remembers a projected item id on the card row', async () => {
+    const { PgKanbanCardRepo } = await import('../../src/persistence/repositories/kanban.repo.js')
+    const cards = new PgKanbanCardRepo(prisma)
+    const board = await prisma.kanbanBoard.create({
+      data: { orgId: DEFAULT_ORG_ID, name: 'item-cache', repoId: 10n, repoFullName: 'acme/item-cache', ...withProject }
+    })
+    const card = await prisma.kanbanCard.create({ data: { boardId: board.id, issueId: 2n, issueNumber: 2 } })
+    expect(card.projectItemId).toBeNull()
+    await cards.setProjectItemId(card.id, 'PVTI_new')
+    await expect(cards.getCard(card.id)).resolves.toMatchObject({ projectItemId: 'PVTI_new' })
+  })
 })

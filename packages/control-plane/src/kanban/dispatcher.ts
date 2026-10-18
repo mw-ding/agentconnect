@@ -33,6 +33,7 @@ import {
   type ObservedIssue
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import type { KanbanProjectHook } from './project-writer.js'
 import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
 
@@ -56,6 +57,8 @@ export interface KanbanDispatcherDeps {
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
+  /** Best-effort Projects v2 projection after a status label write; absent ⇒ labels only. Never fails a transition. */
+  project?: KanbanProjectHook
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   tickMs?: number
   unackedGraceMs?: number
@@ -536,7 +539,7 @@ export class KanbanDispatcher {
 
   /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
   private writeStatus(
-    card: { issueNumber: number; cardId: string },
+    card: { issueNumber: number; cardId: string; boardId: string; orgId: string },
     repo: KanbanRepoRef,
     status: KanbanStatus,
     observed?: ObservedIssue
@@ -546,6 +549,16 @@ export class KanbanDispatcher {
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
         if (!current) return
         await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
+        // The projection mirrors the label write and never fails it: the hook swallows its own failures.
+        const nodeId = 'nodeId' in current && typeof current.nodeId === 'string' ? current.nodeId : null
+        await this.deps.project?.projectAfterLabel({
+          boardId: card.boardId,
+          orgId: card.orgId,
+          cardId: card.cardId,
+          repo,
+          status,
+          issueNodeId: nodeId
+        })
       })
       .catch((err: unknown) =>
         this.deps.log.warn({ err, cardId: card.cardId, status }, 'kanban: status label write failed')
