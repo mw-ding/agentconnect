@@ -14,7 +14,7 @@ Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2). T
 
 `KanbanBoard` (`cp/prisma/schema.prisma`): identity (`id`, `orgId`, `name`), watched repo (`repoId` numeric and rename-proof, `repoFullName` display-only), orchestrator/verifier agents, caps (`maxInProgress`, `maxInProgressPerAgent`, `staleLeaseSec`, `failureLimit`, `protocolRetryLimit`, `blockRecurrenceLimit`), `defaultMode` (`read`/`write`), `completionContract`, the projection pair (`projectNodeId`, `statusFieldId`, both set or both null by CHECK), `enabled`, `visibility`/`sharedWith`, audit ids.
 
-`KanbanCard`: `boardId`, GitHub ids (`issueId`, `issueNumber`, `issueNodeId`), `projectItemId` (cached `ProjectV2Item` id so later Status writes skip the add), `idempotencyKey` (orchestrator creates), `status`, `assigneeAgentId`, `priority`, `mode` override, `stateRevision`/`dispatchRevision`, plus the lease, promotion-intent, recovery-backoff, and attention columns the sections below use. Runs, leases, and audit rows are covered by the lane-1 contract ([kanban-lane1-api.md](kanban-lane1-api.md)) and the pilot doc's M2/M3 sections.
+`KanbanCard`: `boardId`, GitHub ids (`issueId`, `issueNumber`, `issueNodeId`), `projectItemId` plus `projectItemProjectId` (the cached `ProjectV2Item` id and the project it belongs to, so later Status writes there skip the add), `idempotencyKey` (orchestrator creates), `status`, `assigneeAgentId`, `priority`, `mode` override, `stateRevision`/`dispatchRevision`, plus the lease, promotion-intent, recovery-backoff, and attention columns the sections below use. Runs, leases, and audit rows are covered by the lane-1 contract ([kanban-lane1-api.md](kanban-lane1-api.md)) and the pilot doc's M2/M3 sections.
 
 ## State machine and labels
 
@@ -34,7 +34,7 @@ Purpose-bound installation tokens, each scoped by numeric repo id: the daemon ru
 
 ## Project v2 projection (M5 5.1)
 
-Board CRUD carries the optional `projectNodeId` + `statusFieldId` pair (both-or-neither; null clears). The org-only guard requires an Organization repo owner, a live GraphQL read showing an Organization-owned project whose login matches the repo owner, and a single-select field of that project; denials map to stable codes without leaking GitHub text. After each status label write the dispatcher projects best-effort: mint, resolve the option by case-insensitive name, idempotent add (cached on the card), field write, swallow with a body-free reason. Full contract, codes, and mapping are in [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
+Board CRUD carries the optional `projectNodeId` + `statusFieldId` pair (both-or-neither; null clears). The org-only guard requires an Organization repo owner, a live GraphQL read showing an Organization-owned project whose login matches the repo owner, and a single-select field of that project; denials map to stable codes without leaking GitHub text. Every committed status change (dispatcher, human recovery, graph promotion, the #194 sync reconcile, import) queues a best-effort projection of the card's committed status on its own per-card queue: mint, re-check the project owner, resolve the option by case-insensitive name, idempotent add (cached on the card with its project; a NOT_FOUND item is re-added once), field write, swallow with a body-free reason. Full contract, codes, and mapping are in [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
 
 ## Humans in the loop (M4)
 
@@ -42,11 +42,11 @@ M4 review routing (`review` → the board's verifier agent, `submitGithubReview`
 
 ## Operations runbook
 
-- Database: `TEST_DATABASE_URL` to a dedicated Postgres 17 database; `test:int` migrates, seeds, clones per worker, and drops the clones. Production deploys with `prisma migrate deploy` (migration `20261123300000_kanban_board_project_projection` for the projection columns).
+- Database: `TEST_DATABASE_URL` to a dedicated Postgres 17 database; `test:int` migrates, seeds, clones per worker, and drops the clones. Production deploys with `prisma migrate deploy` (migrations `20261123300000_kanban_board_project_projection` and `20261123300100_kanban_card_project_item_project` for the projection columns).
 - Token cache: keyed by installation, repo id, permission levels, and purpose; drop it on permission, suspension, or reinstall changes (`invalidateInstallation`). A grant minted for one run may serve a later same-mode run until 15 minutes before expiry.
 - Webhooks: the 10-minute redelivery sweep re-asks GitHub for doorbells that never landed (at most 3 tries per delivery, live relay required).
-- Projection: needs the App installed on the board repo with `organization_projects:write` consented; a PAT fallback needs the `project` scope (dev only). Rotated option names take up to 5 minutes (field-options TTL).
+- Projection: needs the App installed on the board repo with `organization_projects:write` consented; a PAT fallback needs the `project` scope (dev only). Rotated option names take up to 5 minutes (field-options TTL), or one failed write.
 
 ## Known gaps
 
-History stays in [kanban-p0-pilot.md](kanban-p0-pilot.md); these are the consolidated open items: user-owned Projects v2 stay unsupported (no write path, no webhooks); a human edit in the Project UI is only picked up by the reconciler tick, never pushed; renamed Status options lag up to the field cache TTL; the console has no projection controls and no M3 attention-flag surface; the items above under M4 belong to their owning lanes.
+History stays in [kanban-p0-pilot.md](kanban-p0-pilot.md); these are the consolidated open items: user-owned Projects v2 stay unsupported (no write path, no webhooks); Project UI edits are not reconciled: nothing reads the `Status` field back, so a human edit there stays until the card's next committed status change overwrites it; renamed Status options lag up to the field cache TTL; the console has no projection controls and no M3 attention-flag surface; the items above under M4 belong to their owning lanes.
