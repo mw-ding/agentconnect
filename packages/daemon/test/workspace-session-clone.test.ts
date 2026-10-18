@@ -1651,6 +1651,38 @@ describe('a Kanban write session checks out its ac/card-<n> branch', () => {
     expect(readFileSync(join(next, 'saved.md'), 'utf8')).toBe('saved work\n')
   })
 
+  it.each(['locked', 'foreign'] as const)('refuses a removed %s worktree registration', async (kind) => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+    )
+    const root = workspaces.primaryRoot(agent)
+    let stale = cwd
+    if (kind === 'locked') {
+      git(root.path, ['worktree', 'lock', cwd])
+    } else {
+      stale = join(tempRoot('ac-foreign-card-'), basename(cwd))
+      git(root.path, ['worktree', 'move', cwd, stale])
+    }
+    rmSync(stale, { recursive: true })
+    const nextPath = join(dirname(cwd), workspaces.sessionWorktreeId('kanban:new-7'))
+    const before = git(root.path, ['worktree', 'list', '--porcelain'])
+    await expect(
+      workspaces.addRootSessionWorktree(
+        agent.id,
+        root,
+        nextPath,
+        `refs/remotes/origin/${root.branch}`,
+        undefined,
+        kanbanCardBranch(7)
+      )
+    ).rejects.toThrow('already checked out in another worktree')
+    expect(git(root.path, ['worktree', 'list', '--porcelain'])).toBe(before)
+    expect(existsSync(nextPath)).toBe(false)
+  })
+
   it('refuses an existing worktree without stealing its branch or touching another card', async () => {
     const agent = agentFixture()
     serveAll(agent)

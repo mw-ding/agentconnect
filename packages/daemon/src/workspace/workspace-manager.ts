@@ -83,6 +83,7 @@ import {
 } from './secondary-layout.js'
 import { authorizeWorkspaceGitUrl } from './git-origin-policy.js'
 import { blockingBranchRefs, isSessionBranch, sessionBranchName } from './session-branch.js'
+import { cardWorktreeLocation } from './card-worktree-path.js'
 import {
   confinedSessionDirIn,
   hasSessionsDirIn,
@@ -2403,10 +2404,11 @@ export class WorkspaceManager {
           const fields = record.split('\0')
           if (!fields.includes(`branch refs/heads/${branch}`)) continue
           const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
-          if (!path || path === cwd) continue
-          const managed = dirname(path) === dirname(cwd) && /^[a-f0-9]{24}$/.test(basename(path))
+          if (!path) continue
+          const location = cardWorktreeLocation(path, cwd)
+          if (location === 'same') continue
           if (
-            !managed ||
+            location !== 'managed' ||
             (await this.fsFor(agentId).stat(path)) !== 'missing' ||
             fields.some((field) => field.startsWith('locked'))
           ) {
