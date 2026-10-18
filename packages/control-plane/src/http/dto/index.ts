@@ -4404,6 +4404,8 @@ export const KanbanCardModeDto = z.object({
 })
 
 // ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
+export const KANBAN_EPIC_MAX_CARDS_CEILING = 1000
+export const KANBAN_EPIC_MAX_ACTIVE_CEILING = 100
 const KanbanRepoFullName = z
   .string()
   .regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'repoFullName must be "owner/repo"')
@@ -4417,6 +4419,9 @@ const KanbanBoardConfigFields = {
   verifierAgentId: z.string().uuid().nullable(),
   maxInProgress: z.number().int().min(1).max(100),
   maxInProgressPerAgent: z.number().int().min(1).max(100),
+  // B2 per-epic budgets (the DB CHECKs > 0): lifetime children an epic may file, and how many may run at once.
+  epicMaxCards: z.number().int().min(1).max(KANBAN_EPIC_MAX_CARDS_CEILING),
+  epicMaxActive: z.number().int().min(1).max(KANBAN_EPIC_MAX_ACTIVE_CEILING),
   staleLeaseSec: z
     .number()
     .int()
@@ -4440,6 +4445,8 @@ export const CreateKanbanBoardBody = z
     verifierAgentId: KanbanBoardConfigFields.verifierAgentId.optional(),
     maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
     maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
+    epicMaxCards: KanbanBoardConfigFields.epicMaxCards.optional(),
+    epicMaxActive: KanbanBoardConfigFields.epicMaxActive.optional(),
     staleLeaseSec: KanbanBoardConfigFields.staleLeaseSec.optional(),
     failureLimit: KanbanBoardConfigFields.failureLimit.optional(),
     protocolRetryLimit: KanbanBoardConfigFields.protocolRetryLimit.optional(),
@@ -4481,6 +4488,8 @@ export const KanbanBoardDto = z.object({
   verifierAgentId: z.string().nullable(),
   maxInProgress: z.number().int(),
   maxInProgressPerAgent: z.number().int(),
+  epicMaxCards: z.number().int(),
+  epicMaxActive: z.number().int(),
   staleLeaseSec: z.number().int(),
   failureLimit: z.number().int(),
   protocolRetryLimit: z.number().int(),

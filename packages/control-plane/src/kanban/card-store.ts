@@ -72,6 +72,14 @@ export interface CardStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void>
+  /** Add the issue with GitHub id `subIssueId` (the numeric id, NOT its number) as a sub-issue of `issueNumber`. */
+  addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void>
+  /** Add the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) to the issue's blocked_by. */
+  addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
+  /** Remove the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) from the issue's blocked_by. */
+  removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
+  /** Close an issue as not planned (the duplicate-create and B2-trip paths); throws on any GitHub failure. */
+  closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void>
 }
 
 /** The issue's event history runs past the page bound, so nothing on it can be attributed; sync defers, then fails closed. */
@@ -362,6 +370,41 @@ export class GithubCardStore implements CardStore {
     onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
     return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
+  }
+
+  async addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/sub_issues`, 'POST', { sub_issue_id: Number(subIssueId) })
+  }
+
+  async addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by`, 'POST', {
+      issue_id: Number(blockerIssueId)
+    })
+  }
+
+  async removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by/${blockerIssueId}`, 'DELETE')
+  }
+
+  async closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}`, 'PATCH', { state: 'closed', state_reason: 'not_planned' })
+  }
+
+  /** A metadata write with the CP-only card token (issues write); repo-id addressed so a rename can't misroute it. */
+  private async write(
+    repo: KanbanRepoRef,
+    path: string,
+    method: 'POST' | 'PATCH' | 'DELETE',
+    body?: unknown
+  ): Promise<void> {
+    const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'write')
+    await githubRequest<unknown>(`/repositories/${repo.repoId}${path}`, {
+      method,
+      auth: grant.token,
+      ...(body !== undefined ? { body } : {}),
+      fetchImpl: this.deps.fetchImpl,
+      baseUrl: this.deps.baseUrl
+    })
   }
 
   private async get<T>(repo: KanbanRepoRef, path: string, fetchImpl = this.deps.fetchImpl): Promise<T> {

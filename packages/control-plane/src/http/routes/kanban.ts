@@ -60,6 +60,8 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
     verifierAgentId: board.verifierAgentId,
     maxInProgress: board.maxInProgress,
     maxInProgressPerAgent: board.maxInProgressPerAgent,
+    epicMaxCards: board.epicMaxCards,
+    epicMaxActive: board.epicMaxActive,
     staleLeaseSec: board.staleLeaseSec,
     failureLimit: board.failureLimit,
     protocolRetryLimit: board.protocolRetryLimit,

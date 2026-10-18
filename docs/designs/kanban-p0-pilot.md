@@ -601,3 +601,16 @@ Known gaps update (M5 projection): every committed status change now reaches the
 Projects v2 `Status` field, but the mirror stays one-way. Edits made in the
 Project UI are not reconciled; the card's next committed status change overwrites
 them. Contract: [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
+
+Known gaps (M3 orchestrator): the orchestrator tools (kanbanList/Create/Link/
+Unblock/Assign) are role-gated on `board.orchestratorAgentId`. The daemon files
+the issue body directly with a purpose-bound `kanban_orchestrator_write` token,
+and the CP registers only metadata; a daemon crash between the file and the
+commit_create is a documented window (an in-memory pending map re-commits the
+same issue within a process, but a restart can file a duplicate). The GitHub
+sub_issues and issue-dependencies (`blocked_by`) WRITE endpoints are not exposed
+on every repository (they 404 on user-owned repos), so those link writes are
+best-effort and validated by the CP tests rather than live. The per-epic
+`epicMaxCards` budget is a lifetime counter that archiving a child never
+refunds; `epicMaxActive` bounds concurrent children at claim time. See
+docs/designs/kanban-lane2-orchestrator.md for the frame, codes, and B2 semantics.

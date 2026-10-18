@@ -1,9 +1,12 @@
 // Kanban GitHub tokens: App installation tokens when configured, otherwise a dev/test injected PAT (issue #2 M3).
 import type { InstallationTokenService, MintedGitCred } from '../github/installation-token.service.js'
 
-export type KanbanTokenMinter = Pick<InstallationTokenService, 'mintKanbanCard' | 'mintKanbanRun' | 'mintKanbanProject'>
+export type KanbanTokenMinter = Pick<
+  InstallationTokenService,
+  'mintKanbanCard' | 'mintKanbanRun' | 'mintKanbanOrchestratorWrite' | 'mintKanbanProject'
+>
 
-/** App tokens when the GitHub App is configured; otherwise a dev/test injected PAT, with one warning. */
+// Use a dev PAT only when no App is configured, with one warning.
 export function kanbanTokenSource(opts: {
   app?: KanbanTokenMinter
   injectedToken?: string
@@ -25,8 +28,8 @@ export function kanbanTokenSource(opts: {
   return {
     mintKanbanCard: async (_installationId, repoFullName, _repoId, access) => grant(repoFullName, access),
     mintKanbanRun: async (_installationId, repoFullName, _repoId, mode) => grant(repoFullName, mode),
-    // Dev/test fallback only: a PAT needs the `project` scope to read/write Projects v2; without it the guard
-    // verifier maps the GraphQL denial to project_not_found, same as an App token without organization_projects.
-    mintKanbanProject: async (_installationId, repoFullName) => grant(repoFullName, 'write')
+    // A dev PAT needs project scope; missing scope fails closed like missing App org permission.
+    mintKanbanProject: async (_installationId, repoFullName) => grant(repoFullName, 'write'),
+    mintKanbanOrchestratorWrite: async (_installationId, repoFullName, _repoId) => grant(repoFullName, 'write')
   }
 }
