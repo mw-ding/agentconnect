@@ -307,12 +307,16 @@ describe.skipIf(!enabled)('kanban board view e2e (live GitHub)', () => {
       }
       const renamed = `[kanban-e2e] lane4b v2 renamed ${started}`
       await gh('PATCH', `/repos/${FULL}/issues/${one.number}`, { title: renamed })
+      // Within the 60 s in-memory TTL the cached title is still served; past it the rename appears (live ETag
+      // revalidation), so a rename takes up to about a minute to reach the board.
+      const cached = await api<{ titles: Record<string, { title: string }> }>(`/cards/titles?numbers=${one.number}`)
+      expect(cached.body.titles[String(one.number)]?.title).toBe(one.title)
       await vi.waitFor(
         async () => {
           const next = await api<{ titles: Record<string, { title: string }> }>(`/cards/titles?numbers=${one.number}`)
           expect(next.body.titles[String(one.number)]?.title).toBe(renamed)
         },
-        { timeout: 20_000, interval: 1_000 }
+        { timeout: 90_000, interval: 5_000 }
       )
       const notCard = await api<{ titles: object; missing: number[] }>(`/cards/titles?numbers=${one.number},999999`)
       expect(notCard.body.missing).toEqual([999999])
