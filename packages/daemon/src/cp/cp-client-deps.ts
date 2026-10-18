@@ -202,6 +202,7 @@ export interface CpClientSeamHost {
   resolveSharedImage(req: SharedImageResolveReq, orgId?: string): Promise<SharedImageResolveOk>
   listBackgroundTasks(req: TaskListReq): Promise<TaskList>
   /** Admit one leased Kanban card (issue #2 M2). */
+  kanbanRevoke(req: import('@agentconnect.md/protocol').KanbanRevoke): Promise<void>
   kanbanDispatch(dispatch: KanbanDispatch): Promise<KanbanDispatchOk>
   /** An editor's approve or discard of an assistant-mode draft, run exactly as its card click would. */
   decideAssistantDraft: AssistantActivityDeps['decideDraft']
@@ -424,6 +425,7 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
     // re-done here (the lineage rule lives where the session lives), not trusted from the CP.
     childSessionStatusProbe: (probe) => host.childSessionStatusProbe(probe),
     sharedImageResolve: (req, orgId) => host.resolveSharedImage(req, orgId),
+    kanbanRevoke: (req) => host.kanbanRevoke(req),
     kanbanDispatch: (dispatch) => host.kanbanDispatch(dispatch),
     pullRequestFeedback: async (req) => {
       if (host.dutyCoordinator().dutyEnforced() && !host.duties().holdsAgent(req.agentId)) {

@@ -158,6 +158,11 @@ export const KanbanReportOk = z
   .strict()
 export type KanbanReportOk = z.infer<typeof KanbanReportOk>
 
+// Revoke only the named lease; a delayed request cannot cancel its replacement.
+export const KanbanRevoke = z.object({ leaseId: z.string().uuid(), cardId: z.string().uuid() }).strict()
+export type KanbanRevoke = z.infer<typeof KanbanRevoke>
+export const KanbanRevokeOk = z.object({ leaseId: z.string().uuid() }).strict()
+export type KanbanRevokeOk = z.infer<typeof KanbanRevokeOk>
 /** Longest progress note a worker may post to its card's issue. */
 export const KANBAN_COMMENT_MAX_CHARS = 4_000
 
