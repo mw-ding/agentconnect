@@ -737,7 +737,9 @@ it.each(['open', 'closed'])('finds a %s crash orphan past the first page without
       expect(url.searchParams.get('state')).toBe('all')
       expect(url.searchParams.get('sort')).toBe('created')
       expect(url.searchParams.get('direction')).toBe('desc')
-      expect(Date.now() - Date.parse(url.searchParams.get('since')!)).toBeLessThan(60 * 1000)
+      expect(Math.abs(Date.now() - Date.parse(url.searchParams.get('since')!) - 24 * 60 * 60 * 1000)).toBeLessThan(
+        60_000
+      )
       expect(url.searchParams.get('per_page')).toBe('100')
       expect(url.searchParams.get('page')).toBe(String(index + 1))
     }

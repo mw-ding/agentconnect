@@ -558,10 +558,16 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       ;(daemon as any).kanbanOrchestratorToolset = undefined
       expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
       expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
-      const matches = (await gh<Issue[]>('GET', `/repos/${FULL}/issues?state=all&per_page=100`)).filter(
-        (i) => i.title === req.title
-      )
-      expect(matches.map((i) => i.number)).toEqual([number])
+      // GitHub's listing lags creation, so poll until the issue shows up.
+      let matches: Issue[] = []
+      await waitFor(async () => {
+        const listed = await gh<Issue[]>(
+          'GET',
+          `/repos/${FULL}/issues?state=all&sort=created&direction=desc&per_page=100`
+        )
+        matches = listed.filter((i) => i.title === req.title)
+        expect(matches.map((i) => i.number)).toEqual([number])
+      }, 30_000)
       expect(matches[0]!.body).toMatch(/<!-- agentconnect:kanban-card-key:[0-9a-f]{64} -->/)
       return [number]
     })
@@ -604,10 +610,16 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       }, 30_000)
       expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
       expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
-      const matches = (await gh<Issue[]>('GET', `/repos/${FULL}/issues?state=all&per_page=100`)).filter(
-        (i) => i.title === req.title
-      )
-      expect(matches.map((i) => i.number)).toEqual([number])
+      // GitHub's listing lags creation, so poll until the issue shows up.
+      let matches: Issue[] = []
+      await waitFor(async () => {
+        const listed = await gh<Issue[]>(
+          'GET',
+          `/repos/${FULL}/issues?state=all&sort=created&direction=desc&per_page=100`
+        )
+        matches = listed.filter((i) => i.title === req.title)
+        expect(matches.map((i) => i.number)).toEqual([number])
+      }, 30_000)
       for (const dup of matches.map((i) => i.number)) if (!issues.includes(dup)) issues.push(dup)
       return [number]
     })
