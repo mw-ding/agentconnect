@@ -541,3 +541,5 @@ identity; changing that identity is refused while the board has cards, so old
 issue numbers cannot silently refer to another repository. Human status and
 assignment synchronization beyond mismatch-parked cards and periodic drift repair
 remain for the stacked M1 follow-up.
+
+Known gaps (M5 board view, Lane 4b): the console cannot clear `needsAttention` yet; that waits on Lane 3's restart route. Titles are fetched per visit with one REST read per card (at most 100 per request), so a very large board costs one GitHub call per visible card until a GraphQL batch or an ETag cache is justified; the CP never caches them. The card list is capped at 500 cards per board view. The dry run reads the live connection registry of the CP replica that serves it, so on a multi-replica deployment `daemon_offline` can differ from what the dispatching replica sees. The `open_lease` gate exists in the predicate but not in the SQL claim, so it is excluded from the parity matrix until Lane 3 settles it.
