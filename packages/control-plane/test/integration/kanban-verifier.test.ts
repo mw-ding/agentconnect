@@ -577,4 +577,57 @@ describe('Kanban transition outbox (real Postgres)', () => {
     const [next] = await notify.claim(10, new Date(T0), new Date(T0 + 60_000))
     expect(next).toMatchObject({ id: held!.id, claims: 2, attempts: 0 })
   })
+
+  /** A B8-parked review card on an anchored board: parked, so a human status label is ingested. */
+  async function parkedCard() {
+    const h = await harness({ verifier: A1 })
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { targetChannel: 'C0ANCHOR' } })
+    const c = await h.reviewCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', needsAttention: true })
+    return { h, c }
+  }
+
+  it('vera-414: a label-driven move commits its notification with the status CAS', async () => {
+    const { h, c } = await parkedCard()
+    const before = await h.card(c.id)
+    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked']
+    // The harness dispatcher has no notifier wired: the row must come from the repo's own transaction.
+    expect(await h.dispatcher.onCardChanged(h.board.id, c.issueNumber, 'human')).toBe(true)
+    const after = await h.card(c.id)
+    expect(after.status).toBe('blocked')
+    expect(await rows(c.id)).toMatchObject([
+      { stateRevision: before.stateRevision + 1n, fromStatus: 'review', toStatus: 'blocked', mention: false }
+    ])
+    expect(after.stateRevision).toBe(before.stateRevision + 1n)
+  })
+
+  it('vera-414: a rolled-back or missed ingest CAS leaves neither the move nor its notification', async () => {
+    const { h, c } = await parkedCard()
+    await expect(
+      prisma.$transaction(async (tx) => {
+        const moved = await new PgKanbanDispatchRepo(tx).ingestStatus(h.board.id, c.issueNumber, 'review', 'blocked')
+        expect(moved).toMatchObject({ moved: true })
+        expect(await tx.kanbanNotification.count({ where: { cardId: c.id } })).toBe(1)
+        throw new Error('boom')
+      })
+    ).rejects.toThrow('boom')
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', needsAttention: true })
+    expect(await rows(c.id)).toEqual([])
+    // A CAS whose expected status is stale moves nothing and writes nothing.
+    expect(await h.repo.ingestStatus(h.board.id, c.issueNumber, 'blocked', 'done')).toEqual({ moved: false })
+    expect(await rows(c.id)).toEqual([])
+    // The committed move writes exactly one row, and a replay of the same move is a no-op.
+    expect(await h.repo.ingestStatus(h.board.id, c.issueNumber, 'review', 'blocked')).toMatchObject({ moved: true })
+    expect(await h.repo.ingestStatus(h.board.id, c.issueNumber, 'review', 'blocked')).toEqual({ moved: false })
+    expect(await rows(c.id)).toHaveLength(1)
+  })
+
+  it('vera-414: a headless board records no row for a label-driven move', async () => {
+    const { h, c } = await parkedCard()
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { targetChannel: null } })
+    expect(await h.repo.ingestStatus(h.board.id, c.issueNumber, 'review', 'blocked')).toMatchObject({ moved: true })
+    expect(await rows(c.id)).toEqual([])
+  })
 })

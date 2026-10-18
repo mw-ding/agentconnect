@@ -333,8 +333,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     to: KanbanStatus
   ): Promise<KanbanIngestResult> {
     return this.inTransaction(async (tx) => {
-      const [card] = await tx.$queryRaw<Array<{ id: string; status: KanbanStatus; stateRevision: bigint }>>(Prisma.sql`
-        SELECT c."id", c."status", c."stateRevision" FROM "kanban_card" c
+      const [card] = await tx.$queryRaw<
+        Array<{ id: string; status: KanbanStatus; stateRevision: bigint; targetChannel: string | null }>
+      >(Prisma.sql`
+        SELECT c."id", c."status", c."stateRevision", b."targetChannel" FROM "kanban_card" c
+        JOIN "kanban_board" b ON b."id" = c."boardId"
         LEFT JOIN LATERAL (
           SELECT "reasonCode", "endedAt" FROM "kanban_run"
           WHERE "cardId" = c."id" ORDER BY "attempt" DESC LIMIT 1
@@ -355,7 +358,23 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           ...RECOVERY_RESET
         }
       })
-      return { moved: true, cardId: card.id, stateRevision: card.stateRevision + 1n }
+      // The notification commits or rolls back with the move, as a run end's does; (cardId, stateRevision) dedupes replays.
+      const stateRevision = card.stateRevision + 1n
+      const decision = planNotification(
+        { cardId: card.id, boardId, issueNumber, from, to },
+        { targetChannel: card.targetChannel }
+      )
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          boardId,
+          cardId: card.id,
+          issueNumber,
+          stateRevision,
+          from,
+          to,
+          mention: decision.mention
+        })
+      return { moved: true, cardId: card.id, stateRevision }
     })
   }
 

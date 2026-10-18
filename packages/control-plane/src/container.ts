@@ -86,7 +86,6 @@ import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
-import { enqueueTransition } from './kanban/notifier.js'
 import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
@@ -1810,11 +1809,7 @@ export function buildContainer(
         clock,
         ...(kanbanNotifier
           ? {
-              notify: {
-                enqueue: (transition, stateRevision) =>
-                  enqueueTransition(repos.kanbanNotify, transition, stateRevision),
-                drain: () => kanbanNotifier.drain()
-              }
+              notify: { drain: () => kanbanNotifier.drain() }
             }
           : {}),
         log: {

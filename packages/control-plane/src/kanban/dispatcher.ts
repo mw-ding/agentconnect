@@ -37,7 +37,6 @@ import {
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
 import { planGraphPromotion } from './graph-reconciler.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
-import type { KanbanTransition } from './notifier.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
 
@@ -59,8 +58,8 @@ export interface KanbanDispatcherDeps {
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
-  /** Enqueues a transition notification (planNotification + outbox insert); undefined when notifications are off. */
-  notify?: { enqueue(transition: KanbanTransition, stateRevision: bigint): Promise<void>; drain(): Promise<void> }
+  /** Drains the transition outbox (rows are written in the repo's own transactions); undefined when notifications are off. */
+  notify?: { drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   tickMs?: number
   unackedGraceMs?: number
@@ -290,13 +289,9 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
+    // The move's notification is written in the same transaction, so a crash here can no longer drop it.
     const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
-    if (result.moved) {
-      await this.deps.notify?.enqueue(
-        { cardId: result.cardId, boardId, issueNumber, from, to: plan.to },
-        result.stateRevision
-      )
-    }
+    if (result.moved) void this.deps.notify?.drain().catch(() => undefined)
     return { moved: result.moved, observed }
   }
 
