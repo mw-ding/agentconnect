@@ -41,12 +41,18 @@ enabled, and have `orchestratorAgentId === agentId`. An unknown or other-org boa
   only, minted when the agent orchestrates an enabled board on that repo). A 401/403 invalidates the presented
   cached grant and forces the next mint past the CP token cache; other errors keep the grant.
 - Each issue body carries `<!-- agentconnect:kanban-card-key:<B1 digest> -->`. After `prepare_create` finds no
-  registered B1 card, the daemon lists the repository's issues (`state=all`, paginated, excluding PRs) and matches
-  that exact marker before POSTing. Listing avoids search-index lag immediately after a crash. A lookup failure
-  stops creation. If an orphan exists, the daemon skips POST and commits that issue, including a closed orphan
-  (its GitHub state stays closed). The CP receives only the number and digest, never the body. A card already
-  registered under B1 is returned by prepare before either GitHub lookup or B2. The bounded process-local pending
-  map retains its agent/board/epic/step/spec key, one-hour expiry, and 256-entry cap as a fast retry path.
+  registered B1 card, the daemon first consults its durable pending journal (`<root>/state/
+kanban-pending-creates.json`: the same agent/board/epic/step/spec key → issue number + file time, one-hour
+  expiry, 256-entry oldest-first cap, written atomically via tmp + rename at mode 0600, keys only — never titles,
+  bodies, or tokens). A journal hit skips both the lookup and POST. Otherwise the daemon lists the repository's
+  issues newest-first (`state=all&sort=created&direction=desc&since=<now-24h>`, at most 3 pages, excluding PRs)
+  and matches that exact marker before POSTing. Listing avoids search-index lag immediately after a crash. A
+  lookup failure stops creation. If an orphan exists, the daemon journals it and commits that issue, including a
+  closed orphan (its GitHub state stays closed). The CP receives only the number and digest, never the body. A
+  card already registered under B1 is returned by prepare before journal, lookup, or B2.
+- The remaining window is tiny: a crash between the issue POST response and the journal write, combined with
+  listing lag, can still file twice; the CP's B1 uniqueness and duplicate-close path then select one card and
+  retire the loser.
 - `commit_create` then registers the issue through `createEpicChild`: one transaction locks the epic card
   `FOR UPDATE`, re-checks B2, and composes the Lane 1 `upsertCard` (B1 key, `source: 'orchestrator'`,
   `actorAgentId`). Labels (`ac/status:<status>`, `ac/agent:<slug>`) and the epic sub-issue / `blocked_by` edges are
@@ -77,7 +83,7 @@ two boards claiming in parallel serialize and cannot overshoot.
 ## Known gaps
 
 - Simultaneous independent creates can still race past the marker lookup; the CP's B1 uniqueness and duplicate-close
-  path select one card and retire the losing issue. Crash retries reuse the durable marker.
+  path select one card and retire the losing issue. Crash retries reuse the journal first, then the durable marker.
 - Sub-issue and dependency writes take GitHub's numeric issue **id**, never the issue number; the CardStore methods
   take a `bigint` id to make that hard to get wrong. The live E2E asserts both edges on GitHub.
 - `kanbanCreate` takes a board id (uuid); an `owner/repo` alias is not yet accepted.

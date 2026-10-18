@@ -554,6 +554,7 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
         crashed.mockRestore()
       }
       // Discard the toolset to lose the in-memory pending map, as a daemon restart would.
+      // The on-disk journal survives this, so the retry must reuse the filed issue without a second POST.
       ;(daemon as any).kanbanOrchestratorToolset = undefined
       expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
       expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
@@ -562,6 +563,52 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       )
       expect(matches.map((i) => i.number)).toEqual([number])
       expect(matches[0]!.body).toMatch(/<!-- agentconnect:kanban-card-key:[0-9a-f]{64} -->/)
+      return [number]
+    })
+
+    await scenario('o8b marker recovery without the journal', async () => {
+      const req = {
+        board: boardId,
+        title: `[kanban-e2e] orch marker recovery ${started}`,
+        body: 'Scratch marker recovery after losing both the toolset and the journal.',
+        step: 'marker-recovery'
+      }
+      const { kanbanPendingCreatesPath } = await import('../../../daemon/src/paths.js')
+      const cp = (daemon as any).cpClient
+      const original = cp.kanbanOrchestrate.bind(cp)
+      const crashed = vi.spyOn(cp, 'kanbanOrchestrate').mockImplementation(async (payload: any) => {
+        if (payload.op === 'commit_create') throw new Error('simulated daemon crash before commit')
+        return original(payload)
+      })
+      let number = 0
+      try {
+        const filed = await orch('kanbanCreate', req)
+        number = filed.issueNumber as number
+        if (number) issues.push(number)
+        expect(filed).toMatchObject({ filed: true, retryable: true })
+        expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(0)
+      } finally {
+        crashed.mockRestore()
+      }
+      // Lose both the in-memory map and the journal, so only the marker lookup can recover.
+      ;(daemon as any).kanbanOrchestratorToolset = undefined
+      rmSync(kanbanPendingCreatesPath(root!), { force: true })
+      // Wait out the listing lag before retrying, so the lookup can see the orphan.
+      await waitFor(async () => {
+        await gh('GET', `/repos/${FULL}/issues/${number}`)
+        const listed = await gh<Issue[]>(
+          'GET',
+          `/repos/${FULL}/issues?state=all&sort=created&direction=desc&per_page=100`
+        )
+        expect(listed.some((i) => i.number === number)).toBe(true)
+      }, 30_000)
+      expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
+      expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
+      const matches = (await gh<Issue[]>('GET', `/repos/${FULL}/issues?state=all&per_page=100`)).filter(
+        (i) => i.title === req.title
+      )
+      expect(matches.map((i) => i.number)).toEqual([number])
+      for (const dup of matches.map((i) => i.number)) if (!issues.includes(dup)) issues.push(dup)
       return [number]
     })
 
