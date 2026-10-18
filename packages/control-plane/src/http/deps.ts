@@ -73,6 +73,7 @@ import type {
   OAuthRepo,
   KanbanModeAdminRepo,
   KanbanBoardAdminRepo,
+  KanbanDispatchRepo,
   WebchatMcpOperationRepo
 } from '../persistence/ports.js'
 import type { Clock } from '../domain/clock.js'
@@ -331,6 +332,8 @@ export interface HttpDeps {
     kanbanMode: KanbanModeAdminRepo
     /** Kanban board CRUD; writes recheck owner membership in their own transaction. */
     kanbanBoards: KanbanBoardAdminRepo
+    /** Kanban dispatch reads: the dry-run explain and the board view's card list; both are read-only. */
+    kanbanDispatch: KanbanDispatchRepo
   }
   registry: DaemonRegistry
   /**

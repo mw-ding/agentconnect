@@ -4484,6 +4484,58 @@ export const KanbanBoardDto = z.object({
 export type KanbanBoardDtoT = z.infer<typeof KanbanBoardDto>
 export const KanbanBoardListDto = z.object({ boards: z.array(KanbanBoardDto) })
 
+// ── kanban dry-run explain (read-only, body-free: ids, statuses, counts and timestamps, never an issue title) ──
+export const KanbanExplainVerdictDto = z.object({
+  eligible: z.boolean(),
+  /** Present when eligible: which agent role the claim would dispatch. */
+  role: z.enum(['work', 'verify']).optional(),
+  /** Present when eligible: the agent the claim would dispatch to. */
+  agentId: z.string().optional(),
+  /** Present when not eligible: the first gate, in claim precedence, that blocks the card (a stable code). */
+  gate: z.string().optional()
+})
+export const KanbanExplainFactsDto = z.object({
+  boardEnabled: z.boolean(),
+  status: z.string(),
+  assigneeAgentId: z.string().nullable(),
+  promotionPending: z.boolean(),
+  cooldownUntil: z.string().nullable(),
+  notBefore: z.string().nullable(),
+  hasOpenLease: z.boolean(),
+  assigneeExists: z.boolean(),
+  assigneePaused: z.boolean(),
+  assigneePlaced: z.boolean(),
+  assigneeDaemonLive: z.boolean(),
+  openRunCount: z.number().int(),
+  openRunCountForAssignee: z.number().int(),
+  maxInProgress: z.number().int(),
+  maxInProgressPerAgent: z.number().int()
+})
+export const KanbanCardExplainDto = z.object({
+  boardId: z.string(),
+  cardId: z.string(),
+  issueNumber: z.number().int(),
+  status: z.string(),
+  verdict: KanbanExplainVerdictDto,
+  /** A human sentence from a static table keyed by the gate; no issue text. */
+  hint: z.string(),
+  facts: KanbanExplainFactsDto,
+  /** Board explain only: 1-based position in `wouldClaimNext`. */
+  claimOrder: z.number().int().optional(),
+  /** Board explain only: eligible now, but earlier cards fill this cap first. */
+  capBound: z.enum(['board_cap', 'agent_cap']).optional(),
+  evaluatedAt: z.string()
+})
+export const KanbanBoardExplainDto = z.object({
+  boardId: z.string(),
+  evaluatedAt: z.string(),
+  /** Every card that is not done or archived, in claim order. */
+  cards: z.array(KanbanCardExplainDto),
+  /** Card ids the next claim would take, in order, with the board and per-agent caps applied cumulatively. */
+  wouldClaimNext: z.array(z.string()),
+  wouldClaimNextIssueNumbers: z.array(z.number().int())
+})
+
 // ── shared ────────────────────────────────────────────────────────────────
 export const IdParam = z.object({ id: z.string() })
 export const HealthDto = z.object({ status: z.literal('ok') })

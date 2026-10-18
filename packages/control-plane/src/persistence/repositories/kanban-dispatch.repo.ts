@@ -4,15 +4,21 @@ import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/p
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
+import { explainClaim, type ClaimAgentFacts, type ClaimEligibilityInput } from '../../kanban/claim-eligibility.js'
+import { simulateClaim } from '../../kanban/claim-explain.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
+  KanbanBoardCardRow,
+  KanbanBoardExplanation,
+  KanbanCardExplanation,
   KanbanCardView,
   KanbanCardViewReq,
   KanbanClaimOpts,
   KanbanClaimedLease,
+  KanbanExplainOpts,
   KanbanDispatchRepo,
   KanbanGrantScope,
   KanbanLeaseBeatInput,
@@ -761,4 +767,228 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     const row = rows[0]
     return row ? { repoId: row.repoId } : null
   }
+
+  explainCard(boardId: string, cardId: string, opts: KanbanExplainOpts): Promise<KanbanCardExplanation | null> {
+    return this.readSnapshot(async (tx) => {
+      const load = await loadExplainState(tx, boardId, { id: cardId }, opts)
+      const entry = load?.cards[0]
+      return entry
+        ? { cardId: entry.cardId, issueNumber: entry.issueNumber, input: entry.input, verdict: entry.verdict }
+        : null
+    })
+  }
+
+  explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null> {
+    return this.readSnapshot(async (tx) => {
+      const load = await loadExplainState(tx, boardId, { status: { notIn: ['done', 'archived'] } }, opts)
+      if (!load) return null
+      const sim = simulateClaim(
+        load.cards.map((c) => ({ id: c.cardId, priority: c.priority, createdAt: c.createdAt, verdict: c.verdict })),
+        {
+          maxInProgress: load.board.maxInProgress,
+          maxInProgressPerAgent: load.board.maxInProgressPerAgent,
+          openTotal: load.openTotal,
+          openPerAgent: load.openPerAgent
+        }
+      )
+      const cards = load.cards.map<KanbanCardExplanation>((c) => {
+        const position = sim.order.indexOf(c.cardId)
+        const capBound = sim.capBound.get(c.cardId)
+        return {
+          cardId: c.cardId,
+          issueNumber: c.issueNumber,
+          input: c.input,
+          verdict: c.verdict,
+          ...(position >= 0 ? { claimOrder: position + 1 } : {}),
+          ...(capBound ? { capBound } : {})
+        }
+      })
+      return { boardId, now: opts.now, cards, wouldClaimNext: sim.order }
+    })
+  }
+
+  async listBoardCards(boardId: string, limit: number): Promise<{ cards: KanbanBoardCardRow[]; total: number }> {
+    const [rows, total] = await Promise.all([
+      this.db.kanbanCard.findMany({
+        where: { boardId },
+        orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+        take: limit,
+        select: {
+          id: true,
+          issueNumber: true,
+          status: true,
+          assigneeAgentId: true,
+          assigneeAgent: { select: { name: true, displayName: true } },
+          priority: true,
+          mode: true,
+          needsAttention: true,
+          attentionReason: true,
+          blockKind: true,
+          consecutiveFailures: true,
+          protocolViolations: true,
+          blockRecurrence: true,
+          cooldownUntil: true,
+          notBefore: true,
+          promotionPending: true,
+          linkedPrNumber: true,
+          stateRevision: true,
+          runs: {
+            where: { endedAt: null },
+            take: 1,
+            select: { attempt: true, agentId: true, dispatchedAt: true, ackedAt: true, heartbeatAt: true }
+          }
+        }
+      }),
+      this.db.kanbanCard.count({ where: { boardId } })
+    ])
+    return {
+      total,
+      cards: rows.map(({ assigneeAgent, runs, ...card }) => ({
+        ...card,
+        assigneeName: assigneeAgent?.name ?? null,
+        assigneeDisplayName: assigneeAgent?.displayName ?? null,
+        openRun: runs[0] ?? null
+      }))
+    }
+  }
+
+  async cardNumbersOnBoard(boardId: string, numbers: readonly number[]): Promise<number[]> {
+    if (numbers.length === 0) return []
+    const rows = await this.db.kanbanCard.findMany({
+      where: { boardId, issueNumber: { in: [...numbers] } },
+      select: { issueNumber: true }
+    })
+    return rows.map((r) => r.issueNumber)
+  }
+
+  // One repeatable-read snapshot with no locks and no writes, so a dry run never contends with the claim.
+  private readSnapshot<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    if ('$transaction' in this.db) {
+      return this.db.$transaction(fn, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead })
+    }
+    return fn(this.db as Prisma.TransactionClient)
+  }
+}
+
+interface ExplainedCard {
+  cardId: string
+  issueNumber: number
+  priority: number
+  createdAt: Date
+  input: ClaimEligibilityInput
+  verdict: ReturnType<typeof explainClaim>
+}
+
+/** Gathers exactly the facts `ClaimEligibilityInput` names, the way the claim's SQL reads them (assignee joined within the board's org). */
+async function loadExplainState(
+  tx: Prisma.TransactionClient,
+  boardId: string,
+  cardWhere: Prisma.KanbanCardWhereInput,
+  opts: KanbanExplainOpts
+): Promise<{
+  board: { maxInProgress: number; maxInProgressPerAgent: number }
+  openTotal: number
+  openPerAgent: Map<string, number>
+  cards: ExplainedCard[]
+} | null> {
+  const board = await tx.kanbanBoard.findUnique({
+    where: { id: boardId },
+    select: { orgId: true, enabled: true, verifierAgentId: true, maxInProgress: true, maxInProgressPerAgent: true }
+  })
+  if (!board) return null
+  const cards = await tx.kanbanCard.findMany({
+    where: { boardId, ...cardWhere },
+    orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+    select: {
+      id: true,
+      issueNumber: true,
+      status: true,
+      assigneeAgentId: true,
+      promotionPending: true,
+      cooldownUntil: true,
+      notBefore: true,
+      priority: true,
+      createdAt: true
+    }
+  })
+  const openRuns = await tx.kanbanRun.findMany({
+    where: { endedAt: null, card: { boardId } },
+    select: { cardId: true, agentId: true }
+  })
+  const openPerAgent = new Map<string, number>()
+  for (const run of openRuns) openPerAgent.set(run.agentId, (openPerAgent.get(run.agentId) ?? 0) + 1)
+  const leased = new Set(openRuns.map((r) => r.cardId))
+
+  const agentIds = new Set<string>()
+  for (const c of cards) if (c.assigneeAgentId) agentIds.add(c.assigneeAgentId)
+  if (board.verifierAgentId) agentIds.add(board.verifierAgentId)
+  const agentRows = agentIds.size
+    ? await tx.agent.findMany({
+        where: { id: { in: [...agentIds] }, orgId: board.orgId },
+        select: { id: true, status: true, daemonId: true }
+      })
+    : []
+  const agents = new Map<string, ClaimAgentFacts>(
+    agentRows.map((a) => [
+      a.id,
+      {
+        exists: true,
+        paused: a.status === 'paused',
+        daemonId: a.daemonId,
+        daemonLive: a.daemonId !== null && opts.isDaemonLive(a.daemonId)
+      }
+    ])
+  )
+
+  const reviewIds = cards.filter((c) => c.status === 'review').map((c) => c.id)
+  const latestWork = reviewIds.length
+    ? await tx.kanbanRun.findMany({
+        where: {
+          cardId: { in: reviewIds },
+          endedAt: { not: null },
+          outcome: { in: ['completed', 'review_requested'] }
+        },
+        orderBy: [{ cardId: 'asc' }, { attempt: 'desc' }],
+        distinct: ['cardId'],
+        select: { cardId: true, agentId: true }
+      })
+    : []
+  const latestWorkByCard = new Map(latestWork.map((r) => [r.cardId, r.agentId]))
+  const verifier = board.verifierAgentId ? (agents.get(board.verifierAgentId) ?? null) : null
+  const openTotal = openRuns.length
+
+  const explained = cards.map<ExplainedCard>((c) => {
+    const input: ClaimEligibilityInput = {
+      board: {
+        enabled: board.enabled,
+        verifierAgentId: board.verifierAgentId,
+        maxInProgress: board.maxInProgress,
+        maxInProgressPerAgent: board.maxInProgressPerAgent
+      },
+      card: {
+        status: c.status,
+        assigneeAgentId: c.assigneeAgentId,
+        promotionPending: c.promotionPending,
+        cooldownUntil: c.cooldownUntil,
+        notBefore: c.notBefore,
+        hasOpenLease: leased.has(c.id)
+      },
+      assignee: c.assigneeAgentId ? (agents.get(c.assigneeAgentId) ?? null) : null,
+      verifier,
+      latestWorkAgentId: latestWorkByCard.get(c.id) ?? null,
+      openRunCount: openTotal,
+      openRunCountForAssignee: c.assigneeAgentId ? (openPerAgent.get(c.assigneeAgentId) ?? 0) : 0,
+      openRunCountForVerifier: board.verifierAgentId ? (openPerAgent.get(board.verifierAgentId) ?? 0) : 0,
+      now: opts.now
+    }
+    return {
+      cardId: c.id,
+      issueNumber: c.issueNumber,
+      priority: c.priority,
+      createdAt: c.createdAt,
+      input,
+      verdict: explainClaim(input)
+    }
+  })
+  return { board, openTotal, openPerAgent, cards: explained }
 }

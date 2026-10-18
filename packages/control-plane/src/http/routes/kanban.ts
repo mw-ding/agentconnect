@@ -7,16 +7,19 @@ import { ctxOf, denyNonInteractive, denyNonOwner, orgOf } from '../rbac.js'
 import { Tag } from '../plugins/openapi.js'
 import { canView } from '../../authorization/policy.js'
 import { githubKanbanRepoResolver } from '../../kanban/repo-resolver.js'
-import type { KanbanBoardView, KanbanBoardWriteRefusal } from '../../persistence/ports.js'
+import { capDeferralHint, claimFactsOf, gateHint } from '../../kanban/claim-explain.js'
+import type { KanbanBoardView, KanbanBoardWriteRefusal, KanbanCardExplanation } from '../../persistence/ports.js'
 import { resolveShareSet } from '../sharing.js'
 import {
   CreateKanbanBoardBody,
   ErrorDto,
   KanbanBoardDto,
+  KanbanBoardExplainDto,
   KanbanBoardListDto,
   type KanbanBoardDtoT,
   KanbanBoardModeDto,
   KanbanBoardParams,
+  KanbanCardExplainDto,
   KanbanCardModeDto,
   KanbanCardParams,
   SetKanbanBoardModeBody,
@@ -125,6 +128,28 @@ const UPSTREAM_ERRORS = {
 
 function upstreamError(status: keyof typeof UPSTREAM_ERRORS, message: string) {
   return { ...UPSTREAM_ERRORS[status], statusCode: status, message }
+}
+
+/** The dry-run entry as the wire carries it: the verdict, a static-table hint, and body-free facts only. */
+function explainDto(boardId: string, entry: KanbanCardExplanation, evaluatedAt: string) {
+  const facts = claimFactsOf(entry.input)
+  const hint = !entry.verdict.eligible
+    ? gateHint(entry.verdict.gate, facts)
+    : entry.capBound
+      ? capDeferralHint(entry.capBound, facts)
+      : `eligible: the next claim dispatches it to agent ${entry.verdict.agentId}`
+  return {
+    boardId,
+    cardId: entry.cardId,
+    issueNumber: entry.issueNumber,
+    status: entry.input.card.status,
+    verdict: entry.verdict,
+    hint,
+    facts,
+    ...(entry.claimOrder !== undefined ? { claimOrder: entry.claimOrder } : {}),
+    ...(entry.capBound ? { capBound: entry.capBound } : {}),
+    evaluatedAt
+  }
 }
 
 export function kanbanRoutes(deps: HttpDeps) {
@@ -345,6 +370,68 @@ export function kanbanRoutes(deps: HttpDeps) {
           return reply.code(404).send({ ...notFound, message: 'card not found' })
         }
         return { boardId, cardId, mode: req.body.mode }
+      }
+    )
+
+    // The dry run reads the SAME liveness the dispatcher gives the claim, and writes, locks, audits and calls GitHub never.
+    const explainOpts = async () => ({
+      now: await deps.repos.kanbanDispatch.now(),
+      isDaemonLive: (daemonId: string) => deps.daemonConns.get(daemonId)?.state === 'READY'
+    })
+
+    r.get(
+      '/kanban/boards/:boardId/explain',
+      {
+        config: { kanbanAccess: 'viewer' },
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Explain why a board’s cards are or are not dispatched',
+          description:
+            'Read-only dry run of the claim for every card that is not done or archived, plus `wouldClaimNext`: the ids the next claim would take, in order, with the board and per-agent caps applied cumulatively. Has no side effects: no row changes, no audit rows, no GitHub calls, no dispatcher wake-up. Body-free: ids, statuses, gate codes, counts and timestamps. A board in another organization, or a restricted board not shared with the caller, reads as 404.',
+          operationId: 'explainKanbanBoard',
+          params: KanbanBoardParams,
+          response: { 200: KanbanBoardExplainDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const board = await visibleBoard(req, req.params.boardId)
+        if (!board) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        const explanation = await deps.repos.kanbanDispatch.explainBoard(board.id, await explainOpts())
+        if (!explanation) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        const evaluatedAt = explanation.now.toISOString()
+        const cards = explanation.cards.map((c) => explainDto(board.id, c, evaluatedAt))
+        const numberOf = new Map(cards.map((c) => [c.cardId, c.issueNumber]))
+        return {
+          boardId: board.id,
+          evaluatedAt,
+          cards,
+          wouldClaimNext: explanation.wouldClaimNext,
+          wouldClaimNextIssueNumbers: explanation.wouldClaimNext.map((id) => numberOf.get(id)!)
+        }
+      }
+    )
+
+    r.get(
+      '/kanban/boards/:boardId/cards/:cardId/explain',
+      {
+        config: { kanbanAccess: 'viewer' },
+        schema: {
+          tags: [Tag.Kanban],
+          summary: 'Explain why a card is or is not dispatched',
+          description:
+            'Read-only dry run of the claim for one card (any status): the verdict, the first blocking gate with a human hint, and body-free facts. Has no side effects. A card not on the board, a board in another organization, or a restricted board not shared with the caller reads as 404.',
+          operationId: 'explainKanbanCard',
+          params: KanbanCardParams,
+          response: { 200: KanbanCardExplainDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const board = await visibleBoard(req, req.params.boardId)
+        if (!board) return reply.code(404).send({ ...notFound, message: 'board not found' })
+        const opts = await explainOpts()
+        const entry = await deps.repos.kanbanDispatch.explainCard(board.id, req.params.cardId, opts)
+        if (!entry) return reply.code(404).send({ ...notFound, message: 'card not found' })
+        return explainDto(board.id, entry, opts.now.toISOString())
       }
     )
   }
