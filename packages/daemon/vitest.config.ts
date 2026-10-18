@@ -11,6 +11,7 @@ import { BASE_TEST_TIMEOUT } from '../../scripts/vitest-test-budget.js'
 //
 // `test/no-stray-vi-mock.test.ts` fails if this list drifts from what the suite actually mocks.
 export const MOCKING_TESTS = [
+  'test/kanban/pending-journal.test.ts',
   'test/cp/cp-integration.test.ts',
   'test/mcp-control-server.test.ts',
   'test/mcp-bridge-e2e.test.ts',
