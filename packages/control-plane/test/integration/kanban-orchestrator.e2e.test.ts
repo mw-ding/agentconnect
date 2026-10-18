@@ -576,7 +576,7 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       const req = {
         board: boardId,
         title: `[kanban-e2e] orch marker recovery ${started}`,
-        body: 'Scratch marker recovery after losing both the toolset and the journal.',
+        body: 'Scratch marker recovery after losing the toolset and journal contents.',
         step: 'marker-recovery'
       }
       const { kanbanPendingCreatesPath } = await import('../../../daemon/src/paths.js')
@@ -596,9 +596,9 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       } finally {
         crashed.mockRestore()
       }
-      // Lose both the in-memory map and the journal, so only the marker lookup can recover.
+      // Lose the journal contents; corruption is evidence that marker recovery is required.
       ;(daemon as any).kanbanOrchestratorToolset = undefined
-      rmSync(kanbanPendingCreatesPath(root!), { force: true })
+      writeFileSync(kanbanPendingCreatesPath(root!), 'lost journal contents')
       // Wait out the listing lag before retrying, so the lookup can see the orphan.
       await waitFor(async () => {
         await gh('GET', `/repos/${FULL}/issues/${number}`)
@@ -622,6 +622,44 @@ describe.skipIf(!enabled)('kanban orchestrator e2e (live GitHub)', () => {
       }, 30_000)
       for (const dup of matches.map((i) => i.number)) if (!issues.includes(dup)) issues.push(dup)
       return [number]
+    })
+
+    await scenario('o9 retry after github_partial', async () => {
+      const req = {
+        board: boardId,
+        title: `[kanban-e2e] orch partial retry ${started}`,
+        body: 'Scratch partial label failure followed by metadata repair.',
+        step: 'partial-retry',
+        blockedBy: [aIssue]
+      }
+      const apply = vi
+        .spyOn(GithubCardStore.prototype, 'applyPlan')
+        .mockRejectedValueOnce(new Error('injected label failure'))
+      let number = 0
+      try {
+        const partial = await orch('kanbanCreate', req)
+        number = partial.issueNumber as number
+        if (number) issues.push(number)
+        expect(partial).toMatchObject({ created: true, partial: true, retryable: true })
+        expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
+        expect(await labelNames(number)).not.toContain('ac/status:todo')
+        expect(await blockedByNumbers(number)).not.toContain(aIssue)
+        expect(await orch('kanbanCreate', req)).toMatchObject({ created: true, issueNumber: number })
+        expect(apply).toHaveBeenCalledTimes(2)
+        await waitFor(async () => {
+          expect(await labelNames(number)).toContain('ac/status:todo')
+          expect(await blockedByNumbers(number)).toContain(aIssue)
+          const listed = await gh<Issue[]>(
+            'GET',
+            `/repos/${FULL}/issues?state=all&sort=created&direction=desc&per_page=100`
+          )
+          expect(listed.filter((i) => i.title === req.title).map((i) => i.number)).toEqual([number])
+        })
+        expect(await prisma.kanbanCard.count({ where: { boardId, issueNumber: number } })).toBe(1)
+        return [number]
+      } finally {
+        apply.mockRestore()
+      }
     })
 
     for (const r of results) console.log(`KANBAN_ORCH_E2E_RESULT ${JSON.stringify(r)}`)

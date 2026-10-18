@@ -16,7 +16,7 @@ crosses the wire. The epic ref is its issue **number**, or `board:<id>` when abs
 | op               | fields                                                                                              | reply (`ok: true`)                                                                                                                                                                |
 | ---------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `list`           | `agentId`, `boardId?`, `status?`                                                                    | `{ truncated, boards: [{ boardId, repoFullName, cards: [{ issueNumber, status, assigneeAgentId, assigneeSlug, priority, blockKind, epicIssueNumber, leased }] }] }` (≤ 200 cards) |
-| `prepare_create` | `agentId`, `boardId`, `epicIssueNumber?`, `step`, `specDigest`, `assignee?`, `priority?`, `status?` | `{ verdict: 'existing', issueNumber }` or `{ verdict: 'proceed' }`                                                                                                                |
+| `prepare_create` | `agentId`, `boardId`, `epicIssueNumber?`, `step`, `specDigest`, `assignee?`, `priority?`, `status?` | `{ verdict: 'existing', issueNumber }` or `{ verdict: 'proceed' }`; both include optional nullable `appLogin`                                                                     |
 | `commit_create`  | same + `issueNumber`, `blockedBy?` (≤ 20)                                                           | `{ cardId, issueNumber }`                                                                                                                                                         |
 | `link`           | `agentId`, `boardId`, `issueNumber`, `blockedBy?`, `parentIssueNumber?`                             | `{}`                                                                                                                                                                              |
 | `unblock`        | `agentId`, `boardId`, `issueNumber`, `blockers?` (omitted = all)                                    | `{ status }`                                                                                                                                                                      |
@@ -25,34 +25,52 @@ crosses the wire. The epic ref is its issue **number**, or `board:<id>` when abs
 Refusals are data, never errors, with stable codes: `not_orchestrator`, `board_not_found`, `board_disabled`,
 `epic_not_found`, `epic_budget_exhausted`, `card_not_found`, `issue_not_found`, `issue_not_from_app`,
 `unknown_agent`, `agent_not_assignable`, `key_conflict`, `issue_mismatch`, `invalid_link`, `cross_repo`,
-`github_unavailable`, `github_partial`. The schema tests prove `title`/`body`/`text` keys are rejected everywhere.
+`repo_mismatch`, `status_not_allowed`, `card_conflict`, `github_unavailable`, `github_partial`. The schema tests prove `title`/`body`/`text` keys are rejected everywhere.
+
+Deploy the CP before the daemon: older CP versions reject the new `kanban/orchestrate` frame and
+`kanban_orchestrator_write` gitcred purpose. No relay change is required.
 
 ## Role gate
 
 The handler (`handleKanbanOrchestrate`) fences the request against the authenticated connection: the `agentId`
 must be an agent hosted by `conn.daemonId`. The service then requires the board to exist in that agent's org, be
 enabled, and have `orchestratorAgentId === agentId`. An unknown or other-org board is indistinguishable
-(`board_not_found`) so other orgs' boards never leak.
+(`board_not_found`) so other orgs' boards never leak. D1 offers these tools in every chat session, so any
+chat participant who can talk to the orchestrator agent can steer card filing, bounded by this role gate and
+the B1 idempotency and B2 budget checks.
 
 ## D3 split (daemon files the body, CP writes metadata)
 
-- The daemon masks `{ title, body }` with `maskAgentSecrets`, computes `specDigest`, and POSTs
-  `/repos/{owner}/{repo}/issues` with a purpose-bound `kanban_orchestrator_write` token (issues-only, board repo
-  only, minted when the agent orchestrates an enabled board on that repo). A 401/403 invalidates the presented
-  cached grant and forces the next mint past the CP token cache; other errors keep the grant.
-- Each issue body carries `<!-- agentconnect:kanban-card-key:<B1 digest> -->`. After `prepare_create` finds no
-  registered B1 card, the daemon first consults its durable pending journal (`<root>/state/
-kanban-pending-creates.json`: the same agent/board/epic/step/spec key → issue number + file time, one-hour
-  expiry, 256-entry oldest-first cap, written atomically via tmp + rename at mode 0600, keys only — never titles,
-  bodies, or tokens). A journal hit skips both the lookup and POST. Otherwise the daemon lists the repository's
-  issues newest-first (`state=all&sort=created&direction=desc&since=<now-24h>`, at most 3 pages, excluding PRs)
-  and matches that exact marker before POSTing. Listing avoids search-index lag immediately after a crash. A
-  lookup failure stops creation. If an orphan exists, the daemon journals it and commits that issue, including a
-  closed orphan (its GitHub state stays closed). The CP receives only the number and digest, never the body. A
-  card already registered under B1 is returned by prepare before journal, lookup, or B2.
-- The remaining window is tiny: a crash between the issue POST response and the journal write, combined with
-  listing lag, can still file twice; the CP's B1 uniqueness and duplicate-close path then select one card and
-  retire the loser.
+- The daemon masks `{ title, body }`, neutralizes agent-supplied recovery-marker prefixes (case-insensitive,
+  including whitespace variants), then computes `specDigest` and POSTs `/repos/{owner}/{repo}/issues` with an
+  issues-only, repo-scoped `kanban_orchestrator_write` token. GitHub 401/403 evicts only the presented cached
+  token; CP `not_orchestrator` / `board_disabled` on prepare or commit evicts the known agent+repo grant (or
+  every orchestrator grant for the agent when the board repo is not yet resolved) and forces the next mint
+  past the CP cache. Until a rejection is observed, an already cached gitcred token can remain usable after
+  revocation until its TTL expires (normally under one hour).
+- The daemon appends its own trailing `<!-- agentconnect:kanban-card-key:<B1 digest> -->`. The durable journal
+  (`<root>/state/kanban-pending-creates.json`) stores only keys, timestamps, issue numbers, and rejected lookup
+  numbers, never titles, bodies, or tokens. Before POST it writes `{ issueNumber: null, startedAt }`; after POST
+  it fills in `{ issueNumber, filedAt }`. Writes use a mode-0600 temporary file, fsync before rename and a
+  directory fsync afterwards (the directory fsync is skipped on Windows). Entries expire after one hour and
+  the oldest entries are evicted above 256. Loading rejects unsafe/nonpositive numbers and timestamps over
+  one minute in the future. Failure to persist the intent prevents POST.
+- A filed journal hit skips lookup and POST. `prepare_create: existing` normally returns immediately; when the
+  exact key's journal number equals the existing card, `commit_create` replays labels and edges after a partial
+  metadata failure. Success or terminal refusal clears the entry; transient failures retain it.
+- Ordinary fresh creates skip lookup. Only an intent without a number or a corrupt/invalid journal triggers
+  marker recovery. Lookup is bounded to three pages of 100 issues updated within 24 hours, excludes PRs, and
+  requires `body.trimEnd().endsWith(marker)`. App mode accepts only Bot users whose login matches the CP's
+  trusted `appLogin` case-insensitively. In the PAT development seam, GET `/user` with the same token supplies
+  the sole accepted author login; unavailable identity stops recovery. Among matches, the oldest creation
+  timestamp wins, with the lowest number breaking ties. Closed orphans keep their closed state. Refused
+  looked-up issues (`issue_not_from_app`, `issue_mismatch`, `key_conflict`) are journaled as rejected and skipped
+  on later lookups, including after restart.
+- An unresolved intent returns a retryable `github_unavailable` result without another POST; later calls can
+  retry lookup during the one-hour retention period. A repo with more than 300 updates in 24 hours can hide
+  the orphan outside the lookup bound, now a recovery-only limitation. After intent expiry/eviction, deleting
+  the journal, or losing its storage, a retry can still file a duplicate. That first uncommitted orphan stays
+  open and unlabelled: B1 and duplicate-close cannot retire an issue never presented to `commit_create`.
 - `commit_create` then registers the issue through `createEpicChild`: one transaction locks the epic card
   `FOR UPDATE`, re-checks B2, and composes the Lane 1 `upsertCard` (B1 key, `source: 'orchestrator'`,
   `actorAgentId`). Labels (`ac/status:<status>`, `ac/agent:<slug>`) and the epic sub-issue / `blocked_by` edges are
@@ -82,8 +100,8 @@ two boards claiming in parallel serialize and cannot overshoot.
 
 ## Known gaps
 
-- Simultaneous independent creates can still race past the marker lookup; the CP's B1 uniqueness and duplicate-close
-  path select one card and retire the losing issue. Crash retries reuse the journal first, then the durable marker.
+- Simultaneous independent creates can both POST; if both reach commit, B1 selects one card and closes the
+  losing issue. An issue whose POST lands but never reaches commit can remain open and unlabelled.
 - Sub-issue and dependency writes take GitHub's numeric issue **id**, never the issue number; the CardStore methods
   take a `bigint` id to make that hard to get wrong. The live E2E asserts both edges on GitHub.
 - `kanbanCreate` takes a board id (uuid); an `owner/repo` alias is not yet accepted.
