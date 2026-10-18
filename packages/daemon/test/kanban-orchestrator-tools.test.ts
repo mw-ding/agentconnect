@@ -440,7 +440,7 @@ describe('pending journal', () => {
     expect((aged as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0)
   })
 
-  it('stores only keys, never titles or bodies, at mode 0600', async () => {
+  it('stores only keys, never titles or bodies', async () => {
     const journalPath = freshJournalPath()
     const h = journaled(async (p) => {
       if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
@@ -451,6 +451,15 @@ describe('pending journal', () => {
     expect(raw).not.toContain(TITLE)
     expect(raw).not.toContain(BODY)
     expect(raw).toContain('issueNumber')
+  })
+
+  it.skipIf(process.platform === 'win32')('stores the journal at mode 0600', async () => {
+    const journalPath = freshJournalPath()
+    const h = journaled(async (p) => {
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      throw new Error('CP unavailable')
+    }, journalPath)
+    await h.svc.create(req)
     expect(statSync(journalPath).mode & 0o777).toBe(0o600)
   })
 })
