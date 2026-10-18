@@ -51,6 +51,8 @@ import {
   CronUpsert,
   CronRemove,
   CronRunNow,
+  KanbanRevoke,
+  KanbanRevokeOk,
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanNotify,
@@ -649,6 +651,11 @@ export class ControlSender {
   }
 
   /** Lease one Kanban card to an agent on this daemon (issue #2 M2; body-free REQ → `kanban/dispatch/ok`). */
+  async kanbanRevoke(daemonId: string, req: KanbanRevoke): Promise<KanbanRevokeOk> {
+    const c = this.must(daemonId)
+    return c.conn.request<KanbanRevokeOk>('kanban/revoke', req, { epoch: c.sessionEpoch })
+  }
+
   async kanbanDispatch(daemonId: string, d: KanbanDispatch, opts?: RequestOpts): Promise<KanbanDispatchOk> {
     const c = this.must(daemonId)
     return c.conn.request<KanbanDispatchOk>('kanban/dispatch', d, { epoch: c.sessionEpoch }, opts)

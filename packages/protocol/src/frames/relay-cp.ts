@@ -730,6 +730,15 @@ export const KanbanDoorbellCheckSuite = z
   })
   .strict()
 export type KanbanDoorbellCheckSuite = z.infer<typeof KanbanDoorbellCheckSuite>
+/** A Kanban `issues` doorbell's webhook sender: a human login beside its numeric id, matched against the events API. */
+export const RcGithubGraphSender = z
+  .object({
+    login: z.string().min(1).max(64),
+    id: GithubNumericId,
+    type: z.string().min(1).max(16) // 'User' for a rung doorbell; seen-only markers omit the sender
+  })
+  .strict()
+export type RcGithubGraphSender = z.infer<typeof RcGithubGraphSender>
 export const RcGithubGraph = z
   .object({
     deliveryKey: z.string().min(1).max(200), // X-GitHub-Delivery GUID — the redelivery landed marker
@@ -741,7 +750,12 @@ export const RcGithubGraph = z
     numbers: z.array(z.number().int().positive()).max(4), // the same issues' numbers, when same-repo
     command: KanbanDoorbellCommand.optional(), // `issue_comment` only; absent on a seen-only marker
     pullRequest: KanbanDoorbellPullRequest.optional(), // `pull_request` closed only
-    checkSuite: KanbanDoorbellCheckSuite.optional() // `check_suite` completed only
+    checkSuite: KanbanDoorbellCheckSuite.optional(), // `check_suite` completed only
+    // Optional, so an older relay's frames still parse; the CP requires a `labeled` sender's add to be the latest visible.
+    sender: RcGithubGraphSender.optional(),
+    label: z.string().min(1).max(100).optional(),
+    // The issue's `updated_at` at the label edit, so the CP can recognize a late or redelivered doorbell as superseded.
+    at: z.string().max(40).datetime().optional()
   })
   .strict()
 export type RcGithubGraph = z.infer<typeof RcGithubGraph>

@@ -2622,6 +2622,13 @@ model KanbanCard {
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
+  labelWritePending Boolean @default(false)
+  syncEventCursor BigInt @default(0)
+  syncAgentCursor BigInt @default(0)
+  syncCheckedAt DateTime? @db.Timestamptz(6)
+  // Label-sync deferral: a pass that cannot attribute a live label yet is retried until this bound fails closed.
+  syncDeferredAt DateTime? @db.Timestamptz(6)
+  syncDeferralCount Int @default(0)
   githubSyncedAt      DateTime?        @db.Timestamptz(6)
   createdAt           DateTime         @default(now()) @db.Timestamptz(6)
   updatedAt           DateTime         @updatedAt @db.Timestamptz(6)
@@ -2634,6 +2641,7 @@ model KanbanCard {
 
   @@unique([boardId, issueId])
   @@unique([boardId, issueNumber])
+  @@index([boardId, syncCheckedAt])
   @@unique([boardId, idempotencyKey])
   @@index([issueId]) // graph doorbell lookup
   @@index([boardId, status])

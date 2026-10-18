@@ -403,6 +403,7 @@ export class CpClient {
     }
     this.controlDeps = {
       configApply: deps.configApply,
+      kanbanRevoke: deps.kanbanRevoke,
       kanbanDispatch: deps.kanbanDispatch,
       kanbanNotify: deps.kanbanNotify,
       sessionRead: deps.sessionRead,

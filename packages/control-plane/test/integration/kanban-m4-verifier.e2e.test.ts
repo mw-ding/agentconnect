@@ -12,6 +12,7 @@ import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
@@ -124,7 +125,14 @@ describe.skipIf(!enabled)('kanban M4 verifier + notifier e2e (live GitHub)', () 
     revokedAt: null,
     createdAt: new Date(0)
   }
-  const store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+  // Label sync re-checks the actor's live write grant, so the store needs the permission reader even in E2E.
+  const store = new GithubCardStore({
+    tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+    permissions: new GithubRepoPermission({
+      tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+      ttlMs: 0
+    })
+  })
 
   const issue = (number: number) => gh<Issue>('GET', `/repos/${FULL}/issues/${number}`)
   const comments = (number: number) => gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${number}/comments`)

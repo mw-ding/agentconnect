@@ -51,7 +51,11 @@ let e2eBinding: { authorLogin: string; authorType: string; defaultBranch: string
 const log = { debug: vi.fn(), info: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
 
 function harness() {
-  const store = new GithubCardStore({ tokens: tokenSource as never })
+  // Label sync re-checks the actor's live write grant, so the store needs the permission reader even in E2E.
+  const store = new GithubCardStore({
+    tokens: tokenSource as never,
+    permissions: new GithubRepoPermission({ tokens: tokenSource as never, ttlMs: 0 })
+  })
   const commands = new KanbanCommentCommands({
     cards: new PgKanbanCardRepo(prisma),
     store,

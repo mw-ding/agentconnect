@@ -9,6 +9,7 @@ import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
 import { GithubPrReader } from '../../src/kanban/pr-reader.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/index.js'
@@ -429,7 +430,11 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
       appSlug: 'agentconnect-test',
       repo: new PgKanbanDispatchRepo(prisma),
       prs: new GithubPrReader({ tokens: tokens as never, fetchImpl: github.fetch }),
-      store: new GithubCardStore({ tokens: tokens as never, fetchImpl: github.fetch }),
+      store: new GithubCardStore({
+        tokens: tokens as never,
+        fetchImpl: github.fetch,
+        permissions: new GithubRepoPermission({ tokens: tokens as never, ttlMs: 0, fetchImpl: github.fetch })
+      }),
       repoRef: async () => ({
         installationId: BigInt(INSTALLATION_ID),
         repoId: BigInt(REPO_ID),
