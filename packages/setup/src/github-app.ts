@@ -43,7 +43,9 @@ export const GITHUB_APP_PERMISSIONS = {
   checks: 'write',
   workflows: 'write',
   deployments: 'read',
-  emails: 'read'
+  emails: 'read',
+  // Kanban M5 Projects v2 Status projection (org-owned only); existing installs re-consent before it works.
+  organization_projects: 'write'
 } as const
 
 export const GITHUB_APP_EVENTS = [
@@ -208,6 +210,9 @@ export interface GithubAppAuditResult {
   diff: Array<{ id: string; field: string; current: unknown; expected: unknown }>
 }
 
+// Organization-level permission keys, partitioned out of the mixed /app permissions record for drift reporting.
+const GITHUB_ORG_PERMISSION_KEYS: ReadonlySet<string> = new Set(['organization_projects'])
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
@@ -258,9 +263,25 @@ export async function auditGithubApp(
   if (app.external_url !== expectedManifest.url) {
     addDiff('external_url', 'Homepage URL', app.external_url ?? null, expectedManifest.url ?? null)
   }
-  const expectedPermissions = GITHUB_APP_PERMISSIONS
-  if (!sameRecord(app.permissions, expectedPermissions)) {
-    addDiff('permissions', 'Repository permissions', asRecord(app.permissions), expectedPermissions)
+  // The /app response mixes organization-level permissions with repository ones; the drift report partitions
+  // both sides so an org-permission gap reads as an org problem instead of hiding inside the repo list.
+  const currentOrg: Record<string, unknown> = {}
+  const currentRepo: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(asRecord(app.permissions))) {
+    if (GITHUB_ORG_PERMISSION_KEYS.has(key)) currentOrg[key] = value
+    else currentRepo[key] = value
+  }
+  const expectedOrg: Record<string, string> = {}
+  const expectedRepo: Record<string, string> = {}
+  for (const [key, value] of Object.entries(GITHUB_APP_PERMISSIONS)) {
+    if (GITHUB_ORG_PERMISSION_KEYS.has(key)) expectedOrg[key] = value
+    else expectedRepo[key] = value
+  }
+  if (!sameRecord(currentRepo, expectedRepo)) {
+    addDiff('permissions', 'Repository permissions', currentRepo, expectedRepo)
+  }
+  if (!sameRecord(currentOrg, expectedOrg)) {
+    addDiff('org_permissions', 'Organization permissions', currentOrg, expectedOrg)
   }
   const expectedEvents = Array.isArray(expectedManifest.default_events)
     ? expectedManifest.default_events.filter((event): event is string => typeof event === 'string')
