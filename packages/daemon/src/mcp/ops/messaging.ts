@@ -83,8 +83,16 @@ function normalizeNeedsReply(value: boolean | string | null | undefined): boolea
   return undefined
 }
 
+/** A platform user id: a bare id (`U1234`, `W…`, `42`, `ou_…`, `users/123`) or the
+ *  `<@id>` mention form of the same body. No whitespace and no `<`, `>`, `|` or `&`,
+ *  so a mention-injection into the channel-root `<@${user}>` interpolation is
+ *  impossible. `/` is allowed for Google Chat's `users/123` shape. */
+const USER_ID_BODY = '[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}'
+const USER_ID_SHAPE = new RegExp(`^(?:<@!?${USER_ID_BODY}>|${USER_ID_BODY})$`)
+const USER_ID_SHAPE_ERROR =
+  'sendMessage: `toUser` must be a platform user id like `U1234` or `<@U1234>` — not free text'
 /** `toUser`: one id for every form; a non-empty array only for one channel-root post mentioning them all. */
-const USER_ID = z.string(USER_TARGET_ERROR).refine((id) => id.trim().length > 0, USER_TARGET_ERROR)
+const USER_ID = z.string(USER_TARGET_ERROR).regex(USER_ID_SHAPE, USER_ID_SHAPE_ERROR)
 export const USER_TARGETS = z
   .union([USER_ID, z.array(USER_ID).min(1, USER_TARGET_ERROR)], USER_TARGET_ERROR)
   .transform((value) => (typeof value === 'string' ? [value] : value))
