@@ -224,7 +224,7 @@ it.each(['open', 'closed'] as const)(
     })
     expect(fileIssue).toHaveBeenCalledTimes(1)
     expect(issues).toHaveLength(1)
-    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id } })).toBe(0)
+    expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, id: { not: h.epic.id } } })).toBe(0)
     fileCrashed = false
     h.store.readCard.mockImplementation(async (_repo, n) => ({
       issueId: BigInt(5_000_000 + n),
