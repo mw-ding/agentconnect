@@ -169,7 +169,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           AND a."orgId" = ${board.orgId} AND a."status" <> 'paused'
         JOIN "daemon" d ON d."id" = a."daemonId"
         WHERE c."boardId" = ${boardId}::uuid
-          AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL))
+          AND (c."status" = 'ready' OR (c."status" = 'review' AND ${board.verifierAgentId}::uuid IS NOT NULL
+            -- An approval under a PR contract leaves the card in review; it waits for the PR, not another verify.
+            AND c."verifiedAt" IS NULL))
           ${
             cursor
               ? Prisma.sql`AND (c."priority" < ${cursor.priority} OR
@@ -224,8 +226,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           const updated = await tx.kanbanCard.update({
             where: { id: card.id },
             data: {
-              // A verify run keeps the card in `review`; a work run moves it to `running`.
+              // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
+              ...(card.role === 'work' ? { verifiedAt: null } : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -349,6 +352,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           stateRevision: { increment: 1 },
           cooldownUntil: null,
           blockKind: null,
+          // A human status move starts over, so an old approval never suppresses the next review.
+          verifiedAt: null,
           ...RECOVERY_RESET
         }
       })

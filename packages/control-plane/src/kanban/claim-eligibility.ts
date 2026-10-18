@@ -23,6 +23,8 @@ export type ClaimGate =
   // Review routing: a review card needs a configured verifier that is not its worker (B8 self-approval guard).
   | 'verifier_unset'
   | 'verifier_is_worker'
+  // The verifier approved but a PR completion contract still gates done: re-verifying would loop forever.
+  | 'verified'
 
 /** The verdict: claimable (with the target role and agent), or the first gate in precedence order that blocks it. */
 export type ClaimVerdict = { eligible: true; role: ClaimRole; agentId: string } | { eligible: false; gate: ClaimGate }
@@ -53,6 +55,8 @@ export interface ClaimEligibilityInput {
     promotionPending: boolean
     cooldownUntil: Date | null
     notBefore: Date | null
+    /** When the verifier approved a review card under a PR contract; set ⇒ the card is not re-verified. */
+    verifiedAt: Date | null
     /** An open (un-ended) run already holds this card. */
     hasOpenLease: boolean
   }
@@ -78,6 +82,7 @@ export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   if (card.status !== 'ready' && card.status !== 'review') return { eligible: false, gate: 'status_not_claimable' }
   const role: ClaimRole = card.status === 'review' ? 'verify' : 'work'
   if (role === 'verify' && board.verifierAgentId === null) return { eligible: false, gate: 'verifier_unset' }
+  if (role === 'verify' && card.verifiedAt !== null) return { eligible: false, gate: 'verified' }
   if (card.promotionPending) return { eligible: false, gate: 'promotion_pending' }
   if (card.cooldownUntil !== null && card.cooldownUntil.getTime() > now.getTime()) {
     return { eligible: false, gate: 'cooldown' }

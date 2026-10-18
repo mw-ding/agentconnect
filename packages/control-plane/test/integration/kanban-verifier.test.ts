@@ -63,7 +63,11 @@ class FakeStore {
 }
 
 async function harness(
-  opts: { verifier?: string | null; reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk> } = {}
+  opts: {
+    verifier?: string | null
+    completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+    reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk>
+  } = {}
 ) {
   await seedDaemon(prisma, D1, { sessionEpoch: 4n })
   await seedDaemon(prisma, D2, { sessionEpoch: 2n })
@@ -77,7 +81,8 @@ async function harness(
       repoFullName: 'acme/web',
       maxInProgress: 10,
       maxInProgressPerAgent: 10,
-      verifierAgentId: opts.verifier === undefined ? A2 : opts.verifier
+      verifierAgentId: opts.verifier === undefined ? A2 : opts.verifier,
+      completionContract: opts.completionContract ?? 'close'
     }
   })
   const clock = new FakeClock(T0)
@@ -257,6 +262,81 @@ describe('Kanban verifier routing (real Postgres)', () => {
     })
     await h.dispatcher.settle()
     expect(await h.card(c.id)).toMatchObject({ status: 'done', reviewRounds: 0, verifiedAt: null })
+  })
+})
+
+describe('Kanban verifier approval under a PR contract (real Postgres)', () => {
+  const verifyRuns = (cardId: string) => prisma.kanbanRun.count({ where: { cardId, role: 'verify' } })
+  const tick = async (h: Awaited<ReturnType<typeof harness>>) => {
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+  }
+
+  it.each(['pr_merged', 'pr_checks_green'] as const)(
+    'vera-414: an approval under %s dispatches exactly one verify run across ticks and reports',
+    async (completionContract) => {
+      const h = await harness({ completionContract })
+      const c = await h.reviewCard()
+      await tick(h)
+      expect(h.sent).toHaveLength(1)
+      const verify = h.sent[0]!.d
+      expect(verify).toMatchObject({ cardId: c.id, agentId: A2, role: 'verify' })
+      expect(await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'completed' }))).toEqual({
+        leaseId: verify.leaseId,
+        accepted: true
+      })
+      await h.dispatcher.settle()
+      // The report's poke, more ticks, and a replayed report must not mint another verify lease.
+      for (let i = 0; i < 3; i++) {
+        h.clock.advance(120_000)
+        await tick(h)
+      }
+      await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'completed' }))
+      await tick(h)
+      expect(h.sent).toHaveLength(1)
+      expect(await verifyRuns(c.id)).toBe(1)
+      expect(await prisma.kanbanRun.count({ where: { cardId: c.id, endedAt: null } })).toBe(0)
+      const after = await h.card(c.id)
+      expect(after.status).toBe('review')
+      expect(after.verifiedAt).not.toBeNull()
+    }
+  )
+
+  it.each(['completed', 'review_requested'] as const)(
+    'vera-414: a new review round (changes_requested → ready → work %s → review) is verifiable again',
+    async (workOutcome) => {
+      const h = await harness({ completionContract: 'pr_merged' })
+      const c = await h.reviewCard()
+      await tick(h)
+      const first = h.sent[0]!.d
+      await h.dispatcher.onReport(D2, 2, h.reportFor(first, { outcome: 'changes_requested' }))
+      await h.dispatcher.settle()
+      const work = h.sent.at(-1)!.d
+      expect(work).toMatchObject({ cardId: c.id, agentId: A1 })
+      expect(work.role).toBeUndefined()
+      await h.dispatcher.onReport(D1, 4, h.reportFor(work, { outcome: workOutcome }))
+      await h.dispatcher.settle()
+      // The worker's pass is a new round, so the card returns to the verifier with no approval stamp.
+      const second = h.sent.at(-1)!.d
+      expect(second).toMatchObject({ cardId: c.id, agentId: A2, role: 'verify', attempt: 3 })
+      expect(await h.card(c.id)).toMatchObject({ verifiedAt: null, reviewRounds: 1 })
+      await h.dispatcher.onReport(D2, 2, h.reportFor(second, { outcome: 'completed' }))
+      await h.dispatcher.settle()
+      await tick(h)
+      expect(await verifyRuns(c.id)).toBe(2)
+      expect(h.sent).toHaveLength(3)
+      expect(await h.card(c.id)).toMatchObject({ status: 'review', reviewRounds: 0 })
+      expect((await h.card(c.id)).verifiedAt).not.toBeNull()
+    }
+  )
+
+  it('vera-414: a work claim clears a stale approval stamp, so its next review is verified again', async () => {
+    const h = await harness({ completionContract: 'pr_merged' })
+    const c = await h.addCard()
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { verifiedAt: new Date(T0) } })
+    const claimed = await h.repo.claim(h.board.id, { now: new Date(T0), isDaemonLive: () => true })
+    expect(claimed.leases[0]).toMatchObject({ cardId: c.id, role: 'work' })
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', verifiedAt: null })
   })
 })
 

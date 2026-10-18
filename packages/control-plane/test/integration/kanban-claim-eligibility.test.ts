@@ -121,6 +121,7 @@ async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibili
       promotionPending: c.promotionPending,
       cooldownUntil: c.cooldownUntil,
       notBefore: c.notBefore,
+      verifiedAt: c.verifiedAt,
       hasOpenLease: (await prisma.kanbanRun.count({ where: { cardId, endedAt: null } })) > 0
     },
     assignee: await agentFor(c.assigneeAgentId),
@@ -186,9 +187,10 @@ describe('claim eligibility parity (real Postgres)', () => {
       {
         verify: await card(live.id, 1, { status: 'review' }),
         work: await card(live.id, 2),
-        latest_worker: pastWorker
+        latest_worker: pastWorker,
+        verified: await card(live.id, 4, { status: 'review', verifiedAt: NOW })
       },
-      { verify: 'eligible', work: 'eligible', latest_worker: 'verifier_is_worker' }
+      { verify: 'eligible', work: 'eligible', latest_worker: 'verifier_is_worker', verified: 'verified' }
     )
     expect(claimed.flaggedSelfVerify.map((f) => f.cardId)).toEqual([pastWorker.id])
 

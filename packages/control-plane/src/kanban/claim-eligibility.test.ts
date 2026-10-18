@@ -17,6 +17,7 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
       promotionPending: false,
       cooldownUntil: null,
       notBefore: null,
+      verifiedAt: null,
       hasOpenLease: false
     },
     assignee: liveAgent(),
@@ -51,6 +52,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         }
       }
@@ -64,6 +66,7 @@ describe('explainClaim — gates', () => {
           promotionPending: true,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         }
       }
@@ -77,6 +80,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: new Date(NOW.getTime() + 1000),
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         }
       }
@@ -90,6 +94,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: null,
           notBefore: new Date(NOW.getTime() + 1000),
+          verifiedAt: null,
           hasOpenLease: false
         }
       }
@@ -103,6 +108,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         }
       }
@@ -120,6 +126,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: true
         }
       }
@@ -139,6 +146,7 @@ describe('explainClaim — gates', () => {
           promotionPending: false,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         },
         openRunCount: 10
@@ -157,6 +165,7 @@ describe('explainClaim — gates', () => {
           promotionPending: true,
           cooldownUntil: null,
           notBefore: null,
+          verifiedAt: null,
           hasOpenLease: false
         }
       })
@@ -174,6 +183,7 @@ describe('explainClaim — gates', () => {
             promotionPending: false,
             cooldownUntil: new Date(NOW.getTime() - 1),
             notBefore: new Date(NOW.getTime() - 1),
+            verifiedAt: null,
             hasOpenLease: false
           }
         })
@@ -252,5 +262,22 @@ describe('explainClaim — review routing', () => {
       eligible: false,
       gate: 'board_cap'
     })
+  })
+})
+
+describe('explainClaim — approved review cards', () => {
+  it('vera-414: an approved review card (verifiedAt set) is not re-verified', () => {
+    expect(explainClaim(review({}, { verifiedAt: NOW }))).toEqual({ eligible: false, gate: 'verified' })
+  })
+
+  it('vera-414: a review card without an approval stamp is still verifiable', () => {
+    expect(explainClaim(review({}, { verifiedAt: null }))).toEqual({ eligible: true, role: 'verify', agentId: A2 })
+  })
+
+  it('vera-414: the verified gate follows verifier_unset and precedes the timing gates', () => {
+    const noVerifier = review({ board: { ...review().board, verifierAgentId: null } }, { verifiedAt: NOW })
+    expect(explainClaim(noVerifier)).toEqual({ eligible: false, gate: 'verifier_unset' })
+    const cooling = review({}, { verifiedAt: NOW, cooldownUntil: new Date(NOW.getTime() + 1000) })
+    expect(explainClaim(cooling)).toEqual({ eligible: false, gate: 'verified' })
   })
 })
