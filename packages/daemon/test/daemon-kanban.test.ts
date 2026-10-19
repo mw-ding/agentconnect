@@ -10,6 +10,8 @@ import { maskableSecrets } from '../src/session/secret-mask.js'
 import { LocalStore, sessionKey } from '../src/store/local-store.js'
 import { buildKanbanMessage } from '../src/messages/kanban-message.js'
 import { buildHookMessage } from '../src/messages/hook-message.js'
+import { executeTool, type SessionContext } from '../src/mcp/ops.js'
+import { KANBAN_ORCHESTRATOR_TOOLS } from '../src/mcp/tools.js'
 import type { KanbanDispatch, KanbanReport } from '@agentconnect.md/protocol'
 
 const AGENT = '33333333-3333-4333-8333-333333333333'
@@ -29,6 +31,7 @@ const dispatch: KanbanDispatch = {
 const roots: string[] = []
 const daemons: Daemon[] = []
 afterEach(async () => {
+  vi.restoreAllMocks()
   for (const daemon of daemons.splice(0)) await daemon.stop()
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
@@ -497,6 +500,61 @@ it('masks the org model provider credential in a progress note and in the stored
   }
 })
 
+it('masks title and body through the real orchestrator create path before the issue is filed', async () => {
+  const apiKey = 'org-model-api-key-secret'
+  const headerValue = 'org-model-header-secret'
+  const h = await harness()
+  ;(h.daemon as any).modelProviderSecrets.set(AGENT, [
+    { name: 'MODEL_API_KEY', value: apiKey },
+    { name: 'MODEL_HEADER_X_Tenant', value: headerValue }
+  ])
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const BOARD = '22222222-2222-4222-8222-222222222222'
+  ;(h.daemon as any).cpClient = {
+    state: 'READY',
+    stop: async () => {},
+    kanbanOrchestrate: async (p: { op: string; agentId: string }) => {
+      if (p.op === 'list')
+        return {
+          ok: true,
+          op: 'list',
+          truncated: false,
+          boards: [{ boardId: BOARD, repoFullName: 'acme/web', cards: [] }]
+        }
+      if (p.op === 'prepare_create') return { ok: true, op: 'prepare_create', verdict: 'proceed' }
+      if (p.op === 'commit_create') return { ok: true, op: 'commit_create', cardId: 'c', issueNumber: 42 }
+      return { ok: false, op: p.op, code: 'not_orchestrator' }
+    }
+  }
+  const posted: string[] = []
+  const realFetch = globalThis.fetch.bind(globalThis)
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+    const url = String(input instanceof Request ? input.url : input)
+    const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
+    if (method === 'GET' && url.includes('/issues?state=all')) return Promise.resolve(new Response('[]'))
+    if (method === 'POST' && url.endsWith('/issues')) {
+      posted.push(String(init?.body ?? ''))
+      return Promise.resolve(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+    }
+    return realFetch(input as Parameters<typeof fetch>[0], init)
+  })
+  try {
+    await (h.daemon as any).mcp.deps.kanbanCreate({
+      agentId: AGENT,
+      board: BOARD,
+      title: `fix ${apiKey}`,
+      body: `use ${headerValue}`
+    })
+    expect(posted).toHaveLength(1)
+    expect(posted[0]).toContain('[secret:MODEL_API_KEY]')
+    expect(posted[0]).toContain('[secret:MODEL_HEADER_X_Tenant]')
+    expect(posted[0]).not.toContain(apiKey)
+    expect(posted[0]).not.toContain(headerValue)
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
 it('defers a nudge refused by a draining daemon without charging the card', async () => {
   const h = await harness()
   let release!: () => void
@@ -685,4 +743,271 @@ describe('kanban/notify', () => {
     await expect((h.daemon as any).kanbanNotify(notify)).resolves.toMatchObject({ ok: false, reason: 'post_failed' })
     expect((h.daemon as any).seenNotifyIds.has(notify.notifyId)).toBe(false)
   })
+})
+
+for (const platform of ['slack', 'webchat', 'cli', 'hook']) {
+  it(`offers orchestrator tools in ${platform} sessions and returns the CP role refusal`, async () => {
+    const h = await harness()
+    const orchestrate = vi.fn(async () => ({ ok: false, op: 'list', code: 'not_orchestrator' }))
+    ;(h.daemon as any).cpClient = { stop: async () => {}, kanbanOrchestrate: orchestrate }
+    const at = { platform, channel: 'C1', thread: 'T1', isDm: true }
+    const tools = (h.daemon as any).sessionBridgeTools((h.daemon as any).agents.get(AGENT), at)
+    const names = tools.map((t: { name: string }) => t.name)
+    expect(names).toEqual(expect.arrayContaining(KANBAN_ORCHESTRATOR_TOOLS.map((t) => t.name)))
+    expect(names).not.toContain('kanbanShow')
+    expect(names).not.toContain('kanbanComment')
+    const ctx: SessionContext = { ...at, agentId: AGENT, integrationId: undefined, deliveryThread: 'T1', tools }
+    const result = await executeTool(ctx, 'kanbanList', {}, { ...(h.daemon as any).mcp.deps, canRun: () => true })
+    expect(orchestrate).toHaveBeenCalledWith({ op: 'list', agentId: AGENT })
+    expect(result).toEqual({ refused: 'this agent is not the orchestrator of that board' })
+  })
+}
+
+it.each([401, 403, 422, 500])('invalidates an orchestrator issue token only on auth rejection (%s)', async (status) => {
+  const h = await harness()
+  const creds = (h.daemon as any).gitCreds
+  const request = vi.spyOn(creds.deps, 'request').mockImplementation(async () => ({
+    username: 'x-access-token',
+    token: `ghs_${request.mock.calls.length}`,
+    ttlSec: 3540,
+    expiresAt: '2099-01-01T00:00:00Z',
+    repoFullName: 'acme/web',
+    access: 'write'
+  }))
+  const invalidate = vi.spyOn(creds, 'invalidateKanbanOrchestrator')
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(new Response('', { status }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({ number: 42 }), { status: 201 }))
+  try {
+    await expect((h.daemon as any).fileKanbanIssue(AGENT, 'acme/web', 'title', 'body')).rejects.toThrow(`(${status})`)
+    await expect((h.daemon as any).fileKanbanIssue(AGENT, 'acme/web', 'title', 'body')).resolves.toBe(42)
+    const authRejected = status === 401 || status === 403
+    expect(invalidate).toHaveBeenCalledTimes(authRejected ? 1 : 0)
+    expect(request).toHaveBeenCalledTimes(authRejected ? 2 : 1)
+    if (authRejected) expect(request.mock.calls[1]![0]).toMatchObject({ forceRefresh: true })
+    const second = fetchSpy.mock.calls[1]![1]!.headers as Record<string, string>
+    expect(second.authorization).toBe(authRejected ? 'Bearer ghs_2' : 'Bearer ghs_1')
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
+it.each(['open', 'closed'])('finds a %s crash orphan past the first page without using search', async (state) => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const marker = '<!-- agentconnect:kanban-card-key:' + 'a'.repeat(64) + ' -->'
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify(Array.from({ length: 100 }, (_, n) => ({ number: n + 1, body: '' }))))
+    )
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          { number: 101, body: marker, pull_request: {} },
+          { number: 102, body: `spec\n\n${marker}`, state, user: { type: 'Bot', login: 'acme-app[bot]' } }
+        ])
+      )
+    )
+  try {
+    await expect((h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker, 'acme-app[bot]')).resolves.toBe(102)
+    // Newest first over the last day, so a minutes-old orphan surfaces before listing lag matters.
+    const urls = fetchSpy.mock.calls.map(([url]) => new URL(String(url)))
+    expect(urls).toHaveLength(2)
+    for (const [index, url] of urls.entries()) {
+      expect(`${url.origin}${url.pathname}`).toBe('https://api.github.com/repos/acme/web/issues')
+      expect(url.searchParams.get('state')).toBe('all')
+      expect(url.searchParams.get('sort')).toBe('created')
+      expect(url.searchParams.get('direction')).toBe('desc')
+      expect(Math.abs(Date.now() - Date.parse(url.searchParams.get('since')!) - 24 * 60 * 60 * 1000)).toBeLessThan(
+        60_000
+      )
+      expect(url.searchParams.get('per_page')).toBe('100')
+      expect(url.searchParams.get('page')).toBe(String(index + 1))
+    }
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
+it('stops the marker lookup after 3 pages', async () => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockImplementation(
+      async () => new Response(JSON.stringify(Array.from({ length: 100 }, () => ({ number: 1, body: '' }))))
+    )
+  try {
+    await expect(
+      (h.daemon as any).findKanbanIssue(
+        AGENT,
+        'acme/web',
+        '<!-- agentconnect:kanban-card-key:' + 'b'.repeat(64) + ' -->',
+        'acme-app[bot]'
+      )
+    ).resolves.toBeNull()
+    expect(fetchSpy).toHaveBeenCalledTimes(3)
+  } finally {
+    fetchSpy.mockRestore()
+  }
+})
+
+it.each([
+  ['User', 'acme-app[bot]'],
+  ['Bot', 'other-app[bot]']
+])('vera-349: recovery ignores a marker authored by %s %s', async (type, login) => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const marker = '<!-- agentconnect:kanban-card-key:' + 'a'.repeat(64) + ' -->'
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response(
+      JSON.stringify([
+        { number: 100, body: marker, user: { type, login } },
+        { number: 500, body: marker, user: { type: 'Bot', login: 'Acme-App[bot]' } }
+      ])
+    )
+  )
+  expect(await (h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker, 'acme-app[bot]')).toBe(500)
+})
+
+it('vera-349: recovery requires a trailing marker', async () => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const marker = '<!-- agentconnect:kanban-card-key:' + 'b'.repeat(64) + ' -->'
+  const user = { type: 'Bot', login: 'acme-app[bot]' }
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    new Response(
+      JSON.stringify([
+        { number: 1, body: `${marker}\nagent text`, user },
+        { number: 2, body: `spec\n${marker}\n `, user }
+      ])
+    )
+  )
+  expect(await (h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker, user.login)).toBe(2)
+})
+
+it('vera-349: recovery prefers the oldest match across pages and skips rejected numbers', async () => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'ghs_test' })
+  const marker = '<!-- agentconnect:kanban-card-key:' + 'c'.repeat(64) + ' -->'
+  const user = { type: 'Bot', login: 'acme-app[bot]' }
+  vi.spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          { number: 900, body: marker, user, created_at: '2026-01-02T00:00:00Z' },
+          ...Array.from({ length: 99 }, () => ({ number: 1, body: '' }))
+        ])
+      )
+    )
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          { number: 100, body: marker, user, created_at: '2026-01-01T00:00:00Z' },
+          { number: 200, body: marker, user, created_at: '2026-01-01T00:00:00Z' },
+          { number: 300, body: marker, user, created_at: '2026-01-01T00:00:00Z' }
+        ])
+      )
+    )
+  expect(await (h.daemon as any).findKanbanIssue(AGENT, 'acme/web', marker, user.login, [100])).toBe(200)
+})
+
+it('vera-349: PAT recovery adopts only the same token authenticated login', async () => {
+  const h = await harness()
+  const token = vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'pat' })
+  const fetchSpy = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(new Response(JSON.stringify({ login: 'trusted-user' })))
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          { number: 777, body: 'marker', user: { type: 'User', login: 'other-user' } },
+          { number: 42, body: 'marker', user: { type: 'User', login: 'Trusted-User' } }
+        ])
+      )
+    )
+  expect(await (h.daemon as any).findKanbanIssue(AGENT, 'acme/web', 'marker', null)).toBe(42)
+  expect(fetchSpy.mock.calls[0]?.[0]).toBe('https://api.github.com/user')
+  expect(fetchSpy.mock.calls.map(([, init]) => (init?.headers as Record<string, string>).authorization)).toEqual([
+    'Bearer pat',
+    'Bearer pat'
+  ])
+  expect(token).toHaveBeenCalledTimes(1)
+})
+
+it('vera-349: PAT recovery refuses lookup when authenticated identity is unavailable', async () => {
+  const h = await harness()
+  vi.spyOn((h.daemon as any).gitCreds, 'getKanbanOrchestratorToken').mockResolvedValue({ token: 'pat' })
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'))
+  await expect((h.daemon as any).findKanbanIssue(AGENT, 'acme/web', 'marker', null)).rejects.toThrow()
+  expect(fetchSpy).toHaveBeenCalledTimes(1)
+})
+
+it.each([
+  ['prepare_create', 'not_orchestrator'],
+  ['prepare_create', 'board_disabled'],
+  ['commit_create', 'not_orchestrator'],
+  ['commit_create', 'board_disabled']
+])('vera-349: evicts the agent repo token on CP %s %s', async (phase, code) => {
+  const h = await harness()
+  const creds = (h.daemon as any).gitCreds
+  const request = vi.spyOn(creds.deps, 'request').mockImplementation(async () => ({
+    username: 'x-access-token',
+    token: `grant-${request.mock.calls.length}`,
+    ttlSec: 3540,
+    expiresAt: '2099-01-01T00:00:00Z',
+    repoFullName: 'acme/web',
+    access: 'write'
+  }))
+  let revoked = phase === 'commit_create'
+  ;(h.daemon as any).cpClient = {
+    stop: async () => {},
+    kanbanOrchestrate: async (p: { op: string }) => {
+      if (p.op === 'list') return { ok: true, op: p.op, boards: [{ repoFullName: 'acme/web' }] }
+      if (p.op === phase && revoked) return { ok: false, op: p.op, code }
+      if (p.op === 'prepare_create') return { ok: true, op: p.op, verdict: 'proceed' }
+      return { ok: false, op: p.op, code: 'github_partial' }
+    }
+  }
+  vi.spyOn(globalThis, 'fetch').mockImplementation(
+    async () => new Response(JSON.stringify({ number: 42 }), { status: 201 })
+  )
+  const req = { agentId: AGENT, board: dispatch.boardId, title: 'title', body: 'body' }
+  await (h.daemon as any).mcp.deps.kanbanCreate(req)
+  if (phase === 'prepare_create') {
+    revoked = true
+    await (h.daemon as any).mcp.deps.kanbanCreate(req)
+  }
+  await creds.getKanbanOrchestratorToken(AGENT, 'acme/web')
+  expect(request).toHaveBeenCalledTimes(2)
+  expect(request.mock.calls[1]![0]).toMatchObject({ forceRefresh: true })
+})
+
+it('vera-349: role revocation evicts an already minted grant before board resolution', async () => {
+  const h = await harness()
+  const creds = (h.daemon as any).gitCreds
+  const request = vi.spyOn(creds.deps, 'request').mockImplementation(async () => ({
+    username: 'x-access-token',
+    token: `grant-${request.mock.calls.length}`,
+    ttlSec: 3540,
+    expiresAt: '2099-01-01T00:00:00Z',
+    repoFullName: 'acme/web',
+    access: 'write'
+  }))
+  await creds.getKanbanOrchestratorToken(AGENT, 'acme/web')
+  ;(h.daemon as any).cpClient = {
+    stop: async () => {},
+    kanbanOrchestrate: async () => ({ ok: false, op: 'prepare_create', code: 'not_orchestrator' })
+  }
+  await (h.daemon as any).mcp.deps.kanbanCreate({
+    agentId: AGENT,
+    board: dispatch.boardId,
+    title: 'title',
+    body: 'body'
+  })
+  await creds.getKanbanOrchestratorToken(AGENT, 'acme/web')
+  expect(request).toHaveBeenCalledTimes(2)
+  expect(request.mock.calls[1]![0]).toMatchObject({ forceRefresh: true })
 })

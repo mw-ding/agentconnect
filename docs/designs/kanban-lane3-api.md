@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.1 (2026-10-18)
+**Version:** 1.2 (2026-10-19)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -28,6 +28,8 @@ export type ClaimGate =
   | 'open_lease'
   | 'board_cap'
   | 'agent_cap'
+  | 'epic_cap'
+  | 'daemon_cap'
   | 'verifier_unset'
   | 'verifier_is_worker'
   | 'verified'
@@ -60,6 +62,8 @@ export interface ClaimEligibilityInput {
   openRunCount: number
   openRunCountForAssignee: number
   openRunCountForVerifier: number
+  epicCapacity?: { openRunCount: number; maxActive: number }
+  daemonCapacity?: { openRunCount: number; maxActive: number }
   now: Date
 }
 
@@ -97,7 +101,15 @@ A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a bo
 | 14  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
 | 15  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
 | 16  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
-| 17  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+| 17  | `epic_cap`             | the epic child has no active slot left (work and verify both count)                        |
+| 18  | `daemon_cap`           | the target daemon is at its cross-board active cap                                         |
+| 19  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+
+Main's orchestrator caps apply to work and verify alike. Supply `epicCapacity` for an epic
+child and `daemonCapacity` when a daemon cap is configured; both counts include every open
+work and verify run (the daemon count spans boards). After liveness, the claim checks the
+epic cap, then the daemon cap, then B8. The optional facts preserve callers with no caps.
+The SQL serializes capped work and verify claims using the target daemon's advisory lock.
 
 `verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
 its cap and liveness checks; that is also where it flags the card for a human.
@@ -146,6 +158,9 @@ When you change a claim gate in the SQL, change `explainClaim` in the same commi
 and vice versa.
 
 ## Changelog
+
+- **1.2 (2026-10-19):** add optional epic and daemon capacity facts and matching gates for
+  main's orchestrator caps. Work and verify claims share those caps and daemon locks.
 
 - **1.1 (2026-10-18):**
   - Review routing lands in the predicate: a `review` card is a `verify` claim to

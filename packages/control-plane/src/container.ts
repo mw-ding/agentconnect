@@ -86,6 +86,7 @@ import { GithubCardStore } from './kanban/card-store.js'
 import { kanbanTokenSource } from './kanban/tokens.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
+import { KanbanOrchestrator } from './kanban/orchestrator.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
 import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
@@ -186,6 +187,7 @@ import {
   PgKanbanSyncRepo,
   PgKanbanCardRepo,
   PgKanbanNotifyRepo,
+  PgKanbanOrchestratorRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -566,6 +568,7 @@ export function buildContainer(
     kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     kanbanCard: new PgKanbanCardRepo(prisma),
     kanbanNotify: new PgKanbanNotifyRepo(prisma),
+    kanbanOrchestrator: new PgKanbanOrchestratorRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
@@ -1879,7 +1882,8 @@ export function buildContainer(
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),
           warn: (o, m) => http.log.warn(o, m)
-        }
+        },
+        maxPerDaemon: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON
       })
     : undefined
 
@@ -1910,6 +1914,19 @@ export function buildContainer(
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog
+      })
+    : undefined
+
+  // The role-gated orchestrator uses the Lane 1 repo API and CardStore; agents file issue bodies themselves.
+  const kanbanOrchestrator = kanbanCardStore
+    ? new KanbanOrchestrator({
+        cards: repos.kanbanCard,
+        orchestrator: repos.kanbanOrchestrator,
+        store: kanbanCardStore,
+        installations: repos.githubInstallation,
+        appSlug: githubAppCfg?.slug,
+        poke: (boardId) => kanbanDispatcher?.poke(boardId),
+        log: { warn: (o, m) => http.log.warn(o, m) }
       })
     : undefined
 
@@ -2863,6 +2880,7 @@ export function buildContainer(
     ...(codeHostNoteProjection ? { codeHostNoteProjection } : {}),
     giteaStatusProjection,
     ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
+    ...(kanbanOrchestrator ? { kanbanOrchestrator } : {}),
     kanbanGrants: {
       openScopes: (agentId, daemonId) => repos.kanbanDispatch.openGrantScopes(agentId, daemonId)
     },

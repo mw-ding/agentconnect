@@ -60,6 +60,7 @@ interface BoardRow {
   maxInProgress: number
   maxInProgressPerAgent: number
   verifierAgentId: string | null
+  epicMaxActive: number
 }
 
 interface CandidateRow {
@@ -75,6 +76,7 @@ interface CandidateRow {
   assigneeAgentId: string | null
   /** The board's verifier wrote some work attempt on this card (B8 compares every attempt, not only the latest). */
   verifierDidWork: boolean
+  epicCardId: string | null
 }
 
 interface RunEndRow {
@@ -135,12 +137,27 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return this.inTransaction(async (tx) => {
       // A concurrent claimer already holds this board: skip it rather than queue behind it.
       const [board] = await tx.$queryRaw<BoardRow[]>(Prisma.sql`
-        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode", "verifierAgentId"
+        SELECT "id", "orgId", "repoId", "repoFullName", "maxInProgress", "maxInProgressPerAgent", "defaultMode", "verifierAgentId", "epicMaxActive"
         FROM "kanban_board"
         WHERE "id" = ${boardId}::uuid AND "enabled"
         FOR UPDATE SKIP LOCKED
       `)
       if (!board) return { leases: [], flaggedSelfVerify: [] }
+
+      // Lock work and verify target daemons in sorted order to serialize the cap across boards.
+      const lockedDaemons = new Set<string>()
+      if (opts.maxPerDaemon !== undefined) {
+        const daemons = await tx.$queryRaw<Array<{ daemonId: string }>>(Prisma.sql`
+          SELECT DISTINCT a."daemonId" FROM "kanban_card" c
+          JOIN "agent" a ON a."id" = CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END
+            AND a."orgId" = ${board.orgId}
+          WHERE c."boardId" = ${boardId}::uuid AND c."status" IN ('ready', 'review') AND NOT c."promotionPending"
+        `)
+        for (const id of daemons.map((d) => d.daemonId).sort()) {
+          await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'kanban-daemon-cap:' + id}))::text`
+          lockedDaemons.add(id)
+        }
+      }
 
       // In progress = an open lease, so an unacked dispatch already occupies its slot.
       const open = await tx.$queryRaw<{ agentId: string; n: number }[]>(Prisma.sql`
@@ -154,6 +171,30 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       const room = Math.min(board.maxInProgress - inProgress, opts.limit ?? Number.POSITIVE_INFINITY)
       if (room <= 0) return { leases: [], flaggedSelfVerify: [] }
 
+      // Open-run counts per epic and per daemon, cached within the claim loop and bumped as this claim mints leases.
+      const perEpic = new Map<string, number>()
+      const perDaemon = new Map<string, number>()
+      const epicActive = async (epicCardId: string): Promise<number> => {
+        const known = perEpic.get(epicCardId)
+        if (known !== undefined) return known
+        const [row] = await tx.$queryRaw<{ n: number }[]>(Prisma.sql`
+          SELECT count(*)::int AS "n" FROM "kanban_run" r
+          JOIN "kanban_card" c ON c."id" = r."cardId"
+          WHERE c."epicCardId" = ${epicCardId}::uuid AND r."endedAt" IS NULL
+        `)
+        perEpic.set(epicCardId, row!.n)
+        return row!.n
+      }
+      const daemonActive = async (daemonId: string): Promise<number> => {
+        const known = perDaemon.get(daemonId)
+        if (known !== undefined) return known
+        const [row] = await tx.$queryRaw<{ n: number }[]>(Prisma.sql`
+          SELECT count(*)::int AS "n" FROM "kanban_run" r WHERE r."daemonId" = ${daemonId}::uuid AND r."endedAt" IS NULL
+        `)
+        perDaemon.set(daemonId, row!.n)
+        return row!.n
+      }
+
       const claimed: KanbanClaimedLease[] = []
       const flaggedSelfVerify: KanbanSelfVerifyFlag[] = []
       let cursor: CandidateRow | undefined
@@ -161,7 +202,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
         SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
-               a."daemonId", d."sessionEpoch", c."assigneeAgentId",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
                EXISTS (SELECT 1 FROM "kanban_run" w
                  WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
@@ -197,6 +238,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           if (claimed.length >= room || inProgress >= board.maxInProgress) break
           if ((perAgent.get(card.agentId) ?? 0) >= board.maxInProgressPerAgent) continue
           if (!opts.isDaemonLive(card.daemonId)) continue
+          // B2 maxActive: a child waits while its epic already has enough open runs.
+          if (card.epicCardId !== null && (await epicActive(card.epicCardId)) >= board.epicMaxActive) continue
+          // Per-daemon cap across all boards: an agent moved to an unlocked daemon since the lock pass waits a tick.
+          if (opts.maxPerDaemon !== undefined) {
+            if (!lockedDaemons.has(card.daemonId)) continue
+            if ((await daemonActive(card.daemonId)) >= opts.maxPerDaemon) continue
+          }
 
           // B8 self-approval guard: a review card whose verifier is the worker is never dispatched; flag it once.
           if (card.role === 'verify' && (board.verifierAgentId === card.assigneeAgentId || card.verifierDidWork)) {
@@ -283,6 +331,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
             sessionKeyPrefix: hook?.githubSessionKey ?? `github:${board.repoId}`
           })
           perAgent.set(card.agentId, (perAgent.get(card.agentId) ?? 0) + 1)
+          if (card.epicCardId !== null) perEpic.set(card.epicCardId, (perEpic.get(card.epicCardId) ?? 0) + 1)
+          perDaemon.set(card.daemonId, (perDaemon.get(card.daemonId) ?? 0) + 1)
           inProgress += 1
         }
       }

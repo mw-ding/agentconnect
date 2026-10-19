@@ -2544,6 +2544,9 @@ model KanbanBoard {
   targetIntegrationId   String?                  @db.Uuid
   maxInProgress         Int                      @default(1)
   maxInProgressPerAgent Int                      @default(1)
+  // B2 per-epic budgets: how many children an epic may decompose (lifetime) and run concurrently.
+  epicMaxCards          Int                      @default(100)
+  epicMaxActive         Int                      @default(16)
   staleLeaseSec         Int                      @default(14400)
   failureLimit          Int                      @default(2)
   protocolRetryLimit    Int                      @default(3)
@@ -2582,6 +2585,9 @@ model KanbanCard {
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?
+  // B2: the epic card this card decomposes; archiving a child never refunds epicCardsCreated.
+  epicCardId          String?          @db.Uuid
+  epicCardsCreated    Int              @default(0)
   mode                KanbanRunMode?
   modeRevision        Int              @default(0)
   status              KanbanCardStatus @default(triage)
@@ -2632,6 +2638,8 @@ model KanbanCard {
 
   board         KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
+  epicCard      KanbanCard? @relation("KanbanCardEpic", fields: [epicCardId], references: [id], onDelete: SetNull)
+  epicChildren  KanbanCard[] @relation("KanbanCardEpic")
   runs          KanbanRun[]
   notifications KanbanNotification[]
 
@@ -2642,6 +2650,7 @@ model KanbanCard {
   @@index([issueId]) // graph doorbell lookup
   @@index([boardId, status])
   @@index([assigneeAgentId])
+  @@index([epicCardId])
   @@map("kanban_card")
 }
 

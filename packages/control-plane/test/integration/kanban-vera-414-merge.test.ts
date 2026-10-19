@@ -474,3 +474,36 @@ describe('vera-414-merge2: timeout transaction and competing writers (Postgres)'
     expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toMatchObject({ accepted: true })
   })
 })
+
+describe('vera-414-main2: verifier routing keeps main claim caps (Postgres)', () => {
+  it('vera-414-main2: a capped verify-only board locks the verifier daemon and claims one review at a time', async () => {
+    const f = await fixture()
+    const first = await f.card('review')
+    const second = await f.card('review')
+    const claim = () => f.dispatch.claim(f.board.id, { now: new Date(T0), isDaemonLive: () => true, maxPerDaemon: 1 })
+    const { leases } = await claim()
+    expect(leases).toMatchObject([{ role: 'verify', agentId: A2, daemonId: D2 }])
+    expect(leases).toHaveLength(1)
+    const claimed = leases[0]!
+    const other = claimed.cardId === first.id ? second : first
+    expect((await claim()).leases).toEqual([])
+    expect(await f.sync.failClosed((await f.sync.get(f.board.id, claimed.issueNumber))!)).toMatchObject({
+      revoked: { leaseId: claimed.leaseId }
+    })
+    expect((await claim()).leases).toMatchObject([{ cardId: other.id, role: 'verify', daemonId: D2 }])
+    expect(await f.endRun(claimed.leaseId, { outcome: 'completed' })).toEqual({ accepted: false })
+  })
+
+  it('vera-414-main2: an open work run consumes its epic slot until timeout revokes it, then verify fits', async () => {
+    const f = await fixture()
+    await prisma.kanbanBoard.update({ where: { id: f.board.id }, data: { epicMaxActive: 1 } })
+    const epic = await f.card('todo')
+    const work = await f.card('ready', { epicCardId: epic.id, priority: 10 })
+    const review = await f.card('review', { epicCardId: epic.id })
+    const claim = () => f.dispatch.claim(f.board.id, { now: new Date(T0), isDaemonLive: () => true, maxPerDaemon: 1 })
+    expect((await claim()).leases).toMatchObject([{ cardId: work.id, role: 'work' }])
+    expect((await claim()).leases).toEqual([])
+    await f.sync.failClosed((await f.sync.get(f.board.id, work.issueNumber))!)
+    expect((await claim()).leases).toMatchObject([{ cardId: review.id, role: 'verify', daemonId: D2 }])
+  })
+})

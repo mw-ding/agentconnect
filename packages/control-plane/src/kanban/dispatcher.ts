@@ -67,6 +67,8 @@ export interface KanbanDispatcherDeps {
   tickMs?: number
   unackedGraceMs?: number
   epochGraceMs?: number
+  /** Per-daemon open-run cap across all boards (audit 2.2). */
+  maxPerDaemon?: number
 }
 
 const DEFAULT_TICK_MS = 60_000
@@ -223,7 +225,8 @@ export class KanbanDispatcher {
     }
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
-      isDaemonLive: (id) => this.deps.isDaemonLive(id)
+      isDaemonLive: (id) => this.deps.isDaemonLive(id),
+      ...(this.deps.maxPerDaemon !== undefined ? { maxPerDaemon: this.deps.maxPerDaemon } : {})
     })
     await Promise.allSettled([
       ...result.leases.map((lease) => this.dispatchLease(lease)),

@@ -30,6 +30,15 @@ export function defaultAgentsDir(root: string): string {
   return join(root, 'agents')
 }
 
+/**
+ * Durable copy of the orchestrator pending-create map (key → issue number +
+ * file time, never titles or bodies), so a crash before commit_create retries
+ * without filing a second issue.
+ */
+export function kanbanPendingCreatesPath(root: string): string {
+  return join(root, 'state', 'kanban-pending-creates.json')
+}
+
 /** Daemon-owned ACP adapter installs — never under a HOME, because the adapter is the runtime's parent. */
 export function runtimeStoreDir(root: string): string {
   return join(root, 'runtimes')

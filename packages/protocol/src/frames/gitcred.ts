@@ -71,7 +71,8 @@ export const GitCredRequest = z.object({
       'gitlab_effect',
       'gitea_hook_reply',
       'gitea_effect',
-      'kanban_card_write'
+      'kanban_card_write',
+      'kanban_orchestrator_write'
     ])
     .optional(),
   // The accepted Kanban run whose summary this token may post. The CP rechecks it.
