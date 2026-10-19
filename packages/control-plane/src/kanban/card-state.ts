@@ -115,6 +115,12 @@ export function isPromotionResidue(issue: ObservedIssue): boolean {
   )
 }
 
+/** A verify run dispatches only while the issue still reads `review` (a human's earlier move stands). */
+export function isReviewDispatchableIssue(issue: ObservedIssue): boolean {
+  const { statuses, malformed } = parseStatusLabels(issue.labels)
+  return issue.state === 'open' && malformed.length === 0 && statuses.length === 1 && statuses[0] === 'review'
+}
+
 export type RecoveryPlan =
   { kind: 'none' } | { kind: 'move'; to: KanbanStatus } | { kind: 'illegal'; requested: KanbanStatus }
 

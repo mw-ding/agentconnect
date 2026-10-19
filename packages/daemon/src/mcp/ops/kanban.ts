@@ -32,6 +32,8 @@ export interface KanbanDeps {
   kanbanShow?: (req: KanbanSessionReq) => Promise<unknown>
   /** Posts one progress note on the session's own leased card; throws when refused or over the cap. */
   kanbanComment?: (req: KanbanSessionReq & { text: string }) => Promise<unknown>
+  /** The live lease's role for a session, or undefined when no lease holds it; gates the verifier-only tools. */
+  kanbanLeaseRole?: (req: KanbanSessionReq) => 'work' | 'verify' | undefined
 }
 
 const unexpectedKeys: { error: z.core.$ZodErrorMap } = {
@@ -66,6 +68,7 @@ export const KANBAN_COMMENT_ARGS = z.strictObject(
   unexpectedKeys
 )
 export const KANBAN_FAIL_ARGS = z.strictObject({ summary, reason }, unexpectedKeys)
+export const KANBAN_REQUEST_CHANGES_ARGS = z.strictObject({ reason }, unexpectedKeys)
 
 function sessionReq(ctx: SessionContext): KanbanSessionReq {
   return {
@@ -93,11 +96,28 @@ export const kanbanComplete: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
 }
 
 export const kanbanRequestReview: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  if (deps.kanbanLeaseRole?.(sessionReq(ctx)) === 'verify') {
+    throw new Error(
+      'verifier_cannot_request_review: a verifier cannot request review; call kanbanComplete to approve or kanbanRequestChanges.'
+    )
+  }
   const parsed = parseArgs(KANBAN_REQUEST_REVIEW_ARGS, args)
   return record(ctx, deps, {
     outcome: 'review_requested',
     summary: parsed.summary,
     ...(parsed.prNumber ? { prNumber: parsed.prNumber } : {})
+  })
+}
+
+export const kanbanRequestChanges: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  if (deps.kanbanLeaseRole?.(sessionReq(ctx)) !== 'verify') {
+    throw new Error('not_verifier: kanbanRequestChanges is only available to a verifier run reviewing this card.')
+  }
+  const parsed = parseArgs(KANBAN_REQUEST_CHANGES_ARGS, args)
+  return record(ctx, deps, {
+    outcome: 'changes_requested',
+    summary: '',
+    reason: parsed.reason
   })
 }
 
@@ -138,6 +158,7 @@ export const kanbanComment: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
 export const KANBAN_HANDLERS: [string, ToolHandler<KanbanDeps>][] = [
   ['kanbanComplete', kanbanComplete],
   ['kanbanRequestReview', kanbanRequestReview],
+  ['kanbanRequestChanges', kanbanRequestChanges],
   ['kanbanBlock', kanbanBlock],
   ['kanbanFail', kanbanFail],
   ['kanbanShow', kanbanShow],
@@ -146,6 +167,7 @@ export const KANBAN_HANDLERS: [string, ToolHandler<KanbanDeps>][] = [
 export const KANBAN_ARG_SCHEMAS: [string, z.ZodType][] = [
   ['kanbanComplete', KANBAN_COMPLETE_ARGS],
   ['kanbanRequestReview', KANBAN_REQUEST_REVIEW_ARGS],
+  ['kanbanRequestChanges', KANBAN_REQUEST_CHANGES_ARGS],
   ['kanbanBlock', KANBAN_BLOCK_ARGS],
   ['kanbanFail', KANBAN_FAIL_ARGS],
   ['kanbanShow', KANBAN_SHOW_ARGS],

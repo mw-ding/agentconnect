@@ -29,7 +29,7 @@ function dispatcher(
     now: vi.fn(async () => NOW),
     getBoardRef: vi.fn(async () => BOARD_REF),
     getParkedStatus: vi.fn(async () => 'triage' as const),
-    ingestStatus: vi.fn(async () => true),
+    ingestStatus: vi.fn(async () => ({ moved: true })),
     settlePromotion: vi.fn(async () => true),
     escalatePromotion: vi.fn(async () => true),
     endRun: vi.fn(async () => ({
@@ -144,7 +144,7 @@ describe('dispatcher Projects v2 projection seam', () => {
 
   it('vera-474: B2 a refused human recovery commits nothing and projects nothing', async () => {
     const h = dispatcher()
-    h.repo.ingestStatus.mockResolvedValueOnce(false)
+    h.repo.ingestStatus.mockResolvedValueOnce({ moved: false })
     expect(await h.d.ingestCard('board-1', 11)).toBe(false)
     expect(h.onStatusCommitted).not.toHaveBeenCalled()
   })

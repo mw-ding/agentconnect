@@ -89,6 +89,7 @@ import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanOrchestrator } from './kanban/orchestrator.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
+import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -186,6 +187,7 @@ import {
   PgKanbanDispatchRepo,
   PgKanbanSyncRepo,
   PgKanbanCardRepo,
+  PgKanbanNotifyRepo,
   PgKanbanOrchestratorRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
@@ -566,6 +568,7 @@ export function buildContainer(
     kanbanBoard: new PgKanbanBoardRepo(prisma),
     kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     kanbanCard: new PgKanbanCardRepo(prisma),
+    kanbanNotify: new PgKanbanNotifyRepo(prisma),
     kanbanOrchestrator: new PgKanbanOrchestratorRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
@@ -1822,6 +1825,21 @@ export function buildContainer(
         })
       : undefined
 
+  // Kanban transition notifier (issue #2 M4): drains the notification outbox to the board's anchor channel.
+  const kanbanNotifier = kanbanCardStore
+    ? new KanbanNotifier({
+        repo: repos.kanbanNotify,
+        integration: repos.integration,
+        agent: repos.agent,
+        // No CP linkage maps a CP user to a Slack user id today, so needs_input posts without a ping (known gap).
+        resolveMention: async () => null,
+        liveDaemonIds: () => connReg.readyDaemonIds(),
+        send: (daemonId, n) => sender.kanbanNotify(daemonId, n),
+        clock,
+        log: { warn: (o, m) => http.log.warn(o, m), info: (o, m) => http.log.info(o, m) }
+      })
+    : undefined
+
   const kanbanGraphLog = {
     debug: (o: unknown, m?: string) => http.log.debug(o, m),
     warn: (o: unknown, m?: string) => http.log.warn(o, m)
@@ -1873,7 +1891,6 @@ export function buildContainer(
           ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
         })
       : undefined
-
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
@@ -1884,6 +1901,11 @@ export function buildContainer(
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
         isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
         clock,
+        ...(kanbanNotifier
+          ? {
+              notify: { drain: () => kanbanNotifier.drain() }
+            }
+          : {}),
         log: {
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),
@@ -1924,8 +1946,7 @@ export function buildContainer(
       })
     : undefined
 
-  // Kanban orchestrator (issue #2 M3): the role-gated create/link/assign surface. The card write path is the
-  // frozen Lane 1 repo API; GitHub metadata writes go through the CardStore. The agent files the issue body itself.
+  // The role-gated orchestrator uses the Lane 1 repo API and CardStore; agents file issue bodies themselves.
   const kanbanOrchestrator = kanbanCardStore
     ? new KanbanOrchestrator({
         cards: repos.kanbanCard,

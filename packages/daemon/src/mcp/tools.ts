@@ -1127,6 +1127,14 @@ export const KANBAN_TOOLS: ToolDescriptor[] = [
     inputSchema: obj({ summary: KANBAN_SUMMARY, prNumber: KANBAN_PR }, ['summary'])
   },
   {
+    name: 'kanbanRequestChanges',
+    description:
+      'Request changes on the dispatched Kanban card you are reviewing: the card returns to its worker with no ' +
+      'failure counted. Only available while a verifier run holds this session.' +
+      KANBAN_TOOL_NOTE,
+    inputSchema: obj({ reason: KANBAN_REASON }, ['reason'])
+  },
+  {
     name: 'kanbanBlock',
     description:
       'Report that the dispatched Kanban card cannot proceed until something outside this run changes: `dependency` ' +

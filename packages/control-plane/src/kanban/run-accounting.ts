@@ -7,6 +7,8 @@ export type KanbanCompletionContract = 'close' | 'pr_merged' | 'pr_checks_green'
 /** How one run ended; `reclaimed` is the reaper's, the rest come from the worker's report or a dispatch nack. */
 export type KanbanRunEnd =
   | { outcome: 'completed' | 'review_requested' | 'failed' | 'protocol_violation' | 'reclaimed' }
+  /** The verifier asked the worker for changes (verifier runs only); moves the card back to ready, no failure. */
+  | { outcome: 'changes_requested' }
   /** `provider` marks a classified provider outage, which backs off and is bounded; other transients keep the flat cooldown. */
   | { outcome: 'transient'; provider?: boolean }
   | { outcome: 'blocked'; blockKind: KanbanBlockKind }
@@ -26,10 +28,19 @@ export interface AccountingCard {
   blockRecurrence: number
   cooldownUntil: Date | null
   blockKind: KanbanBlockKind | null
+  /** Times the verifier asked for changes without the card ever being approved. */
+  reviewRounds: number
+  /** When the verifier approved but a PR completion contract still gates `done`; null otherwise. */
+  verifiedAt: Date | null
 }
 
 export type TrippedLimit =
-  'failure_limit' | 'protocol_retry_limit' | 'block_recurrence_limit' | 'capability' | 'transient_limit'
+  | 'failure_limit'
+  | 'protocol_retry_limit'
+  | 'block_recurrence_limit'
+  | 'capability'
+  | 'transient_limit'
+  | 'review_round_limit'
 
 export interface RunEndPlan extends AccountingCard {
   countsAsFailure: boolean
@@ -42,11 +53,15 @@ export const FAILURE_COOLDOWN_MAX_MS = 60 * 60_000
 export const TRANSIENT_COOLDOWN_MS = 60_000
 /** Consecutive provider-outage runs after which a card goes to triage instead of retrying forever (backoff reaches the hour cap at the 7th). */
 export const PROVIDER_TRANSIENT_LIMIT = 8
+/** Changes a verifier may request before the card routes to triage instead of looping the review forever. */
+export const KANBAN_REVIEW_ROUND_LIMIT = 3
 
 /** Facts about earlier runs that the card row does not carry. */
 export interface RunEndContext {
   /** Provider-outage `transient` runs that ended back to back just before this one. */
   trailingProviderTransients: number
+  /** The run's role: work (ready card) or verify (review card). */
+  role: 'work' | 'verify'
 }
 
 /** Respawn cooldown after the nth consecutive failure: doubling from one minute, capped at an hour. */
@@ -59,25 +74,66 @@ function reaches(count: number, limit: number): boolean {
   return count >= Math.max(1, limit)
 }
 
-/** The card after one run ends; only a `running` card moves, so a human's earlier move (blocked, triage) stands. */
+/** The card after one run ends; only a `running` card moves for a work run, only a `review` card for a verify run. */
 export function planRunEnd(
   card: AccountingCard,
   board: AccountingBoard,
   end: KanbanRunEnd,
   now: Date,
-  ctx: RunEndContext = { trailingProviderTransients: 0 }
+  ctx: RunEndContext = { trailingProviderTransients: 0, role: 'work' }
 ): RunEndPlan {
-  if (card.status !== 'running') return { ...card, countsAsFailure: false }
+  const isVerify = ctx.role === 'verify'
+  const movable = isVerify ? card.status === 'review' : card.status === 'running'
+  if (!movable) return { ...card, countsAsFailure: false }
   const after = (ms: number) => new Date(now.getTime() + ms)
   const settled = { consecutiveFailures: 0, protocolViolations: 0, cooldownUntil: null, blockKind: null }
   switch (end.outcome) {
     case 'completed': {
-      // A verifier or a PR contract gates done; otherwise completion closes the card (M4 adds the contracts).
-      const gated = board.verifierAgentId !== null || board.completionContract !== 'close'
-      return { ...card, ...settled, blockRecurrence: 0, status: gated ? 'review' : 'done', countsAsFailure: false }
+      if (!isVerify) {
+        // A verifier or a PR contract gates done. A worker pass clears the verify stamp but keeps the round count bounded.
+        const gated = board.verifierAgentId !== null || board.completionContract !== 'close'
+        return {
+          ...card,
+          ...settled,
+          blockRecurrence: 0,
+          verifiedAt: null,
+          reviewRounds: gated ? card.reviewRounds : 0,
+          status: gated ? 'review' : 'done',
+          countsAsFailure: false
+        }
+      }
+      // A verifier approving: done on the close contract, else stays review with the approval stamped for the PR doorbell.
+      if (board.completionContract === 'close') {
+        return {
+          ...card,
+          ...settled,
+          blockRecurrence: 0,
+          verifiedAt: null,
+          reviewRounds: 0,
+          status: 'done',
+          countsAsFailure: false
+        }
+      }
+      return { ...card, ...settled, status: 'review', verifiedAt: now, reviewRounds: 0, countsAsFailure: false }
     }
     case 'review_requested':
-      return { ...card, ...settled, status: 'review', countsAsFailure: false }
+      // Worker-only (a verifier's request-review is refused on the daemon). A fresh review clears the verify stamp.
+      return { ...card, ...settled, verifiedAt: null, status: 'review', countsAsFailure: false }
+    case 'changes_requested': {
+      // Verifier-only: back to ready for the original assignee, no failure, one review round counted.
+      if (!isVerify) return { ...card, ...settled, verifiedAt: null, status: 'review', countsAsFailure: false }
+      const reviewRounds = card.reviewRounds + 1
+      if (reviewRounds >= KANBAN_REVIEW_ROUND_LIMIT)
+        return {
+          ...card,
+          reviewRounds,
+          verifiedAt: null,
+          status: 'triage',
+          countsAsFailure: false,
+          tripped: 'review_round_limit'
+        }
+      return { ...card, reviewRounds, verifiedAt: null, status: 'ready', countsAsFailure: false }
+    }
     case 'blocked': {
       const blockRecurrence = card.blockRecurrence + 1
       const base = { ...card, cooldownUntil: null, blockKind: end.blockKind, blockRecurrence, countsAsFailure: false }
@@ -98,7 +154,13 @@ export function planRunEnd(
           tripped: 'failure_limit'
         }
       const cooldownUntil = after(failureCooldownMs(consecutiveFailures))
-      return { ...card, consecutiveFailures, cooldownUntil, status: 'ready', countsAsFailure: true }
+      return {
+        ...card,
+        consecutiveFailures,
+        cooldownUntil,
+        status: isVerify ? 'review' : 'ready',
+        countsAsFailure: true
+      }
     }
     case 'protocol_violation': {
       // Its own budget (protocolRetryLimit), so a model that forgets the terminal tool is not judged as a crash.
@@ -113,19 +175,35 @@ export function planRunEnd(
           tripped: 'protocol_retry_limit'
         }
       const cooldownUntil = after(failureCooldownMs(protocolViolations))
-      return { ...card, protocolViolations, cooldownUntil, status: 'ready', countsAsFailure: false }
+      return {
+        ...card,
+        protocolViolations,
+        cooldownUntil,
+        status: isVerify ? 'review' : 'ready',
+        countsAsFailure: false
+      }
     }
     case 'transient': {
       if (!end.provider)
-        return { ...card, cooldownUntil: after(TRANSIENT_COOLDOWN_MS), status: 'ready', countsAsFailure: false }
+        return {
+          ...card,
+          cooldownUntil: after(TRANSIENT_COOLDOWN_MS),
+          status: isVerify ? 'review' : 'ready',
+          countsAsFailure: false
+        }
       // A provider outage is not the card's fault, so it backs off like a failure without counting as one, and is bounded.
       const run = ctx.trailingProviderTransients + 1
       if (reaches(run, PROVIDER_TRANSIENT_LIMIT))
         return { ...card, cooldownUntil: null, status: 'triage', countsAsFailure: false, tripped: 'transient_limit' }
-      return { ...card, cooldownUntil: after(failureCooldownMs(run)), status: 'ready', countsAsFailure: false }
+      return {
+        ...card,
+        cooldownUntil: after(failureCooldownMs(run)),
+        status: isVerify ? 'review' : 'ready',
+        countsAsFailure: false
+      }
     }
     case 'reclaimed':
-      return { ...card, cooldownUntil: null, status: 'ready', countsAsFailure: false }
+      return { ...card, cooldownUntil: null, status: isVerify ? 'review' : 'ready', countsAsFailure: false }
   }
 }
 

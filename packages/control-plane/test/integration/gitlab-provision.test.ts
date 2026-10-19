@@ -608,8 +608,7 @@ describe('GitlabProvisioner (§10.2) — per-agent identity', () => {
   })
 
   it('records an accepted-but-unobserved deletion as pending, then the sweep closes it (§19.4)', async () => {
-    // GitLab deletes a user asynchronously: the DELETE is accepted and the
-    // account is still listed for a while afterwards.
+    // GitLab accepts the deletion while the account remains visible.
     const h = await harness({ deferServiceAccountDeletion: true })
     await h.provisioner.provision(DEFAULT_ORG_ID, h.binding.id)
     const account = (await h.accounts.byAgentRoot(DEFAULT_ORG_ID, AGENT, ROOT_GROUP))!
@@ -628,11 +627,14 @@ describe('GitlabProvisioner (§10.2) — per-agent identity', () => {
     await h.accountService.sweepPendingRetirements(0)
     expect((await h.accounts.get(account.id))?.stateReason).toBe('deletion_pending')
 
-    // Once GitLab has actually removed the user, absence is the positive
-    // evidence the retirement was waiting for.
+    // Retry sweeps until the row is older than the strict cutoff, even if its last write landed in this millisecond.
     h.fake.settleServiceAccountDeletions()
-    await h.accountService.sweepPendingRetirements(0)
-    expect(await h.accounts.get(account.id)).toBeNull()
+    await expect
+      .poll(async () => {
+        await h.accountService.sweepPendingRetirements(0)
+        return h.accounts.get(account.id)
+      })
+      .toBeNull()
   })
 
   it('the sweep leaves rows alone until they have been quiet, and reserves gitlab_unreachable', async () => {

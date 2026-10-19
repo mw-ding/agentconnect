@@ -1,8 +1,8 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
+import { buildKanbanMessage, kanbanNotifyText } from './messages/kanban-message.js'
 import { KanbanOrchestratorTools } from './kanban/orchestrator-tools.js'
-import { buildKanbanMessage } from './messages/kanban-message.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
   MEMORY_ENTRIES_V1_FEATURE,
@@ -1067,6 +1067,8 @@ import type {
   TaskListReq,
   KanbanDispatch,
   KanbanDispatchRefusal,
+  KanbanNotify,
+  KanbanNotifyOk,
   McpAppRpc,
   McpAppRpcResult,
   CodeHostProvider,
@@ -4401,6 +4403,9 @@ export class Daemon {
           // The org model credential (MODEL_API_KEY / MODEL_HEADER_*) rides this mask too, so a prompt-injected agent cannot exfiltrate it through a progress note.
           this.maskAgentSecrets(req.agentId, req.text)
         ),
+      kanbanLeaseRole: (req) =>
+        this.kanban?.forSession(sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope))
+          ?.role ?? 'work',
       kanbanList: (req) => this.kanbanOrchestratorTools().list(req),
       kanbanCreate: (req) =>
         // Mask before marker neutralization, digesting, or filing agent text.
@@ -26738,6 +26743,7 @@ export class Daemon {
       kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
       kanbanRevoke: (req) => this.kanbanWorker().revoke(req.leaseId, req.cardId),
       kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
+      kanbanNotify: (notify) => this.kanbanNotify(notify),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
       drainSessionPurges: () => this.drainSessionPurges(),
       effectiveAgents: () => this.effectiveAgents(),
@@ -27255,6 +27261,42 @@ export class Daemon {
       invalidateToken: (agentId, repo, leaseId, token) =>
         this.gitCreds.invalidateKanbanComment(agentId, repo, leaseId, token)
     }))
+  }
+
+  /** `kanban/notify`: post one body-free transition notification through the target integration's own connection. */
+  private async kanbanNotify(notify: KanbanNotify): Promise<KanbanNotifyOk> {
+    const agentId = this.agentForIntegration(notify.target.integrationId)
+    if (!agentId || !this.servesAgent(agentId)) {
+      return { notifyId: notify.notifyId, ok: false, reason: 'integration_missing' }
+    }
+    // Dedupe by notifyId in a bounded in-memory set; a daemon restart may post a retried notification twice.
+    if (this.seenNotifyIds.has(notify.notifyId)) return { notifyId: notify.notifyId, ok: true }
+    const conn = this.replyConnFor(agentId, notify.target.integrationId)
+    if (!conn) return { notifyId: notify.notifyId, ok: false, reason: 'no_connection' }
+    const text = this.maskAgentSecrets(agentId, kanbanNotifyText(notify))
+    try {
+      await conn.postMessage(notify.target.channel, text)
+    } catch {
+      return { notifyId: notify.notifyId, ok: false, reason: 'post_failed' }
+    }
+    this.rememberNotifyId(notify.notifyId)
+    return { notifyId: notify.notifyId, ok: true }
+  }
+
+  private agentForIntegration(integrationId: string): string | undefined {
+    for (const [agentId, agent] of this.agents) {
+      if (agent.integrations.some((integration) => integration.id === integrationId)) return agentId
+    }
+    return undefined
+  }
+
+  private readonly seenNotifyIds = new Map<string, number>()
+  private rememberNotifyId(notifyId: string): void {
+    this.seenNotifyIds.set(notifyId, Date.now())
+    if (this.seenNotifyIds.size > 1000) {
+      const oldest = [...this.seenNotifyIds.entries()].sort((a, b) => a[1] - b[1])[0]
+      if (oldest) this.seenNotifyIds.delete(oldest[0])
+    }
   }
 
   private kanbanOrchestratorTools(): KanbanOrchestratorTools {

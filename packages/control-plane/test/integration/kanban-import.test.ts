@@ -317,7 +317,7 @@ describe('issue import doorbells (Postgres)', () => {
       const rows = await prisma.kanbanCard.findMany({ where: { boardId: f.board.id } })
       expect(rows.every((row) => row.status !== 'ready')).toBe(true)
       expect(
-        await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+        (await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })).leases
       ).toHaveLength(0)
     })
 
@@ -337,7 +337,7 @@ describe('issue import doorbells (Postgres)', () => {
       const [audit] = await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' } })
       expect(audit!.details).toMatchObject({ to: 'triage', humanAuthority: null })
       expect(
-        await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+        (await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })).leases
       ).toHaveLength(0)
     })
 

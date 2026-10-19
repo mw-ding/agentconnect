@@ -12,6 +12,8 @@ import {
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanLeaseHeartbeat,
+  KanbanNotify,
+  KanbanNotifyOk,
   KanbanOrchestrate,
   KanbanOrchestrateOk,
   KanbanReasonCode,
@@ -98,6 +100,23 @@ describe('kanban wire (issue #2 M2)', () => {
     const { agentId: _, ...missingAgent } = dispatch
     expect(KanbanDispatch.safeParse(missingAgent).success).toBe(false)
     expect(KanbanDispatch.safeParse({ ...dispatch, sessionKeyPrefix: 'acme/web', mode: 'write' }).success).toBe(true)
+  })
+
+  it('kanban/dispatch carries an optional role: absent = work, and older frames without it still parse', () => {
+    expect(KanbanDispatch.safeParse(dispatch).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'work' }).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'verify' }).success).toBe(true)
+    expect(KanbanDispatch.safeParse({ ...dispatch, role: 'admin' }).success).toBe(false)
+    const parsed = KanbanDispatch.parse(dispatch)
+    expect(parsed.role).toBeUndefined()
+    expect(KanbanDispatch.parse({ ...dispatch, role: 'verify' }).role).toBe('verify')
+  })
+
+  it('kanban/report accepts changes_requested, a verifier-only outcome', () => {
+    expect(KanbanReport.safeParse({ ...report, outcome: 'changes_requested' }).success).toBe(true)
+    expect(KanbanReport.safeParse({ ...report, outcome: 'changes_requested', reasonCode: undefined }).success).toBe(
+      true
+    )
   })
 
   it('kanban/dispatch/ok carries a typed refusal only when not accepted', () => {
@@ -361,4 +380,40 @@ it('vera-349: prepare advertises optional nullable App identity in a strict body
     expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin }).success).toBe(false)
   }
   expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin: 'app[bot]', body: 'secret' }).success).toBe(false)
+})
+
+describe('kanban/notify', () => {
+  const base = {
+    notifyId: '66666666-6666-4666-8666-666666666666',
+    boardId: BOARD,
+    cardId: CARD,
+    repoFullName: 'acme/web',
+    issueNumber: 7,
+    from: 'running',
+    to: 'blocked',
+    target: { platform: 'slack', channel: 'C0ANCHOR', integrationId: AGENT }
+  }
+
+  it('parses with and without the optional detail and mention', () => {
+    expect(KanbanNotify.parse(base)).toEqual(base)
+    const full = {
+      ...base,
+      blockKind: 'needs_input',
+      reasonCode: 'x_y',
+      tripped: 'review_round_limit',
+      mention: { slackUserId: 'U1' }
+    }
+    expect(KanbanNotify.parse(full)).toEqual(full)
+  })
+
+  it('rejects unknown keys so a body can never ride the frame', () => {
+    expect(() => KanbanNotify.parse({ ...base, title: 'secret' })).toThrow()
+    expect(() => KanbanNotify.parse({ ...base, target: { ...base.target, text: 'hi' } })).toThrow()
+  })
+
+  it('round-trips both frames through the envelope registry', () => {
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/notify', base))).ok).toBe(true)
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/notify', { ...base, title: 'x' }))).ok).toBe(false)
+    expect(KanbanNotifyOk.parse({ notifyId: base.notifyId, ok: false, reason: 'post_failed' }).ok).toBe(false)
+  })
 })
