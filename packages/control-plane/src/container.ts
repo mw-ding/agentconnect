@@ -1934,7 +1934,8 @@ export function buildContainer(
         installations: repos.githubInstallation,
         appSlug: githubAppCfg?.slug,
         poke: (boardId) => kanbanDispatcher?.poke(boardId),
-        log: { warn: (o, m) => http.log.warn(o, m) }
+        log: { warn: (o, m) => http.log.warn(o, m) },
+        ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
       })
     : undefined
 
@@ -3359,9 +3360,10 @@ export function buildContainer(
         ...(sessionPullRequestFeedback ? [sessionPullRequestFeedback.settle()] : []),
         ...(installationDoorbell ? [installationDoorbell.settle()] : []),
         ...(kanbanGraphDoorbell ? [kanbanGraphDoorbell.settle()] : []),
-        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : []),
-        ...(kanbanProjectStatus ? [kanbanProjectStatus.settle()] : [])
+        ...(kanbanDispatcher ? [kanbanDispatcher.settle()] : [])
       ])
+      // Doorbell and dispatcher tasks include sync, graph and import; drain their late projections before disconnect.
+      await kanbanProjectStatus?.settle()
       await rootPrisma.$disconnect()
     }
   }

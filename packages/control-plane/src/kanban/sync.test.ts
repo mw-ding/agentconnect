@@ -1232,3 +1232,121 @@ describe('vera-474 B2: KanbanSync status commits reach the projection seam', () 
     expect(project.onStatusCommitted).not.toHaveBeenCalled()
   })
 })
+
+describe('sync post-commit projection under downstream failures', () => {
+  const lease = { leaseId: 'lease', runId: 'run', agentId: 'worker', daemonId: 'daemon', dispatchRevision: 1n }
+
+  it.each(['label write', 'revoke', 'ack', 'promote'] as const)(
+    'vera-474r2: a committed status projects exactly once when %s rejects, including retries',
+    async (failure) => {
+      const from = failure === 'revoke' ? 'running' : failure === 'promote' ? 'triage' : 'todo'
+      const to = failure === 'revoke' ? 'blocked' : failure === 'promote' ? 'todo' : 'ready'
+      const f = fixture({ status: from, lease: failure === 'revoke' ? lease : null })
+      f.issue.labels = [`ac/status:${to}`]
+      f.events.splice(0, f.events.length, labelEvent(1, 'labeled', `ac/status:${to}`, alice))
+      const projected: string[] = []
+      const project = { onStatusCommitted: vi.fn(() => projected.push(f.card().status)) }
+      const sync = new KanbanSync({ ...f.deps, project })
+      const error = new Error(`${failure} failed`)
+      if (failure === 'label write') vi.mocked(f.deps.store.applyPlan).mockRejectedValueOnce(error)
+      if (failure === 'revoke') vi.mocked(f.deps.revoke).mockRejectedValueOnce(error)
+      if (failure === 'ack') vi.mocked(f.deps.repo.ack).mockRejectedValueOnce(error)
+      if (failure === 'promote') vi.mocked(f.deps.promote).mockRejectedValueOnce(error)
+      await expect(sync.onCardChanged('board', 1, true)).rejects.toThrow(error)
+      expect(f.card().status).toBe(to)
+      const afterFailure = [...projected]
+      await sync.onCardChanged('board', 1, true)
+      await sync.reconcileBoard('board')
+      expect(afterFailure).toEqual([to])
+      expect(projected).toEqual([to])
+      expect(project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({ boardId: 'board', issueNumber: 1 })
+    }
+  )
+
+  it.each(['revoke', 'comment'] as const)(
+    'vera-474r2: a reassignment restart projects before its %s rejects',
+    async (failure) => {
+      const f = fixture({ status: 'running', assigneeAgentId: 'worker', lease })
+      f.issue.labels = ['ac/status:running', 'ac/agent:next']
+      f.events.splice(
+        0,
+        f.events.length,
+        labelEvent(1, 'labeled', 'ac/status:running', app),
+        labelEvent(2, 'labeled', 'ac/agent:next', alice)
+      )
+      vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+        Object.assign(f.card(), { status: 'ready', assigneeAgentId: agentId, lease: null, syncAgentCursor: 2n })
+        return {
+          ok: true,
+          changed: true,
+          card: { status: 'ready' } as never,
+          previousAgentId: 'worker',
+          revokedLease: lease
+        }
+      })
+      const projected: string[] = []
+      const project = { onStatusCommitted: vi.fn(() => projected.push(f.card().status)) }
+      const sync = new KanbanSync({ ...f.deps, project })
+      const error = new Error(`${failure} failed`)
+      if (failure === 'revoke') vi.mocked(f.deps.revoke).mockRejectedValueOnce(error)
+      else vi.mocked(f.deps.store.applyPlan).mockRejectedValueOnce(error)
+      await expect(sync.onCardChanged('board', 1, true)).rejects.toThrow(error)
+      expect(f.card().status).toBe('ready')
+      const afterFailure = [...projected]
+      await sync.onCardChanged('board', 1, true)
+      await sync.reconcileBoard('board')
+      expect(afterFailure).toEqual(['ready'])
+      expect(projected).toEqual(['ready'])
+      expect(project.onStatusCommitted).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it('vera-474r2: fail-closed projects triage before lease revocation rejects', async () => {
+    const f = fixture({ status: 'running', lease, syncDeferredAt: new Date(Date.now() - 11 * 60_000) })
+    f.events.splice(0, f.events.length)
+    vi.mocked(f.deps.revoke).mockRejectedValueOnce(new Error('revoke failed'))
+    const projected: string[] = []
+    const project = { onStatusCommitted: vi.fn(() => projected.push(f.card().status)) }
+    const sync = new KanbanSync({ ...f.deps, project })
+    await expect(sync.onCardChanged('board', 1, true)).rejects.toThrow('revoke failed')
+    expect(f.card().status).toBe('triage')
+    expect(projected).toEqual(['triage'])
+    await sync.onCardChanged('board', 1, true)
+    await sync.reconcileBoard('board')
+    expect(project.onStatusCommitted).toHaveBeenCalledTimes(1)
+  })
+
+  it('vera-474r2: assignment-only commits never project a status', async () => {
+    const f = fixture({ status: 'ready', assigneeAgentId: 'worker' })
+    f.issue.labels = [...f.issue.labels, 'ac/agent:next']
+    f.events.push(labelEvent(2, 'labeled', 'ac/agent:next', alice))
+    vi.mocked(f.deps.cards.setAssignee).mockImplementation(async ({ agentId }) => {
+      Object.assign(f.card(), { assigneeAgentId: agentId, syncAgentCursor: 2n })
+      return {
+        ok: true,
+        changed: true,
+        card: { status: 'ready' } as never,
+        previousAgentId: 'worker',
+        revokedLease: null
+      }
+    })
+    const project = { onStatusCommitted: vi.fn() }
+    await new KanbanSync({ ...f.deps, project }).onCardChanged('board', 1, true)
+    expect(f.card().status).toBe('ready')
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  })
+
+  it.each(['unchanged', 'lost CAS', 'rejected commit'] as const)(
+    'vera-474r2: %s followed by failed I/O queues no projection',
+    async (outcome) => {
+      const f = fixture({ status: outcome === 'unchanged' ? 'ready' : 'todo' })
+      if (outcome === 'lost CAS') vi.mocked(f.deps.repo.apply).mockResolvedValueOnce(null)
+      if (outcome === 'rejected commit') vi.mocked(f.deps.repo.apply).mockRejectedValueOnce(new Error('DB failed'))
+      vi.mocked(f.deps.store.applyPlan).mockRejectedValueOnce(new Error('label failed'))
+      const project = { onStatusCommitted: vi.fn() }
+      await new KanbanSync({ ...f.deps, project }).onCardChanged('board', 1, true).catch(() => {})
+      expect(f.card().status).toBe(outcome === 'unchanged' ? 'ready' : 'todo')
+      expect(project.onStatusCommitted).not.toHaveBeenCalled()
+    }
+  )
+})

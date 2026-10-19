@@ -8,6 +8,14 @@ import {
   type ProjectWriteReason
 } from './project-writer.js'
 
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 const PROJECT = 'PVT_kwDOAbc'
 const FIELD = 'PVTSSF_lADOAbc'
 const ISSUE_NODE = 'I_kwDOAbc123'
@@ -410,6 +418,42 @@ describe('kanbanProjectHook', () => {
     h.hook.onStatusCommitted(REF)
     release()
     await h.hook.settle()
+    expect(h.writer.project).toHaveBeenCalledTimes(2)
+  })
+
+  it('vera-474r2: one card has at most one active projection and a burst writes ready then done', async () => {
+    const row = { ...card, status: 'ready' as KanbanStatus }
+    const h = hookHarness({ card: row })
+    const gate = deferred()
+    const started = deferred()
+    let active = 0
+    let maxActive = 0
+    const writes: string[] = []
+    h.writer.project.mockImplementation(async (args) => {
+      active++
+      maxActive = Math.max(maxActive, active)
+      const { status } = args as { status: KanbanStatus }
+      if (status === 'ready') {
+        started.resolve()
+        await gate.promise
+      }
+      writes.push(status)
+      active--
+      return { itemId: 'PVTI_new' }
+    })
+    h.hook.onStatusCommitted(REF)
+    await started.promise
+    row.status = 'running'
+    h.hook.onStatusCommitted(REF)
+    row.status = 'review'
+    h.hook.onStatusCommitted(REF)
+    row.status = 'done'
+    h.hook.onStatusCommitted(REF)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    gate.resolve()
+    await h.hook.settle()
+    expect(maxActive).toBe(1)
+    expect(writes).toEqual(['ready', 'done'])
     expect(h.writer.project).toHaveBeenCalledTimes(2)
   })
 

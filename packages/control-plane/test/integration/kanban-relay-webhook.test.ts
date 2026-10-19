@@ -2,12 +2,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPublicKey, createVerify, generateKeyPairSync, randomUUID } from 'node:crypto'
 import { prisma } from '../setup.db.js'
+import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
+import { KanbanProjectWriter } from '../../src/kanban/project-writer.js'
 import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
 
 const RELAY_TOKEN = 'relay-shared-secret-0123456789abcdef'
 const WEBHOOK_SECRET = 'kanban-webhook-secret-0123456789'
@@ -117,7 +127,7 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot(level = 'write', opts: { project?: boolean } = {}) {
+async function boot(level = 'write', opts: { project?: boolean; beforeFetch?: (url: string) => Promise<void> } = {}) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
   const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, level)
   await prisma.githubInstallation.create({
@@ -177,7 +187,10 @@ async function boot(level = 'write', opts: { project?: boolean } = {}) {
     }),
     clock: systemClock,
     secretsProvider: new MemorySecretsProvider(),
-    githubFetch: github.fetch
+    githubFetch: async (url, init) => {
+      await opts.beforeFetch?.(url)
+      return github.fetch(url, init)
+    }
   })
   const cpUrl = await app.http.listen({ port: 0, host: '127.0.0.1' })
   app.mountWs()
@@ -368,4 +381,80 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     )
     expect(calls).toContain(`/repositories/${REPO_ID}/issues/${ISSUE.number}/dependencies/blocked_by`)
   })
+})
+
+it('vera-474r2: shutdown settles a projection queued by a producer after shutdown starts', async () => {
+  const permissionStarted = vi.fn()
+  const allowCommit = deferred()
+  const projectionStarted = vi.fn()
+  const allowProjection = deferred()
+  const producerStopped = vi.fn()
+  const producerSettled = vi.fn()
+  const originalSettle = KanbanGraphDoorbell.prototype.settle
+  const settle = vi.spyOn(KanbanGraphDoorbell.prototype, 'settle').mockImplementation(async function (
+    this: KanbanGraphDoorbell
+  ) {
+    await originalSettle.call(this)
+    producerSettled()
+  })
+  const originalStop = KanbanGraphDoorbell.prototype.stop
+  const stop = vi.spyOn(KanbanGraphDoorbell.prototype, 'stop').mockImplementation(function (this: KanbanGraphDoorbell) {
+    originalStop.call(this)
+    producerStopped()
+  })
+  const originalProject = KanbanProjectWriter.prototype.project
+  const project = vi.spyOn(KanbanProjectWriter.prototype, 'project').mockImplementation(async function (
+    this: KanbanProjectWriter,
+    args
+  ) {
+    projectionStarted()
+    await allowProjection.promise
+    return originalProject.call(this, args)
+  })
+  const disconnect = vi.spyOn(prisma, '$disconnect')
+  let shuttingDown: Promise<void> | undefined
+  try {
+    const { card, link } = await boot('write', {
+      project: true,
+      beforeFetch: async (url) => {
+        if (url.endsWith('/collaborators/alice/permission')) {
+          permissionStarted()
+          await allowCommit.promise
+        }
+      }
+    })
+    expect(
+      (
+        await postGithubWebhook(link.webhookUrl, {
+          secret: WEBHOOK_SECRET,
+          event: 'issues',
+          payload: issuesLabeled(HUMAN)
+        })
+      ).status
+    ).toBe(202)
+    await vi.waitFor(() => expect(permissionStarted).toHaveBeenCalled(), { timeout: 5000 })
+    await link.close()
+    shuttingDown = app!.shutdown()
+    await vi.waitFor(() => expect(producerStopped).toHaveBeenCalled(), { timeout: 5000 })
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('triage')
+    allowCommit.resolve()
+    await vi.waitFor(() => expect(projectionStarted).toHaveBeenCalled(), { timeout: 5000 })
+    // Let the producer finish while the Projects write is still blocked.
+    await vi.waitFor(() => expect(producerSettled).toHaveBeenCalled(), { timeout: 5000 })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(disconnect).not.toHaveBeenCalled()
+    allowProjection.resolve()
+    await shuttingDown
+    expect(disconnect).toHaveBeenCalledTimes(1)
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).projectItemId).toBe('PVTI_7')
+  } finally {
+    allowCommit.resolve()
+    allowProjection.resolve()
+    await shuttingDown
+    app = undefined
+    settle.mockRestore()
+    stop.mockRestore()
+    project.mockRestore()
+    disconnect.mockRestore()
+  }
 })

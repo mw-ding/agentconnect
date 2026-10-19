@@ -376,3 +376,18 @@ describe('vera-474 B2: graph promotion reaches the projection seam', () => {
     expect(project.onStatusCommitted).not.toHaveBeenCalled()
   })
 })
+
+it.each(['lost CAS', 'DB error'] as const)(
+  'vera-474r2: a graph rollback with %s never projects an uncommitted revert',
+  async (failure) => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
+    h.store.applyPlan.mockRejectedValueOnce(new Error('label POST failed'))
+    if (failure === 'lost CAS') h.cards.revertPromotion.mockResolvedValueOnce(false)
+    else h.cards.revertPromotion.mockRejectedValueOnce(new Error('DB offline'))
+    const project = { onStatusCommitted: vi.fn() }
+    const reconciler = new KanbanGraphReconciler({ cards: h.cards, store: h.store, log: { debug: vi.fn() }, project })
+    await expect(reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('label POST failed')
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  }
+)

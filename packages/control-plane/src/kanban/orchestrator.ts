@@ -27,6 +27,7 @@ import {
   type GithubInstallationRepo
 } from '../persistence/ports.js'
 import type { CardStore, KanbanRepoRef, CardIssue, CardGraph } from './card-store.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 export interface KanbanOrchestratorDeps {
   cards: Pick<KanbanCardRepo, 'findByIdempotencyKey' | 'casStatus' | 'setAssignee' | 'resolveAgentSlug'>
@@ -41,6 +42,8 @@ export interface KanbanOrchestratorDeps {
   /** Wake the board dispatcher after a reassign so the next claim opens the new run. */
   poke?: (boardId: string) => void
   log?: { warn(obj: unknown, msg?: string): void }
+  // Queue committed statuses before fallible GitHub effects.
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
 }
 
 type Op = KanbanOrchestrate['op']
@@ -200,6 +203,7 @@ export class KanbanOrchestrator {
       return refuse('commit_create', result.reason)
     }
     const card = result.card
+    if (result.created) this.deps.project?.onStatusCommitted({ boardId: req.boardId, issueNumber: card.issueNumber })
     if (result.matchedBy === 'idempotency_key' && card.issueNumber !== req.issueNumber) {
       // A concurrent create won the key; close our duplicate and return the winner.
       await this.closeFiledOrphan(repo, req.boardId, issue)
@@ -306,6 +310,7 @@ export class KanbanOrchestrator {
     if (!truncated && card.status === 'blocked' && !card.leased) {
       if (await this.deps.cards.casStatus(card.cardId, card.stateRevision, 'todo')) {
         status = 'todo'
+        this.deps.project?.onStatusCommitted({ boardId: req.boardId, issueNumber: req.issueNumber })
         try {
           const observed = await this.deps.store.readCard(repo, req.issueNumber)
           if (observed) {
@@ -347,6 +352,9 @@ export class KanbanOrchestrator {
       return refuse('assign', 'card_conflict')
     }
     if (!result.changed) return { ok: true, op: 'assign', assigned: result.card.assigneeAgentId !== null }
+    if (result.card.status !== card.status) {
+      this.deps.project?.onStatusCommitted({ boardId: req.boardId, issueNumber: req.issueNumber })
+    }
     // The reassign already committed; the poke must not wait on (or be lost to) a GitHub label failure.
     if (result.revokedLease) this.deps.poke?.(req.boardId)
     try {
@@ -505,6 +513,7 @@ export class KanbanOrchestrator {
     const epic = await this.deps.orchestrator.cardByIssueNumber(board.id, epicIssueNumber)
     if (!epic || epic.leased || epic.status === 'triage' || !canTransition(epic.status, 'triage')) return
     if (!(await this.deps.cards.casStatus(epic.cardId, epic.stateRevision, 'triage'))) return
+    this.deps.project?.onStatusCommitted({ boardId: board.id, issueNumber: epicIssueNumber })
     // The refusal is the answer; a label mirror lost here is repaired by the graph reconciler.
     try {
       const repo = await this.repoRef(board)
