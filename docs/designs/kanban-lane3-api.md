@@ -139,6 +139,9 @@ approval stamp remains stored, but the hold prevents dispatch until an attribute
 status move clears it and the stamp. A non-writer's revert to `triage` also retains the stamp;
 the next work claim or human status move clears it before another review round.
 
+Timeout and run-end transactions lock the card before its run. A report waiting behind a
+timeout reads the committed revocation before testing its lease fence.
+
 `reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
 `triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
 approval resets it; a worker's pass and every human move keep it. So after a trip, a human
