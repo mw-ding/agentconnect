@@ -537,6 +537,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   endRun(input: KanbanRunEndInput): Promise<KanbanRunEndResult> {
     return this.inTransaction(async (tx) => {
+      // Lock the card before its run, matching sync and reassignment so a concurrent timeout cannot deadlock.
+      const cards = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT c."id" FROM "kanban_card" c
+        JOIN "kanban_run" r ON r."cardId" = c."id"
+        WHERE r."leaseId" = ${input.leaseId}::uuid
+        FOR UPDATE OF c
+      `)
+      if (cards.length === 0) return { accepted: false }
       const [row] = await tx.$queryRaw<RunEndRow[]>(Prisma.sql`
         SELECT r."id" AS "runId", r."cardId", r."attempt", r."agentId", r."daemonId", r."role",
                r."dispatchRevision" AS "runRevision", r."endedAt",

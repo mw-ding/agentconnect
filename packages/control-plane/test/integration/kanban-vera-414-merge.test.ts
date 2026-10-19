@@ -349,7 +349,7 @@ describe('vera-414-merge: 6 the outbox drain leaves rows for a daemon live on no
 })
 
 describe('vera-414-merge2: attribution timeout fences every open run (Postgres)', () => {
-  it.each(['close', 'pr_merged'] as const)(
+  it.each(['close', 'pr_merged', 'pr_checks_green'] as const)(
     'vera-414-merge2: %s refuses a verifier report after failClosed without lifting the human hold',
     async (completionContract) => {
       const f = await fixture()
@@ -413,6 +413,75 @@ describe('vera-414-merge2: attribution timeout fences every open run (Postgres)'
 })
 
 describe('vera-414-merge2: timeout transaction and competing writers (Postgres)', () => {
+  it('vera-414-cutover: a report waiting on the timeout card lock is fenced without a deadlock', async () => {
+    const f = await fixture()
+    const c = await f.card('review')
+    const [lease] = await f.claim()
+    const snapshot = (await f.sync.get(f.board.id, c.issueNumber))!
+    let cardLocked!: () => void
+    const locked = new Promise<void>((resolve) => {
+      cardLocked = resolve
+    })
+    let reportBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      reportBlocked = resolve
+    })
+    let timeoutPid = 0
+    let reportPid = 0
+    const timeout = prisma
+      .$transaction(async (tx) => {
+        timeoutPid = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
+        await tx.$queryRaw`SELECT "id" FROM "kanban_card" WHERE "id" = ${c.id}::uuid FOR UPDATE`
+        cardLocked()
+        await blocked
+        return new PgKanbanSyncRepo(tx).failClosed(snapshot)
+      })
+      .then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error })
+      )
+    let report: ReturnType<typeof timeoutReport> | undefined
+    function timeoutReport() {
+      return prisma
+        .$transaction(async (tx) => {
+          reportPid = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
+          return new PgKanbanDispatchRepo(tx).endRun({
+            leaseId: lease!.leaseId,
+            outcome: 'completed',
+            reasonCode: null,
+            now: new Date(T0),
+            plan: (card, board, ctx) => planRunEnd(card, board, { outcome: 'completed' }, new Date(T0), ctx)
+          })
+        })
+        .then(
+          (result) => ({ result }),
+          (error: unknown) => ({ error })
+        )
+    }
+    try {
+      await locked
+      report = timeoutReport()
+      await vi.waitFor(
+        async () => {
+          expect(reportPid).toBeGreaterThan(0)
+          const [state] = await prisma.$queryRaw<
+            Array<{ blockers: number[] }>
+          >`SELECT pg_blocking_pids(${reportPid}::int) AS blockers`
+          expect(state!.blockers).toContain(timeoutPid)
+        },
+        { timeout: 2_000, interval: 10 }
+      )
+    } finally {
+      reportBlocked()
+      await timeout
+      await report
+    }
+    expect(await timeout).toMatchObject({ result: { revoked: { leaseId: lease!.leaseId } } })
+    expect(await report).toEqual({ result: { accepted: false } })
+    expect(await f.read(c.id)).toMatchObject({ status: 'review', needsAttention: true, verifiedAt: null })
+    expect(await prisma.kanbanRun.count({ where: { cardId: c.id, endedAt: null } })).toBe(0)
+  })
+
   it('vera-414-merge2: a claim winning first invalidates the old timeout snapshot', async () => {
     const f = await fixture()
     const c = await f.card('review')
