@@ -119,9 +119,13 @@ starts a new review round clears the stamp:
   the label sync (`PgKanbanSyncRepo.apply`, any accepted change of status) and the parked
   human ingest (`PgKanbanDispatchRepo.ingestStatus`).
 
-A move the CP makes on its own (a non-writer's revert to `triage`, a fail-closed attribution
-timeout) keeps the stamp: neither moves a card into `review`, and the next work claim or human
-move clears it before another round can reach the verifier.
+A fail-closed attribution timeout moves `ready`/`running` to `triage` and leaves other
+statuses in place, including `review`. It revokes any open work or verify run and increments
+`dispatchRevision` with the revocation, so a late report cannot complete the card, set
+`verifiedAt`, or clear the `needsAttention: label_attribution_timeout` hold. An existing
+approval stamp remains stored, but the hold prevents dispatch until an attributed human
+status move clears it and the stamp. A non-writer's revert to `triage` also retains the stamp;
+the next work claim or human status move clears it before another review round.
 
 `reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
 `triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an

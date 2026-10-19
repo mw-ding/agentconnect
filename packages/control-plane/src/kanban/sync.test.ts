@@ -80,7 +80,7 @@ function fixture(overrides: Partial<SyncCard> = {}) {
       }),
       failClosed: vi.fn(async (_c) => {
         const status = card.status === 'ready' || card.status === 'running' ? 'triage' : card.status
-        const revoked = status !== card.status ? card.lease : null
+        const revoked = card.lease
         card = { ...card, status, needsAttention: true, syncDeferredAt: null, syncDeferralCount: 0, lease: null }
         return { status, revoked }
       })
@@ -1198,5 +1198,34 @@ describe('vera-r4: same-snapshot close survives reassignment', () => {
     expect(f.deps.revoke).toHaveBeenCalledOnce()
     expect(f.deps.repo.defer).not.toHaveBeenCalled()
     expect(vi.mocked(f.deps.repo.apply).mock.calls.at(-1)![5]).toEqual({ login: 'bob', id: 1 })
+  })
+})
+
+describe('vera-414-merge2: a review timeout uses the existing daemon revoke path', () => {
+  it('vera-414-merge2: revokes before projection and acknowledges the new dispatch revision', async () => {
+    const start = new Date('2026-10-17T00:00:00Z')
+    const lease = {
+      leaseId: 'verify-lease',
+      runId: 'verify-run',
+      agentId: 'verifier',
+      daemonId: 'daemon',
+      dispatchRevision: 7n
+    }
+    const f = fixture({ status: 'review', dispatchRevision: 7n, lease, syncDeferredAt: start })
+    f.deps.now = () => new Date(start.getTime() + 11 * 60_000)
+    f.issue.labels = ['ac/status:blocked']
+    f.events.length = 0
+    await f.sync.onCardChanged('board', 1, true)
+    expect(f.deps.revoke).toHaveBeenCalledExactlyOnceWith(lease, 'card')
+    expect(vi.mocked(f.deps.revoke).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(f.deps.store.applyPlan).mock.invocationCallOrder[0]!
+    )
+    expect(f.deps.repo.ack).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'review', stateRevision: 1n, dispatchRevision: 8n }),
+      0n,
+      0n
+    )
+    expect(f.card()).toMatchObject({ status: 'review', needsAttention: true, lease: null })
+    expect(f.deps.promote).not.toHaveBeenCalled()
   })
 })

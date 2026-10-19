@@ -20,7 +20,7 @@ const A2 = 'a1414141-1414-4141-8141-141414141412'
 const T0 = Date.parse('2026-10-18T12:00:00.000Z')
 const APPROVED = new Date(T0 - 60_000)
 
-/** A pr_merged board with verifier A2 and an anchor channel; worker A1 sits on D1, verifier A2 on D2. */
+// Worker A1 and verifier A2 sit on separate daemons; the board has an anchor channel.
 async function fixture() {
   await seedDaemon(prisma, D1)
   await seedDaemon(prisma, D2)
@@ -57,7 +57,7 @@ async function fixture() {
     (await prisma.auditEvent.findMany({ where: { kind: 'kanban_card_change' }, orderBy: { createdAt: 'asc' } }))
       .map((a) => a.details as Record<string, unknown>)
       .filter((d) => d.cardId === cardId)
-  /** One human-attributed status label, through #194's sync apply exactly as a live label edit lands. */
+  // A human status label lands through the live sync apply path.
   const humanMove = async (issueNumber: number, to: KanbanStatus, cursor: bigint, db = sync) => {
     const snapshot = (await db.get(board.id, issueNumber))!
     const plan = planLabelReconcile(
@@ -263,7 +263,7 @@ describe('vera-414-merge: 8 a human re-ready keeps the review round count (Postg
 })
 
 describe('vera-414-merge: 6 the outbox drain leaves rows for a daemon live on no connection here (Postgres)', () => {
-  /** One pending row on an anchored board whose integration posts through A1's daemon D1. */
+  // The pending row posts through A1's daemon D1.
   async function outbox() {
     const f = await fixture()
     const botId = randomUUID()
@@ -345,5 +345,132 @@ describe('vera-414-merge: 6 the outbox drain leaves rows for a daemon live on no
     await prisma.agent.update({ where: { id: A1 }, data: { daemonId: null } })
     const [unplaced] = await notify.claim(10, at, lease, [], [])
     expect(unplaced).toMatchObject({ boardId: f.board.id })
+  })
+})
+
+describe('vera-414-merge2: attribution timeout fences every open run (Postgres)', () => {
+  it.each(['close', 'pr_merged'] as const)(
+    'vera-414-merge2: %s refuses a verifier report after failClosed without lifting the human hold',
+    async (completionContract) => {
+      const f = await fixture()
+      await prisma.kanbanBoard.update({ where: { id: f.board.id }, data: { completionContract } })
+      const c = await f.card('review')
+      const [lease] = await f.claim()
+      expect(lease).toMatchObject({ role: 'verify', cardId: c.id })
+      const snapshot = (await f.sync.get(f.board.id, c.issueNumber))!
+      expect(await f.sync.failClosed(snapshot)).toMatchObject({
+        status: 'review',
+        revoked: { leaseId: lease!.leaseId, agentId: A2, daemonId: D2, dispatchRevision: lease!.dispatchRevision }
+      })
+      expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toEqual({ accepted: false })
+      expect(await f.read(c.id)).toMatchObject({
+        status: 'review',
+        needsAttention: true,
+        attentionReason: 'label_attribution_timeout',
+        verifiedAt: null,
+        dispatchRevision: snapshot.dispatchRevision + 1n,
+        stateRevision: snapshot.stateRevision,
+        labelWritePending: true
+      })
+      expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: lease!.runId } })).toMatchObject({
+        endedAt: expect.any(Date),
+        outcome: 'reclaimed',
+        reasonCode: 'label_attribution_timeout'
+      })
+      expect(await f.claim()).toEqual([])
+      expect(await f.rows(c.id)).toEqual([])
+      // A same-status hold is not a status audit; the reclaimed run records why its lease ended.
+      expect(await f.audits(c.id)).toMatchObject([{ source: 'claim', role: 'verify' }])
+      expect(await f.audits(c.id)).toHaveLength(1)
+      expect(await f.sync.failClosed(snapshot)).toBeNull()
+    }
+  )
+
+  it('vera-414-merge2: a running work lease is still revoked and its report is fenced', async () => {
+    const f = await fixture()
+    const c = await f.card('ready')
+    const [lease] = await f.claim()
+    const snapshot = (await f.sync.get(f.board.id, c.issueNumber))!
+    expect(await f.sync.failClosed(snapshot)).toMatchObject({
+      status: 'triage',
+      revoked: { leaseId: lease!.leaseId, agentId: A1, daemonId: D1 }
+    })
+    expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toEqual({ accepted: false })
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'triage',
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout',
+      verifiedAt: null,
+      stateRevision: snapshot.stateRevision + 1n,
+      dispatchRevision: snapshot.dispatchRevision + 1n
+    })
+    expect(await f.audits(c.id)).toMatchObject([
+      { source: 'claim' },
+      { from: 'running', to: 'triage', source: 'label_attribution_timeout', leaseId: lease!.leaseId }
+    ])
+    expect(await f.rows(c.id)).toEqual([])
+  })
+})
+
+describe('vera-414-merge2: timeout transaction and competing writers (Postgres)', () => {
+  it('vera-414-merge2: a claim winning first invalidates the old timeout snapshot', async () => {
+    const f = await fixture()
+    const c = await f.card('review')
+    const stale = (await f.sync.get(f.board.id, c.issueNumber))!
+    const [lease] = await f.claim()
+    expect(await f.sync.failClosed(stale)).toBeNull()
+    expect(await f.read(c.id)).toMatchObject({ needsAttention: false })
+    const current = (await f.sync.get(f.board.id, c.issueNumber))!
+    expect(await f.sync.failClosed(current)).toMatchObject({ revoked: { leaseId: lease!.leaseId } })
+    expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toEqual({ accepted: false })
+  })
+
+  it('vera-414-merge2: a completed report winning first invalidates the old timeout snapshot', async () => {
+    const f = await fixture()
+    const c = await f.card('review')
+    const [lease] = await f.claim()
+    const stale = (await f.sync.get(f.board.id, c.issueNumber))!
+    expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toMatchObject({ accepted: true })
+    expect(await f.sync.failClosed(stale)).toBeNull()
+    expect(await f.read(c.id)).toMatchObject({ needsAttention: false, verifiedAt: new Date(T0) })
+  })
+
+  it('vera-414-merge2: a timeout winning first prevents a new verify claim without a status change', async () => {
+    const f = await fixture()
+    const c = await f.card('review')
+    const snapshot = (await f.sync.get(f.board.id, c.issueNumber))!
+    expect(await f.sync.failClosed(snapshot)).toEqual({ status: 'review', revoked: null })
+    expect(await f.claim()).toEqual([])
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      dispatchRevision: snapshot.dispatchRevision
+    })
+    expect(await f.rows(c.id)).toEqual([])
+    expect(await f.audits(c.id)).toEqual([])
+  })
+
+  it('vera-414-merge2: rollback restores the verify lease and hold together with no outbox or audit leak', async () => {
+    const f = await fixture()
+    const c = await f.card('review')
+    const [lease] = await f.claim()
+    const snapshot = (await f.sync.get(f.board.id, c.issueNumber))!
+    const before = await f.read(c.id)
+    await expect(
+      prisma.$transaction(async (tx) => {
+        const result = await new PgKanbanSyncRepo(tx).failClosed(snapshot)
+        expect(result).toMatchObject({ revoked: { leaseId: lease!.leaseId } })
+        expect(await tx.kanbanRun.findUniqueOrThrow({ where: { id: lease!.runId } })).toMatchObject({
+          outcome: 'reclaimed',
+          reasonCode: 'label_attribution_timeout'
+        })
+        throw new Error('rollback timeout')
+      })
+    ).rejects.toThrow('rollback timeout')
+    expect(await f.read(c.id)).toEqual(before)
+    expect(await prisma.kanbanRun.findUniqueOrThrow({ where: { id: lease!.runId } })).toMatchObject({ endedAt: null })
+    expect(await f.rows(c.id)).toEqual([])
+    expect(await f.audits(c.id)).toHaveLength(1)
+    expect(await f.endRun(lease!.leaseId, { outcome: 'completed' })).toMatchObject({ accepted: true })
   })
 })
