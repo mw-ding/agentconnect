@@ -45,106 +45,113 @@ describe('PgKanbanDispatchRepo claim caps (real Postgres)', () => {
     const repo = new PgKanbanDispatchRepo(prisma)
     const opts = { now: new Date(), isDaemonLive: () => true }
 
-    const first = await repo.claim(board.id, opts)
+    const first = (await repo.claim(board.id, opts)).leases
     expect(first.map((l) => l.cardId)).toEqual([c1.id])
     // The epic now has one open run (c1); c2 is ready but the epic is at its active cap.
-    const second = await repo.claim(board.id, opts)
+    const second = (await repo.claim(board.id, opts)).leases
     expect(second).toEqual([])
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c2.id } })).status).toBe('ready')
   })
 
-  it('vera-349: per-daemon cap serializes overlapping claims until the first transaction commits', async () => {
-    const daemonId = randomUUID()
-    await seedDaemon(prisma, daemonId, { sessionEpoch: 1n })
-    const mk = async (boardId: string, issueNumber: number) => {
-      const agentId = randomUUID()
-      await seedAgent(prisma, agentId, { daemonId })
-      return prisma.kanbanCard.create({
+  it.each(['ready', 'review'] as const)(
+    'vera-414-cutover: %s claims serialize the daemon cap across boards',
+    async (status) => {
+      const daemonId = randomUUID()
+      await seedDaemon(prisma, daemonId, { sessionEpoch: 1n })
+      const mk = async (boardId: string, issueNumber: number) => {
+        const agentId = randomUUID()
+        await seedAgent(prisma, agentId, { daemonId })
+        if (status === 'review') {
+          await prisma.kanbanBoard.update({ where: { id: boardId }, data: { verifierAgentId: agentId } })
+        }
+        return prisma.kanbanCard.create({
+          data: {
+            boardId,
+            issueId: BigInt(9_500 + issueNumber),
+            issueNumber,
+            status,
+            assigneeAgentId: status === 'ready' ? agentId : null
+          }
+        })
+      }
+      const boardA = await prisma.kanbanBoard.create({
         data: {
-          boardId,
-          issueId: BigInt(9_500 + issueNumber),
-          issueNumber,
-          status: 'ready',
-          assigneeAgentId: agentId
+          orgId: DEFAULT_ORG_ID,
+          name: 'caps-a',
+          repoId: REPO_ID,
+          repoFullName: 'acme/web',
+          maxInProgress: 10,
+          maxInProgressPerAgent: 10
         }
       })
-    }
-    const boardA = await prisma.kanbanBoard.create({
-      data: {
-        orgId: DEFAULT_ORG_ID,
-        name: 'caps-a',
-        repoId: REPO_ID,
-        repoFullName: 'acme/web',
-        maxInProgress: 10,
-        maxInProgressPerAgent: 10
-      }
-    })
-    const boardB = await prisma.kanbanBoard.create({
-      data: {
-        orgId: DEFAULT_ORG_ID,
-        name: 'caps-b',
-        repoId: REPO_ID + 1n,
-        repoFullName: 'acme/api',
-        maxInProgress: 10,
-        maxInProgressPerAgent: 10
-      }
-    })
-    await mk(boardA.id, 1)
-    await mk(boardB.id, 1)
-    const repo = new PgKanbanDispatchRepo(prisma)
-    const opts = { now: new Date(), isDaemonLive: () => true, maxPerDaemon: 1 }
+      const boardB = await prisma.kanbanBoard.create({
+        data: {
+          orgId: DEFAULT_ORG_ID,
+          name: 'caps-b',
+          repoId: REPO_ID + 1n,
+          repoFullName: 'acme/api',
+          maxInProgress: 10,
+          maxInProgressPerAgent: 10
+        }
+      })
+      await mk(boardA.id, 1)
+      await mk(boardB.id, 1)
+      const repo = new PgKanbanDispatchRepo(prisma)
+      const opts = { now: new Date(), isDaemonLive: () => true, maxPerDaemon: 1 }
 
-    let releaseA!: () => void
-    const barrier = new Promise<void>((resolve) => {
-      releaseA = resolve
-    })
-    let readyA!: () => void
-    const claimedA = new Promise<void>((resolve) => {
-      readyA = resolve
-    })
-    let pidA = 0
-    const claimA = prisma.$transaction(async (tx) => {
-      pidA = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
-      const leases = await new PgKanbanDispatchRepo(tx).claim(boardA.id, opts)
-      expect(leases).toHaveLength(1)
-      readyA()
-      await barrier
-      return leases
-    })
-    let claimB: Promise<unknown> | undefined
-    let completedB = false
-    let pidB = 0
-    try {
-      await claimedA
-      claimB = prisma
-        .$transaction(async (tx) => {
-          pidB = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
-          return new PgKanbanDispatchRepo(tx).claim(boardB.id, opts)
-        })
-        .then((leases) => {
-          completedB = true
-          return leases
-        })
-      await vi.waitFor(
-        async () => {
-          expect(completedB).toBe(false)
-          expect(pidB).toBeGreaterThan(0)
-          const [state] = await prisma.$queryRaw<
-            Array<{ blockers: number[] }>
-          >`SELECT pg_blocking_pids(${pidB}::int) AS blockers`
-          expect(state!.blockers).toContain(pidA)
-        },
-        { timeout: 2_000, interval: 10 }
-      )
-    } finally {
-      releaseA()
-      await claimA
-      if (claimB) await claimB
+      let releaseA!: () => void
+      const barrier = new Promise<void>((resolve) => {
+        releaseA = resolve
+      })
+      let readyA!: () => void
+      const claimedA = new Promise<void>((resolve) => {
+        readyA = resolve
+      })
+      let pidA = 0
+      const claimA = prisma.$transaction(async (tx) => {
+        pidA = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
+        const leases = (await new PgKanbanDispatchRepo(tx).claim(boardA.id, opts)).leases
+        expect(leases).toHaveLength(1)
+        expect(leases[0]).toMatchObject({ daemonId, role: status === 'review' ? 'verify' : 'work' })
+        readyA()
+        await barrier
+        return leases
+      })
+      let claimB: Promise<unknown> | undefined
+      let completedB = false
+      let pidB = 0
+      try {
+        await claimedA
+        claimB = prisma
+          .$transaction(async (tx) => {
+            pidB = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0]!.pid
+            return new PgKanbanDispatchRepo(tx).claim(boardB.id, opts).then((r) => r.leases)
+          })
+          .then((leases) => {
+            completedB = true
+            return leases
+          })
+        await vi.waitFor(
+          async () => {
+            expect(completedB).toBe(false)
+            expect(pidB).toBeGreaterThan(0)
+            const [state] = await prisma.$queryRaw<
+              Array<{ blockers: number[] }>
+            >`SELECT pg_blocking_pids(${pidB}::int) AS blockers`
+            expect(state!.blockers).toContain(pidA)
+          },
+          { timeout: 2_000, interval: 10 }
+        )
+      } finally {
+        releaseA()
+        await claimA
+        if (claimB) await claimB
+      }
+      expect(completedB).toBe(true)
+      expect(await claimB).toEqual([])
+      expect(await prisma.kanbanRun.count({ where: { daemonId, endedAt: null } })).toBe(1)
     }
-    expect(completedB).toBe(true)
-    expect(await claimB).toEqual([])
-    expect(await prisma.kanbanRun.count({ where: { daemonId, endedAt: null } })).toBe(1)
-  })
+  )
 
   it('per-daemon cap counts open runs across boards, not just the claimed one', async () => {
     const daemonId = randomUUID()
@@ -187,12 +194,12 @@ describe('PgKanbanDispatchRepo claim caps (real Postgres)', () => {
     const repo = new PgKanbanDispatchRepo(prisma)
     // Cap of 2: first board claims its one, second board also fits.
     const opts = { now: new Date(), isDaemonLive: () => true, maxPerDaemon: 2 }
-    const a = await repo.claim(boardA.id, opts)
-    const b = await repo.claim(boardB.id, opts)
+    const a = (await repo.claim(boardA.id, opts)).leases
+    const b = (await repo.claim(boardB.id, opts)).leases
     expect(a).toHaveLength(1)
     expect(b).toHaveLength(1)
     // With no cap, a board with room claims freely.
-    const uncapped = await repo.claim(boardA.id, { now: new Date(), isDaemonLive: () => true })
+    const uncapped = (await repo.claim(boardA.id, { now: new Date(), isDaemonLive: () => true })).leases
     expect(uncapped).toEqual([]) // its only card is already running
   })
   it('per-daemon cap skips a candidate whose agent moved to a daemon the claim did not lock', async () => {
@@ -253,7 +260,7 @@ describe('PgKanbanDispatchRepo claim caps (real Postgres)', () => {
         maxPerDaemon: 8
       })
     })
-    expect(leases.map((l) => l.cardId)).toEqual([kept.id])
+    expect(leases.leases.map((l) => l.cardId)).toEqual([kept.id])
     expect(await prisma.kanbanRun.count({ where: { daemonId: moved, endedAt: null } })).toBe(0)
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: skipped.id } })).status).toBe('ready')
     // The next claim locks the new daemon and admits the card.
@@ -262,6 +269,6 @@ describe('PgKanbanDispatchRepo claim caps (real Postgres)', () => {
       isDaemonLive: () => true,
       maxPerDaemon: 8
     })
-    expect(next.map((l) => l.cardId)).toEqual([skipped.id])
+    expect(next.leases.map((l) => l.cardId)).toEqual([skipped.id])
   })
 })

@@ -10,11 +10,14 @@ export async function auditCardTransition(
     from: KanbanStatus
     to: KanbanStatus
     source: string
+    /** A claim's run role; a verify dispatch keeps the status, so it is the one same-status row recorded. */
+    role?: 'work' | 'verify'
     leaseId?: string
     actor?: { login: string; id?: number }
   }
 ): Promise<void> {
-  if (input.from === input.to) return
+  const dispatch = input.from === input.to && input.role === 'verify'
+  if (input.from === input.to && !dispatch) return
   const card = await tx.kanbanCard.findUniqueOrThrow({
     where: { id: input.cardId },
     select: { boardId: true, issueNumber: true, stateRevision: true, board: { select: { orgId: true } } }
@@ -23,16 +26,19 @@ export async function auditCardTransition(
     data: {
       orgId: card.board.orgId,
       kind: 'kanban_card_change',
-      message: `kanban card ${input.cardId} status changed`,
+      message: dispatch
+        ? `kanban card ${input.cardId} dispatched for verify`
+        : `kanban card ${input.cardId} status changed`,
       details: {
         boardId: card.boardId,
         cardId: input.cardId,
         issueNumber: card.issueNumber,
-        change: 'status',
+        change: dispatch ? 'dispatch' : 'status',
         from: input.from,
         to: input.to,
         source: input.source,
         stateRevision: card.stateRevision.toString(),
+        ...(input.role ? { role: input.role } : {}),
         ...(input.leaseId ? { leaseId: input.leaseId } : {}),
         ...(input.actor ? { actorLogin: input.actor.login, actorGitHubId: input.actor.id ?? null } : {})
       }

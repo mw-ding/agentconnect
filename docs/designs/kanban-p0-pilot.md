@@ -573,8 +573,10 @@ Known gaps update (M1 label sync attribution): an edit is adopted only when the
 visible issue events attribute the live label to a human writer; when the events
 API lags the live labels, the pass is deferred and neither adopts, reverts, nor
 advances the cursor. A deferred card is retried on later passes and fails closed
-10 minutes after its first deferral: a `ready` or `running` card moves to `triage`,
-revoking any active lease; other statuses remain unchanged. The card is flagged
+10 minutes after its first deferral: a `ready` or `running` card moves to `triage`;
+other statuses remain unchanged, including `review`. Any active work or verify lease
+is revoked and its dispatch revision fenced, even when the status stays the same.
+A late report cannot complete the card, stamp approval, or clear the hold. The card is flagged
 with `needsAttention`, its status label is projected with one timeout comment,
 and a claim neither takes the card nor clears the flag. Failed label writes
 remain eligible for repair; only a cleanly attributed human writer edit releases

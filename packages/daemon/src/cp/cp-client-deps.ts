@@ -28,6 +28,8 @@ import type {
   TaskListReq,
   KanbanDispatch,
   KanbanDispatchOk,
+  KanbanNotify,
+  KanbanNotifyOk,
   ExecutorStrategyTable,
   TransferNetwork
 } from '@agentconnect.md/protocol'
@@ -204,6 +206,8 @@ export interface CpClientSeamHost {
   /** Admit one leased Kanban card (issue #2 M2). */
   kanbanRevoke(req: import('@agentconnect.md/protocol').KanbanRevoke): Promise<void>
   kanbanDispatch(dispatch: KanbanDispatch): Promise<KanbanDispatchOk>
+  /** Post one body-free Kanban transition notification in the anchor channel (issue #2 M4). */
+  kanbanNotify(notify: KanbanNotify): Promise<KanbanNotifyOk>
   /** An editor's approve or discard of an assistant-mode draft, run exactly as its card click would. */
   decideAssistantDraft: AssistantActivityDeps['decideDraft']
   /** The `!cancel` core shared by every stop surface: interrupt a session's turn, no mute; true when one was interrupted. */
@@ -427,6 +431,7 @@ export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
     sharedImageResolve: (req, orgId) => host.resolveSharedImage(req, orgId),
     kanbanRevoke: (req) => host.kanbanRevoke(req),
     kanbanDispatch: (dispatch) => host.kanbanDispatch(dispatch),
+    kanbanNotify: (notify) => host.kanbanNotify(notify),
     pullRequestFeedback: async (req) => {
       if (host.dutyCoordinator().dutyEnforced() && !host.duties().holdsAgent(req.agentId)) {
         const claimed = await host.dutyCoordinator().claimDutyForTrigger(req.agentId)
