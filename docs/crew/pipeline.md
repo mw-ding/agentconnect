@@ -101,8 +101,8 @@ The synthesizer rechecks all of the following immediately before merging:
 - Required checks, including `CI OK` and `Conventional PR`, are green at that head.
   An override never bypasses CI.
 - The PR is non-draft, mergeable, and targets the default branch.
-- Neither `crew:hold` nor `crew:escalated` blocks the PR. A maintainer override can
-  bypass escalation; a hold must be cleared.
+- The PR carries neither `crew:hold` nor `crew:escalated`. A maintainer
+  `/crew merge-ok` approval can override escalation; a hold must be cleared first.
 - The issue is linked with `Closes #n`; spec PRs and outside PRs are exempt.
 
 Only the synthesizer squash-merges, under a repository-wide merge lock and with a
@@ -141,7 +141,8 @@ The formal result is `APPROVE` only when both passes pass.
 Review bodies carry hidden role, pass, head SHA, round, and verdict markers so
 automation can identify the evidence. These records are append-only; a newer head
 supersedes older evidence. Narrative acknowledgements, fixes, and escalations use
-comment reviews; the formal verdict supplies the transition signal.
+COMMENT-type pull request reviews, never conversation comments; the formal verdict
+supplies the transition signal.
 
 ## Outside contributors
 

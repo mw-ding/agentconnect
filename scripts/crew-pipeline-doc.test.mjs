@@ -35,14 +35,40 @@ test('crew pipeline headings match the required order', () => {
   assert.deepEqual(actual, headings)
 })
 
-test('crew pipeline mentions exactly the canonical eight labels', () => {
+function section(doc, heading) {
+  return doc.split(`## ${heading}\n`)[1]?.split(/^## /m)[0].trim() ?? ''
+}
+
+test('crew pipeline documents exactly eight one-line label bullets under Labels', () => {
   const doc = readFileSync(docUrl, 'utf8')
-  const actual = new Set(doc.match(/\bcrew:[\w-]+/g) ?? [])
-  assert.deepEqual(actual, new Set(labels))
+  const lines = section(doc, 'Labels').split('\n').filter(Boolean)
+  assert.equal(lines.length, 8, 'Labels must contain exactly eight one-line bullets')
+  const actual = lines.map((line) => {
+    const match = /^- `(crew:[^`\r\n]+)`: ([^`\r\n]+)$/.exec(line)
+    assert.ok(match, 'Each label bullet must name exactly one backticked label with a description')
+    assert.ok(match[2].trim(), 'Each label needs a nonempty description')
+    return match[1]
+  })
+  assert.deepEqual(new Set(actual), new Set(labels))
+  const mentioned = [...doc.matchAll(/`(crew:[^`\r\n]+)`/g)].map((match) => match[1])
+  assert.deepEqual(new Set(mentioned), new Set(labels))
 })
 
-test('crew pipeline mentions exactly the canonical six steering commands', () => {
+test('crew pipeline documents exactly six steering command rows with owners and effects', () => {
   const doc = readFileSync(docUrl, 'utf8')
-  const actual = new Set([...doc.matchAll(/\/crew\s+([\w-]+)/g)].map((match) => match[1]))
-  assert.deepEqual(actual, new Set(commands))
+  const rows = section(doc, 'Steering commands')
+    .split('\n')
+    .filter((line) => /^\| `/.test(line))
+  assert.equal(rows.length, 6, 'Steering commands must contain exactly six command rows')
+  const actual = rows.map((row) => {
+    const match = /^\| `\/crew ([\w-]+)(?:: <note>)?` +\| ([^|]+)\| ([^|]+)\|$/.exec(row)
+    assert.ok(match, 'Each command row needs a backticked command, owner, and effect')
+    assert.ok(match[2].trim() && match[3].trim(), 'Command owners and effects must be nonempty')
+    return match[1]
+  })
+  assert.deepEqual(new Set(actual), new Set(commands))
+  const mentioned = [...doc.matchAll(/`\/crew ([^`\r\n]+)`/g)].map((match) => {
+    return match[1].split(/[:\s]/)[0]
+  })
+  assert.deepEqual(new Set(mentioned), new Set(commands))
 })
