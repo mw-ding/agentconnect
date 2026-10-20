@@ -1,8 +1,11 @@
-// Live issue titles for the console board (issue #2 Lane 4b): a short in-memory TTL over the reads, never stored, logged, or cached anywhere else.
+// Live issue titles for the console board (issue #2 Lane 4b): a short per-source in-memory TTL over the reads, never stored, logged, or cached anywhere else.
 // This is the one place an issue title enters the CP, and it only passes through to the response.
 // TTL and installation-scoped single-flight limit reads; ETag revalidation preserves the shared REST budget.
 import { GithubApiError, GithubNotModified, githubRequestPage, type FetchLike } from '../github/api.js'
-import type { InstallationTokenService } from '../github/installation-token.service.js'
+import {
+  InstallationTokenInvalidatedError,
+  type InstallationTokenService
+} from '../github/installation-token.service.js'
 import type { OrgId } from '../domain/ids.js'
 import type { GithubInstallationRepo } from '../persistence/ports.js'
 
@@ -52,27 +55,7 @@ interface TitleCacheEntry {
   expiresAt: number
 }
 
-const titleCache = new Map<string, TitleCacheEntry>()
-const titleInflight = new Map<string, Promise<TitleCacheEntry>>()
 const keyOf = (installationId: bigint, repoId: bigint, number: number) => `${installationId}:${repoId}:${number}`
-
-/** Test hook: drop every cached and in-flight title (call between tests, never in production). */
-export function clearKanbanTitleCache(): void {
-  titleCache.clear()
-  titleInflight.clear()
-}
-
-function storeEntry(key: string, title: LiveIssueTitle | null, etag: string | null, now: number) {
-  const entry: TitleCacheEntry = { title, etag, expiresAt: now + TITLE_TTL_MS }
-  titleCache.delete(key)
-  titleCache.set(key, entry)
-  while (titleCache.size > TITLE_CACHE_MAX) {
-    const oldest = titleCache.keys().next()
-    if (oldest.done) break
-    titleCache.delete(oldest.value)
-  }
-  return entry
-}
 
 interface GhIssueTitle {
   number?: number
@@ -80,7 +63,6 @@ interface GhIssueTitle {
   state?: string
   html_url?: string
   pull_request?: unknown
-  repository?: { id?: number }
 }
 
 export interface GithubTitleSourceDeps {
@@ -95,6 +77,20 @@ export interface GithubTitleSourceDeps {
 /** Reads titles with the read-scoped kanban card token, minted for this one repository id. */
 export function githubKanbanTitleSource(deps: GithubTitleSourceDeps): KanbanTitleSource {
   const now = () => (deps.clock ?? Date.now)()
+  // Owned by this source: each container (and each test) gets its own cache and in-flight map.
+  const titleCache = new Map<string, TitleCacheEntry>()
+  const titleInflight = new Map<string, Promise<TitleCacheEntry>>()
+  const storeEntry = (key: string, title: LiveIssueTitle | null, etag: string | null): TitleCacheEntry => {
+    const entry: TitleCacheEntry = { title, etag, expiresAt: now() + TITLE_TTL_MS }
+    titleCache.delete(key)
+    titleCache.set(key, entry)
+    while (titleCache.size > TITLE_CACHE_MAX) {
+      const oldest = titleCache.keys().next()
+      if (oldest.done) break
+      titleCache.delete(oldest.value)
+    }
+    return entry
+  }
   return {
     async read(board, numbers) {
       const owner = board.repoFullName.split('/', 1)[0]
@@ -125,13 +121,15 @@ export function githubKanbanTitleSource(deps: GithubTitleSourceDeps): KanbanTitl
         }
       }
       if (queue.length === 0) return { titles, missing: missing.sort((a, b) => a - b) }
+      let token: string
       try {
-        const grant = await deps.tokens.mintKanbanCard(
-          installation.installationId,
-          board.repoFullName,
-          board.repoId,
-          'read'
-        )
+        token = (
+          await deps.tokens.mintKanbanCard(installation.installationId, board.repoFullName, board.repoId, 'read')
+        ).token
+      } catch (err) {
+        throw toMintError(err)
+      }
+      try {
         // One read per key across concurrent requests: the second request awaits the first one's promise.
         // Sharing is limited to the same installation, repository and issue.
         const readKey = (n: number): Promise<TitleCacheEntry> => {
@@ -146,7 +144,9 @@ export function githubKanbanTitleSource(deps: GithubTitleSourceDeps): KanbanTitl
           if (running) return running
           const started = (async (): Promise<TitleCacheEntry> => {
             try {
-              return await fetchIssue(deps, grant.token, key, board.repoId, n, cached ?? validators.get(n), now)
+              return await fetchIssue(deps, token, board.repoId, n, cached ?? validators.get(n), (title, etag) =>
+                storeEntry(key, title, etag)
+              )
             } finally {
               titleInflight.delete(key)
             }
@@ -179,26 +179,26 @@ export function githubKanbanTitleSource(deps: GithubTitleSourceDeps): KanbanTitl
 async function fetchIssue(
   deps: GithubTitleSourceDeps,
   token: string,
-  key: string,
   repoId: bigint,
   number: number,
   validator: TitleCacheEntry | undefined,
-  now: () => number
+  store: (title: LiveIssueTitle | null, etag: string | null) => TitleCacheEntry
 ): Promise<TitleCacheEntry> {
-  const missing = () => storeEntry(key, null, null, now())
+  const missing = () => store(null, null)
   let title: LiveIssueTitle
   let etag: string | null
   try {
+    // Redirects are not followed: GitHub answers a transferred issue with a 301 to another repository.
     const page = await githubRequestPage<GhIssueTitle>(`/repositories/${repoId}/issues/${number}`, {
       auth: token,
       fetchImpl: deps.fetchImpl,
       baseUrl: deps.baseUrl,
+      redirect: 'manual',
       ...(validator?.etag ? { etag: validator.etag } : {})
     })
     const issue = page.data
-    // A transfer redirect can land on another issue or repository, and a pull request is not a card.
+    // A pull request is not a card, and a body for another number is not this card.
     if (issue.pull_request !== undefined || issue.number !== number) return missing()
-    if (issue.repository?.id !== undefined && BigInt(issue.repository.id) !== repoId) return missing()
     if (typeof issue.title !== 'string' || typeof issue.html_url !== 'string') return missing()
     title = { title: issue.title, state: issue.state === 'closed' ? 'closed' : 'open', htmlUrl: issue.html_url }
     etag = page.etag ?? null
@@ -206,13 +206,31 @@ async function fetchIssue(
     // The validator held: the cached copy is still current, so refresh its TTL and serve it.
     if (err instanceof GithubNotModified) {
       if (!validator?.etag) return missing()
-      return storeEntry(key, validator.title, validator.etag, now())
+      return store(validator.title, validator.etag)
     }
-    if (err instanceof GithubApiError && (err.status === 404 || err.status === 410)) return missing()
+    // Moved (a transfer redirect), deleted, or gone: no longer an issue of this repository.
+    if (
+      err instanceof GithubApiError &&
+      ((err.status >= 300 && err.status < 400) || err.status === 404 || err.status === 410)
+    ) {
+      return missing()
+    }
     throw err
   }
   // Missing entries share the short TTL so deleted or transferred issues do not consume a read on every view.
-  return storeEntry(key, title, etag, now())
+  return store(title, etag)
+}
+
+/** A refused mint for an installation the CP believes live is a configuration problem; outages stay 502. */
+function toMintError(err: unknown): KanbanTitleError {
+  if (err instanceof GithubApiError) {
+    if (err.code === 'RATE_LIMITED' || err.status === 429) return new KanbanTitleError('github_rate_limited')
+    if (err.status === 0 || err.status >= 500) return new KanbanTitleError('github_unavailable')
+    return new KanbanTitleError('github_app_not_configured')
+  }
+  // The installation's facts changed mid-mint: a retry reads the new state.
+  if (err instanceof InstallationTokenInvalidatedError) return new KanbanTitleError('github_unavailable')
+  return new KanbanTitleError('github_app_not_configured')
 }
 
 function toTitleError(err: unknown): KanbanTitleError {

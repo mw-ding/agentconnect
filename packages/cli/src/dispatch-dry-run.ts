@@ -29,6 +29,13 @@ export class DispatchDryRunError extends Error {
   }
 }
 
+/** The line `fail` prints: the stable code leads when the message does not already carry it. */
+export function dispatchErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  if (!(err instanceof DispatchDryRunError) || !err.code || message.includes(err.code)) return message
+  return `${err.code}: ${message}`
+}
+
 interface ExplainEntry {
   cardId: string
   issueNumber: number

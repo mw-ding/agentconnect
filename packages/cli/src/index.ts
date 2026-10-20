@@ -14,7 +14,7 @@ import {
 } from './route.js'
 import { cliCommand, setInvocation } from './invocation.js'
 import { runLogin } from './login.js'
-import { runDispatchCommand } from './dispatch-dry-run.js'
+import { dispatchErrorMessage, runDispatchCommand } from './dispatch-dry-run.js'
 import {
   controllerFor,
   isElevated,
@@ -313,7 +313,7 @@ async function main(): Promise<void> {
         )
         process.exit(0)
       } catch (err) {
-        fail('dispatch', err)
+        fail('dispatch', new Error(dispatchErrorMessage(err)))
       }
     })
 

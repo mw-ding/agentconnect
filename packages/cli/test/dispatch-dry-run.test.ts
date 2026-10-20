@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { persistCredentials } from '../src/login.js'
 import {
   DispatchDryRunError,
+  dispatchErrorMessage,
   formatEntry,
   readStoredCredentials,
   restBaseFor,
@@ -262,6 +263,16 @@ describe('errors', () => {
     fetchMock.mockImplementation(withOrgList({ code: 'not_found', message: 'board not found' }, 404))
     const err = await runDispatchDryRun(opts, deps()).catch((e: unknown) => e)
     expect((err as DispatchDryRunError).code).toBe('not_found')
+  })
+
+  it('leads the printed line with the code when the message lacks it', () => {
+    const local = new DispatchDryRunError('needs a personal API key', 'personal_api_key_required')
+    expect(dispatchErrorMessage(local)).toBe('personal_api_key_required: needs a personal API key')
+    expect(dispatchErrorMessage(new DispatchDryRunError('404 not_found: board not found', 'not_found'))).toBe(
+      '404 not_found: board not found'
+    )
+    expect(dispatchErrorMessage(new DispatchDryRunError('--board <id> is required'))).toBe('--board <id> is required')
+    expect(dispatchErrorMessage(new Error('boom'))).toBe('boom')
   })
 
   it('reports an unreachable control plane', async () => {

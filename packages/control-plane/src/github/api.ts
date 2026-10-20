@@ -105,6 +105,8 @@ export interface GithubRequestOpts {
   idempotent?: boolean
   /** Send `If-None-Match` on a GET; a held validator answers 304 as `GithubNotModified`. */
   etag?: string
+  /** `manual` surfaces a 3xx as a `GithubApiError` carrying its status instead of following it. */
+  redirect?: 'follow' | 'manual'
 }
 
 /** A conditional GET whose validator still holds: the caller's cached copy is fresh (HTTP 304). */
@@ -183,7 +185,8 @@ async function githubRequestOnce<T>(path: string, opts: GithubRequestOpts): Prom
         ...(opts.etag ? { 'if-none-match': opts.etag } : {})
       },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      signal: AbortSignal.timeout(TIMEOUT_MS)
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      ...(opts.redirect ? { redirect: opts.redirect } : {})
     })
   } catch (e) {
     const unreachable = new GithubApiError(`github unreachable: ${(e as Error).message}`, 0, 'INTERNAL', true)

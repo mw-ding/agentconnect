@@ -56,8 +56,8 @@ async function danglingAssigneeCard(boardId: string, n: number): Promise<{ id: s
   await prisma.$transaction(async (tx) => {
     await tx.$executeRawUnsafe(`SET LOCAL session_replication_role = replica`)
     await tx.$executeRawUnsafe(
-      `INSERT INTO "kanban_card" ("id", "boardId", "issueId", "issueNumber", "status", "assigneeAgentId", "createdAt", "updatedAt")
-       VALUES ($1, $2, $3, $4, 'ready', $5, now(), now())`,
+      `INSERT INTO "kanban_card" ("id", "boardId", "issueId", "issueNumber", "status", "assigneeAgentId", "priority", "createdAt", "updatedAt")
+       VALUES ($1, $2, $3, $4, 'ready', $5, 100, now(), now())`,
       id,
       boardId,
       BigInt(1000 + n),
@@ -142,17 +142,19 @@ describe('claim dry run parity (real Postgres)', () => {
   it('explainBoard agrees with the real claim: same set, same order, every skipped card explained', async () => {
     await seedAgents()
     const b = await board(4, 2)
+    // Gated rows outrank every eligible card, so the claim scans them while both caps still have room: a dropped gate claims one.
+    const top = { priority: 100 }
     const gated: Record<string, { id: string }> = {
-      status_not_claimable: await card(b.id, 20, { status: 'todo' }),
-      no_assignee: await card(b.id, 21, { assigneeAgentId: null }),
+      status_not_claimable: await card(b.id, 20, { ...top, status: 'todo' }),
+      no_assignee: await card(b.id, 21, { ...top, assigneeAgentId: null }),
       agent_missing: await danglingAssigneeCard(b.id, 22),
-      agent_paused: await card(b.id, 23, { assigneeAgentId: A2 }),
-      agent_unplaced: await card(b.id, 24, { assigneeAgentId: A3 }),
-      daemon_offline: await card(b.id, 25, { assigneeAgentId: A4 }),
-      cooldown: await card(b.id, 26, { cooldownUntil: new Date(NOW.getTime() + 60_000) }),
-      not_before: await card(b.id, 27, { notBefore: new Date(NOW.getTime() + 60_000) }),
-      promotion_pending: await card(b.id, 28, { promotionPending: true }),
-      needs_attention: await card(b.id, 29, { needsAttention: true })
+      agent_paused: await card(b.id, 23, { ...top, assigneeAgentId: A2 }),
+      agent_unplaced: await card(b.id, 24, { ...top, assigneeAgentId: A3 }),
+      daemon_offline: await card(b.id, 25, { ...top, assigneeAgentId: A4 }),
+      cooldown: await card(b.id, 26, { ...top, cooldownUntil: new Date(NOW.getTime() + 60_000) }),
+      not_before: await card(b.id, 27, { ...top, notBefore: new Date(NOW.getTime() + 60_000) }),
+      promotion_pending: await card(b.id, 28, { ...top, promotionPending: true }),
+      needs_attention: await card(b.id, 29, { ...top, needsAttention: true })
     }
     // A1 has three eligible cards but a per-agent cap of 2; A5's third meets the board cap of 4.
     const n1 = await card(b.id, 1, { priority: 5 })
@@ -176,9 +178,19 @@ describe('claim dry run parity (real Postgres)', () => {
     for (const [gate, c] of Object.entries(gated)) {
       expect(byId.get(c.id)!.verdict, `card ${gate}`).toEqual({ eligible: false, gate })
     }
+    // vera-528 r2: the single-card explain replays the same caps, so a cap-bound card is not reported as claimable next.
+    for (const c of [n1, n2, n3, n4, n5, n6, gated.needs_attention!]) {
+      const single = (await repo.explainCard(b.id, c.id, opts))!
+      expect(single, `card ${c.id}`).toEqual(byId.get(c.id))
+    }
+    expect(await repo.explainCard(b.id, n3.id, opts)).toMatchObject({ capBound: 'agent_cap' })
+    expect((await repo.explainCard(b.id, n3.id, opts))!.claimOrder).toBeUndefined()
+    expect(await repo.explainCard(b.id, n6.id, opts)).toMatchObject({ capBound: 'board_cap' })
+    expect(await repo.explainCard(b.id, n4.id, opts)).toMatchObject({ claimOrder: 3 })
+    expect(await snapshot()).toEqual(before)
 
     const { leases: claimed } = await repo.claim(b.id, opts)
-    // A new gate in the SQL claim shows up here: it would claim a card the dry run called blocked, or skip one it called free.
+    // A gate only one side applies shows up here, for any gated row a dropped gate would let the claim reach first.
     expect(claimed.map((l) => l.cardId)).toEqual(explanation.wouldClaimNext)
     const claimedIds = new Set(claimed.map((l) => l.cardId))
     for (const entry of explanation.cards) {
@@ -281,6 +293,27 @@ describe('claim dry run parity (real Postgres)', () => {
     const explanation = (await repo.explainBoard(b.id, opts))!
     expect(explanation.wouldClaimNext).toEqual([olderId])
     expect((await repo.claim(b.id, opts)).leases).toMatchObject([{ cardId: olderId }])
+  })
+
+  it('vera-528 r2: the explain snapshot is READ ONLY in the database', async () => {
+    await seedAgents()
+    const b = await board(5, 5)
+    const c = await card(b.id, 1)
+    const seen: string[] = []
+    // Wraps the root client's transaction to read the session's access mode right after the explain ran inside it.
+    const probe = {
+      $transaction: <T>(fn: (tx: Prisma.TransactionClient) => Promise<T>, o: unknown) =>
+        prisma.$transaction(async (tx) => {
+          const out = await fn(tx)
+          const [row] = await tx.$queryRawUnsafe<Array<{ transaction_read_only: string }>>('SHOW transaction_read_only')
+          seen.push(row!.transaction_read_only)
+          return out
+        }, o as never)
+    }
+    const repo = new PgKanbanDispatchRepo(probe as never)
+    expect((await repo.explainBoard(b.id, opts))!.cards.map((e) => e.cardId)).toEqual([c.id])
+    expect((await repo.explainCard(b.id, c.id, opts))!.cardId).toBe(c.id)
+    expect(seen).toEqual(['on', 'on'])
   })
 
   it('vera-528: the dry run takes no row locks — it runs in a read-only transaction', async () => {

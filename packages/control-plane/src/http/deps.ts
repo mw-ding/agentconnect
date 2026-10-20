@@ -336,8 +336,11 @@ export interface HttpDeps {
     kanbanMode: KanbanModeAdminRepo
     /** Kanban board CRUD; writes recheck owner membership in their own transaction. */
     kanbanBoards: KanbanBoardAdminRepo
-    /** Kanban dispatch reads: the dry-run explain and the board view's card list; both are read-only. */
-    kanbanDispatch: KanbanDispatchRepo
+    /** Kanban dispatch reads only (dry-run explain, board card list); never the claim or any lease write. */
+    kanbanDispatch: Pick<
+      KanbanDispatchRepo,
+      'now' | 'explainBoard' | 'explainCard' | 'listBoardCards' | 'cardNumbersOnBoard'
+    >
   }
   registry: DaemonRegistry
   /**

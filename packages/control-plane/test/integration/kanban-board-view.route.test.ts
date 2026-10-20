@@ -1,10 +1,10 @@
 // Kanban board view routes (issue #2 Lane 4b): card metadata from the CP, titles live from GitHub and never persisted.
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { prisma } from '../setup.db.js'
 import { buildHttpApp } from '../fakes/build-http.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { memberBearer, ownerBearer, startKanbanOidc, type KanbanOidc } from '../fixtures/kanban-oidc.js'
-import { clearKanbanTitleCache, githubKanbanTitleSource } from '../../src/kanban/card-titles.js'
+import { githubKanbanTitleSource } from '../../src/kanban/card-titles.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import type { GithubInstallationRecord } from '../../src/persistence/ports.js'
@@ -21,11 +21,6 @@ beforeAll(async () => {
   oidc = await startKanbanOidc('kanban-view-test')
 })
 afterAll(() => oidc.close())
-
-// The title source caches in module memory: clear it so tests never read each other's GitHub answers.
-beforeEach(() => {
-  clearKanbanTitleCache()
-})
 
 const installation: GithubInstallationRecord = {
   id: 'view-inst',
@@ -61,7 +56,7 @@ const issue = (number: number, title = `title ${number}`, extra: Record<string, 
     title,
     state: 'open',
     html_url: `https://github.com/acme/web/issues/${number}`,
-    repository: { id: Number(REPO_ID) },
+    repository_url: 'https://api.github.com/repos/acme/web',
     ...extra
   }
 })
@@ -209,6 +204,43 @@ describe('Kanban cards route', () => {
     }
   })
 
+  it('vera-528 r2: ?numbers= caps at 500 distinct numbers, so a by-number lookup is never silently truncated', async () => {
+    const board = await seedBoard()
+    await prisma.kanbanCard.createMany({
+      data: Array.from({ length: 501 }, (_, i) => ({
+        boardId: board.id,
+        issueId: BigInt(7000 + i + 1),
+        issueNumber: i + 1
+      }))
+    })
+    const { app, close } = buildApp()
+    try {
+      const headers = await ownerBearer(prisma, oidc)
+      const list = (n: number) => Array.from({ length: n }, (_, i) => i + 1).join(',')
+      const tooMany = await app.inject({
+        method: 'GET',
+        url: `${BOARDS}/${board.id}/cards?numbers=${list(501)}`,
+        headers
+      })
+      expect(tooMany.statusCode).toBe(400)
+      expect(tooMany.json()).toMatchObject({ code: 'too_many_numbers' })
+      const full = await app.inject({ method: 'GET', url: `${BOARDS}/${board.id}/cards?numbers=${list(500)}`, headers })
+      expect(full.statusCode).toBe(200)
+      expect(full.json()).toMatchObject({ total: 500, truncated: false })
+      expect(full.json().cards).toHaveLength(500)
+      // Repeats count once: 500 distinct numbers spelled with duplicates still pass.
+      const repeated = await app.inject({
+        method: 'GET',
+        url: `${BOARDS}/${board.id}/cards?numbers=${list(499)},1,1,500`,
+        headers
+      })
+      expect(repeated.statusCode).toBe(200)
+      expect(repeated.json()).toMatchObject({ total: 500, truncated: false })
+    } finally {
+      await close()
+    }
+  })
+
   it('works with GitHub unreachable: it never calls it', async () => {
     const board = await seedBoard()
     await seedCard(board.id, 1)
@@ -344,22 +376,30 @@ describe('Kanban titles route', () => {
 
   it('reports an issue GitHub no longer serves, a pull request, and a redirected number as missing', async () => {
     const board = await seedBoard()
-    for (const n of [1, 2, 3, 4]) await seedCard(board.id, n)
+    for (const n of [1, 2, 3, 4, 5]) await seedCard(board.id, n)
     const stub = githubStub({
       1: { status: 404 },
       2: { status: 410 },
       3: issue(3, 'a pr', { pull_request: {} }),
-      4: issue(5, 'redirected to another issue')
+      4: issue(6, 'a body for another issue'),
+      5: {
+        status: 301,
+        body: { message: 'Moved Permanently', url: 'https://api.github.com/repositories/9999/issues/1' },
+        headers: { location: 'https://api.github.com/repositories/9999/issues/1' }
+      }
     })
     const { app, close } = buildApp(stub.fetchImpl)
     try {
       const res = await app.inject({
         method: 'GET',
-        url: titlesUrl(board.id, '1,2,3,4'),
+        url: titlesUrl(board.id, '1,2,3,4,5'),
         headers: await ownerBearer(prisma, oidc)
       })
       expect(res.statusCode).toBe(200)
-      expect(res.json()).toEqual({ titles: {}, missing: [1, 2, 3, 4] })
+      expect(res.json()).toEqual({ titles: {}, missing: [1, 2, 3, 4, 5] })
+      // The 301 was not followed: one read per number, none at the redirect target.
+      expect(stub.urls).toHaveLength(5)
+      expect(stub.urls.some((u) => u.includes('/repositories/9999/'))).toBe(false)
     } finally {
       await close()
     }

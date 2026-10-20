@@ -973,46 +973,24 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
 
   explainCard(boardId: string, cardId: string, opts: KanbanExplainOpts): Promise<KanbanCardExplanation | null> {
     return this.readSnapshot(async (tx) => {
-      const load = await loadExplainState(tx, boardId, { id: cardId }, opts)
-      const entry = load?.cards[0]
-      return entry
-        ? { cardId: entry.cardId, issueNumber: entry.issueNumber, input: entry.input, verdict: entry.verdict }
-        : null
+      // The whole board is simulated so a cap-bound card is not reported as the next claim; a done card joins as ineligible.
+      const load = await loadExplainState(
+        tx,
+        boardId,
+        { OR: [{ status: { notIn: CLOSED_STATUSES } }, { id: cardId }] },
+        opts
+      )
+      if (!load) return null
+      return simulateBoard(load).cards.find((c) => c.cardId === cardId) ?? null
     })
   }
 
   explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null> {
     return this.readSnapshot(async (tx) => {
-      const load = await loadExplainState(tx, boardId, { status: { notIn: ['done', 'archived'] } }, opts)
+      const load = await loadExplainState(tx, boardId, { status: { notIn: CLOSED_STATUSES } }, opts)
       if (!load) return null
-      const sim = simulateClaim(
-        load.cards.map((c) => ({
-          id: c.cardId,
-          priority: c.priority,
-          createdAt: c.createdAt,
-          verdict: c.verdict,
-          ...c.capacities
-        })),
-        {
-          maxInProgress: load.board.maxInProgress,
-          maxInProgressPerAgent: load.board.maxInProgressPerAgent,
-          openTotal: load.openTotal,
-          openPerAgent: load.openPerAgent
-        }
-      )
-      const cards = load.cards.map<KanbanCardExplanation>((c) => {
-        const position = sim.order.indexOf(c.cardId)
-        const capBound = sim.capBound.get(c.cardId)
-        return {
-          cardId: c.cardId,
-          issueNumber: c.issueNumber,
-          input: c.input,
-          verdict: c.verdict,
-          ...(position >= 0 ? { claimOrder: position + 1 } : {}),
-          ...(capBound ? { capBound } : {})
-        }
-      })
-      return { boardId, now: opts.now, cards, wouldClaimNext: sim.order }
+      const { cards, wouldClaimNext } = simulateBoard(load)
+      return { boardId, now: opts.now, cards, wouldClaimNext }
     })
   }
 
@@ -1076,13 +1054,61 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     return rows.map((r) => r.issueNumber)
   }
 
-  // One repeatable-read snapshot with no locks and no writes, so a dry run never contends with the claim.
+  // One repeatable-read, database-enforced READ ONLY snapshot with no locks, so a dry run never contends with the claim.
   private readSnapshot<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
     if ('$transaction' in this.db) {
-      return this.db.$transaction(fn, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead })
+      return this.db.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SET TRANSACTION READ ONLY`
+          return fn(tx)
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
+      )
     }
     return fn(this.db as Prisma.TransactionClient)
   }
+}
+
+/** Statuses the board explain leaves out: the claim never reads them. */
+const CLOSED_STATUSES: KanbanStatus[] = ['done', 'archived']
+
+/** Replays the claim loop's cumulative caps over every loaded card, as the board view and the single-card explain both report it. */
+function simulateBoard(load: ExplainState): { cards: KanbanCardExplanation[]; wouldClaimNext: string[] } {
+  const sim = simulateClaim(
+    load.cards.map((c) => ({
+      id: c.cardId,
+      priority: c.priority,
+      createdAt: c.createdAt,
+      verdict: c.verdict,
+      ...c.capacities
+    })),
+    {
+      maxInProgress: load.board.maxInProgress,
+      maxInProgressPerAgent: load.board.maxInProgressPerAgent,
+      openTotal: load.openTotal,
+      openPerAgent: load.openPerAgent
+    }
+  )
+  const cards = load.cards.map<KanbanCardExplanation>((c) => {
+    const position = sim.order.indexOf(c.cardId)
+    const capBound = sim.capBound.get(c.cardId)
+    return {
+      cardId: c.cardId,
+      issueNumber: c.issueNumber,
+      input: c.input,
+      verdict: c.verdict,
+      ...(position >= 0 ? { claimOrder: position + 1 } : {}),
+      ...(capBound ? { capBound } : {})
+    }
+  })
+  return { cards, wouldClaimNext: sim.order }
+}
+
+interface ExplainState {
+  board: { maxInProgress: number; maxInProgressPerAgent: number }
+  openTotal: number
+  openPerAgent: Map<string, number>
+  cards: ExplainedCard[]
 }
 
 interface ExplainedCard {
@@ -1101,12 +1127,7 @@ async function loadExplainState(
   boardId: string,
   cardWhere: Prisma.KanbanCardWhereInput,
   opts: KanbanExplainOpts
-): Promise<{
-  board: { maxInProgress: number; maxInProgressPerAgent: number }
-  openTotal: number
-  openPerAgent: Map<string, number>
-  cards: ExplainedCard[]
-} | null> {
+): Promise<ExplainState | null> {
   const board = await tx.kanbanBoard.findUnique({
     where: { id: boardId },
     select: {

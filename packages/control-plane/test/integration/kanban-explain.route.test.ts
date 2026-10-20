@@ -99,8 +99,23 @@ describe('Kanban explain routes', () => {
       expect(cardRes.statusCode).toBe(200)
       expect(cardRes.json()).toMatchObject({
         verdict: { eligible: true },
+        capBound: 'daemon_cap',
         facts: { daemonCapacity: { openRunCount: 0, maxActive: 1 } }
       })
+      // vera-528 r2: the single-card view replays the board's caps, so a cap-bound card is never "the next claim".
+      expect(cardRes.json().claimOrder).toBeUndefined()
+      expect(cardRes.json().hint).not.toContain('the next claim dispatches')
+      expect(cardRes.json().hint).toContain('once the cards ahead of it are dispatched')
+      const firstRes = await app.inject({
+        method: 'GET',
+        url: `${BOARDS}/${board.id}/cards/${first.id}/explain`,
+        headers
+      })
+      expect(firstRes.json()).toMatchObject({
+        claimOrder: 1,
+        hint: `eligible: the next claim dispatches it to agent ${AGENT}`
+      })
+      expect(firstRes.json().capBound).toBeUndefined()
     } finally {
       await close()
     }

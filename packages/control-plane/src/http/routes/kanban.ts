@@ -550,7 +550,7 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'Explain why a card is or is not dispatched',
           description:
-            'Read-only dry run of the claim for one card (any status): the verdict, the first blocking gate with a human hint, and body-free facts. Has no side effects. A card not on the board, a board in another organization, or a restricted board not shared with the caller reads as 404.',
+            'Read-only dry run of the claim for one card (any status): the verdict, the first blocking gate with a human hint, and body-free facts. The board’s caps are replayed as for the board explain, so `claimOrder` or `capBound` match it. Has no side effects. A card not on the board, a board in another organization, or a restricted board not shared with the caller reads as 404.',
           operationId: 'explainKanbanCard',
           params: KanbanCardParams,
           response: { 200: KanbanCardExplainDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto }
@@ -574,7 +574,7 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'List a board’s cards',
           description:
-            'CP metadata for the cards of one board, for the console board view: status, assignee, effective run mode, attention and failure counters, cooldowns and the open run. Body-free: issue titles are NOT included and are never stored; read them live with `getKanbanCardTitles`. Returns at most 500 cards (priority, then age); `total` and `truncated` say when there are more. With `?numbers=` only those issue numbers are returned (a by-number lookup over the viewer-visible board; never truncated). A board in another organization, or a restricted board not shared with the caller, reads as 404.',
+            'CP metadata for the cards of one board, for the console board view: status, assignee, effective run mode, attention and failure counters, cooldowns and the open run. Body-free: issue titles are NOT included and are never stored; read them live with `getKanbanCardTitles`. Returns at most 500 cards (priority, then age); `total` and `truncated` say when there are more. With `?numbers=` only those issue numbers are returned (a by-number lookup over the viewer-visible board; at most 500 distinct numbers, else 400 `too_many_numbers`, so never truncated). A board in another organization, or a restricted board not shared with the caller, reads as 404.',
           operationId: 'listKanbanCards',
           params: KanbanBoardParams,
           querystring: KanbanBoardCardsQuery,
@@ -593,6 +593,14 @@ export function kanbanRoutes(deps: HttpDeps) {
               statusCode: 400,
               code: 'invalid_numbers',
               message: 'numbers must be comma-separated positive issue numbers'
+            })
+          }
+          if (parsed.length > BOARD_CARDS_CAP) {
+            return reply.code(400).send({
+              error: 'Bad Request',
+              statusCode: 400,
+              code: 'too_many_numbers',
+              message: `at most ${BOARD_CARDS_CAP} numbers per request`
             })
           }
           filter = parsed
