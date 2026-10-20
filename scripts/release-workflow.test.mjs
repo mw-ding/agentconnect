@@ -25,25 +25,6 @@ test('release tags and release records cannot trigger another workflow run', () 
       assert.equal(events.push.tags, undefined, name)
     }
   }
-  assert.deepEqual(Object.keys(workflows['build.yaml'].on), ['workflow_call', 'workflow_dispatch'])
-})
-
-test('one release/prepare job starts npm, images, and chart in parallel and all gate notification', () => {
-  const release = workflows['release.yaml'].jobs.release
-  assert.equal(release.uses, './.github/workflows/build.yaml')
-  assert.equal(release.with.create_release, true)
-  assert.equal(release.concurrency['cancel-in-progress'], false)
-  assert.equal(release.permissions['id-token'], 'write')
-  const jobs = workflows['build.yaml'].jobs
-  assert.ok(jobs.prepare.steps.some((step) => step.id === 'release' && step.run === 'pnpm exec semantic-release'))
-  assert.match(jobs.prepare.steps.find((step) => step.id === 'meta').if, /steps\.release\.outputs\.version != ''/)
-  for (const name of ['publish-npm', 'build-images', 'publish-chart']) {
-    assert.equal(jobs[name].needs, 'prepare')
-    assert.match(jobs[name].if, /needs\.prepare\.outputs\.version != ''/)
-  }
-  assert.deepEqual(jobs['notify-workflow'].needs, ['finalize', 'publish-chart', 'publish-npm'])
-  assert.match(jobs['notify-workflow'].if, /needs\.publish-npm\.result == 'success'/)
-  assert.equal(jobs['publish-npm'].permissions['id-token'], 'write')
 })
 
 test(

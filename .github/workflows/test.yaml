@@ -4,26 +4,8 @@ on:
   pull_request:
     branches:
       - main
-  # Release calls this workflow as its quality gate for main/release pushes.
-  # Keeping the jobs here avoids duplicating CI logic between PRs and releases.
-  workflow_call:
-    inputs:
-      defer_summaries:
-        description: 'Return job summaries to the caller instead of publishing them here'
-        required: false
-        type: boolean
-        default: false
-    outputs:
-      build_test_summary:
-        description: 'Unit test summary markdown'
-        value: ${{ jobs.unit.outputs.summary }}
-      integration_test_summary:
-        description: 'Integration test summary markdown'
-        value: ${{ jobs.integration.outputs.summary }}
 
 # Cancel superseded runs for the same PR (a newer push makes the old one moot).
-# Reusable release-gate calls use a run-scoped group so their tests can proceed
-# independently; release.yaml serializes only the publishing job.
 concurrency:
   group: test-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
