@@ -36,6 +36,13 @@ export function canTransition(from: KanbanStatus, to: KanbanStatus): boolean {
   return KANBAN_TRANSITIONS[from].includes(to)
 }
 
+/** Ending a work episode: the next work claim starts a new one, and the old PR can no longer complete the card. */
+export const EPISODE_RESET = { linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] as string[] }
+
+/** A closed card (`done` or `archived`) that reopens starts a new episode; every other move stays inside it. */
+export const endsEpisode = (from: string, to: string): boolean =>
+  (from === 'done' || from === 'archived') && to !== from
+
 /** The GitHub issue state a status implies. */
 export function issueStateFor(status: KanbanStatus): { state: 'open' } | { state: 'closed'; reason: IssueCloseReason } {
   if (status === 'done') return { state: 'closed', reason: 'completed' }

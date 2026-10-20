@@ -3,10 +3,16 @@ import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import type { KanbanLeaseRef } from '../ports.js'
 import type { GitHubActor, KanbanSyncRepo, SyncCard } from '../../kanban/sync.js'
-import { isKanbanStatus, type KanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
+import {
+  endsEpisode,
+  EPISODE_RESET,
+  isKanbanStatus,
+  type KanbanStatus,
+  type LabelPlan
+} from '../../kanban/card-state.js'
 import { auditCardTransition } from '../../kanban/audit.js'
 import { planNotification } from '../../kanban/notifier.js'
-import { endsEpisode, EPISODE_RESET, PROMOTION_CLEARED } from './kanban.repo.js'
+import { PROMOTION_CLEARED } from './kanban.repo.js'
 import { insertKanbanNotification } from './kanban-notify.repo.js'
 
 export class PgKanbanSyncRepo implements KanbanSyncRepo {

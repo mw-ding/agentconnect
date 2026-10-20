@@ -4,12 +4,13 @@ import { randomUUID } from 'node:crypto'
 import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
-import type { KanbanStatus } from '../../kanban/card-state.js'
+import { endsEpisode, EPISODE_RESET, type KanbanStatus } from '../../kanban/card-state.js'
 import { explainClaim, type ClaimAgentFacts, type ClaimEligibilityInput } from '../../kanban/claim-eligibility.js'
 import { simulateClaim, type ClaimCandidate } from '../../kanban/claim-explain.js'
+import { FLAGGED_WAITS } from '../../kanban/contracts.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { planNotification } from '../../kanban/notifier.js'
-import { endsEpisode, EPISODE_RESET, PROMOTION_CLEARED } from './kanban.repo.js'
+import { PROMOTION_CLEARED } from './kanban.repo.js'
 import { insertKanbanNotification } from './kanban-notify.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
@@ -61,13 +62,16 @@ const PENDING_UNLEASED = (id: string): Prisma.KanbanCardWhereInput => ({
 const PROMOTION_COLUMNS = Prisma.sql`c."promotionEventCursor", c."promotionPostAccepted", c."promotionStartedAt",
   c."promotionWatchUntil", c."promotionChecks", c."recoveryCheckAt"`
 
+/** Unheld, or held only by this PR's own contract flag: any other attention reason is a human's hold. */
+const CONTRACT_HOLD_OWN = Prisma.sql`(NOT c."needsAttention" OR (c."attentionReason" = ANY(${[...FLAGGED_WAITS]}::text[])
+  AND c."attentionReason" || '#' || c."linkedPrNumber" = ANY(c."contractFlags")))`
 /** An unleased review card with a linked PR on an enabled board under a PR completion contract. */
 const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."linkedPrNumber" IS NOT NULL
-  AND b."completionContract" <> 'close'
+  AND b."completionContract" <> 'close' AND ${CONTRACT_HOLD_OWN}
   AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
 const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
   c."linkedPrNumber", c."workEpisodeStartedAt", c."contractFlags", c."needsAttention", c."verifiedAt",
-  b."completionContract", b."verifierAgentId"`
+  b."completionContract", b."verifierAgentId", b."configRevision"`
 
 interface BoardRow {
   id: string
@@ -581,13 +585,29 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
 
   settleContract(input: KanbanContractSettleInput): Promise<boolean> {
     return this.inTransaction(async (tx) => {
-      // Only an unleased review card at the judged revision moves; a verify run still open re-judges on its own end.
+      // FOR SHARE holds off a board edit (which locks FOR UPDATE) until this move commits under the judged config.
+      const [board] = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT b."id" FROM "kanban_board" b JOIN "kanban_card" c ON c."boardId" = b."id"
+        WHERE c."id" = ${input.cardId}::uuid AND b."enabled" AND b."configRevision" = ${input.expectedConfigRevision}
+        FOR SHARE OF b
+      `)
+      if (!board) return false
+      // Only an unleased review card at the judged revision and PR moves; a verify run still open re-judges on its own end.
       const { count } = await tx.kanbanCard.updateMany({
         where: {
           id: input.cardId,
           stateRevision: input.expectedStateRevision,
           status: 'review',
-          runs: { none: { endedAt: null } }
+          linkedPrNumber: input.prNumber,
+          runs: { none: { endedAt: null } },
+          // A human hold (any reason but this PR's own contract flag) is never settled through.
+          OR: [
+            { needsAttention: false },
+            ...[...FLAGGED_WAITS].map((reason) => ({
+              attentionReason: reason,
+              contractFlags: { has: `${reason}#${input.prNumber}` }
+            }))
+          ]
         },
         data: {
           status: input.to,

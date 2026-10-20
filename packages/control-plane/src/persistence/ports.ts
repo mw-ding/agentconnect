@@ -8425,6 +8425,10 @@ export interface KanbanCardRepo {
   recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult>
   /** The command's GitHub effect landed, so a later delivery of the same comment is a no-op. */
   settleCommand(id: string): Promise<void>
+  /** Claim an unsettled command's GitHub effect (DB clock); null while settled or another claim is younger than ttlMs. */
+  claimCommandEffect(id: string, ttlMs: number): Promise<Date | null>
+  /** Drop this holder's claim after a failed effect, so the next delivery retries at once instead of after the TTL. */
+  releaseCommandEffect(id: string, claimedAt: Date): Promise<void>
   /** Remember the card's ProjectV2Item id and the project it belongs to, so later writes there skip the add. */
   setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void>
 }
@@ -8531,11 +8535,15 @@ export interface KanbanContractCard {
   verifiedAt: Date | null
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
   verifierAgentId: string | null
+  /** The board configuration the contract and verifier were read under; a board edit bumps it. */
+  configRevision: bigint
 }
 
 export interface KanbanContractSettleInput {
   cardId: string
   expectedStateRevision: bigint
+  /** The board's configRevision at the read: a contract or verifier edit (or a disable) since then refuses the move. */
+  expectedConfigRevision: bigint
   to: 'done' | 'triage'
   /** The contract that completed it, or why it went to triage; recorded on the audit row and attention flag. */
   reason: string
@@ -8557,7 +8565,7 @@ export interface KanbanContractRepo {
     opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
   ): Promise<KanbanContractCard[]>
   getContractCard(cardId: string): Promise<KanbanContractCard | null>
-  /** CAS review → done/triage (no open lease) with an audit row; false when the card moved, was leased, or vanished. */
+  /** CAS review → done/triage with an audit row; false when the card moved, was leased or held, or the board changed. */
   settleContract(input: KanbanContractSettleInput): Promise<boolean>
   /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */
   flagContract(input: KanbanContractFlagInput): Promise<boolean>

@@ -1,6 +1,6 @@
 // Status audit rows contain only stable identifiers, state names, and a source code.
 import type { Prisma } from '../generated/prisma/client.js'
-import type { KanbanStatus } from './card-state.js'
+import { endsEpisode, EPISODE_RESET, type KanbanStatus } from './card-state.js'
 import { withAmbientTx, type PrismaLike } from '../persistence/prisma.js'
 
 export async function auditCardTransition(
@@ -56,9 +56,11 @@ export async function applyCardTransition(
   return withAmbientTx(db, async (tx) => {
     const card = await tx.kanbanCard.findFirst({ where, select: { id: true, status: true, stateRevision: true } })
     if (!card) return false
+    // Leaving `done`/`archived` ends the work episode on every path through here, whichever caller moved it.
+    const reset = typeof data.status === 'string' && endsEpisode(card.status, data.status) ? EPISODE_RESET : {}
     const { count } = await tx.kanbanCard.updateMany({
       where: { ...where, id: card.id, stateRevision: card.stateRevision },
-      data: { ...data, labelWritePending: true }
+      data: { ...data, ...reset, labelWritePending: true }
     })
     if (count !== 1) return false
     const updated = await tx.kanbanCard.findUniqueOrThrow({ where: { id: card.id }, select: { status: true } })

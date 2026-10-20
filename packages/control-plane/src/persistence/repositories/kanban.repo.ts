@@ -5,7 +5,7 @@ import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
-import { isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import { endsEpisode, EPISODE_RESET, isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
 import { isAttestedHumanAuthority } from '../../kanban/human-authority.js'
 import { hasWriteAccess } from '../../github/repo-permission.js'
 import {
@@ -131,13 +131,6 @@ export const PROMOTION_CLEARED = {
   needsAttention: false,
   attentionReason: null
 } as const
-
-/** Ending a work episode: the next work claim starts a new one, and the old PR can no longer complete the card. */
-export const EPISODE_RESET = { linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] as string[] }
-
-/** A closed card (`done` or `archived`) that reopens starts a new episode; every other move stays inside it. */
-export const endsEpisode = (from: string, to: string): boolean =>
-  (from === 'done' || from === 'archived') && to !== from
 
 export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, KanbanBoardAdminRepo {
   constructor(private readonly db: PrismaLike) {}
@@ -570,6 +563,25 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
 
   async settleCommand(id: string): Promise<void> {
     await this.db.kanbanCommand.updateMany({ where: { id, settledAt: null }, data: { settledAt: new Date() } })
+  }
+
+  async claimCommandEffect(id: string, ttlMs: number): Promise<Date | null> {
+    const ttlSec = ttlMs / 1000
+    // Millisecond precision, so the holder's JS Date matches the row exactly when it releases.
+    const [row] = await this.db.$queryRaw<Array<{ effectClaimedAt: Date }>>(Prisma.sql`
+      UPDATE "kanban_command" SET "effectClaimedAt" = date_trunc('milliseconds', now())
+      WHERE "id" = ${id}::uuid AND "settledAt" IS NULL
+        AND ("effectClaimedAt" IS NULL OR "effectClaimedAt" <= now() - make_interval(secs => ${ttlSec}::float8))
+      RETURNING "effectClaimedAt"
+    `)
+    return row?.effectClaimedAt ?? null
+  }
+
+  async releaseCommandEffect(id: string, claimedAt: Date): Promise<void> {
+    await this.db.kanbanCommand.updateMany({
+      where: { id, settledAt: null, effectClaimedAt: claimedAt },
+      data: { effectClaimedAt: null }
+    })
   }
 
   async upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult> {

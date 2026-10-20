@@ -8,6 +8,7 @@ import { systemClock } from '../../src/domain/clock.js'
 import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
+import { COMMAND_EFFECT_TTL_MS } from '../../src/kanban/comment-command.js'
 
 const RELAY_TOKEN = 'relay-shared-secret-0123456789abcdef'
 const WEBHOOK_SECRET = 'kanban-webhook-secret-0123456789'
@@ -25,7 +26,12 @@ interface GithubCall {
 type Status = 'triage' | 'todo' | 'ready' | 'running' | 'blocked' | 'review' | 'done' | 'archived'
 
 // One issue whose labels and state follow the CP's writes; the permission API answers per login.
-function fakeGithub(start: { status: Status; permissions: Record<string, string> }) {
+function fakeGithub(start: {
+  status: Status
+  permissions: Record<string, string>
+  // Called per comment POST; resolves to the HTTP status GitHub answers, so a test can hold or fail the write.
+  onComment?: () => Promise<number>
+}) {
   const calls: GithubCall[] = []
   let labels = [`ac/status:${start.status}`, 'bug']
   let state: 'open' | 'closed' = start.status === 'done' || start.status === 'archived' ? 'closed' : 'open'
@@ -73,7 +79,10 @@ function fakeGithub(start: { status: Status; permissions: Record<string, string>
       labels = labels.filter((l) => l !== name)
       return json(200, [])
     }
-    if (pathname === `${base}/comments` && method === 'POST') return json(201, { id: 1 })
+    if (pathname === `${base}/comments` && method === 'POST') {
+      const status = (await start.onComment?.()) ?? 201
+      return status === 201 ? json(201, { id: 1 }) : json(status, { message: 'Server Error' })
+    }
     return json(404, { message: 'Not Found' })
   }
   return { calls, fetch, labels: () => labels, state: () => state }
@@ -100,9 +109,13 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot(status: Status, permissions: Record<string, string> = { alice: 'admin' }) {
+async function boot(
+  status: Status,
+  permissions: Record<string, string> = { alice: 'admin' },
+  onComment?: () => Promise<number>
+) {
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const github = fakeGithub({ status, permissions })
+  const github = fakeGithub({ status, permissions, ...(onComment ? { onComment } : {}) })
   await prisma.githubInstallation.create({
     data: {
       orgId: DEFAULT_ORG_ID,
@@ -276,6 +289,103 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('ready')
     const comments = writes(github.calls).filter((c) => c.path.endsWith('/comments'))
     expect(comments.map((c) => (c.body as { body: string }).body)).toEqual([expect.stringContaining('(wrong_status)')])
+  })
+
+  it('vera-415r2: B6 a redelivery overlapping an in-flight refusal posts no second comment', async () => {
+    let release!: () => void
+    const held = new Promise<number>((resolve) => (release = () => resolve(201)))
+    const { github, board, link } = await boot('ready', { alice: 'admin' }, () => held)
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    await postGithubWebhook(link.webhookUrl, request)
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    await until(
+      async () => posts().length,
+      (n) => n === 1
+    )
+    // The first POST is still in flight when GitHub redelivers the same GUID.
+    expect((await postGithubWebhook(link.webhookUrl, request)).status).toBe(202)
+    await until(
+      async () => link.graphPokes.length,
+      (n) => n === 2
+    )
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    release()
+    const [row] = await settled(board.id)
+    expect(row!.outcome).toBe('wrong_status')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(posts()).toHaveLength(1)
+    expect(await prisma.kanbanCommand.count()).toBe(1)
+  })
+
+  it('vera-415r2: B6 a failed refusal POST releases its claim, so the next delivery posts it once', async () => {
+    const answers = [502, 201]
+    const { github, board, link } = await boot('ready', { alice: 'admin' }, async () => answers.shift() ?? 201)
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    await postGithubWebhook(link.webhookUrl, request)
+    await until(
+      async () => posts().length,
+      (n) => n === 1
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+    await postGithubWebhook(link.webhookUrl, request)
+    await settled(board.id)
+    expect(posts()).toHaveLength(2)
+    expect(answers).toEqual([])
+    expect(await prisma.kanbanCommand.count()).toBe(1)
+  })
+
+  it('vera-415r2: B6 an effect claim whose holder died is retried only after the TTL, exactly once', async () => {
+    const { github, board, link } = await boot('ready')
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    // A holder that claimed the effect and then died: the ledger row is recorded, claimed just now, never settled.
+    const card = await prisma.kanbanCard.findFirstOrThrow({ where: { boardId: board.id } })
+    await prisma.kanbanCommand.create({
+      data: {
+        id: randomUUID(),
+        boardId: board.id,
+        cardId: card.id,
+        commentId: 5001n,
+        command: 'reopen',
+        actorLogin: 'alice',
+        outcome: 'wrong_status',
+        fromStatus: 'ready',
+        effectClaimedAt: new Date()
+      }
+    })
+    await postGithubWebhook(link.webhookUrl, request)
+    await until(
+      async () => link.graphPokes.length,
+      (n) => n === 1
+    )
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect(posts()).toHaveLength(0)
+    expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+    // Past the TTL the claim is stale: the redelivery takes it over and posts the one refusal.
+    await prisma.kanbanCommand.updateMany({
+      data: { effectClaimedAt: new Date(Date.now() - COMMAND_EFFECT_TTL_MS - 1_000) }
+    })
+    await postGithubWebhook(link.webhookUrl, request)
+    await settled(board.id)
+    expect(posts()).toHaveLength(1)
+    expect((posts()[0]!.body as { body: string }).body).toContain('(wrong_status)')
   })
 
   it('a duplicate delivery of an applied command has exactly one effect', async () => {

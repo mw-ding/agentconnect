@@ -131,6 +131,29 @@ describe('KanbanOrchestrator over real Postgres', () => {
     expect(await prisma.kanbanCard.count({ where: { boardId: h.board.id, issueNumber: 11 } })).toBe(0)
   })
 
+  it('vera-415r2: B5 a done epic moved to triage by the budget fallback ends its work episode', async () => {
+    const h = await setup(1)
+    await h.svc.orchestrate(ORG, h.agentId, h.create('first', 10))
+    await prisma.kanbanCard.update({
+      where: { id: h.epic.id },
+      data: {
+        status: 'done',
+        linkedPrNumber: 12,
+        workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z'),
+        contractFlags: ['pr_unbound#11']
+      }
+    })
+    expect(await h.svc.orchestrate(ORG, h.agentId, h.create('second'))).toMatchObject({
+      code: 'epic_budget_exhausted'
+    })
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.epic.id } })).toMatchObject({
+      status: 'triage',
+      linkedPrNumber: null,
+      workEpisodeStartedAt: null,
+      contractFlags: []
+    })
+  })
+
   it('a leased epic is refused but never moved', async () => {
     const h = await setup(1)
     await h.svc.orchestrate(ORG, h.agentId, h.create('first', 10))

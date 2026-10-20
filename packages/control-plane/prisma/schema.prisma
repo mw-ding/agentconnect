@@ -2707,6 +2707,8 @@ model KanbanCommand {
   toStatus   KanbanCardStatus?
   // The GitHub effect (label/reopen write or the one refusal comment) landed; null re-runs it on the next delivery.
   settledAt  DateTime?         @db.Timestamptz(6)
+  // The delivery running the effect (DB clock); another waits until it settles, releases, or its claim outlives the TTL.
+  effectClaimedAt DateTime? @db.Timestamptz(6)
   createdAt  DateTime          @default(now()) @db.Timestamptz(6)
 
   board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)

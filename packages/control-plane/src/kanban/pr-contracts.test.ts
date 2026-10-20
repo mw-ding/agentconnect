@@ -39,6 +39,7 @@ const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   verifiedAt: null,
   completionContract: 'pr_merged',
   verifierAgentId: null,
+  configRevision: 1n,
   ...over
 })
 
@@ -118,6 +119,7 @@ function make(
     })
   }
   const onSettled = vi.fn()
+  const project = { onStatusCommitted: vi.fn() }
   const log = { info: vi.fn(), warn: vi.fn() }
   const contracts = new KanbanPrContracts({
     appSlug: 'agentconnect',
@@ -126,9 +128,10 @@ function make(
     store,
     repoRef: async () => REPO,
     onSettled,
+    project,
     log
   })
-  return { contracts, repo, prs, store, settles, flags, plans, onSettled, log }
+  return { contracts, repo, prs, store, settles, flags, plans, onSettled, project, log }
 }
 
 const SUCCESS: CheckRunFacts = { status: 'completed', conclusion: 'success' }
@@ -138,7 +141,14 @@ describe('KanbanPrContracts', () => {
     const h = make()
     await h.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
     expect(h.settles).toEqual([
-      { cardId: 'c1', expectedStateRevision: 5n, to: 'done', reason: 'pr_merged', prNumber: 12 }
+      {
+        cardId: 'c1',
+        expectedStateRevision: 5n,
+        expectedConfigRevision: 1n,
+        to: 'done',
+        reason: 'pr_merged',
+        prNumber: 12
+      }
     ])
     expect(h.plans[0]).toMatchObject({
       addLabels: [statusLabel('done')],
@@ -331,4 +341,21 @@ it('vera-415 actions:read: an unreadable workflow list flags pr_checks_green onc
   expect(h.settles).toEqual([])
   expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'actions_read_missing', prNumber: 12 }])
   expect(h.plans[0]!.comment).toContain('(actions_read_missing)')
+})
+
+describe('vera-415r2: PR contract settlement', () => {
+  it('vera-415r2: 🟡2 a settled contract queues the Projects projection; a lost race does not', async () => {
+    const won = make()
+    await won.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
+    expect(won.project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({ boardId: BOARD.id, issueNumber: 7 })
+    const lost = make({ settle: false })
+    await lost.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
+    expect(lost.project.onStatusCommitted).not.toHaveBeenCalled()
+  })
+
+  it('vera-415r2: 🟡1 the settle CAS carries the board configRevision the decision was made under', async () => {
+    const h = make({ cards: [card({ configRevision: 9n })] })
+    await h.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
+    expect(h.settles[0]).toMatchObject({ expectedConfigRevision: 9n })
+  })
 })

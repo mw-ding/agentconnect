@@ -273,6 +273,8 @@ describe("vera-414-merge: 9 #415's contract and comment-command moves keep their
       await f.dispatch.settleContract({
         cardId: c.id,
         expectedStateRevision: before.stateRevision,
+        expectedConfigRevision: (await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: f.board.id } }))
+          .configRevision,
         to: 'done',
         reason: 'pr_merged',
         prNumber: 7

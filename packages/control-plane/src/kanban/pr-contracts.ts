@@ -13,6 +13,7 @@ import {
   type ContractWait
 } from './contracts.js'
 import type { PrReader } from './pr-reader.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 /** Review cards re-judged per board per sweep; a cursor walks the rest on later ticks. */
 const SWEEP_BATCH = 25
@@ -30,6 +31,8 @@ export interface KanbanPrContractsDeps {
   repoRef(boardId: string): Promise<KanbanRepoRef | null>
   /** A contract moved the card: wake the board and its notifier. */
   onSettled?: (card: KanbanContractCard, to: 'done' | 'triage') => void | Promise<void>
+  /** Every committed status change is projected to the board's GitHub Project. */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
   log: { info(obj: unknown, msg?: string): void; warn(obj: unknown, msg?: string): void }
 }
 
@@ -138,11 +141,13 @@ export class KanbanPrContracts {
     const moved = await this.deps.repo.settleContract({
       cardId: card.cardId,
       expectedStateRevision: card.stateRevision,
+      expectedConfigRevision: card.configRevision,
       to,
       reason: to === 'done' ? card.completionContract : decision.reason,
       prNumber: card.linkedPrNumber
     })
     if (!moved) return 'lost_race'
+    this.deps.project?.onStatusCommitted({ boardId: card.boardId, issueNumber: card.issueNumber })
     this.deps.log.info(
       { boardId: card.boardId, issueNumber: card.issueNumber, to, prNumber: card.linkedPrNumber },
       'kanban: PR contract moved a card'

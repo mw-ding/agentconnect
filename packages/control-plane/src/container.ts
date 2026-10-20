@@ -1843,7 +1843,8 @@ export function buildContainer(
           repoRef: (boardId): Promise<KanbanRepoRef | null> =>
             kanbanDispatcher?.boardRepo(boardId) ?? Promise.resolve(null),
           onSettled: (card) => kanbanDispatcher?.poke(card.boardId),
-          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) }
+          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) },
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
         })
       : undefined
 
@@ -1967,7 +1968,8 @@ export function buildContainer(
           }),
           appSlug: githubAppCfg?.slug,
           onApplied: (board) => kanbanDispatcher?.poke(board.id),
-          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) }
+          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) },
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
         })
       : undefined
 

@@ -8,6 +8,7 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { FakeClock } from '../fakes/fake-clock.js'
 import { insertKanbanNotification, PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
@@ -882,5 +883,194 @@ describe("vera-415b3: the PR binding follows the card's work episode (real Postg
     // A flagged card is a human's: no verify lease, and exactly one body-free comment.
     expect(h.sent.map((s) => s.d.role ?? 'work')).toEqual(['work'])
     expect(h.store.writes.filter((w) => w.comment?.includes('(pr_unbound)'))).toHaveLength(1)
+  })
+})
+
+// A PR bound to card `n` (merged by a human unless the test says otherwise), its creation time chosen per test.
+function cardPr(n: () => number, over: Partial<LivePullRequest> = {}, onRead?: () => Promise<void>): PrReader {
+  return {
+    readPullRequest: async (repo, prNumber) => {
+      await onRead?.()
+      const pr = await mergedCardPr(n(), 12, new Date(T0 + 30_000)).readPullRequest(repo, prNumber)
+      return pr ? { ...pr, ...over } : null
+    },
+    readCheckRuns: async () => ({ runs: [], complete: true })
+  }
+}
+
+describe('vera-415r2: a PR contract never settles through a human hold (real Postgres)', () => {
+  // An approved review card bound to PR 12 at episode T0, optionally held; the board has a verifier (A2).
+  async function held(
+    attention: { reason: string; flags?: string[] } | null,
+    over: Partial<LivePullRequest> = {},
+    onRead?: (h: Awaited<ReturnType<typeof harness>>, cardId: string) => Promise<void>
+  ) {
+    let issue = 0
+    const ctx: { current?: { h: Awaited<ReturnType<typeof harness>>; id: string } } = {}
+    const prs = cardPr(
+      () => issue,
+      over,
+      async () => {
+        if (ctx.current) await onRead?.(ctx.current.h, ctx.current.id)
+      }
+    )
+    const h = await harness({ completionContract: 'pr_merged', prs })
+    const c = await h.reviewCard()
+    issue = c.issueNumber
+    const card = await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: {
+        linkedPrNumber: 12,
+        workEpisodeStartedAt: new Date(T0),
+        verifiedAt: new Date(T0),
+        ...(attention
+          ? { needsAttention: true, attentionReason: attention.reason, contractFlags: attention.flags ?? [] }
+          : {})
+      }
+    })
+    ctx.current = { h, id: c.id }
+    return { h, card }
+  }
+  const judge = async (h: Awaited<ReturnType<typeof harness>>, cardId: string) => {
+    await h.contracts!.sweep(h.board.id)
+    await h.contracts!.onVerified(cardId)
+  }
+
+  it.each([
+    ['label_attribution_timeout', [], {}],
+    ['label_attribution_timeout', [], { merged: false }],
+    ['verifier_is_worker', [], {}],
+    // Another PR's contract flag is not this PR's: the hold stays a human's.
+    ['pr_unbound', ['pr_unbound#11'], {}]
+  ] as const)(
+    'vera-415r2: B4 a card held for %s (flags %j, PR %j) stays held in review',
+    async (reason, flags, over) => {
+      const { h, card } = await held({ reason, flags: [...flags] }, over)
+      await judge(h, card.id)
+      expect(await h.card(card.id)).toMatchObject({
+        status: 'review',
+        needsAttention: true,
+        attentionReason: reason,
+        stateRevision: card.stateRevision
+      })
+      expect(h.store.writes).toEqual([])
+    }
+  )
+
+  it.each(['pr_unbound', 'actions_read_missing', 'merged_by_app'])(
+    "vera-415r2: B4 this PR's own %s flag still settles the card to done",
+    async (reason) => {
+      const { h, card } = await held({ reason, flags: [`${reason}#12`] })
+      await judge(h, card.id)
+      expect(await h.card(card.id)).toMatchObject({ status: 'done', needsAttention: false, attentionReason: null })
+    }
+  )
+
+  it('vera-415r2: B4 a hold landing during the PR read (no revision bump) blocks the settle inside the CAS', async () => {
+    const { h, card } = await held(null, {}, async (_h, id) => {
+      // failClosed keeps a review card's status, so only the attention predicate can see this hold.
+      await prisma.kanbanCard.update({
+        where: { id },
+        data: { needsAttention: true, attentionReason: 'label_attribution_timeout' }
+      })
+    })
+    await h.contracts!.sweep(h.board.id)
+    expect(await h.card(card.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout'
+    })
+  })
+
+  it('vera-415r2: 🟡1 a verifier added during the PR read fences the settle (configRevision)', async () => {
+    let edited = false
+    const { h, card } = await held(null, {}, async (h) => {
+      if (edited) return
+      edited = true
+      await prisma.kanbanBoard.update({
+        where: { id: h.board.id },
+        data: { verifierAgentId: A2, configRevision: { increment: 1 } }
+      })
+    })
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { verifierAgentId: null } })
+    await prisma.kanbanCard.update({ where: { id: card.id }, data: { verifiedAt: null } })
+    await h.contracts!.sweep(h.board.id)
+    expect(await h.card(card.id)).toMatchObject({ status: 'review', stateRevision: card.stateRevision })
+    // The next judgement reads the new verifier and waits for its approval.
+    await h.contracts!.sweep(h.board.id)
+    expect((await h.card(card.id)).status).toBe('review')
+  })
+
+  it('vera-415r2: 🟡1 a board disabled during the PR read never settles the card', async () => {
+    const { h, card } = await held(null, {}, async (h) => {
+      await prisma.kanbanBoard.update({
+        where: { id: h.board.id },
+        data: { enabled: false, configRevision: { increment: 1 } }
+      })
+    })
+    await h.contracts!.sweep(h.board.id)
+    expect(await h.card(card.id)).toMatchObject({ status: 'review', stateRevision: card.stateRevision })
+  })
+})
+
+describe('vera-415r2: B5 every path out of done ends the work episode (real Postgres)', () => {
+  it("vera-415r2: B5 casStatus out of done clears the episode, so the old merged PR can't complete new work", async () => {
+    let issue = 0
+    // PR 12 was created after the OLD episode began but before the new one, and it merged long ago.
+    const h = await harness({
+      completionContract: 'pr_merged',
+      prs: cardPr(() => issue, { createdAt: new Date(T0 - 30 * 60_000) })
+    })
+    const c = await h.addCard(['ac/status:done'])
+    issue = c.issueNumber
+    const done = await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: {
+        status: 'done',
+        linkedPrNumber: 12,
+        workEpisodeStartedAt: new Date(T0 - 60 * 60_000),
+        contractFlags: ['pr_unbound#11']
+      }
+    })
+    const cards = new PgKanbanCardRepo(prisma)
+    // The orchestrator's epic-budget fallback (orchestrator.ts moveEpicToTriage) goes through casStatus.
+    expect(await cards.casStatus(c.id, done.stateRevision, 'triage')).toBe(true)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'triage',
+      linkedPrNumber: null,
+      workEpisodeStartedAt: null,
+      contractFlags: []
+    })
+    // A human readies it; new work reports no PR; the verifier approves: the card waits, it never completes.
+    expect(await cards.casStatus(c.id, (await h.card(c.id)).stateRevision, 'ready')).toBe(true)
+    h.store.issues.set(c.issueNumber, { labels: ['ac/status:ready'], state: 'open', stateReason: null })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const work = h.sent.at(-1)!.d
+    expect(work.cardId).toBe(c.id)
+    expect((await h.run(work.leaseId)).role).toBe('work')
+    expect((await h.card(c.id)).workEpisodeStartedAt).toEqual(new Date(T0))
+    await h.dispatcher.onReport(D1, 4, h.reportFor(work, { outcome: 'review_requested' }))
+    await h.dispatcher.settle()
+    await h.dispatcher.onReport(D2, 2, h.reportFor(h.sent.at(-1)!.d, { outcome: 'completed' }))
+    await h.dispatcher.settle()
+    await h.contracts!.sweep(h.board.id)
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', linkedPrNumber: null })
+  })
+
+  it('vera-415r2: B5 casStatus inside an episode keeps it', async () => {
+    const h = await harness({ completionContract: 'pr_merged' })
+    const c = await h.addCard()
+    const blocked = await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: { status: 'blocked', linkedPrNumber: 12, workEpisodeStartedAt: new Date(T0), contractFlags: ['x#12'] }
+    })
+    expect(await new PgKanbanCardRepo(prisma).casStatus(c.id, blocked.stateRevision, 'todo')).toBe(true)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'todo',
+      linkedPrNumber: 12,
+      workEpisodeStartedAt: new Date(T0),
+      contractFlags: ['x#12']
+    })
   })
 })
