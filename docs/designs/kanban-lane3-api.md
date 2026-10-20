@@ -269,6 +269,14 @@ A `no_write` refusal is recorded and settled silently, with no GitHub reply or l
 write, so untrusted comments cannot amplify into App posts. `settledAt` marks it done. A redelivery of an unsettled row re-runs
 the effect; it does not re-decide. A lost CAS is re-read up to three times.
 
+One delivery at a time runs the effect. It first claims the row with a CAS on
+`effectClaimedAt` (migration `20261123200130_kanban_command_effect_claim`, DB clock): unsettled, and
+unclaimed or claimed longer ago than `COMMAND_EFFECT_TTL_MS` (5 minutes). A delivery that
+overlaps a live claim posts nothing and throws, so its GUID stays unlanded; the redelivery
+sweep (10-minute ticks) re-asks it, and by then the row is settled (`duplicate`). A failed effect
+releases its own claim so the next delivery retries at once; a holder that died is taken over
+after the TTL. An applied move queues the Projects projection when it commits.
+
 ### PR completion contracts
 
 > **Inert until #416.** The binding below requires a head branch `ac/card-<issueNumber>`,
@@ -282,7 +290,16 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
 `checksVerdict(runs) → green | pending | failed | none`.
 
 - The planner only judges cards that meet all of these: status `review`,
-  `completionContract` ≠ `close`, `linkedPrNumber` set, and no open run.
+  `completionContract` ≠ `close`, `linkedPrNumber` set, no open run, and no human hold.
+  A card with `needsAttention` is judged only when its reason is one of this PR's own
+  contract flags (`pr_unbound`, `actions_read_missing`, `merged_by_app` with
+  `<reason>#<linkedPrNumber>` in `contractFlags`). Any other reason, such as
+  `label_attribution_timeout` or `verifier_is_worker`, stays until a human moves the card.
+- The settle (`settleContract`) is one CAS on the judged card `stateRevision` and linked PR,
+  no open run, and the same hold rule, under a `FOR SHARE` lock on the board row at the
+  judged `configRevision` with `enabled` still set. A board edit (contract, verifier, or
+  disable) during the GitHub read therefore refuses the move, and the next judgement reads
+  the new configuration. A committed settle queues the Projects projection.
 - Before either completion or unmerged-close triage, the live PR must be bound to
   this card: author login `<appSlug>[bot]` with type `Bot`, head branch
   `ac/card-<issueNumber>` in the board's repository (no fork), and base equal to
@@ -348,9 +365,14 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   `linkedPrNumber`; a report omitting it keeps the episode's PR. Verifier reports never
   replace it. Leaving `done` (or `archived`) ends the episode, clearing `workEpisodeStartedAt`,
   `linkedPrNumber`, and `contractFlags`, on every path: `/kanban reopen`, the label sync's
-  `apply` (a human status move or an issue reopened on GitHub), and the parked ingest.
+  `apply` (a human status move or an issue reopened on GitHub), the parked ingest, and every
+  `applyCardTransition` write, which includes `casStatus` (the orchestrator's epic-budget
+  fallback to `triage`).
   The migration backfills `running`/`review` cards conservatively (the old reporting-run
   stamp, else their latest work claim); other cards stamp at their next work claim.
+  A card in `ready` or `blocked` between rework rounds at deploy time therefore starts a new
+  episode at its next claim, and attempt 1's PR is flagged `pr_unbound` once. That is
+  acceptable while contracts are inert.
 - Known gap: a base branch renamed after merge leaves the merged PR's old `base.ref`,
   so the card waits as `pr_unbound` (flagged once). It fails closed; a human moves it.
 - `done` resets `reviewRounds` and `verifiedAt`.
@@ -373,7 +395,7 @@ The App manifest already subscribes `issue_comment`, `pull_request`, `check_run`
 for `actions:read`: MD's approval of the permission change, and every installation
 accepting it, come **before** this deploys. Without it `pr_merged` still works, and
 `pr_checks_green` cards with Actions checks wait as `actions_read_missing`. Apply the
-migrations (`20261123200100`, `…200110`, `…200120`) before starting the new CP, and
+migrations (`20261123200100`, `…200110`, `…200120`, `…200130`) before starting the new CP, and
 upgrade the CP before emitting `command.viaApp` from the relay. Its optional
 boolean is additive for new decoders; an old strict decoder rejects it, leaving
 the delivery eligible for redelivery after upgrade.
