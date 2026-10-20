@@ -160,7 +160,8 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
     try {
       return await withAmbientTx(this.db, async (tx) => {
@@ -176,6 +177,9 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
         if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
         const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
         if (!current) return { ok: false, reason: 'not_found' }
+        // The route's GitHub guard must still describe the configuration locked here.
+        if (expectedConfigRevision !== undefined && current.configRevision !== expectedConfigRevision)
+          return { ok: false, reason: 'stale' }
         if (
           patch.repoId !== undefined &&
           patch.repoId !== current.repoId &&

@@ -7910,7 +7910,7 @@ export interface KanbanBoardConfigInput {
 export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
 
 export type KanbanBoardWriteRefusal =
-  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards'
+  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards' | 'stale'
 
 export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
 
@@ -7927,7 +7927,8 @@ export interface KanbanBoardAdminRepo {
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
   /** Refused while any card holds an open lease: disable the board and let its runs end first. */
   deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>

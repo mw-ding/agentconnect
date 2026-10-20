@@ -1,5 +1,6 @@
 // Kanban board Projects v2 projection config (issue #2 D1): org-only guard on create/PATCH, the pair CHECK, and the DTO round-trip.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { LightMyRequestResponse } from 'fastify'
 import { prisma } from '../setup.db.js'
 import { buildHttpApp } from '../fakes/build-http.js'
 import { memberBearer, ownerBearer, startKanbanOidc, type KanbanOidc } from '../fixtures/kanban-oidc.js'
@@ -39,7 +40,7 @@ function build(
     kanbanRepoResolver: resolver,
     ...(opts.noVerifier ? {} : { kanbanProjectVerifier: verifier })
   })
-  return { ...http, verifier }
+  return { ...http, verifier, resolver }
 }
 
 const withProject = { projectNodeId: PROJECT, statusFieldId: FIELD }
@@ -552,4 +553,51 @@ describe('vera-474 B1: the item cache across a project re-point (PG)', () => {
     expect(s.gh.of('addProjectV2ItemById')).toHaveLength(2)
     expect(s.gh.of('updateProjectV2ItemFieldValue').at(-1)!.variables.item).toBe(second)
   })
+})
+
+it('vera-474 cutover: a concurrent repo PATCH invalidates a project guard from the old revision', async () => {
+  let checked!: () => void
+  let release!: () => void
+  const checking = new Promise<void>((resolve) => (checked = resolve))
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  const { app, close, resolver, verifier } = build(async () => {
+    checked()
+    await gate
+    return { ok: true, options: [] }
+  })
+  const headers = await ownerBearer(prisma, oidc)
+  let projectPatch: Promise<LightMyRequestResponse> | undefined
+  try {
+    const created = await app.inject({
+      method: 'POST',
+      url: BOARDS,
+      headers,
+      payload: { name: 'web', repoFullName: 'acme/web' }
+    })
+    expect(created.statusCode).toBe(201)
+    const url = `${BOARDS}/${created.json().id}`
+    projectPatch = app.inject({ method: 'PATCH', url, headers, payload: withProject })
+    await checking
+    resolver.resolve.mockResolvedValueOnce({ ...ORG_REPO, repoId: 5555n, repoFullName: 'other/web' })
+    const repointed = await app.inject({ method: 'PATCH', url, headers, payload: { repoFullName: 'other/web' } })
+    expect(repointed.statusCode).toBe(200)
+    release()
+    const stale = await projectPatch
+    expect(stale.statusCode).toBe(409)
+    expect(stale.json()).toMatchObject({ code: 'stale' })
+    expect(verifier.verify).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ repoFullName: 'acme/web', ...withProject })
+    )
+    expect(await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: created.json().id } })).toMatchObject({
+      repoFullName: 'other/web',
+      repoId: 5555n,
+      projectNodeId: null,
+      statusFieldId: null,
+      configRevision: 2n
+    })
+  } finally {
+    release()
+    await projectPatch
+    await close()
+  }
 })

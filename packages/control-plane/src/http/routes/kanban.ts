@@ -112,6 +112,12 @@ const REFUSALS: Record<
     message: 'a board with cards cannot change repository',
     code: 'repo_has_cards'
   },
+  stale: {
+    statusCode: 409,
+    error: 'Conflict',
+    message: 'board configuration changed; retry the update',
+    code: 'stale'
+  },
   active_runs: {
     statusCode: 409,
     error: 'Conflict',
@@ -269,7 +275,7 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'Update a Kanban board',
           description:
-            'Owner-only, interactive sign-in only. Changes board configuration and bumps its config revision. The repository is resolved again through a live installation of this organization. Caps and limits apply from the next claim; active leases are not changed.',
+            'Owner-only, interactive sign-in only. Changes board configuration and bumps its config revision. Concurrent configuration changes return 409 stale so the caller can retry validation. The repository is resolved again through a live installation of this organization. Caps and limits apply from the next claim; active leases are not changed.',
           operationId: 'updateKanbanBoard',
           params: KanbanBoardParams,
           body: UpdateKanbanBoardBody,
@@ -320,13 +326,19 @@ export function kanbanRoutes(deps: HttpDeps) {
           const refused = await checkProject(req, resolvedRepo, finalProject.projectNodeId, finalProject.statusFieldId)
           if (refused) return reply.code(refused.statusCode).send(refused)
         }
-        const result = await deps.repos.kanbanBoards.updateBoard(orgId, req.params.boardId, userId, {
-          ...rest,
-          ...(sharedWith !== undefined
-            ? { sharedWith: await resolveShareSet(deps.repos.user, orgId, sharedWith) }
-            : {}),
-          ...(repo ?? {})
-        })
+        const result = await deps.repos.kanbanBoards.updateBoard(
+          orgId,
+          req.params.boardId,
+          userId,
+          {
+            ...rest,
+            ...(sharedWith !== undefined
+              ? { sharedWith: await resolveShareSet(deps.repos.user, orgId, sharedWith) }
+              : {}),
+            ...(repo ?? {})
+          },
+          current.configRevision
+        )
         if (!result.ok) return reply.code(REFUSALS[result.reason].statusCode).send(REFUSALS[result.reason])
         return boardDto(result.value, req)
       }

@@ -110,6 +110,7 @@ describe('dispatcher Projects v2 projection seam', () => {
     await h.d.settle()
     expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
     expect(throwing).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(h.log.warn.mock.calls)).not.toContain('[SECRET]')
   })
 
   it('no hook means labels only, with no extra call', async () => {

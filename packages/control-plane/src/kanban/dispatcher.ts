@@ -652,8 +652,8 @@ export class KanbanDispatcher {
     const issueNodeId = observed && 'nodeId' in observed && typeof observed.nodeId === 'string' ? observed.nodeId : null
     try {
       this.deps.project?.onStatusCommitted({ boardId, issueNumber, ...(issueNodeId ? { issueNodeId } : {}) })
-    } catch (err) {
-      this.deps.log.warn({ err, boardId, issueNumber }, 'kanban: projection hook failed')
+    } catch {
+      this.deps.log.warn({ boardId, issueNumber, reason: 'project_hook_failed' }, 'kanban: projection hook failed')
     }
   }
 
