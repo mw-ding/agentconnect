@@ -57,8 +57,7 @@
 <p align="center">
   <a href="https://slack.agentconnect.md"><img src="https://custom-icon-badges.demolab.com/badge/Slack-4A154B?logo=slack&logoColor=fff" alt="Join AgentConnect on Slack" /></a>
   <a href="https://x.com/getAgentConnect"><img src="https://img.shields.io/badge/Follow-000000?logo=x&logoColor=fff" alt="Follow @getAgentConnect on X" /></a>
-  <a href="https://github.com/agentconnect-md/agentconnect/actions/workflows/test.yaml"><img src="https://github.com/agentconnect-md/agentconnect/actions/workflows/test.yaml/badge.svg" alt="Test status" /></a>
-  <a href="https://github.com/agentconnect-md/agentconnect/releases/latest"><img src="https://img.shields.io/github/v/release/agentconnect-md/agentconnect" alt="Latest upstream release" /></a>
+  <a href="https://github.com/mw-ding/agentconnect/actions/workflows/test.yaml"><img src="https://github.com/mw-ding/agentconnect/actions/workflows/test.yaml/badge.svg" alt="Test status" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="Apache 2.0 license" /></a>
 </p>
 
@@ -182,18 +181,13 @@ command, and create your first agent. The default stack listens only on
 
 ### Kubernetes
 
-The official Helm chart is published by the upstream project on every upstream release
-under the same version number as the release itself:
-
-```
-oci://ghcr.io/agentconnect-md/charts/agentconnect
-```
+This repository does not publish releases or Helm charts; install from the chart source in
+[`charts/agentconnect`](charts/agentconnect).
 
 A cluster install is three steps — create the namespace and its secrets, write
 the values file for your deployment, then install — so follow the
 [Kubernetes guide](https://www.agentconnect.md/docs/self-hosting/kubernetes/deploy)
-rather than a one-liner. The chart source lives in
-[`charts/agentconnect`](charts/agentconnect).
+rather than a one-liner.
 
 ### Configure the deployment
 

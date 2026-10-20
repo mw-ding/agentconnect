@@ -930,9 +930,8 @@ a compatible image explicitly. The full image's Antigravity binary requires
 AVX in the guest CPU; amd64 emulation without AVX cannot run that runtime.
 
 To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile`. This repository
-does not build or publish runtime base images or releases; that happens upstream in
-`agentconnect-md/agentconnect`, and the two base ARGs in the release Dockerfile are updated
-to the digest-pinned references it publishes.
+does not build or publish runtime base images or releases; the two base ARGs in the release
+Dockerfile are updated to digest-pinned references from wherever you publish your own bases.
 
 For a local build, use a new tag and an amd64 host with AVX for full application
 verification. Nothing references a new tag until the release Dockerfile pins it.
@@ -973,12 +972,11 @@ the `$variant` target with `--load -t "$variant:local"` and, after `pnpm install
 `pnpm --filter @agentconnect.md/daemon exec tsx scripts/smoke-runtime-image.mts "$variant:local"`,
 which starts the container with `docker run` and drives the same steps.
 
-After both variants pass, upstream publishes the base tags; update both `ARG` defaults in
+After both variants pass and you publish the base tags yourself, update both `ARG` defaults in
 `docker/runtime-sandbox.Dockerfile` to the published `tag@sha256:digest` references in
 the dependency update PR. Do not overwrite an existing base tag.
 Changing only the base Dockerfile does not publish a daemon or release image;
-changing a base digest in the release Dockerfile does, and upstream release CI verifies
-the final images and exercises a real ACP session through the shim.
+changing a base digest in the release Dockerfile does; this repository does not publish either.
 
 An explicit daemon image overrides this metadata. Development builds remove
 release metadata and require an explicit image; they do not derive a default

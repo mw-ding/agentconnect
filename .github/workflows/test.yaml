@@ -1,6 +1,9 @@
 name: Test
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -115,8 +118,6 @@ jobs:
     needs: scope
     if: ${{ needs.scope.outputs.code == 'true' }}
     runs-on: ubuntu-latest
-    outputs:
-      summary: ${{ steps.export-summary.outputs.markdown }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -168,21 +169,10 @@ jobs:
             'k8s-client=@agentconnect.md/k8s-client' \
             'object-store=@agentconnect.md/object-store'
       - name: Publish unit test summary
-        if: ${{ !cancelled() && !inputs.defer_summaries }}
+        if: ${{ !cancelled() }}
         env:
           CAPTURED_JOB_SUMMARY: ${{ runner.temp }}/unit-test-summary.md
         run: cat "$CAPTURED_JOB_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-      - name: Export unit test summary
-        id: export-summary
-        if: ${{ !cancelled() && inputs.defer_summaries }}
-        env:
-          CAPTURED_JOB_SUMMARY: ${{ runner.temp }}/unit-test-summary.md
-        run: |
-          {
-            echo 'markdown<<__AGENTCONNECT_UNIT_TEST_SUMMARY__'
-            cat "$CAPTURED_JOB_SUMMARY"
-            echo '__AGENTCONNECT_UNIT_TEST_SUMMARY__'
-          } >> "$GITHUB_OUTPUT"
 
   # The two packages with real Windows surface — the daemon (runtimes, skills, spawn driver, IPC
   # paths) and the CLI (junction-based version pointers) — on a Windows runner. `windows-latest`
@@ -191,7 +181,7 @@ jobs:
   #
   # Skipped unless the diff reaches the daemon/CLI closure; the unexpanded skip name is fine, `CI OK` is what is required.
   #
-  # Releases run it too: a leg the release path drops is a leg whose failure reaches main unwatched.
+  # Pushes to main run it too, so a failure there is not unwatched.
   #
   # No `prisma:generate` step: neither package imports the generated client.
   unit-windows:
@@ -282,8 +272,6 @@ jobs:
             'Windows unit test report · shard ${{ matrix.shard }}' \
             'daemon=@agentconnect.md/daemon' \
             'cli=@agentconnect.md/cli'
-      # Published here whatever the caller asked: unlike the Unit and Integration jobs this one has
-      # no deferred output, so honouring `defer_summaries` would drop the report instead of moving it.
       - name: Publish Windows unit test summary
         if: ${{ !cancelled() }}
         env:
@@ -343,7 +331,7 @@ jobs:
   # Exercise the daemon's core sandbox boundaries and confined skills pipeline
   # under the real Linux kernel sandbox. These cases self-skip in the bwrap-free
   # Unit Test job above and run for real here on a bwrap-capable runner.
-  # Releases run it too: publication is gated on the same legs review was.
+  # Pushes to main run it too.
   sandbox-linux:
     name: Sandbox (Linux)
     needs: scope
@@ -524,8 +512,6 @@ jobs:
     needs: scope
     if: ${{ needs.scope.outputs.code == 'true' }}
     runs-on: ubuntu-latest
-    outputs:
-      summary: ${{ steps.export-summary.outputs.markdown }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -561,21 +547,10 @@ jobs:
             'Integration test report' \
             'control-plane=@agentconnect.md/control-plane'
       - name: Publish integration test summary
-        if: ${{ !cancelled() && !inputs.defer_summaries }}
+        if: ${{ !cancelled() }}
         env:
           CAPTURED_JOB_SUMMARY: ${{ runner.temp }}/integration-test-summary.md
         run: cat "$CAPTURED_JOB_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-      - name: Export integration test summary
-        id: export-summary
-        if: ${{ !cancelled() && inputs.defer_summaries }}
-        env:
-          CAPTURED_JOB_SUMMARY: ${{ runner.temp }}/integration-test-summary.md
-        run: |
-          {
-            echo 'markdown<<__AGENTCONNECT_INTEGRATION_TEST_SUMMARY__'
-            cat "$CAPTURED_JOB_SUMMARY"
-            echo '__AGENTCONNECT_INTEGRATION_TEST_SUMMARY__'
-          } >> "$GITHUB_OUTPUT"
 
   # The ruleset's only CI check must need every job; `always()` keeps failed needs from skipping it.
   ci-ok:
