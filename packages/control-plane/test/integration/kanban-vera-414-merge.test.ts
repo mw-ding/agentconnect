@@ -347,6 +347,37 @@ describe('vera-415b3: leaving done ends the work episode on every path (Postgres
     expect(await f.read(archived.id)).toMatchObject({ linkedPrNumber: null, workEpisodeStartedAt: null })
   })
 
+  it('vera-415b3: flagContract wins once per (card, reason, PR), even after a human clears the flag', async () => {
+    const f = await fixture()
+    const c = await f.card('review', { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED })
+    const flag = async () =>
+      f.dispatch.flagContract({
+        cardId: c.id,
+        expectedStateRevision: (await f.read(c.id)).stateRevision,
+        reason: 'pr_unbound',
+        prNumber: 7
+      })
+    expect(await flag()).toBe(true)
+    expect(await f.read(c.id)).toMatchObject({
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#7']
+    })
+    expect(await flag()).toBe(false)
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { needsAttention: false, attentionReason: null } })
+    expect(await flag()).toBe(false)
+    // A stale revision, another PR, or an open run never flags.
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { linkedPrNumber: 8 } })
+    const rev = (await f.read(c.id)).stateRevision
+    const at = (expectedStateRevision: bigint, prNumber: number) =>
+      f.dispatch.flagContract({ cardId: c.id, expectedStateRevision, reason: 'pr_unbound', prNumber })
+    expect(await at(rev - 1n, 8)).toBe(false)
+    expect(await at(rev, 7)).toBe(false)
+    const [lease] = await f.claim()
+    expect(lease).toMatchObject({ cardId: c.id, role: 'verify' })
+    expect(await at((await f.read(c.id)).stateRevision, 8)).toBe(false)
+  })
+
   it('vera-415b3: the parked ingest out of done clears the episode, while a move inside the episode keeps it', async () => {
     const f = await fixture()
     const done = await f.card('done', { ...OLD, needsAttention: true })
