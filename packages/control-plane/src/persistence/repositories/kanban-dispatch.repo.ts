@@ -5,6 +5,8 @@ import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/p
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
 import type { KanbanStatus } from '../../kanban/card-state.js'
+import { explainClaim, type ClaimAgentFacts, type ClaimEligibilityInput } from '../../kanban/claim-eligibility.js'
+import { simulateClaim, type ClaimCandidate } from '../../kanban/claim-explain.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { planNotification } from '../../kanban/notifier.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
@@ -12,11 +14,15 @@ import { insertKanbanNotification } from './kanban-notify.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
 import type {
+  KanbanBoardCardRow,
+  KanbanBoardExplanation,
+  KanbanCardExplanation,
   KanbanCardView,
   KanbanCardViewReq,
   KanbanClaimOpts,
   KanbanClaimResult,
   KanbanClaimedLease,
+  KanbanExplainOpts,
   KanbanDispatchRepo,
   KanbanGrantScope,
   KanbanIngestResult,
@@ -964,4 +970,307 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
     const row = rows[0]
     return row ? { repoId: row.repoId } : null
   }
+
+  explainCard(boardId: string, cardId: string, opts: KanbanExplainOpts): Promise<KanbanCardExplanation | null> {
+    return this.readSnapshot(async (tx) => {
+      // The whole board is simulated so a cap-bound card is not reported as the next claim; a done card joins as ineligible.
+      const load = await loadExplainState(
+        tx,
+        boardId,
+        { OR: [{ status: { notIn: CLOSED_STATUSES } }, { id: cardId }] },
+        opts
+      )
+      if (!load) return null
+      return simulateBoard(load).cards.find((c) => c.cardId === cardId) ?? null
+    })
+  }
+
+  explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null> {
+    return this.readSnapshot(async (tx) => {
+      const load = await loadExplainState(tx, boardId, { status: { notIn: CLOSED_STATUSES } }, opts)
+      if (!load) return null
+      const { cards, wouldClaimNext } = simulateBoard(load)
+      return { boardId, now: opts.now, cards, wouldClaimNext }
+    })
+  }
+
+  async listBoardCards(
+    boardId: string,
+    limit: number,
+    numbers?: readonly number[]
+  ): Promise<{ cards: KanbanBoardCardRow[]; total: number }> {
+    // A by-number lookup narrows both the listing and its total, so the viewer sees exactly what was asked for.
+    const where = { boardId, ...(numbers ? { issueNumber: { in: [...numbers] } } : {}) }
+    const [rows, total] = await Promise.all([
+      this.db.kanbanCard.findMany({
+        where,
+        orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+        take: limit,
+        select: {
+          id: true,
+          issueNumber: true,
+          status: true,
+          assigneeAgentId: true,
+          assigneeAgent: { select: { name: true, displayName: true } },
+          priority: true,
+          mode: true,
+          needsAttention: true,
+          attentionReason: true,
+          blockKind: true,
+          consecutiveFailures: true,
+          protocolViolations: true,
+          blockRecurrence: true,
+          cooldownUntil: true,
+          notBefore: true,
+          promotionPending: true,
+          linkedPrNumber: true,
+          stateRevision: true,
+          runs: {
+            where: { endedAt: null },
+            take: 1,
+            select: { attempt: true, agentId: true, dispatchedAt: true, ackedAt: true, heartbeatAt: true }
+          }
+        }
+      }),
+      this.db.kanbanCard.count({ where })
+    ])
+    return {
+      total,
+      cards: rows.map(({ assigneeAgent, runs, ...card }) => ({
+        ...card,
+        assigneeName: assigneeAgent?.name ?? null,
+        assigneeDisplayName: assigneeAgent?.displayName ?? null,
+        openRun: runs[0] ?? null
+      }))
+    }
+  }
+
+  async cardNumbersOnBoard(boardId: string, numbers: readonly number[]): Promise<number[]> {
+    if (numbers.length === 0) return []
+    const rows = await this.db.kanbanCard.findMany({
+      where: { boardId, issueNumber: { in: [...numbers] } },
+      select: { issueNumber: true }
+    })
+    return rows.map((r) => r.issueNumber)
+  }
+
+  // One repeatable-read, database-enforced READ ONLY snapshot with no locks, so a dry run never contends with the claim.
+  private readSnapshot<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    if ('$transaction' in this.db) {
+      return this.db.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SET TRANSACTION READ ONLY`
+          return fn(tx)
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead }
+      )
+    }
+    return fn(this.db as Prisma.TransactionClient)
+  }
+}
+
+/** Statuses the board explain leaves out: the claim never reads them. */
+const CLOSED_STATUSES: KanbanStatus[] = ['done', 'archived']
+
+/** Replays the claim loop's cumulative caps over every loaded card, as the board view and the single-card explain both report it. */
+function simulateBoard(load: ExplainState): { cards: KanbanCardExplanation[]; wouldClaimNext: string[] } {
+  const sim = simulateClaim(
+    load.cards.map((c) => ({
+      id: c.cardId,
+      priority: c.priority,
+      createdAt: c.createdAt,
+      verdict: c.verdict,
+      ...c.capacities
+    })),
+    {
+      maxInProgress: load.board.maxInProgress,
+      maxInProgressPerAgent: load.board.maxInProgressPerAgent,
+      openTotal: load.openTotal,
+      openPerAgent: load.openPerAgent
+    }
+  )
+  const cards = load.cards.map<KanbanCardExplanation>((c) => {
+    const position = sim.order.indexOf(c.cardId)
+    const capBound = sim.capBound.get(c.cardId)
+    return {
+      cardId: c.cardId,
+      issueNumber: c.issueNumber,
+      input: c.input,
+      verdict: c.verdict,
+      ...(position >= 0 ? { claimOrder: position + 1 } : {}),
+      ...(capBound ? { capBound } : {})
+    }
+  })
+  return { cards, wouldClaimNext: sim.order }
+}
+
+interface ExplainState {
+  board: { maxInProgress: number; maxInProgressPerAgent: number }
+  openTotal: number
+  openPerAgent: Map<string, number>
+  cards: ExplainedCard[]
+}
+
+interface ExplainedCard {
+  capacities: Pick<ClaimCandidate, 'epicCapacity' | 'daemonCapacity'>
+  cardId: string
+  issueNumber: number
+  priority: number
+  createdAt: Date
+  input: ClaimEligibilityInput
+  verdict: ReturnType<typeof explainClaim>
+}
+
+/** Gathers exactly the facts `ClaimEligibilityInput` names, the way the claim's SQL reads them (assignee joined within the board's org). */
+async function loadExplainState(
+  tx: Prisma.TransactionClient,
+  boardId: string,
+  cardWhere: Prisma.KanbanCardWhereInput,
+  opts: KanbanExplainOpts
+): Promise<ExplainState | null> {
+  const board = await tx.kanbanBoard.findUnique({
+    where: { id: boardId },
+    select: {
+      orgId: true,
+      enabled: true,
+      verifierAgentId: true,
+      maxInProgress: true,
+      maxInProgressPerAgent: true,
+      epicMaxActive: true
+    }
+  })
+  if (!board) return null
+  const cards = await tx.kanbanCard.findMany({
+    where: { boardId, ...cardWhere },
+    orderBy: [{ priority: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
+    select: {
+      id: true,
+      issueNumber: true,
+      status: true,
+      assigneeAgentId: true,
+      verifiedAt: true,
+      needsAttention: true,
+      epicCardId: true,
+      promotionPending: true,
+      cooldownUntil: true,
+      notBefore: true,
+      priority: true,
+      createdAt: true
+    }
+  })
+  const openRuns = await tx.kanbanRun.findMany({
+    where: { endedAt: null, card: { boardId } },
+    select: { cardId: true, agentId: true }
+  })
+  const openPerAgent = new Map<string, number>()
+  for (const run of openRuns) openPerAgent.set(run.agentId, (openPerAgent.get(run.agentId) ?? 0) + 1)
+  const leased = new Set(openRuns.map((r) => r.cardId))
+
+  const agentIds = new Set<string>()
+  for (const c of cards) if (c.assigneeAgentId) agentIds.add(c.assigneeAgentId)
+  if (board.verifierAgentId) agentIds.add(board.verifierAgentId)
+  const agentRows = agentIds.size
+    ? await tx.agent.findMany({
+        where: { id: { in: [...agentIds] }, orgId: board.orgId },
+        select: { id: true, status: true, daemonId: true }
+      })
+    : []
+  const agents = new Map<string, ClaimAgentFacts>(
+    agentRows.map((a) => [
+      a.id,
+      {
+        exists: true,
+        paused: a.status === 'paused',
+        daemonId: a.daemonId,
+        daemonLive: a.daemonId !== null && opts.isDaemonLive(a.daemonId)
+      }
+    ])
+  )
+
+  const cardIds = cards.map((c) => c.id)
+  const workRuns = cardIds.length
+    ? await tx.kanbanRun.findMany({
+        where: { cardId: { in: cardIds }, role: 'work' },
+        distinct: ['cardId', 'agentId'],
+        select: { cardId: true, agentId: true }
+      })
+    : []
+  const workByCard = new Map<string, string[]>()
+  for (const run of workRuns) workByCard.set(run.cardId, [...(workByCard.get(run.cardId) ?? []), run.agentId])
+  const epicIds = [...new Set(cards.flatMap((c) => (c.epicCardId ? [c.epicCardId] : [])))]
+  const epicRuns = epicIds.length
+    ? await tx.kanbanRun.findMany({
+        where: { endedAt: null, card: { epicCardId: { in: epicIds } } },
+        select: { card: { select: { epicCardId: true } } }
+      })
+    : []
+  const perEpic = new Map<string, number>()
+  for (const run of epicRuns) {
+    const id = run.card.epicCardId!
+    perEpic.set(id, (perEpic.get(id) ?? 0) + 1)
+  }
+  const daemonIds = [...new Set(agentRows.flatMap((a) => (a.daemonId ? [a.daemonId] : [])))]
+  const daemonRuns =
+    opts.maxPerDaemon !== undefined && daemonIds.length
+      ? await tx.kanbanRun.groupBy({
+          by: ['daemonId'],
+          where: { endedAt: null, daemonId: { in: daemonIds } },
+          _count: true
+        })
+      : []
+  const perDaemon = new Map(daemonRuns.map((r) => [r.daemonId, r._count]))
+  const verifier = board.verifierAgentId ? (agents.get(board.verifierAgentId) ?? null) : null
+  const openTotal = openRuns.length
+
+  const explained = cards.map<ExplainedCard>((c) => {
+    const target = c.status === 'review' ? verifier : c.assigneeAgentId ? agents.get(c.assigneeAgentId) : null
+    const epicCapacity = c.epicCardId
+      ? { id: c.epicCardId, openRunCount: perEpic.get(c.epicCardId) ?? 0, maxActive: board.epicMaxActive }
+      : undefined
+    const daemonCapacity =
+      opts.maxPerDaemon !== undefined && target?.daemonId
+        ? {
+            id: target.daemonId,
+            openRunCount: perDaemon.get(target.daemonId) ?? 0,
+            maxActive: opts.maxPerDaemon
+          }
+        : undefined
+    const input: ClaimEligibilityInput = {
+      board: {
+        enabled: board.enabled,
+        verifierAgentId: board.verifierAgentId,
+        maxInProgress: board.maxInProgress,
+        maxInProgressPerAgent: board.maxInProgressPerAgent
+      },
+      card: {
+        status: c.status,
+        assigneeAgentId: c.assigneeAgentId,
+        verifiedAt: c.verifiedAt,
+        needsAttention: c.needsAttention,
+        promotionPending: c.promotionPending,
+        cooldownUntil: c.cooldownUntil,
+        notBefore: c.notBefore,
+        hasOpenLease: leased.has(c.id)
+      },
+      assignee: c.assigneeAgentId ? (agents.get(c.assigneeAgentId) ?? null) : null,
+      verifier,
+      workAgentIds: workByCard.get(c.id) ?? [],
+      ...(epicCapacity ? { epicCapacity } : {}),
+      ...(daemonCapacity ? { daemonCapacity } : {}),
+      openRunCount: openTotal,
+      openRunCountForAssignee: c.assigneeAgentId ? (openPerAgent.get(c.assigneeAgentId) ?? 0) : 0,
+      openRunCountForVerifier: board.verifierAgentId ? (openPerAgent.get(board.verifierAgentId) ?? 0) : 0,
+      now: opts.now
+    }
+    return {
+      capacities: { ...(epicCapacity ? { epicCapacity } : {}), ...(daemonCapacity ? { daemonCapacity } : {}) },
+      cardId: c.id,
+      issueNumber: c.issueNumber,
+      priority: c.priority,
+      createdAt: c.createdAt,
+      input,
+      verdict: explainClaim(input)
+    }
+  })
+  return { board, openTotal, openPerAgent, cards: explained }
 }

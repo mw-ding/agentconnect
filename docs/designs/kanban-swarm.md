@@ -22,7 +22,7 @@ Statuses: `triage, todo, ready, running, blocked, review, done, archived`. GitHu
 
 ## Dispatcher, claim, and leases
 
-Claims, reports, heartbeats, and the reaper run in `KanbanDispatcher` over `KanbanDispatchRepo`; a daemon posts the one summary after acceptance while the CP only mints its `kanban_card_write` token. Caps, cooldowns, provider-transient backoff, and the nudge protocol are in [kanban-p0-pilot.md](kanban-p0-pilot.md) §M3. Two sibling-owned seams plug in here at a high level: Lane 3's claim-eligibility predicate (`explainClaim`) powers the CP explain endpoint that tells an operator why a card is not running, and Lane 4b's `dispatch --dry-run` diagnostic reuses that predicate from the console (see [kanban-lane4-api.md](kanban-lane4-api.md) `## 4b` once it lands). The console board shows CP metadata plus live titles proxied through the CP, never persisted.
+Claims, reports, heartbeats, and the reaper run in `KanbanDispatcher` over `KanbanDispatchRepo`; a daemon posts the one summary after acceptance while the CP only mints its `kanban_card_write` token. Caps, cooldowns, provider-transient backoff, and the nudge protocol are in [kanban-p0-pilot.md](kanban-p0-pilot.md) §M3. Two sibling-owned seams plug in here at a high level: Lane 3's claim-eligibility predicate (`explainClaim`) powers the CP explain routes that tell an operator why a card is not running, and Lane 4b's console "Why isn't this running?" and `agentconnect dispatch --dry-run` read those routes (see [kanban-lane4-api.md](kanban-lane4-api.md) `## 4b`). The console board shows CP metadata plus live titles proxied through the CP, never persisted.
 
 ## Worker protocol and tools
 
@@ -51,4 +51,4 @@ M4 review routing (`review` → the board's verifier agent, `submitGithubReview`
 
 ## Known gaps
 
-History stays in [kanban-p0-pilot.md](kanban-p0-pilot.md); these are the consolidated open items: user-owned Projects v2 stay unsupported (no write path, no webhooks); Project UI edits are not reconciled: nothing reads the `Status` field back, so a human edit there stays until the card's next committed status change overwrites it; renamed Status options lag up to the field cache TTL; the console has no projection controls and no M3 attention-flag surface; the items above under M4 belong to their owning lanes.
+History stays in [kanban-p0-pilot.md](kanban-p0-pilot.md); these are the consolidated open items: user-owned Projects v2 stay unsupported (no write path, no webhooks); Project UI edits are not reconciled: nothing reads the `Status` field back, so a human edit there stays until the card's next committed status change overwrites it; renamed Status options lag up to the field cache TTL; the console has no projection controls, and its board shows M3 attention flags but cannot clear them (Lane 3's restart route); the items above under M4 belong to their owning lanes.

@@ -103,6 +103,18 @@ export interface GithubRequestOpts {
   sleep?: (ms: number) => Promise<void>
   /** The caller vouches this POST has no effect (a GraphQL query), so it repeats like a GET. */
   idempotent?: boolean
+  /** Send `If-None-Match` on a GET; a held validator answers 304 as `GithubNotModified`. */
+  etag?: string
+  /** `manual` surfaces a 3xx as a `GithubApiError` carrying its status instead of following it. */
+  redirect?: 'follow' | 'manual'
+}
+
+/** A conditional GET whose validator still holds: the caller's cached copy is fresh (HTTP 304). */
+export class GithubNotModified extends Error {
+  constructor() {
+    super('github not modified')
+    this.name = 'GithubNotModified'
+  }
 }
 
 // A GET is the one verb safe to repeat blind; every write's retry belongs to its caller's fenced, marker-first loop.
@@ -124,6 +136,8 @@ export interface GithubPage<T> {
   /** Next page as a path under the SAME base — a `next` pointing anywhere else
    *  is dropped rather than followed. */
   nextPath?: string
+  /** The response validator for a later conditional GET, when the server sent one. */
+  etag?: string | null
 }
 
 /** `rel="next"` from a Link header, relative to `baseUrl`. */
@@ -167,16 +181,20 @@ async function githubRequestOnce<T>(path: string, opts: GithubRequestOpts): Prom
         accept: 'application/vnd.github+json',
         'x-github-api-version': '2022-11-28',
         ...(opts.auth ? { authorization: `Bearer ${opts.auth}` } : {}),
-        ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {})
+        ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
+        ...(opts.etag ? { 'if-none-match': opts.etag } : {})
       },
       body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-      signal: AbortSignal.timeout(TIMEOUT_MS)
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+      ...(opts.redirect ? { redirect: opts.redirect } : {})
     })
   } catch (e) {
     const unreachable = new GithubApiError(`github unreachable: ${(e as Error).message}`, 0, 'INTERNAL', true)
     unreachable.cause = e // the read-retry loop tells a timeout from a reset by it
     throw unreachable
   }
+  // A held validator: no body to parse, and the retry loop must not repeat it (it is not a GithubApiError).
+  if (res.status === 304) throw new GithubNotModified()
   if (res.ok) {
     const text = await res.text()
     const nextPath = nextPathFrom(res.headers.get('link'), opts.baseUrl ?? API_BASE)
@@ -184,7 +202,8 @@ async function githubRequestOnce<T>(path: string, opts: GithubRequestOpts): Prom
     // Only `id` keys with ≥15 digits are re-quoted — small numeric ids
     // (repositories, installations) stay numbers for existing callers.
     const safe = opts.bigIdsAsStrings ? text.replace(/"id"\s*:\s*(\d{15,})/g, '"id":"$1"') : text
-    return { data: JSON.parse(safe) as T, ...(nextPath ? { nextPath } : {}) }
+    const etag = res.headers.get('etag')
+    return { data: JSON.parse(safe) as T, ...(nextPath ? { nextPath } : {}), ...(etag ? { etag } : {}) }
   }
 
   // Read the message for diagnostics; GitHub error bodies carry no secrets.

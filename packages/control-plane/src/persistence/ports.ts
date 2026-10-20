@@ -1,6 +1,8 @@
 // Lightweight repository ports: services and edges depend on these interfaces, never Prisma models.
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type { KanbanStatus } from '../kanban/card-state.js'
+import type { ClaimEligibilityInput, ClaimVerdict } from '../kanban/claim-eligibility.js'
+import type { ClaimCapGate } from '../kanban/claim-explain.js'
 import type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 export type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 import type {
@@ -8138,6 +8140,77 @@ export interface KanbanDispatchRepo {
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
   /** Open runs for one agent on one daemon: the repos whose daemon grants must follow the run mode. */
   openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+  /** Read-only dry run of the claim for one card; null when the card is not on the board. No locks, no writes. */
+  explainCard(boardId: string, cardId: string, opts: KanbanExplainOpts): Promise<KanbanCardExplanation | null>
+  /** Read-only dry run for every non-terminal card plus the ordered ids the claim would take now; null for a missing board. */
+  explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null>
+  /** Body-free metadata of up to `limit` cards of one board (console board view), plus the board's total card count. */
+  listBoardCards(
+    boardId: string,
+    limit: number,
+    numbers?: readonly number[]
+  ): Promise<{ cards: KanbanBoardCardRow[]; total: number }>
+  /** Which of these issue numbers are cards of this board; the titles route reads only those. */
+  cardNumbersOnBoard(boardId: string, numbers: readonly number[]): Promise<number[]>
+}
+
+/** One card as the console board lists it: CP metadata only, never a title; the assignee's name comes from the agent table. */
+export interface KanbanBoardCardRow {
+  id: string
+  issueNumber: number
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  assigneeName: string | null
+  assigneeDisplayName: string | null
+  priority: number
+  /** The card's own override; null inherits the board default. */
+  mode: 'read' | 'write' | null
+  needsAttention: boolean
+  attentionReason: string | null
+  blockKind: KanbanBlockKind | null
+  consecutiveFailures: number
+  protocolViolations: number
+  blockRecurrence: number
+  cooldownUntil: Date | null
+  notBefore: Date | null
+  promotionPending: boolean
+  linkedPrNumber: number | null
+  stateRevision: bigint
+  openRun: {
+    attempt: number
+    agentId: string
+    dispatchedAt: Date
+    ackedAt: Date | null
+    heartbeatAt: Date | null
+  } | null
+}
+
+export interface KanbanExplainOpts {
+  /** The same cross-board daemon cap the dispatcher passes to claim. */
+  maxPerDaemon?: number
+  now: Date
+  /** The SAME liveness check the dispatcher hands the claim, so a daemon is online here exactly when the claim sees it so. */
+  isDaemonLive(daemonId: string): boolean
+}
+
+/** One card's claim facts and verdict. Body-free: ids, status and metadata, never an issue title. */
+export interface KanbanCardExplanation {
+  cardId: string
+  issueNumber: number
+  input: ClaimEligibilityInput
+  verdict: ClaimVerdict
+  /** 1-based position in `wouldClaimNext` (board explain only). */
+  claimOrder?: number
+  /** Eligible, but earlier cards fill a cap first (board explain only). */
+  capBound?: ClaimCapGate
+}
+
+export interface KanbanBoardExplanation {
+  boardId: string
+  now: Date
+  cards: KanbanCardExplanation[]
+  /** Card ids the claim would take now, in order, with caps applied cumulatively. */
+  wouldClaimNext: string[]
 }
 
 // ── Kanban notifications (M4) — a body-free outbox drained to the board's anchor channel ──

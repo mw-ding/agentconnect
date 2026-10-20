@@ -166,7 +166,19 @@ async function expectParity(
   const repo = new PgKanbanDispatchRepo(prisma)
   const snapshots = new Map<string, ClaimEligibilityInput>()
   for (const c of Object.values(cards)) snapshots.set(c.id, await factsFor(boardId, c.id, maxPerDaemon))
+  const boardExplanation = (await repo.explainBoard(boardId, {
+    now: NOW,
+    isDaemonLive: (id) => LIVE.has(id),
+    maxPerDaemon
+  }))!
+  for (const c of Object.values(cards)) {
+    expect(boardExplanation.cards.find((e) => e.cardId === c.id)!.verdict).toEqual(explainClaim(snapshots.get(c.id)!))
+    expect(
+      (await repo.explainCard(boardId, c.id, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!.verdict
+    ).toEqual(explainClaim(snapshots.get(c.id)!))
+  }
   const claimed = await repo.claim(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon })
+  expect(boardExplanation.wouldClaimNext).toEqual(claimed.leases.map((l) => l.cardId))
   const leases = new Map(claimed.leases.map((l) => [l.cardId, l]))
   for (const [name, c] of Object.entries(cards)) {
     const verdict = explainClaim(snapshots.get(c.id)!)
@@ -177,6 +189,17 @@ async function expectParity(
     ).toBe(true)
     if (verdict.eligible) expect(verdict, name).toEqual({ eligible: true, role: lease!.role, agentId: lease!.agentId })
     expect(verdict.eligible ? 'eligible' : verdict.gate, name).toBe(expected[name])
+  }
+  for (const flagged of claimed.flaggedSelfVerify) {
+    expect(
+      (await repo.explainCard(boardId, flagged.cardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!
+        .verdict
+    ).toEqual({ eligible: false, gate: 'needs_attention' })
+    expect(
+      (await repo.explainBoard(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!.cards.find(
+        (entry) => entry.cardId === flagged.cardId
+      )!.verdict
+    ).toEqual({ eligible: false, gate: 'needs_attention' })
   }
   return claimed
 }

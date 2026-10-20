@@ -85,6 +85,7 @@ import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconcile
 import { GithubCardStore } from './kanban/card-store.js'
 import { kanbanProjectHook, KanbanProjectWriter } from './kanban/project-writer.js'
 import { kanbanTokenSource } from './kanban/tokens.js'
+import { githubKanbanTitleSource } from './kanban/card-titles.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanOrchestrator } from './kanban/orchestrator.js'
@@ -2213,7 +2214,8 @@ export function buildContainer(
       webchatMcpOperation: repos.webchatMcpOperation,
       oauth: repos.oauth,
       kanbanMode: repos.kanbanBoard,
-      kanbanBoards: repos.kanbanBoard
+      kanbanBoards: repos.kanbanBoard,
+      kanbanDispatch: repos.kanbanDispatch
     },
     registry,
     agentSpecs,
@@ -2257,6 +2259,15 @@ export function buildContainer(
     resolvePublicRepo: createPublicRepoResolver(),
     trustedActors,
     ...(github ? { github } : {}),
+    ...(kanbanTokens
+      ? {
+          kanbanTitles: githubKanbanTitleSource({
+            installations: repos.githubInstallation,
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          })
+        }
+      : {}),
     ...(gitlab ? { gitlab } : {}),
     gitea,
     ...(pullRequestView ? { pullRequestView } : {}),
@@ -3416,6 +3427,7 @@ export function httpServerConfigFrom(
     ...(config.PUBLIC_CP_URL ? { PUBLIC_CP_URL: config.PUBLIC_CP_URL } : {}),
     ...(config.OPENAPI_PATH_PREFIX ? { OPENAPI_PATH_PREFIX: config.OPENAPI_PATH_PREFIX } : {}),
     ...(config.PUBLIC_MCP_URL ? { PUBLIC_MCP_URL: config.PUBLIC_MCP_URL } : {}),
+    KANBAN_MAX_IN_PROGRESS_PER_DAEMON: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON,
     ...(config.DAEMON_DIST_TAG ? { DAEMON_DIST_TAG: config.DAEMON_DIST_TAG } : {}),
     ...(config.OIDC_ISSUER ? { OIDC_ISSUER: config.OIDC_ISSUER } : {}),
     ...(config.LOGTO_MGMT_ENDPOINT ? { OIDC_UPSTREAM: config.LOGTO_MGMT_ENDPOINT } : {}),

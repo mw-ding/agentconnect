@@ -14,6 +14,7 @@ import {
 } from './route.js'
 import { cliCommand, setInvocation } from './invocation.js'
 import { runLogin } from './login.js'
+import { dispatchErrorMessage, runDispatchCommand } from './dispatch-dry-run.js'
 import {
   controllerFor,
   isElevated,
@@ -289,6 +290,30 @@ async function main(): Promise<void> {
         process.exit(0)
       } catch (err) {
         fail('login', err)
+      }
+    })
+
+  // "Why isn't this card running?": a read-only explain against the Control Plane; dispatch itself stays server-side.
+  program
+    .command('dispatch')
+    .description(
+      'Explain Kanban dispatch decisions (read-only; requires --dry-run and a personal API key via --api-key or AGENTCONNECT_API_KEY — the daemon key saved by login is refused)'
+    )
+    .option('--board <id>', 'Kanban board id')
+    .option('--card <id>', 'explain one card by id')
+    .option('--issue <n>', 'explain one card by its issue number')
+    .option('--org <id|slug>', 'organization id or slug (default: the key’s only organization)')
+    .option('--json', 'print the control plane’s JSON')
+    .action(async (o: { board?: string; card?: string; issue?: string; org?: string; json?: boolean }) => {
+      const global = program.opts()
+      try {
+        await runDispatchCommand(
+          { ...o, root, dryRun: global.dryRun, config: global.config, apiUrl: global.apiUrl, apiKey: global.apiKey },
+          { fetch, out: (line) => console.log(line) }
+        )
+        process.exit(0)
+      } catch (err) {
+        fail('dispatch', new Error(dispatchErrorMessage(err)))
       }
     })
 
