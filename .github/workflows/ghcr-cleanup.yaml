@@ -3,9 +3,6 @@ name: GHCR Cleanup
 # Prunes aged-out release candidates and unreferenced manifests from the packages this repository publishes.
 
 on:
-  schedule:
-    # Daily keeps each run within the GITHUB_TOKEN rate limit and the action's manifest cache warm.
-    - cron: '17 3 * * *'
   workflow_dispatch:
 
 permissions: {}
