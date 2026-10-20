@@ -12,6 +12,7 @@ import { observedCardStatus, parseStatusLabels, planStatusWrite, isStatusLabel }
 import { attestHumanAuthority } from './human-authority.js'
 import { doorbellAddVisible, labelAddedByWriter, latestTransferEvent } from './label-attribution.js'
 import type { KanbanIssueDoorbell } from './graph-doorbell.js'
+import type { KanbanProjectHook } from './project-writer.js'
 import {
   isAppActor,
   isHumanActor,
@@ -33,6 +34,8 @@ export interface KanbanImporterDeps {
   appSlug?: string
   log?: { warn: (obj: unknown, msg?: string) => void }
   now?: () => Date
+  /** Post-commit Projects v2 seam: an imported card's initial status is queued there (never throws). */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
 }
 
 /** How long a live writer's not-yet-visible doorbell add keeps an import retrying before it imports as triage. */
@@ -100,6 +103,7 @@ export class KanbanImporter {
       ...(authority ? { syncEventCursor: BigInt(latestManagedEdits(authority.events).status?.id ?? 0) } : {}),
       ...(kept ? { humanAuthority: authority.human } : {})
     })
+    this.deps.project?.onStatusCommitted({ boardId: board.id, issueNumber, issueNodeId: issue.nodeId })
     return true
   }
 

@@ -1003,6 +1003,31 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     expect(calls()).toBe(3)
   })
 
+  it('mints the Kanban project token with organization_projects:write, scoped by repo id on its own cache key', async () => {
+    const clock = new FakeClock(1_700_000_000_000)
+    const { svc, bodies, calls } = levelsService(clock)
+
+    const first = await svc.mintKanbanProject(IID, 'acme/tools', 777n)
+    expect(first.access).toBe('read')
+    // metadata:read always rides along; organization_projects:write is never dropped or clamped.
+    expect(bodies[0]).toEqual({
+      repository_ids: [777],
+      permissions: { metadata: 'read', organization_projects: 'write', issues: 'read' }
+    })
+
+    // Same call hits the cache — no second mint.
+    await svc.mintKanbanProject(IID, 'acme/tools', 777n)
+    expect(calls()).toBe(1)
+
+    // The kanban_card read grant is issues:read on the same repo but a different purpose — a distinct entry.
+    await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'read')
+    expect(calls()).toBe(2)
+    expect(bodies[1]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', issues: 'read' } })
+    await svc.mintKanbanProject(IID, 'acme/tools', 777n)
+    await svc.mintKanbanCard(IID, 'acme/tools', 777n, 'read')
+    expect(calls()).toBe(2)
+  })
+
   it('mints Kanban run and poster tokens with a valid App JWT, then refreshes after the fresh window', async () => {
     const clock = new FakeClock(1_700_000_000_000)
     const bodies: unknown[] = []

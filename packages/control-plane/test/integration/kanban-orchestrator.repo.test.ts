@@ -246,3 +246,27 @@ describe('PgKanbanOrchestratorRepo (B2 epic budgets)', () => {
     }
   })
 })
+
+it('vera-474r2: epic adoption and its replay retain the project item cache', async () => {
+  const board = await prisma.kanbanBoard.create({
+    data: { orgId: DEFAULT_ORG_ID, name: 'projection-cache', repoId: REPO_ID, repoFullName: 'acme/web' }
+  })
+  const repo = new PgKanbanOrchestratorRepo(prisma)
+  const input = { boardId: board.id, upsert: upsert(board.id, 1, 'cached') }
+  const first = await repo.createEpicChild(input)
+  expect(first.ok).toBe(true)
+  if (!first.ok) throw new Error('create refused')
+  await prisma.kanbanCard.update({
+    where: { id: first.card.id },
+    data: { projectItemId: 'PVTI_cached', projectItemProjectId: 'PVT_board' }
+  })
+  await repo.createEpicChild({ boardId: board.id, upsert: upsert(board.id, 2, 'epic') })
+  for (const changed of [true, false]) {
+    const adopted = await repo.adoptEpic({ cardId: first.card.id, epicIssueNumber: 2 })
+    expect(adopted).toMatchObject({
+      ok: true,
+      changed,
+      card: { projectItemId: 'PVTI_cached', projectItemProjectId: 'PVT_board' }
+    })
+  }
+})

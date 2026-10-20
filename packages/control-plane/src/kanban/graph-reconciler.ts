@@ -2,6 +2,7 @@
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
 import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 export interface GraphReconcilerLog {
   debug(obj: unknown, msg?: string): void
@@ -17,6 +18,8 @@ export interface KanbanGraphReconcilerDeps {
   log: GraphReconcilerLog
   /** Defaults to the wall clock; stamps when the promotion intent opened, for the recovery age cap. */
   clock?: { now(): number }
+  /** Post-commit Projects v2 seam: a settled promotion (ready) or its rollback (todo) is queued there. */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
 }
 
 export type GraphPromotion = 'promote' | 'none'
@@ -78,13 +81,17 @@ export class KanbanGraphReconciler {
         // Only an acknowledged POST lets recovery treat an App ready-add in the window as ours.
         if (label === statusLabel('ready')) await this.deps.cards.notePromotionPosted(card.id)
       })
-      if (!(await this.deps.cards.clearPromotionIntent(card.id))) {
+      if (await this.deps.cards.clearPromotionIntent(card.id)) {
+        this.deps.project?.onStatusCommitted({ boardId: board.id, issueNumber, issueNodeId: observed.nodeId })
+      } else {
         this.deps.log.debug({ boardId: board.id, issueNumber }, 'kanban: promotion intent clear lost')
       }
     } catch (err) {
       // Whatever landed, recovery judges the cursor window; the intent keeps the card unclaimable until then.
       const revertedAt = new Date(this.deps.clock?.now() ?? Date.now())
-      await this.deps.cards.revertPromotion(card.id, revision, revertedAt).catch(() => false)
+      if (await this.deps.cards.revertPromotion(card.id, revision, revertedAt).catch(() => false)) {
+        this.deps.project?.onStatusCommitted({ boardId: board.id, issueNumber, issueNodeId: observed.nodeId })
+      }
       throw err
     }
   }

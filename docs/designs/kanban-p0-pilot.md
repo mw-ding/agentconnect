@@ -5,6 +5,8 @@
 
 Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2) §9 Phase 0 — validate board UX and worker prompts using GitHub labels and existing GitHub hooks, before Kanban MCP tools and control-plane automation land in later milestones.
 
+Consolidated as-built design: [kanban-swarm.md](kanban-swarm.md) (this pilot doc stays the history).
+
 ## What P0 is
 
 - A **board repo** whose issues are cards; **humans** move cards by adding/removing labels.
@@ -596,6 +598,11 @@ the newer visible label event through the normal attribution path.
 An agent using a writer's own host `gh` credentials is indistinguishable from
 that human (the shared-GitHub-login limit): label attribution trusts the events
 API's actor, which reports the credential's login, not the process behind it.
+
+Known gaps update (M5 projection): every committed status change now reaches the
+Projects v2 `Status` field, but the mirror stays one-way. Edits made in the
+Project UI are not reconciled; the card's next committed status change overwrites
+them. Contract: [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
 
 Known gaps (M3 orchestrator): the orchestrator tools (kanbanList/Create/Link/
 Unblock/Assign) are role-gated on `board.orchestratorAgentId`. The daemon files

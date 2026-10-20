@@ -93,7 +93,9 @@ async function harness(
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
+  const project = { onStatusCommitted: vi.fn() }
   const dispatcher = new KanbanDispatcher({
+    project,
     repo,
     installations: {
       liveByOrgAndAccount: async (orgId, login) =>
@@ -145,7 +147,7 @@ async function harness(
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, log, sent, repo, dispatcher, addCard, reviewCard, reportFor, card, run }
+  return { board, clock, store, log, sent, repo, dispatcher, project, addCard, reviewCard, reportFor, card, run }
 }
 
 describe('Kanban verifier routing (real Postgres)', () => {
@@ -630,4 +632,43 @@ describe('Kanban transition outbox (real Postgres)', () => {
     expect(await h.repo.ingestStatus(h.board.id, c.issueNumber, 'review', 'blocked')).toMatchObject({ moved: true })
     expect(await rows(c.id)).toEqual([])
   })
+})
+
+it('vera-474 cutover: M4 review, changes-requested and round-limit commits each project once', async () => {
+  const h = await harness()
+  const c = await h.addCard()
+  // Suppress report pokes so each committed transition can be asserted before the next claim.
+  h.dispatcher.stop()
+  for (let round = 1; round <= 3; round++) {
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('running')
+    h.project.onStatusCommitted.mockClear()
+    const work = h.sent.at(-1)!.d
+    await h.dispatcher.onReport(D1, 4, h.reportFor(work, { outcome: 'review_requested' }))
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('review')
+    expect(h.project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({
+      boardId: h.board.id,
+      issueNumber: c.issueNumber
+    })
+    h.project.onStatusCommitted.mockClear()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const verify = h.sent.at(-1)!.d
+    expect(verify.role).toBe('verify')
+    expect(h.project.onStatusCommitted).not.toHaveBeenCalled()
+    const report = h.reportFor(verify, { outcome: 'changes_requested' })
+    await h.dispatcher.onReport(D2, 2, report)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: round < 3 ? 'ready' : 'triage', consecutiveFailures: 0 })
+    expect(h.project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({
+      boardId: h.board.id,
+      issueNumber: c.issueNumber
+    })
+    h.project.onStatusCommitted.mockClear()
+    await h.dispatcher.onReport(D2, 2, report)
+    await h.dispatcher.settle()
+    expect(h.project.onStatusCommitted).not.toHaveBeenCalled()
+  }
 })
