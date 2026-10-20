@@ -107,8 +107,6 @@ describe('claimFactsOf', () => {
       status: 'ready',
       assigneeAgentId: 'a1',
       promotionPending: false,
-      controlWritePending: false,
-      labelWritePending: false,
       cooldownUntil: cooldown.toISOString(),
       notBefore: null,
       hasOpenLease: true,
