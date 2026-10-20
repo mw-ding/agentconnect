@@ -2417,15 +2417,48 @@ export class WorkspaceManager {
           await git().raw(['worktree', 'remove', path])
         }
       }
-      // No upstream: pushing the card must not target the repository's default branch.
+      // A card branch pushed from another clone or daemon resumes from origin; no upstream, so a push never targets the default branch.
+      const start = exists
+        ? undefined
+        : ((await this.fetchRemoteCardBranch(agentId, root, root.path, branch)) ?? target)
       await git().raw(
-        exists ? ['worktree', 'add', cwd, branch] : ['worktree', 'add', '-b', branch, '--no-track', cwd, target]
+        start === undefined
+          ? ['worktree', 'add', cwd, branch]
+          : ['worktree', 'add', '-b', branch, '--no-track', cwd, start]
       )
       return
     }
     const name = await this.drawSessionBranch(git(), initiatedBy)
     // No upstream: the console's push authorization must never treat the base branch as the session's target.
     await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
+  }
+
+  /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
+  private async fetchRemoteCardBranch(
+    agentId: string,
+    root: WorkspaceRoot,
+    path: string,
+    branch: string,
+    blobless = false
+  ): Promise<string | undefined> {
+    if (root.githubApp) await preWarmGitCred(agentId, 'pull', additionalRepositoryOf(root))
+    const remote = workspaceGitRemoteTarget(root.cloneUrl, root.githubApp ? agentId : undefined, root.managed, {
+      blobless
+    })
+    const git = this.runnerFor(agentId, path).withEnv(blobless ? { ...remote.env, GIT_NO_LAZY_FETCH: '0' } : remote.env)
+    const listed = await git.raw(['ls-remote', '--heads', remote.remote, `refs/heads/${branch}`])
+    if (listed.trim() === '') return undefined
+    const tracking = `refs/remotes/origin/${branch}`
+    await git.raw([
+      'fetch',
+      '--force',
+      '--no-tags',
+      '--no-recurse-submodules',
+      ...(blobless ? [`--filter=${SESSION_CLONE_FILTER}`] : []),
+      remote.remote,
+      `+refs/heads/${branch}:${tracking}`
+    ])
+    return tracking
   }
 
   /** A session branch name no ref in the repository `git` runs in blocks — word pairs first, random bytes once the draws are spent; only a printed ref counts, since a miss exits 1 silently, which one runner resolves and the other throws. */
@@ -2919,7 +2952,10 @@ export class WorkspaceManager {
         .raw(['show-ref', '--verify', `refs/heads/${branch}`])
         .then(() => true)
         .catch(() => false)
-      if (!exists) await git.raw(['branch', '--no-track', branch, target])
+      if (!exists) {
+        const start = (await this.fetchRemoteCardBranch(agentId, root, cwd, branch, true)) ?? target
+        await git.raw(['branch', '--no-track', branch, start])
+      }
     } else {
       await git.raw(['branch', '--no-track', name, target])
     }

@@ -17580,7 +17580,13 @@ export class Daemon {
           launchWorkspaceCwd = await this.prepareAgentWorkspace(currentAgent, undefined, {
             sessionKey: key,
             isolation: 'session',
-            initiatedBy: await sessionInitiatedBy((ids) => this.store.getDisplayNames(ids), persisted?.triggeredBy, msg)
+            initiatedBy: await sessionInitiatedBy(
+              (ids) => this.store.getDisplayNames(ids),
+              persisted?.triggeredBy,
+              msg
+            ),
+            // A write card's first preparation fixes the clone's branch, so it must name the card branch too.
+            ...(entry.kanban?.mode === 'write' ? { branch: kanbanCardBranch(entry.kanban.issueNumber) } : {})
           })
         }
         entry.selectedHost = await this.modelSessions.ensure(currentAgent, key, firstTurnModel)

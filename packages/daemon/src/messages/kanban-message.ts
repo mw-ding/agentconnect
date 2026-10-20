@@ -36,7 +36,7 @@ export function buildKanbanText(d: KanbanDispatch): string {
   }
   const mode =
     d.mode === 'write'
-      ? `Mode: write. You may change code in this session worktree and open a pull request that references the issue. Your worktree is on branch \`${kanbanCardBranch(d.issueNumber)}\`, created on first use and reused on later attempts.`
+      ? `Mode: write. You may change code in this session worktree and open a pull request that references the issue. Your worktree is on branch \`${kanbanCardBranch(d.issueNumber)}\`, created on first use and reused on later attempts. If the AgentConnect App's restart comment on the issue names a pull request from earlier work, that pull request can no longer complete the card: close it if it is still open (\`gh pr close <number> -R ${d.repoFullName}\`) and open a new one from \`${kanbanCardBranch(d.issueNumber)}\`.`
       : 'Mode: read-only. Do not commit, push, or open pull requests; investigate and report findings only.'
   return [
     `AgentConnect Kanban dispatched card ${ref} to you (attempt ${d.attempt}).`,

@@ -693,6 +693,26 @@ export class KanbanDispatcher {
     this.background.add(task)
   }
 
+  /** Hold the card's status-write queue for an outside post-commit GitHub write; a claim reads GitHub only once `release` has run it. */
+  holdStatusWrite(cardId: string): (write?: () => Promise<void>) => Promise<void> {
+    let open!: (write: (() => Promise<void>) | undefined) => void
+    const held = new Promise<(() => Promise<void>) | undefined>((resolve) => (open = resolve))
+    const task = (this.statusWrites.get(cardId) ?? Promise.resolve())
+      .then(() => held)
+      .then((write) => write?.())
+      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: held status write failed'))
+      .finally(() => {
+        this.background.delete(task)
+        if (this.statusWrites.get(cardId) === task) this.statusWrites.delete(cardId)
+      })
+    this.statusWrites.set(cardId, task)
+    this.background.add(task)
+    return (write) => {
+      open(write)
+      return task
+    }
+  }
+
   /** The board's repository with its installation resolved live; null when the board or installation is gone. */
   boardRepo(boardId: string): Promise<KanbanRepoRef | null> {
     return this.boardRepoRef(boardId)

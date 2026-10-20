@@ -145,7 +145,9 @@ timeout reads the committed revocation before testing its lease fence.
 
 `reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
 `triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
-approval resets it; a worker's pass and every human move keep it. So after a trip, a human
+approval resets it; a worker's pass and every human status move keep it. The one exception
+is the owner-only restart control, which resets it to 0 together with the rest of the
+card's failure state and starts a new work episode. So after a trip, a human
 who moves the card back to `ready` buys exactly **one more verify round**: the worker runs,
 the verifier reviews once, and a further `changes_requested` (round 4) sends the card straight
 back to `triage`, while an approval ends the loop and resets the count. This is deliberate:
@@ -497,9 +499,10 @@ intent + idempotent label-write pattern as graph promotion, replacing prior
 ### Write-card branch (B3)
 
 A WRITE-mode Kanban run for issue #n checks out its session worktree on branch
-`ac/card-<n>`, created from the repository's default branch on first use and
-reused on later attempts and after a restart; it is never reused for another
-card. The branch name comes from `kanbanCardBranch` in
+`ac/card-<n>`, reused on later attempts and after a restart, and never used for
+another card. On first use in a clone or worktree, it starts from `origin`'s
+`ac/card-<n>` when an earlier attempt pushed one, and from the repository's
+default branch otherwise. The branch name comes from `kanbanCardBranch` in
 `packages/daemon/src/kanban/card-branch.ts` and is told to the worker in the
 kanban prompt. Read-mode runs are unchanged.
 
@@ -511,6 +514,5 @@ notifications. Headless boards and status self-moves stay silent.
 For `ac/card-<n>`, an existing checked-out worktree is never detached or deleted
 by a competing session. Removed daemon session registrations can be pruned and
 the branch reused, preserving committed progress. Existing directories require
-explicit retirement before another session can acquire their branch. A confined
-session's clone keeps the branch locally; separate clones do not share unpushed
-commits.
+explicit retirement before another session can acquire their branch. A local
+branch is preferred over `origin`'s. Separate clones share only what was pushed.

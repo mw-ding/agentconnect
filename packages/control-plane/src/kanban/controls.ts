@@ -18,15 +18,25 @@ export function skipComment(login: string | null): string {
   return login ? `skipped by @${login} via AgentConnect` : 'skipped via AgentConnect'
 }
 
-export function restartComment(): string {
-  return 'restarted via AgentConnect'
+export function restartComment(issueNumber: number, supersededPrNumber: number | null): string {
+  if (supersededPrNumber === null) return 'restarted via AgentConnect'
+  return (
+    `restarted via AgentConnect; pull request #${supersededPrNumber} from the earlier work can no longer complete ` +
+    `this card, so close it if it is still open and open a new one from \`ac/card-${issueNumber}\``
+  )
 }
+
+/** Releases a held status-write slot, running `write` (if any) in it; resolves once the slot has drained. */
+type StatusWriteRelease = (write?: () => Promise<void>) => Promise<void>
 
 export interface KanbanControlsDeps {
   boards: KanbanBoardAdminRepo
   cards: KanbanCardControlRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  store: Pick<CardStore, 'readCard' | 'applyPlan'>
+  /** The GitHub card store; without one (no GitHub App) only pause and resume are available. */
+  store?: Pick<CardStore, 'readCard' | 'applyPlan'>
+  /** The dispatcher's per-card status-write queue, held across the DB write so no claim reads GitHub before the control's write lands. */
+  gate?: { holdStatusWrite(cardId: string): StatusWriteRelease }
   /** Resolve the acting user's GitHub login for the body-free skip comment; undefined or null ⇒ no login in the comment. */
   resolveLogin?: (userId: string) => Promise<string | null>
   poke(boardId: string): void
@@ -52,25 +62,71 @@ export class KanbanControls {
   }
 
   async skip(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
-    const result = await this.deps.cards.skipCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' })
-    if (!result.ok || !result.value.changed) return result
-    await this.committed(boardId, result.value)
-    const login = this.deps.resolveLogin ? await this.deps.resolveLogin(userId).catch(() => null) : null
-    await this.writeIssue(result.value, 'archived', skipComment(login))
-    return result
+    const store = this.cardStore()
+    return this.control(
+      boardId,
+      cardId,
+      () => this.deps.cards.skipCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' }),
+      async (card) => {
+        const login = this.deps.resolveLogin ? await this.deps.resolveLogin(userId).catch(() => null) : null
+        await this.writeIssue(store, card, 'archived', skipComment(login))
+      }
+    )
   }
 
   async restart(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
-    const result = await this.deps.cards.restartCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' })
-    if (!result.ok || !result.value.changed) return result
-    await this.committed(boardId, result.value)
-    await this.writeIssue(result.value, 'ready', restartComment())
-    this.deps.poke(boardId)
+    const store = this.cardStore()
+    const result = await this.control(
+      boardId,
+      cardId,
+      () => this.deps.cards.restartCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' }),
+      (card) => this.writeIssue(store, card, 'ready', restartComment(card.issueNumber, card.supersededPrNumber))
+    )
+    if (result.ok && result.value.changed) this.deps.poke(boardId)
     return result
   }
 
-  private async committed(boardId: string, card: KanbanCardControlOutcome): Promise<void> {
-    if (card.from !== card.status) this.deps.project?.onStatusCommitted({ boardId, issueNumber: card.issueNumber })
+  /** Skip and restart write the GitHub issue, so they need the card store; without one their routes answer unavailable. */
+  get cardControlsAvailable(): boolean {
+    return this.deps.store !== undefined
+  }
+
+  private cardStore(): NonNullable<KanbanControlsDeps['store']> {
+    if (!this.deps.store) throw new Error('kanban card controls need a GitHub card store')
+    return this.deps.store
+  }
+
+  /** Hold the card's status-write slot across the DB move, write GitHub in it, and revoke the old lease alongside, never ahead of it. */
+  private async control(
+    boardId: string,
+    cardId: string,
+    move: () => Promise<KanbanCardControlResult>,
+    write: (card: KanbanCardControlOutcome) => Promise<void>
+  ): Promise<KanbanCardControlResult> {
+    const release: StatusWriteRelease = this.deps.gate?.holdStatusWrite(cardId) ?? ((w) => w?.() ?? Promise.resolve())
+    let card: KanbanCardControlOutcome | undefined
+    try {
+      const result = await move()
+      if (result.ok && result.value.changed) card = result.value
+      return result
+    } finally {
+      const changed = card
+      if (changed && changed.from !== changed.status) this.projectCommitted(boardId, changed)
+      const revoking = changed ? this.revokeLease(changed) : undefined
+      await release(changed ? () => write(changed) : undefined)
+      await revoking
+    }
+  }
+
+  private projectCommitted(boardId: string, card: KanbanCardControlOutcome): void {
+    try {
+      this.deps.project?.onStatusCommitted({ boardId, issueNumber: card.issueNumber })
+    } catch (err) {
+      this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: projection hook failed')
+    }
+  }
+
+  private async revokeLease(card: KanbanCardControlOutcome): Promise<void> {
     if (!card.revokedLease || !this.deps.revoke) return
     await this.deps.revoke(card.revokedLease, card.cardId).catch((err: unknown) => {
       this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: immediate revocation failed; the fence still holds')
@@ -78,13 +134,18 @@ export class KanbanControls {
   }
 
   /** Best-effort label/close + comment after the DB write committed; a failure leaves drift for the reconciler. */
-  private async writeIssue(card: KanbanCardControlOutcome, status: KanbanStatus, comment: string): Promise<void> {
-    const repo = await this.repoRef(card)
-    if (!repo) return
+  private async writeIssue(
+    store: NonNullable<KanbanControlsDeps['store']>,
+    card: KanbanCardControlOutcome,
+    status: KanbanStatus,
+    comment: string
+  ): Promise<void> {
     try {
-      const observed = await this.deps.store.readCard(repo, card.issueNumber)
+      const repo = await this.repoRef(card)
+      if (!repo) return
+      const observed = await store.readCard(repo, card.issueNumber)
       if (!observed) return
-      await this.deps.store.applyPlan(repo, card.issueNumber, observed, {
+      await store.applyPlan(repo, card.issueNumber, observed, {
         ...planStatusWrite(status, observed),
         comment
       })

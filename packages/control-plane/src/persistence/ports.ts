@@ -8558,6 +8558,8 @@ export interface KanbanCardControlOutcome {
   repoFullName: string
   /** The open lease this write ended as `reclaimed` (dispatchRevision already bumped); null when none. */
   revokedLease: KanbanLeaseRef | null
+  /** The PR a restart unlinked from the ended work episode, which can no longer complete the card; null when none. */
+  supersededPrNumber: number | null
 }
 
 export type KanbanCardControlRefusal = 'not_found' | 'illegal_transition'

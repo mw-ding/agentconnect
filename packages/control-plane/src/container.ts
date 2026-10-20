@@ -1957,23 +1957,22 @@ export function buildContainer(
       })
     : undefined
 
-  // Human controls (issue #2 B5): the DB writes live in the repos; this wraps the GitHub close/reopen + comment.
-  const kanbanControls = kanbanCardStore
-    ? new KanbanControls({
-        boards: repos.kanbanBoard,
-        cards: repos.kanbanCard,
-        installations: repos.githubInstallation,
-        store: kanbanCardStore,
-        resolveLogin: async (userId) =>
-          (await prisma.githubRepoIdentity.findFirst({ where: { userId }, select: { login: true } }))?.login ?? null,
-        poke: (boardId) => kanbanDispatcher?.poke(boardId),
-        revoke: async (lease, cardId) => {
-          await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
-        },
-        ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {}),
-        log: { warn: (o, m) => http.log.warn(o, m) }
-      })
-    : undefined
+  // Human controls (issue #2 B5): pause/resume need no GitHub; skip/restart also need the card store for the issue write.
+  const kanbanControls = new KanbanControls({
+    boards: repos.kanbanBoard,
+    cards: repos.kanbanCard,
+    installations: repos.githubInstallation,
+    ...(kanbanCardStore ? { store: kanbanCardStore } : {}),
+    ...(kanbanDispatcher ? { gate: kanbanDispatcher } : {}),
+    resolveLogin: async (userId) =>
+      (await prisma.githubRepoIdentity.findUnique({ where: { userId }, select: { login: true } }))?.login ?? null,
+    poke: (boardId) => kanbanDispatcher?.poke(boardId),
+    revoke: async (lease, cardId) => {
+      await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
+    },
+    ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {}),
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
 
   // `/kanban` comment commands: a live, uncached write check per command, so a revoked grant stops the next one.
   const kanbanCommentCommands =
@@ -2299,7 +2298,7 @@ export function buildContainer(
       kanbanBoards: repos.kanbanBoard,
       kanbanDispatch: repos.kanbanDispatch
     },
-    ...(kanbanControls ? { kanbanControls } : {}),
+    kanbanControls,
     registry,
     agentSpecs,
     ...(daemonRelease ? { daemonRelease } : {}),

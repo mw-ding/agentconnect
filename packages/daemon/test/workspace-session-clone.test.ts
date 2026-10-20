@@ -1826,3 +1826,52 @@ describe('a Kanban write session checks out its ac/card-<n> branch', () => {
     expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
   })
 })
+
+// A card branch an earlier attempt pushed from another clone or daemon is resumed from origin, never recreated from the default branch.
+describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin', () => {
+  function pushCardBranch(seed: string, n: number): string {
+    git(seed, ['checkout', '-q', '-b', `ac/card-${n}`, 'origin/main'])
+    writeFileSync(join(seed, 'card.md'), 'pushed card work\n')
+    git(seed, ['add', 'card.md'])
+    git(seed, ['commit', '-q', '-m', 'card work'])
+    git(seed, ['push', '-q', 'origin', `ac/card-${n}`])
+    const tip = git(seed, ['rev-parse', 'HEAD'])
+    git(seed, ['checkout', '-q', 'main'])
+    return tip
+  }
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r2: a fresh %s session checks out the pushed card branch tip with no upstream',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const tip = pushCardBranch(primary!.seed, 7)
+      const request = (tier === 'confined' ? confined : unconfined)({ branch: kanbanCardBranch(7) })
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(readFileSync(join(cwd, 'card.md'), 'utf8')).toBe('pushed card work\n')
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+    }
+  )
+
+  it('416r2: a fresh confined session with no pushed card branch starts it at the default branch', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+  })
+
+  it('416r2: resumes the pushed card branch across the sandbox exec channel with only admitted Git', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAllThroughShim(agent)
+    const tip = pushCardBranch(primary!.seed, 7)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(readFileSync(join(cwd, 'card.md'), 'utf8')).toBe('pushed card work\n')
+    const issued = [...new Set(gitRuns.map((run) => run.args[0]!))]
+    expect(issued).toEqual(expect.arrayContaining(['ls-remote', 'fetch']))
+    expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+  })
+})

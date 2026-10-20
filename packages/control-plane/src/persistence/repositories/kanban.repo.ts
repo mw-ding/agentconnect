@@ -959,10 +959,11 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           repoId: bigint
           repoFullName: string
           targetChannel: string | null
+          linkedPrNumber: number | null
         }>
       >(
         Prisma.sql`
-          SELECT c."id", c."status", c."stateRevision", c."issueNumber", b."orgId", b."repoId", b."repoFullName", b."targetChannel"
+          SELECT c."id", c."status", c."stateRevision", c."issueNumber", c."linkedPrNumber", b."orgId", b."repoId", b."repoFullName", b."targetChannel"
           FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
           WHERE c."id" = ${input.cardId}::uuid AND c."boardId" = ${input.boardId}::uuid AND b."orgId" = ${input.orgId}
           FOR UPDATE OF c
@@ -977,7 +978,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         status: to,
         orgId: OrgId(row.orgId),
         repoId: row.repoId,
-        repoFullName: row.repoFullName
+        repoFullName: row.repoFullName,
+        supersededPrNumber: null
       }
       // A repeated skip is idempotent: an archived card holds no lease, so there is nothing to revoke, move, audit or write.
       if (to === 'archived' && row.status === 'archived')
@@ -1032,7 +1034,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           githubSyncedAt: new Date(),
           // The GitHub write runs after commit; a failed one stays pending for the label sync's repair.
           labelWritePending: true,
-          ...(to === 'ready' ? reset : {})
+          // A skip also drops any open promotion intent: recovery and the label sync never revisit an archived card.
+          ...(to === 'ready' ? reset : PROMOTION_CLEARED)
         }
       })
       await auditCardTransition(tx, {
@@ -1074,7 +1077,15 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           }
         }
       })
-      return { ok: true, value: { ...outcome, changed: true, revokedLease: open ?? null } }
+      return {
+        ok: true,
+        value: {
+          ...outcome,
+          changed: true,
+          revokedLease: open ?? null,
+          supersededPrNumber: to === 'ready' ? row.linkedPrNumber : null
+        }
+      }
     })
   }
 

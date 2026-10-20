@@ -144,6 +144,7 @@ async function harness(opts: { completionContract?: 'close' | 'pr_merged' } = {}
     store,
     resolveLogin: async () => 'maintainer',
     poke: (boardId) => dispatcher.poke(boardId),
+    gate: dispatcher,
     revoke: async (lease, cardId) => {
       revoked.push({ daemonId: lease.daemonId, leaseId: lease.leaseId, cardId })
     },
@@ -711,5 +712,95 @@ describe('416c: a paused board keeps its sync and graph loops (real Postgres)', 
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
     expect(h.sent.map(({ d }) => d.cardId).sort()).toEqual([human.id, blocked.id].sort())
+  })
+})
+
+describe('416r2: controls on an unpaused board race the dispatcher (real Postgres)', () => {
+  it('416r2: restart on an UNPAUSED board survives a claim/reconcile racing the GitHub write', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:done'], 'running')
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'done' } })
+    Object.assign(h.store.issues.get(c.issueNumber)!, { state: 'closed', stateReason: 'completed' })
+    const restartCard = PgKanbanCardRepo.prototype.restartCard
+    let race: Promise<void> | undefined
+    vi.spyOn(PgKanbanCardRepo.prototype, 'restartCard').mockImplementation(async function (
+      this: PgKanbanCardRepo,
+      input
+    ) {
+      const result = await restartCard.call(this, input)
+      // The committed card is claimable now; the cap only keeps a gated claim from hanging the control.
+      race = h.dispatcher.reconcileBoard(h.board.id)
+      await Promise.race([race, new Promise((resolve) => setTimeout(resolve, 1_500))])
+      return result
+    })
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await race
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.store.issues.get(c.issueNumber)).toMatchObject({ state: 'open', labels: ['ac/status:running'] })
+  })
+
+  it("416r2: skip's GitHub write is ordered after the dispatcher's in-flight label write for the card", async () => {
+    const h = await harness()
+    const c = await h.addCard()
+    let land!: () => void
+    const held = new Promise<void>((resolve) => (land = resolve))
+    const apply = h.store.applyPlan.bind(h.store)
+    vi.spyOn(h.store, 'applyPlan').mockImplementation(async (repo, n, observed, plan, onLabelAdded) => {
+      if (plan.status === 'running') await held
+      return apply(repo, n, observed, plan, onLabelAdded)
+    })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+    const skipped = h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    land()
+    expect((await skipped).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('archived')
+    expect(h.store.issues.get(c.issueNumber)).toMatchObject({
+      state: 'closed',
+      stateReason: 'not_planned',
+      labels: ['ac/status:archived']
+    })
+  })
+
+  it('416r2: skip clears an open promotion intent', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: {
+        status: 'todo',
+        promotionPending: true,
+        promotionPostAccepted: true,
+        promotionStartedAt: new Date(T0),
+        promotionChecks: 2
+      }
+    })
+    expect((await h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'archived',
+      promotionPending: false,
+      promotionPostAccepted: false,
+      promotionStartedAt: null,
+      promotionChecks: 0
+    })
+  })
+
+  it('416r2: restart names the pull request linked to the earlier work so it can be closed and replaced', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanCard.update({
+      where: { id: c.id },
+      data: { status: 'review', linkedPrNumber: 21, workEpisodeStartedAt: new Date(T0 - 60_000) }
+    })
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    expect(h.store.writes.at(-1)!.comment).toBe(
+      `restarted via AgentConnect; pull request #21 from the earlier work can no longer complete this card, ` +
+        `so close it if it is still open and open a new one from \`ac/card-${c.issueNumber}\``
+    )
   })
 })

@@ -41,7 +41,7 @@ afterAll(() => oidc.close())
 
 const store = new FakeStore()
 
-function controls(poke = vi.fn()) {
+function controls(poke = vi.fn(), withStore = true) {
   return new KanbanControls({
     boards: new PgKanbanBoardRepo(prisma),
     cards: new PgKanbanCardRepo(prisma),
@@ -59,7 +59,7 @@ function controls(poke = vi.fn()) {
             } as never)
           : null
     },
-    store,
+    ...(withStore ? { store } : {}),
     resolveLogin: async () => 'owner',
     poke,
     log: { warn: vi.fn() }
@@ -153,6 +153,30 @@ describe('Kanban control routes — an interactive owner', () => {
       const illegal = await app.inject({ method: 'POST', url: cardSkip, headers })
       expect(illegal.statusCode).toBe(409)
       expect(illegal.json()).toMatchObject({ code: 'illegal_transition' })
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('Kanban control routes — without a GitHub card store', () => {
+  it('416r2: pause and resume still work, while skip and restart answer unavailable and write nothing', async () => {
+    await seedBoard()
+    const { app, close } = buildHttpApp(
+      prisma,
+      { OIDC_ISSUER: oidc.issuer, OIDC_AUDIENCE: oidc.audience },
+      undefined,
+      undefined,
+      { kanbanControls: controls(vi.fn(), false) }
+    )
+    const headers = await ownerBearer(prisma, oidc)
+    try {
+      expect((await app.inject({ method: 'POST', url: boardPause, headers })).statusCode).toBe(200)
+      expect((await app.inject({ method: 'POST', url: boardResume, headers })).statusCode).toBe(200)
+      expect((await app.inject({ method: 'POST', url: cardSkip, headers })).statusCode).toBe(404)
+      expect((await app.inject({ method: 'POST', url: cardRestart, headers })).statusCode).toBe(404)
+      expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: CARD } })).toMatchObject({ status: 'ready' })
+      expect(await prisma.auditEvent.count({ where: { kind: { in: ['card_skipped', 'card_restarted'] } } })).toBe(0)
     } finally {
       await close()
     }

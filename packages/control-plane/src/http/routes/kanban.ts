@@ -581,7 +581,8 @@ export function kanbanRoutes(deps: HttpDeps) {
       async (req, reply) => {
         const { orgId, userId } = req.orgCtx!
         const { boardId, cardId } = req.params
-        const result = await deps.kanbanControls?.skip(orgId, boardId, cardId, userId)
+        const controls = deps.kanbanControls?.cardControlsAvailable ? deps.kanbanControls : undefined
+        const result = await controls?.skip(orgId, boardId, cardId, userId)
         if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
         if (!result.ok) return controlRefusal(reply, result.reason)
         return { boardId, cardId, status: result.value.status }
@@ -604,7 +605,8 @@ export function kanbanRoutes(deps: HttpDeps) {
       async (req, reply) => {
         const { orgId, userId } = req.orgCtx!
         const { boardId, cardId } = req.params
-        const result = await deps.kanbanControls?.restart(orgId, boardId, cardId, userId)
+        const controls = deps.kanbanControls?.cardControlsAvailable ? deps.kanbanControls : undefined
+        const result = await controls?.restart(orgId, boardId, cardId, userId)
         if (!result) return reply.code(404).send({ ...notFound, message: 'kanban controls unavailable' })
         if (!result.ok) return controlRefusal(reply, result.reason)
         return { boardId, cardId, status: result.value.status }
