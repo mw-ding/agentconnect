@@ -132,6 +132,13 @@ export const PROMOTION_CLEARED = {
   attentionReason: null
 } as const
 
+/** Ending a work episode: the next work claim starts a new one, and the old PR can no longer complete the card. */
+export const EPISODE_RESET = { linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] as string[] }
+
+/** A closed card (`done` or `archived`) that reopens starts a new episode; every other move stays inside it. */
+export const endsEpisode = (from: string, to: string): boolean =>
+  (from === 'done' || from === 'archived') && to !== from
+
 export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, KanbanBoardAdminRepo {
   constructor(private readonly db: PrismaLike) {}
 
@@ -525,8 +532,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
             recoveryChecks: 0,
             recoveryObserved: null,
             ...PROMOTION_CLEARED,
-            // A reopened card starts a new piece of work; the old PR must not complete it.
-            ...(input.from === 'done' ? { linkedPrNumber: null, linkedPrWorkStartedAt: null } : {})
+            ...(endsEpisode(input.from, input.to!) ? EPISODE_RESET : {})
           }
         })
         if (count !== 1) throw STALE_COMMAND

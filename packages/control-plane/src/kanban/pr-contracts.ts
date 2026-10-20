@@ -3,7 +3,15 @@ import type { KanbanDoorbellCheckSuite, KanbanDoorbellPullRequest } from '@agent
 import type { KanbanBoardRecord, KanbanContractCard, KanbanContractRepo } from '../persistence/ports.js'
 import { planStatusWrite, type LabelPlan } from './card-state.js'
 import type { CardStore, KanbanRepoRef } from './card-store.js'
-import { checksVerdict, planContract, prClosedUnmergedComment, type ContractDecision } from './contracts.js'
+import {
+  checksVerdict,
+  contractAttentionComment,
+  FLAGGED_WAITS,
+  planContract,
+  prClosedUnmergedComment,
+  type ContractDecision,
+  type ContractWait
+} from './contracts.js'
 import type { PrReader } from './pr-reader.js'
 
 /** Review cards re-judged per board per sweep; a cursor walks the rest on later ticks. */
@@ -85,7 +93,7 @@ export class KanbanPrContracts {
         appSlug: this.deps.appSlug,
         repoId: repo.repoId,
         issueNumber: card.issueNumber,
-        workStartedAt: card.linkedPrWorkStartedAt,
+        workEpisodeStartedAt: card.workEpisodeStartedAt,
         ...(this.deps.bindingOverrideForTests ? { overrideForTests: this.deps.bindingOverrideForTests } : {})
       },
       contract: card.completionContract,
@@ -103,8 +111,16 @@ export class KanbanPrContracts {
       // An unread page could hold a failure, so a truncated list is at best pending.
       decision = planContract({
         ...input,
-        checks: { headSha: pr.headSha, verdict: read.complete || verdict === 'failed' ? verdict : 'pending' }
+        checks: {
+          headSha: pr.headSha,
+          verdict: read.complete || verdict === 'failed' ? verdict : 'pending',
+          ...(read.actionsUnreadable ? { actionsUnreadable: true } : {})
+        }
       })
+    }
+    if (decision.kind === 'wait' && FLAGGED_WAITS.has(decision.reason)) {
+      await this.flag(card, repo, decision.reason)
+      return 'wait'
     }
     if (decision.kind === 'wait') {
       this.deps.log.info(
@@ -134,6 +150,37 @@ export class KanbanPrContracts {
     await this.writeIssue(card, repo, to)
     await this.deps.onSettled?.(card, to)
     return to
+  }
+
+  // A stuck contract is raised once per (card, reason, PR): the CAS winner alone posts the one body-free comment.
+  private async flag(card: KanbanContractCard, repo: KanbanRepoRef, reason: ContractWait): Promise<void> {
+    const prNumber = card.linkedPrNumber!
+    if (card.needsAttention || card.contractFlags.includes(`${reason}#${prNumber}`)) return
+    const flagged = await this.deps.repo.flagContract({
+      cardId: card.cardId,
+      expectedStateRevision: card.stateRevision,
+      reason,
+      prNumber
+    })
+    if (!flagged) return
+    this.deps.log.info(
+      { boardId: card.boardId, issueNumber: card.issueNumber, prNumber, reason },
+      'kanban: PR contract needs attention'
+    )
+    try {
+      const issue = await this.deps.store.readCard(repo, card.issueNumber)
+      const plan: LabelPlan = {
+        outcome: 'noop',
+        status: 'review',
+        releaseLease: false,
+        addLabels: [],
+        removeLabels: [],
+        comment: contractAttentionComment(reason, prNumber)
+      }
+      await this.deps.store.applyPlan(repo, card.issueNumber, issue ?? { labels: [], state: 'open' }, plan)
+    } catch (err) {
+      this.deps.log.warn({ err, cardId: card.cardId, reason }, 'kanban: contract attention comment failed')
+    }
   }
 
   // Best-effort after the commit, like every CP status write: a failure leaves label drift, never a second move.

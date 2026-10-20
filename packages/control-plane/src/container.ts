@@ -1829,7 +1829,7 @@ export function buildContainer(
         })
       : undefined
 
-  // PR completion contracts (TRD 4.7): live PR/check reads with a CP-only pull_requests:read + checks:read token.
+  // PR completion contracts (TRD 4.7): CP-only pull_requests:read + checks:read reads; workflow lookup on its own actions:read token.
   const kanbanPrContracts: KanbanPrContracts | undefined =
     kanbanCardStore && kanbanTokens
       ? new KanbanPrContracts({

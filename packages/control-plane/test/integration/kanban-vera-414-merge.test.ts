@@ -294,7 +294,7 @@ describe("vera-414-merge: 9 #415's contract and comment-command moves keep their
 
   it('vera-414-merge: 9 a /kanban unblock lands ready under its own audit, then claims as work with the role-aware audit', async () => {
     const f = await fixture()
-    const c = await f.card('blocked', { linkedPrNumber: 7, linkedPrWorkStartedAt: APPROVED })
+    const c = await f.card('blocked', { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED })
     const before = await f.read(c.id)
     const recorded = await new PgKanbanCardRepo(prisma).recordCommand({
       boardId: f.board.id,
@@ -315,13 +315,48 @@ describe("vera-414-merge: 9 #415's contract and comment-command moves keep their
       { from: 'blocked', to: 'ready', source: 'comment_command', command: 'unblock' },
       { from: 'ready', to: 'running', source: 'claim', role: 'work', leaseId: lease!.leaseId }
     ])
-    // The work claim owes the running label and invalidates the old PR provenance until this run reports its PR.
+    // The work claim owes the running label; an unblock is not a reopen, so the work episode and its PR stay.
     expect(await f.read(c.id)).toMatchObject({
       status: 'running',
       labelWritePending: true,
       verifiedAt: null,
-      linkedPrWorkStartedAt: null
+      linkedPrNumber: 7,
+      workEpisodeStartedAt: APPROVED
     })
+  })
+})
+
+describe('vera-415b3: leaving done ends the work episode on every path (Postgres)', () => {
+  const OLD = { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED, contractFlags: ['pr_unbound#7'] }
+
+  it('vera-415b3: a human label move out of done clears the episode; the next work claim starts a new one', async () => {
+    const f = await fixture()
+    const c = await f.card('done', OLD)
+    expect(await f.humanMove(c.issueNumber, 'ready', 10n)).toMatchObject({ changed: true })
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'ready',
+      linkedPrNumber: null,
+      workEpisodeStartedAt: null,
+      contractFlags: []
+    })
+    expect(await f.claim()).toMatchObject([{ cardId: c.id, role: 'work' }])
+    expect((await f.read(c.id)).workEpisodeStartedAt).toEqual(new Date(T0))
+    // An archived card reopened to triage starts over too.
+    const archived = await f.card('archived', OLD)
+    expect(await f.humanMove(archived.issueNumber, 'triage', 11n)).toMatchObject({ changed: true })
+    expect(await f.read(archived.id)).toMatchObject({ linkedPrNumber: null, workEpisodeStartedAt: null })
+  })
+
+  it('vera-415b3: the parked ingest out of done clears the episode, while a move inside the episode keeps it', async () => {
+    const f = await fixture()
+    const done = await f.card('done', { ...OLD, needsAttention: true })
+    expect(await f.dispatch.ingestStatus(f.board.id, done.issueNumber, 'done', 'ready')).toMatchObject({ moved: true })
+    expect(await f.read(done.id)).toMatchObject({ linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] })
+    const blocked = await f.card('blocked', { ...OLD, needsAttention: true })
+    expect(await f.dispatch.ingestStatus(f.board.id, blocked.issueNumber, 'blocked', 'ready')).toMatchObject({
+      moved: true
+    })
+    expect(await f.read(blocked.id)).toMatchObject(OLD)
   })
 })
 

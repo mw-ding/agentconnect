@@ -162,7 +162,7 @@ async function boot(
       status: 'review',
       linkedPrNumber: card.linkedPrNumber === undefined ? PR : card.linkedPrNumber,
       verifiedAt: card.verifiedAt ?? null,
-      linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z')
+      workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z')
     }
   })
   app = buildApp({
@@ -219,8 +219,33 @@ const settle = async () => {
 }
 const comments = (calls: GithubCall[]) => calls.filter((c) => c.method === 'POST' && c.path.endsWith('/comments'))
 
+// A standalone contract judge over the same fake GitHub, as the CP's 60s tick drives it.
+function sweeper(fetchImpl: (url: string, init?: RequestInit) => Promise<Response>) {
+  const tokens = {
+    mintKanbanCard: async () => ({ token: 't' }),
+    mintKanbanPr: async () => ({ token: 't' }),
+    mintKanbanActions: async () => ({ token: 't' })
+  }
+  return new KanbanPrContracts({
+    appSlug: 'agentconnect-test',
+    repo: new PgKanbanDispatchRepo(prisma),
+    prs: new GithubPrReader({ tokens: tokens as never, fetchImpl }),
+    store: new GithubCardStore({
+      tokens: tokens as never,
+      fetchImpl,
+      permissions: new GithubRepoPermission({ tokens: tokens as never, ttlMs: 0, fetchImpl })
+    }),
+    repoRef: async () => ({
+      installationId: BigInt(INSTALLATION_ID),
+      repoId: BigInt(REPO_ID),
+      repoFullName: 'acme/board'
+    }),
+    log: { info: () => {}, warn: () => {} }
+  })
+}
+
 describe('Kanban PR completion contracts through the real relay (real ports, real Postgres)', () => {
-  it('vera-415: P2 an old unrelated merged PR leaves the card in review', async () => {
+  it('vera-415: P2 an old unrelated merged PR leaves the card in review (flagged, never completed)', async () => {
     const { github, card, link } = await boot(
       { state: 'closed', merged: true, headSha: HEAD, runs: [], unbound: true },
       { completionContract: 'pr_merged' }
@@ -229,7 +254,46 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
     await settle()
     expect((await cardOf(card.id)).status).toBe('review')
     expect(github.issueState().state).toBe('open')
-    expect(comments(github.calls)).toEqual([])
+    expect(github.labels()).toEqual(['ac/status:review'])
+    expect(comments(github.calls).map((c) => (c.body as { body: string }).body)).toEqual([
+      expect.stringContaining('(pr_unbound)')
+    ])
+  })
+
+  it('vera-415b3: an unbound PR flags the card once, with one comment, across sweeps and webhook redeliveries', async () => {
+    const pr: PrState = { state: 'closed', merged: true, headSha: HEAD, runs: [], unbound: true }
+    const { github, board, card, link } = await boot(pr, { completionContract: 'pr_merged' })
+    const deliveryId = '6f1d6a8e-0000-4000-8000-000000000415'
+    const ring = (id?: string) =>
+      postGithubWebhook(link.webhookUrl, {
+        secret: WEBHOOK_SECRET,
+        event: 'pull_request',
+        payload: prClosed(true),
+        ...(id ? { deliveryId: id } : {})
+      })
+    await ring(deliveryId)
+    const flagged = await until(
+      () => cardOf(card.id),
+      (c) => c.needsAttention
+    )
+    expect(flagged).toMatchObject({ status: 'review', needsAttention: true, attentionReason: 'pr_unbound' })
+    // The same GUID redelivered, a fresh delivery, and three sweeps change nothing and post nothing more.
+    await ring(deliveryId)
+    await ring()
+    const contracts = sweeper(github.fetch)
+    for (let i = 0; i < 3; i++) await contracts.sweep(board.id)
+    await settle()
+    expect(await cardOf(card.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      stateRevision: flagged.stateRevision
+    })
+    expect(comments(github.calls)).toHaveLength(1)
+    const body = (comments(github.calls)[0]!.body as { body: string }).body
+    expect(body).toContain('pr_unbound')
+    expect(body).toContain(`#${PR}`)
+    expect(body).not.toContain('secret')
   })
 
   it('vera-415: P1 two workflows named test retain a failure; rerunning that workflow replaces it', async () => {
@@ -318,14 +382,15 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
     )
     expect(github.issueState()).toEqual({ state: 'closed', stateReason: 'completed' })
     expect(github.labels()).toEqual(['ac/status:done'])
-    // The PR read used the CP-only contract token.
+    // The PR read used the CP-only contract token, without actions:read, and pr_merged never minted the actions token.
     const mint = github.calls.find(
       (c) => c.path.endsWith('/access_tokens') && JSON.stringify(c.body).includes('checks')
     )
     expect(mint?.body).toEqual({
       repository_ids: [REPO_ID],
-      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read', actions: 'read' }
+      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read' }
     })
+    expect(github.calls.some((c) => JSON.stringify(c.body ?? {}).includes('actions'))).toBe(false)
     const audit = await prisma.auditEvent.findFirstOrThrow({ where: { kind: 'kanban_card_change' } })
     expect(audit.details).toMatchObject({
       from: 'review',
@@ -460,7 +525,7 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
         issueNumber: 10,
         status: 'review',
         linkedPrNumber: PR,
-        linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z'),
+        workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z'),
         verifiedAt: new Date()
       }
     })

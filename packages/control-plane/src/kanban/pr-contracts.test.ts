@@ -1,7 +1,12 @@
 // KanbanPrContracts over fakes: doorbell routing, stale suites, the verifier re-check, sweep batching, and race safety.
 import { describe, expect, it, vi } from 'vitest'
 import { OrgId } from '../domain/ids.js'
-import type { KanbanBoardRecord, KanbanContractCard, KanbanContractSettleInput } from '../persistence/ports.js'
+import type {
+  KanbanBoardRecord,
+  KanbanContractCard,
+  KanbanContractFlagInput,
+  KanbanContractSettleInput
+} from '../persistence/ports.js'
 import { statusLabel, type LabelPlan } from './card-state.js'
 import type { CheckRunFacts, LivePullRequest } from './contracts.js'
 import { KanbanPrContracts } from './pr-contracts.js'
@@ -17,7 +22,8 @@ const PR_BINDING = {
   headRepoId: 42n,
   baseRef: 'main',
   defaultBranch: 'main',
-  createdAt: new Date('2026-10-16T00:00:00Z')
+  createdAt: new Date('2026-10-16T00:00:00Z'),
+  mergedByLogin: 'octocat'
 }
 
 const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
@@ -27,7 +33,9 @@ const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   status: 'review',
   stateRevision: 5n,
   linkedPrNumber: 12,
-  linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z'),
+  workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z'),
+  contractFlags: [],
+  needsAttention: false,
   verifiedAt: null,
   completionContract: 'pr_merged',
   verifierAgentId: null,
@@ -40,12 +48,14 @@ function make(
     pr?: LivePullRequest | null
     runs?: CheckRunFacts[]
     complete?: boolean
+    actionsUnreadable?: boolean
     settle?: boolean
     applyFails?: boolean
   } = {}
 ) {
   const cards = opts.cards ?? [card()]
   const settles: KanbanContractSettleInput[] = []
+  const flags: KanbanContractFlagInput[] = []
   const plans: LabelPlan[] = []
   const repo = {
     listContractCards: vi.fn(
@@ -59,6 +69,20 @@ function make(
     settleContract: vi.fn(async (input: KanbanContractSettleInput) => {
       settles.push(input)
       return opts.settle ?? true
+    }),
+    // Mirrors the PG CAS: the first flag for a (reason, PR) on an unflagged card wins; the card row then carries it.
+    flagContract: vi.fn(async (input: KanbanContractFlagInput) => {
+      const c = cards.find((x) => x.cardId === input.cardId)
+      const key = `${input.reason}#${input.prNumber}`
+      if (!c || c.stateRevision !== input.expectedStateRevision || c.needsAttention || c.contractFlags.includes(key))
+        return false
+      flags.push(input)
+      Object.assign(c, {
+        needsAttention: true,
+        contractFlags: [...c.contractFlags, key],
+        stateRevision: c.stateRevision + 1n
+      })
+      return true
     })
   }
   const prs = {
@@ -74,7 +98,11 @@ function make(
           }
         : opts.pr
     ),
-    readCheckRuns: vi.fn(async () => ({ runs: opts.runs ?? [], complete: opts.complete ?? true }))
+    readCheckRuns: vi.fn(async () => ({
+      runs: opts.runs ?? [],
+      complete: opts.complete ?? true,
+      ...(opts.actionsUnreadable ? { actionsUnreadable: true } : {})
+    }))
   }
   const store = {
     readCard: vi.fn(async () => ({
@@ -100,7 +128,7 @@ function make(
     onSettled,
     log
   })
-  return { contracts, repo, prs, store, settles, plans, onSettled, log }
+  return { contracts, repo, prs, store, settles, flags, plans, onSettled, log }
 }
 
 const SUCCESS: CheckRunFacts = { status: 'completed', conclusion: 'success' }
@@ -241,6 +269,66 @@ it('vera-415: unbound PRs wait with body-free metadata before attempting check r
   expect(h.settles).toEqual([])
   expect(h.log.info).toHaveBeenCalledWith(
     { boardId: 'b1', issueNumber: 7, prNumber: 12, reason: 'pr_unbound' },
-    'kanban: PR contract waiting'
+    'kanban: PR contract needs attention'
   )
+})
+
+const UNBOUND: LivePullRequest = {
+  ...PR_BINDING,
+  number: 12,
+  state: 'closed',
+  merged: true,
+  headSha: HEAD,
+  headRef: 'feature-x'
+}
+
+it('vera-415b3: pr_unbound is raised once per (card, PR) across doorbells, sweeps and re-checks, with no wait log', async () => {
+  const h = make({ pr: UNBOUND })
+  for (let i = 0; i < 3; i++) {
+    await h.contracts.onPullRequest(BOARD, REPO, { number: 12, merged: true, headSha: HEAD })
+    await h.contracts.sweep(BOARD.id)
+    await h.contracts.onVerified('c1')
+  }
+  expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'pr_unbound', prNumber: 12 }])
+  expect(h.plans).toHaveLength(1)
+  expect(h.plans[0]).toMatchObject({ outcome: 'noop', status: 'review', addLabels: [], removeLabels: [] })
+  expect(h.plans[0]!.comment).toContain('#12')
+  expect(h.plans[0]!.comment).toContain('(pr_unbound)')
+  expect(h.settles).toEqual([])
+  expect(h.log.info).toHaveBeenCalledOnce()
+})
+
+it('vera-415b3: a card a human cleared is not re-flagged for the same PR, but a newly reported PR is', async () => {
+  const c = card()
+  const h = make({ cards: [c], pr: UNBOUND })
+  await h.contracts.sweep(BOARD.id)
+  c.needsAttention = false
+  await h.contracts.sweep(BOARD.id)
+  expect(h.flags).toHaveLength(1)
+  c.linkedPrNumber = 13
+  h.prs.readPullRequest.mockResolvedValue({ ...UNBOUND, number: 13 })
+  await h.contracts.sweep(BOARD.id)
+  expect(h.flags.map((f) => f.prNumber)).toEqual([12, 13])
+  expect(h.plans).toHaveLength(2)
+})
+
+it('vera-415b3: a lost flag CAS posts no comment', async () => {
+  const h = make({ pr: UNBOUND })
+  h.repo.flagContract.mockResolvedValueOnce(false)
+  await h.contracts.onVerified('c1')
+  expect(h.plans).toEqual([])
+})
+
+it('vera-415 actions:read: an unreadable workflow list flags pr_checks_green once as actions_read_missing', async () => {
+  const h = make({
+    cards: [card({ completionContract: 'pr_checks_green' })],
+    pr: { ...UNBOUND, headRef: 'ac/card-7', state: 'open', merged: false },
+    runs: [SUCCESS],
+    complete: false,
+    actionsUnreadable: true
+  })
+  for (let i = 0; i < 2; i++) await h.contracts.sweep(BOARD.id)
+  expect(h.settles).toEqual([])
+  expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'actions_read_missing', prNumber: 12 }])
+  expect(h.plans[0]!.comment).toContain('(actions_read_missing)')
 })

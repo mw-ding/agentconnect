@@ -208,11 +208,16 @@ export class InstallationTokenService {
     return this.mintPermissionLevels(
       installationId,
       repoFullName,
-      { pull_requests: 'read', checks: 'read', actions: 'read' },
+      { pull_requests: 'read', checks: 'read' },
       repoId,
       false,
       'kanban_pr'
     )
+  }
+
+  // CP-only actions:read for the contract's workflow lookup alone, so a missing grant never blocks the PR read.
+  async mintKanbanActions(installationId: bigint, repoFullName: string, repoId: bigint): Promise<MintedGitCred> {
+    return this.mintPermissionLevels(installationId, repoFullName, { actions: 'read' }, repoId, false, 'kanban_actions')
   }
 
   // CP-only Kanban Projects v2 token (org-owned projects): organization_projects write plus issues read on one repo id.
@@ -259,7 +264,13 @@ export class InstallationTokenService {
     repoId?: bigint,
     forceRefresh = false,
     purpose?:
-      'kanban_card' | 'kanban_card_write' | 'kanban_orchestrator_write' | 'kanban_run' | 'kanban_project' | 'kanban_pr'
+      | 'kanban_card'
+      | 'kanban_card_write'
+      | 'kanban_orchestrator_write'
+      | 'kanban_run'
+      | 'kanban_project'
+      | 'kanban_pr'
+      | 'kanban_actions'
   ): Promise<MintedGitCred> {
     const serveEpoch = this.epoch(installationId)
     const effectiveLevels: InternalPermissionLevels =

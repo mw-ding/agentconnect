@@ -10,6 +10,9 @@ import { insertKanbanNotification, PgKanbanNotifyRepo } from '../../src/persiste
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
+import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
+import type { LivePullRequest } from '../../src/kanban/contracts.js'
+import type { PrReader } from '../../src/kanban/pr-reader.js'
 import type {
   CardGraph,
   CardIssue,
@@ -74,6 +77,7 @@ async function harness(
     verifier?: string | null
     completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
     reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk>
+    prs?: PrReader
   } = {}
 ) {
   await seedDaemon(prisma, D1, { sessionEpoch: 4n })
@@ -99,8 +103,24 @@ async function harness(
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
   const project = { onStatusCommitted: vi.fn() }
+  const repoRef = { installationId: 77n, repoId: REPO_ID, repoFullName: 'acme/web' }
+  const contracts = opts.prs
+    ? new KanbanPrContracts({
+        appSlug: 'agentconnect',
+        repo,
+        prs: opts.prs,
+        store,
+        repoRef: async () => repoRef,
+        log
+      })
+    : undefined
   const dispatcher = new KanbanDispatcher({
     project,
+    ...(contracts
+      ? {
+          contracts: { sweep: (id: string) => contracts.sweep(id), onReview: (id: string) => contracts.onVerified(id) }
+        }
+      : {}),
     repo,
     installations: {
       liveByOrgAndAccount: async (orgId, login) =>
@@ -153,7 +173,44 @@ async function harness(
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const run = (leaseId: string) => prisma.kanbanRun.findUniqueOrThrow({ where: { leaseId } })
-  return { board, clock, store, log, sent, repo, dispatcher, project, addCard, reviewCard, reportFor, card, run }
+  return {
+    board,
+    clock,
+    store,
+    log,
+    sent,
+    repo,
+    dispatcher,
+    project,
+    contracts,
+    addCard,
+    reviewCard,
+    reportFor,
+    card,
+    run
+  }
+}
+
+// A merged PR bound to card `n` in every way but its creation time, which each test chooses.
+function mergedCardPr(n: number, number: number, createdAt: Date): PrReader {
+  const pr: LivePullRequest = {
+    number,
+    state: 'closed',
+    merged: true,
+    headSha: 'a'.repeat(40),
+    authorLogin: 'agentconnect[bot]',
+    authorType: 'Bot',
+    headRef: `ac/card-${n}`,
+    headRepoId: REPO_ID,
+    baseRef: 'main',
+    defaultBranch: 'main',
+    createdAt,
+    mergedByLogin: 'octocat'
+  }
+  return {
+    readPullRequest: async (_repo, prNumber) => (prNumber === number ? pr : null),
+    readCheckRuns: async () => ({ runs: [], complete: true })
+  }
 }
 
 describe('Kanban verifier routing (real Postgres)', () => {
@@ -343,22 +400,25 @@ describe('Kanban verifier approval under a PR contract (real Postgres)', () => {
     await h.dispatcher.settle()
   }
 
-  it('vera-415: a new work lease invalidates an earlier PR binding until that work reports its PR', async () => {
+  it('vera-415b3: the first work claim stamps the episode on the DB clock; a rework claim keeps it', async () => {
     const h = await harness({ completionContract: 'pr_merged' })
     const c = await h.addCard()
-    await prisma.kanbanCard.update({
-      where: { id: c.id },
-      data: { linkedPrNumber: 12, linkedPrWorkStartedAt: new Date(T0 - 60_000) }
-    })
+    expect((await h.card(c.id)).workEpisodeStartedAt).toBeNull()
     await tick(h)
     expect((await h.run(h.sent[0]!.d.leaseId)).role).toBe('work')
-    expect((await h.card(c.id)).linkedPrWorkStartedAt).toBeNull()
+    expect((await h.card(c.id)).workEpisodeStartedAt).toEqual(new Date(T0))
     await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested' }))
     await h.dispatcher.settle()
-    expect((await h.card(c.id)).linkedPrWorkStartedAt).toBeNull()
+    h.clock.advance(5 * 60_000)
+    await h.dispatcher.onReport(D2, 2, h.reportFor(h.sent.at(-1)!.d, { outcome: 'changes_requested' }))
+    await h.dispatcher.settle()
+    const rework = h.sent.at(-1)!.d
+    expect(rework).toMatchObject({ cardId: c.id, attempt: 3 })
+    expect((await h.run(rework.leaseId)).dispatchedAt).toEqual(new Date(T0 + 5 * 60_000))
+    expect((await h.card(c.id)).workEpisodeStartedAt).toEqual(new Date(T0))
   })
 
-  it('vera-415: only the reporting work run stamps PR provenance; a verifier cannot replace it', async () => {
+  it('vera-415: only a work run links its PR; a verifier cannot replace it or move the episode', async () => {
     const h = await harness({ completionContract: 'pr_merged' })
     const c = await h.addCard()
     await tick(h)
@@ -366,13 +426,13 @@ describe('Kanban verifier approval under a PR contract (real Postgres)', () => {
     h.clock.advance(60_000)
     await h.dispatcher.onReport(D1, 4, h.reportFor(work, { outcome: 'review_requested', prNumber: 12 }))
     await h.dispatcher.settle()
-    expect(await h.card(c.id)).toMatchObject({ linkedPrNumber: 12, linkedPrWorkStartedAt: new Date(T0) })
+    expect(await h.card(c.id)).toMatchObject({ linkedPrNumber: 12, workEpisodeStartedAt: new Date(T0) })
     const verify = h.sent.find(({ d }) => d.role === 'verify')!.d
     await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'completed', prNumber: 99 }))
     await h.dispatcher.settle()
     expect(await h.card(c.id)).toMatchObject({
       linkedPrNumber: 12,
-      linkedPrWorkStartedAt: new Date(T0),
+      workEpisodeStartedAt: new Date(T0),
       status: 'review'
     })
   })
@@ -724,4 +784,103 @@ it('vera-474 cutover: M4 review, changes-requested and round-limit commits each 
     await h.dispatcher.settle()
     expect(h.project.onStatusCommitted).not.toHaveBeenCalled()
   }
+})
+
+describe("vera-415b3: the PR binding follows the card's work episode (real Postgres)", () => {
+  // Work 1 at T0 reports `prAt`'s PR 12; the verifier asks for changes; work 2 at T0+2min reports PR 12 again; approve.
+  async function rework(prCreatedAt: (t0: number) => Date, reportSecondPr = true) {
+    let issue = 0
+    const prs: PrReader = {
+      readPullRequest: (repo, n) => mergedCardPr(issue, 12, prCreatedAt(T0)).readPullRequest(repo, n),
+      readCheckRuns: async () => ({ runs: [], complete: true })
+    }
+    const h = await harness({ completionContract: 'pr_merged', prs })
+    const c = await h.addCard()
+    issue = c.issueNumber
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const work1 = h.sent[0]!.d
+    h.clock.advance(30_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(work1, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    const verify1 = h.sent.at(-1)!.d
+    expect(verify1).toMatchObject({ cardId: c.id, role: 'verify' })
+    h.clock.advance(90_000)
+    await h.dispatcher.onReport(D2, 2, h.reportFor(verify1, { outcome: 'changes_requested' }))
+    await h.dispatcher.settle()
+    const work2 = h.sent.at(-1)!.d
+    expect(work2).toMatchObject({ cardId: c.id, agentId: A1, attempt: 3 })
+    expect((await h.run(work2.leaseId)).dispatchedAt).toEqual(new Date(T0 + 120_000))
+    h.clock.advance(30_000)
+    await h.dispatcher.onReport(
+      D1,
+      4,
+      h.reportFor(work2, { outcome: 'review_requested', ...(reportSecondPr ? { prNumber: 12 } : {}) })
+    )
+    await h.dispatcher.settle()
+    const verify2 = h.sent.at(-1)!.d
+    expect(verify2).toMatchObject({ cardId: c.id, role: 'verify', attempt: 4 })
+    await h.dispatcher.onReport(D2, 2, h.reportFor(verify2, { outcome: 'completed' }))
+    await h.dispatcher.settle()
+    return { h, c }
+  }
+
+  it("vera-415b3: R2 work 2 re-reports work 1's PR after changes_requested, and approval completes the card", async () => {
+    const { h, c } = await rework((t0) => new Date(t0 + 30_000))
+    expect(await h.card(c.id)).toMatchObject({ status: 'done', linkedPrNumber: 12, needsAttention: false })
+  })
+
+  it('vera-415b3: R1 control: the PR reported by the first work run completes the card', async () => {
+    let issue = 0
+    const prs: PrReader = {
+      readPullRequest: (repo, n) => mergedCardPr(issue, 12, new Date(T0 + 30_000)).readPullRequest(repo, n),
+      readCheckRuns: async () => ({ runs: [], complete: true })
+    }
+    const h = await harness({ completionContract: 'pr_merged', prs })
+    const c = await h.addCard()
+    issue = c.issueNumber
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    h.clock.advance(60_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    await h.dispatcher.onReport(D2, 2, h.reportFor(h.sent.at(-1)!.d, { outcome: 'completed' }))
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('done')
+  })
+
+  it("vera-415b3: a rework run that reports no PR keeps the episode's PR, which still completes the card", async () => {
+    const { h, c } = await rework((t0) => new Date(t0 + 30_000), false)
+    expect(await h.card(c.id)).toMatchObject({ status: 'done', linkedPrNumber: 12 })
+  })
+
+  it('vera-415b3: a PR created before the episode started never binds; the card is flagged once, before any verify', async () => {
+    let issue = 0
+    const prs: PrReader = {
+      readPullRequest: (repo, n) => mergedCardPr(issue, 12, new Date(T0 - 1_000)).readPullRequest(repo, n),
+      readCheckRuns: async () => ({ runs: [], complete: true })
+    }
+    const h = await harness({ completionContract: 'pr_merged', prs })
+    const c = await h.addCard()
+    issue = c.issueNumber
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    h.clock.advance(30_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    for (let i = 0; i < 3; i++) {
+      await h.contracts!.sweep(h.board.id)
+      await h.dispatcher.reconcileBoard(h.board.id)
+      await h.dispatcher.settle()
+    }
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#12']
+    })
+    // A flagged card is a human's: no verify lease, and exactly one body-free comment.
+    expect(h.sent.map((s) => s.d.role ?? 'work')).toEqual(['work'])
+    expect(h.store.writes.filter((w) => w.comment?.includes('(pr_unbound)'))).toHaveLength(1)
+  })
 })

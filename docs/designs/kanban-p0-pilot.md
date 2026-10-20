@@ -565,8 +565,13 @@ Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
 - `pr_checks_green` reads GitHub check runs only. Legacy commit statuses are not read,
   because the App has no `statuses` permission. A head with no check runs, or more
   than 300, is never green.
-- The card-to-PR link is `linkedPrNumber` from the worker's report. Matching a PR by
-  its `ac/card-<n>` head branch (3c's convention) is not implemented.
+- The card-to-PR link is `linkedPrNumber` from the worker's report, and it only counts
+  when the PR is bound to the card: App-authored, head `ac/card-<n>` in the board's
+  repository, base the default branch, created inside the card's work episode. No worker
+  creates `ac/card-<n>` branches until #416 (on hold) lands, so until then PR contracts are
+  inert: every `pr_merged` / `pr_checks_green` card waits in `review` on `pr_unbound`,
+  flagged once with `needsAttention` and one body-free comment. Use `close` with a verifier
+  for boards that need completion before #416.
 - A missed `pull_request`/`check_suite` doorbell is recovered by the redelivery sweep
   (24 h look-back) and the 60 s sweep: 25 review cards per board per tick, with a
   rotating cursor. A board with hundreds of cards in review can take several minutes

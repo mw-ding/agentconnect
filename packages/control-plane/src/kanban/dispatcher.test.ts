@@ -16,6 +16,10 @@ function dispatcher(
     readCard: vi.fn(async () => ({ labels: ['ac/status:todo'], state: 'open' as const, nodeId: 'I_kwDOAbc123' })),
     applyPlan: vi.fn(async () => {}),
     statusSetByHuman: vi.fn(async () => true),
+    // #415: the human label's adder must hold live write access before a parked card moves.
+    readLabelEvents: vi.fn(async () => [
+      { id: 1, event: 'labeled', label: { name: 'ac/status:todo' }, actor: { login: 'alice', type: 'User' } }
+    ]),
     promotionVerdict: vi.fn(async () => 'accept' as const),
     readGraph: vi.fn(async () => ({
       parent: null,
@@ -54,6 +58,7 @@ function dispatcher(
     isDaemonLive: () => false,
     clock: {},
     log,
+    humanAuthz: { appSlug: 'agentconnect', permissions: { permission: async () => 'write' as const } },
     ...(project ? { project } : {}),
     ...(over.sync ? { sync: over.sync } : {})
   } as unknown as KanbanDispatcherDeps)

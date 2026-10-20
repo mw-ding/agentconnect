@@ -6,7 +6,7 @@ import type { GitHubActor, KanbanSyncRepo, SyncCard } from '../../kanban/sync.js
 import { isKanbanStatus, type KanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
 import { auditCardTransition } from '../../kanban/audit.js'
 import { planNotification } from '../../kanban/notifier.js'
-import { PROMOTION_CLEARED } from './kanban.repo.js'
+import { endsEpisode, EPISODE_RESET, PROMOTION_CLEARED } from './kanban.repo.js'
 import { insertKanbanNotification } from './kanban-notify.repo.js'
 
 export class PgKanbanSyncRepo implements KanbanSyncRepo {
@@ -108,6 +108,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
           ...(human ? PROMOTION_CLEARED : {}),
           // A human status move starts over, so an old approval never suppresses the next review.
           ...(human && changed ? { verifiedAt: null } : {}),
+          ...(endsEpisode(card.status, plan.status) ? EPISODE_RESET : {}),
           ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
           labelWritePending: repair || current.labelWritePending,
           syncEventCursor: cursor > current.syncEventCursor ? cursor : current.syncEventCursor,

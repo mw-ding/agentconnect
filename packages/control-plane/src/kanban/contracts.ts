@@ -15,6 +15,7 @@ export interface LivePullRequest {
   baseRef: string | null
   defaultBranch: string | null
   createdAt: Date | null
+  mergedByLogin: string | null
 }
 
 /** One check run on a commit, body-free: its lifecycle and result only. */
@@ -42,7 +43,8 @@ export interface ContractInput {
     appSlug: string | undefined
     repoId: bigint
     issueNumber: number
-    workStartedAt: Date | null
+    /** The card's work episode start; a PR created before it belongs to earlier work. */
+    workEpisodeStartedAt: Date | null
     // Only live E2E constructors supply this; production has no config or environment override.
     overrideForTests?: { authorLogin: string; authorType: string; defaultBranch: string }
   }
@@ -53,7 +55,7 @@ export interface ContractInput {
   /** Null when the PR could not be found (deleted, transferred, or not a PR). */
   pr: LivePullRequest | null
   /** The verdict for `pr.headSha`, read live; only `pr_checks_green` needs it. */
-  checks?: { headSha: string; verdict: ChecksVerdict }
+  checks?: { headSha: string; verdict: ChecksVerdict; actionsUnreadable?: boolean }
 }
 
 export type ContractWait =
@@ -63,11 +65,13 @@ export type ContractWait =
   | 'pr_missing'
   | 'pr_unbound'
   | 'pr_open'
+  | 'merged_by_app'
   | 'awaiting_verifier'
   | 'checks_unread'
   | 'stale_sha'
   | 'checks_pending'
   | 'checks_failed'
+  | 'actions_read_missing'
   | 'no_checks'
 
 export type ContractDecision =
@@ -91,7 +95,7 @@ export function planContract(input: ContractInput): ContractDecision {
     !binding ||
     !expected.authorLogin ||
     !expected.defaultBranch ||
-    !binding.workStartedAt ||
+    !binding.workEpisodeStartedAt ||
     !pr.createdAt ||
     pr.authorLogin?.toLowerCase() !== expected.authorLogin.toLowerCase() ||
     pr.authorType !== expected.authorType ||
@@ -99,19 +103,25 @@ export function planContract(input: ContractInput): ContractDecision {
     pr.headRepoId !== binding.repoId ||
     pr.baseRef !== expected.defaultBranch ||
     !Number.isFinite(pr.createdAt.getTime()) ||
-    !Number.isFinite(binding.workStartedAt.getTime()) ||
-    pr.createdAt.getTime() < binding.workStartedAt.getTime()
+    !Number.isFinite(binding.workEpisodeStartedAt.getTime()) ||
+    pr.createdAt.getTime() < binding.workEpisodeStartedAt.getTime()
   )
     return wait('pr_unbound')
   if (pr.state === 'closed' && !pr.merged) return { kind: 'triage', reason: 'pr_closed_unmerged' }
   const verified = input.verifierAgentId === null || input.verifiedAt !== null
   if (input.contract === 'pr_merged') {
     if (!pr.merged) return wait('pr_open')
+    // The worker's own token can merge on an unprotected base, so with no verifier an App-bot merge proves nothing.
+    const appBot = binding.appSlug ? `${binding.appSlug}[bot]`.toLowerCase() : null
+    if (input.verifierAgentId === null && appBot !== null && pr.mergedByLogin?.toLowerCase() === appBot)
+      return wait('merged_by_app')
     return verified ? { kind: 'done' } : wait('awaiting_verifier')
   }
   const checks = input.checks
   if (!checks) return wait('checks_unread')
   if (checks.headSha !== pr.headSha) return wait('stale_sha')
+  // Without actions:read, same-named jobs of different workflows cannot be told apart, so the head is never green.
+  if (checks.actionsUnreadable && checks.verdict !== 'failed') return wait('actions_read_missing')
   if (checks.verdict === 'pending') return wait('checks_pending')
   if (checks.verdict === 'failed') return wait('checks_failed')
   if (checks.verdict === 'none') return wait('no_checks')
@@ -123,5 +133,25 @@ export function prClosedUnmergedComment(prNumber: number): string {
   return (
     `AgentConnect Kanban: linked pull request #${prNumber} was closed without merging, so this card moved to ` +
     '`ac/status:triage` (pr_closed_unmerged). Set another status to continue.'
+  )
+}
+
+/** Waits no event will end on their own: each sets needsAttention and posts one comment per (card, reason, PR). */
+export const FLAGGED_WAITS: ReadonlySet<ContractWait> = new Set(['pr_unbound', 'actions_read_missing', 'merged_by_app'])
+
+const FLAG_HINTS: Partial<Record<ContractWait, string>> = {
+  pr_unbound:
+    'is not bound to this card (it must be opened by the AgentConnect App on `ac/card-<issue>` in this repository, ' +
+    "against the default branch, after this card's work started)",
+  actions_read_missing:
+    'has GitHub Actions checks, but the App cannot read workflow runs (`actions:read`), so its checks cannot be judged',
+  merged_by_app: 'was merged by the AgentConnect App itself and this board has no verifier, so the merge is not proof'
+}
+
+/** Body-free note for a contract that needs a human: the PR number, a fixed reason, and the reason code only. */
+export function contractAttentionComment(reason: ContractWait, prNumber: number): string {
+  return (
+    `AgentConnect Kanban: linked pull request #${prNumber} ${FLAG_HINTS[reason] ?? 'cannot complete this card'}, ` +
+    `so this card stays in \`ac/status:review\` and needs attention (${reason}). Move the card to continue.`
   )
 }

@@ -1003,7 +1003,7 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     expect(calls()).toBe(3)
   })
 
-  it('vera-415: the CP-only PR reader adds actions:read for workflow identity without sharing reporter grants', async () => {
+  it('vera-415: the CP-only PR reader token is pull_requests + checks read; actions:read is its own token', async () => {
     const clock = new FakeClock(1_700_000_000_000)
     const { svc, bodies, calls } = levelsService(clock)
 
@@ -1011,12 +1011,16 @@ describe('InstallationTokenService.mintLevels — per-capability levels (issue #
     expect(grant.access).toBe('read')
     expect(bodies[0]).toEqual({
       repository_ids: [777],
-      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read', actions: 'read' }
+      permissions: { metadata: 'read', checks: 'read', pull_requests: 'read' }
     })
     await svc.mintKanbanPr(IID, 'acme/tools', 777n)
     expect(calls()).toBe(1)
     await svc.mintChecks(IID, 'acme/tools', 777n)
     expect(calls()).toBe(2)
+    await svc.mintKanbanActions(IID, 'acme/tools', 777n)
+    expect(bodies[2]).toEqual({ repository_ids: [777], permissions: { metadata: 'read', actions: 'read' } })
+    await svc.mintKanbanActions(IID, 'acme/tools', 777n)
+    expect(calls()).toBe(3)
   })
 
   it('mints the Kanban project token with organization_projects:write, scoped by repo id on its own cache key', async () => {

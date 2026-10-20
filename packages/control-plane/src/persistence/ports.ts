@@ -8523,7 +8523,11 @@ export interface KanbanContractCard {
   status: KanbanStatus
   stateRevision: bigint
   linkedPrNumber: number | null
-  linkedPrWorkStartedAt: Date | null
+  /** Start of the card's work episode (DB clock); a bound PR was created no earlier. */
+  workEpisodeStartedAt: Date | null
+  /** `<reason>#<pr>` keys already flagged once in this episode. */
+  contractFlags: string[]
+  needsAttention: boolean
   verifiedAt: Date | null
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
   verifierAgentId: string | null
@@ -8538,6 +8542,14 @@ export interface KanbanContractSettleInput {
   prNumber: number
 }
 
+/** A contract wait that needs a human (pr_unbound, actions_read_missing, merged_by_app), flagged once per PR. */
+export interface KanbanContractFlagInput {
+  cardId: string
+  expectedStateRevision: bigint
+  reason: string
+  prNumber: number
+}
+
 export interface KanbanContractRepo {
   /** Unleased `review` cards with a linked PR on an enabled board under a PR contract, by issue number. */
   listContractCards(
@@ -8547,6 +8559,8 @@ export interface KanbanContractRepo {
   getContractCard(cardId: string): Promise<KanbanContractCard | null>
   /** CAS review → done/triage (no open lease) with an audit row; false when the card moved, was leased, or vanished. */
   settleContract(input: KanbanContractSettleInput): Promise<boolean>
+  /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */
+  flagContract(input: KanbanContractFlagInput): Promise<boolean>
 }
 
 /** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */

@@ -9,7 +9,7 @@ import { explainClaim, type ClaimAgentFacts, type ClaimEligibilityInput } from '
 import { simulateClaim, type ClaimCandidate } from '../../kanban/claim-explain.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { planNotification } from '../../kanban/notifier.js'
-import { PROMOTION_CLEARED } from './kanban.repo.js'
+import { endsEpisode, EPISODE_RESET, PROMOTION_CLEARED } from './kanban.repo.js'
 import { insertKanbanNotification } from './kanban-notify.repo.js'
 import { PROVIDER_TRANSIENT_LIMIT, type KanbanBlockKind } from '../../kanban/run-accounting.js'
 import type { PrismaLike } from '../prisma.js'
@@ -23,6 +23,7 @@ import type {
   KanbanClaimResult,
   KanbanClaimedLease,
   KanbanContractCard,
+  KanbanContractFlagInput,
   KanbanContractRepo,
   KanbanContractSettleInput,
   KanbanExplainOpts,
@@ -65,7 +66,8 @@ const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."lin
   AND b."completionContract" <> 'close'
   AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
 const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
-  c."linkedPrNumber", c."linkedPrWorkStartedAt", c."verifiedAt", b."completionContract", b."verifierAgentId"`
+  c."linkedPrNumber", c."workEpisodeStartedAt", c."contractFlags", c."needsAttention", c."verifiedAt",
+  b."completionContract", b."verifierAgentId"`
 
 interface BoardRow {
   id: string
@@ -93,6 +95,7 @@ interface CandidateRow {
   /** The board's verifier wrote some work attempt on this card (B8 compares every attempt, not only the latest). */
   verifierDidWork: boolean
   epicCardId: string | null
+  workEpisodeStartedAt: Date | null
 }
 
 interface RunEndRow {
@@ -218,7 +221,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
         SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
-               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
                EXISTS (SELECT 1 FROM "kanban_run" w
                  WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
@@ -292,8 +295,13 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
               // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
               // Only a work claim changes the status label; a verify claim leaves any label write already owed as it is.
+              // The first work claim of an episode stamps its start (DB clock); rework claims keep it.
               ...(card.role === 'work'
-                ? { verifiedAt: null, linkedPrWorkStartedAt: null, labelWritePending: true }
+                ? {
+                    verifiedAt: null,
+                    labelWritePending: true,
+                    ...(card.workEpisodeStartedAt ? {} : { workEpisodeStartedAt: opts.now })
+                  }
                 : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
@@ -435,7 +443,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
           blockKind: null,
           // A human status move starts over, so an old approval never suppresses the next review.
           verifiedAt: null,
-          ...RECOVERY_RESET
+          ...RECOVERY_RESET,
+          ...(endsEpisode(from, to) ? EPISODE_RESET : {})
         }
       })
       await auditCardTransition(tx, { cardId: card.id, from, to, source: 'parked_ingest' })
@@ -545,6 +554,29 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
       WHERE c."id" = ${cardId}::uuid AND ${CONTRACT_DUE}
     `)
     return card ?? null
+  }
+
+  async flagContract(input: KanbanContractFlagInput): Promise<boolean> {
+    const key = `${input.reason}#${input.prNumber}`
+    // Once per (card, reason, PR) in an episode; a card a human already holds keeps its own reason.
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: {
+        id: input.cardId,
+        stateRevision: input.expectedStateRevision,
+        status: 'review',
+        linkedPrNumber: input.prNumber,
+        needsAttention: false,
+        NOT: { contractFlags: { has: key } },
+        runs: { none: { endedAt: null } }
+      },
+      data: {
+        needsAttention: true,
+        attentionReason: input.reason,
+        contractFlags: { push: key },
+        stateRevision: { increment: 1 }
+      }
+    })
+    return count === 1
   }
 
   settleContract(input: KanbanContractSettleInput): Promise<boolean> {
@@ -729,12 +761,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
           // A run end that keeps the status (a verify approval under a PR contract) owes GitHub no label write.
           ...(plan.status !== row.status ? { labelWritePending: true } : {}),
           // A verifier report never replaces the linked PR.
-          ...(row.role === 'work' && input.prNumber !== undefined
-            ? {
-                linkedPrNumber: input.prNumber,
-                linkedPrWorkStartedAt: row.dispatchedAt
-              }
-            : {}),
+          ...(row.role === 'work' && input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,

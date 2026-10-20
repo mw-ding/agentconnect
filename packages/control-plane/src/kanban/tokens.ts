@@ -3,7 +3,12 @@ import type { InstallationTokenService, MintedGitCred } from '../github/installa
 
 export type KanbanTokenMinter = Pick<
   InstallationTokenService,
-  'mintKanbanCard' | 'mintKanbanRun' | 'mintKanbanOrchestratorWrite' | 'mintKanbanProject' | 'mintKanbanPr'
+  | 'mintKanbanCard'
+  | 'mintKanbanRun'
+  | 'mintKanbanOrchestratorWrite'
+  | 'mintKanbanProject'
+  | 'mintKanbanPr'
+  | 'mintKanbanActions'
 >
 
 // Use a dev PAT only when no App is configured, with one warning.
@@ -29,6 +34,7 @@ export function kanbanTokenSource(opts: {
     mintKanbanCard: async (_installationId, repoFullName, _repoId, access) => grant(repoFullName, access),
     mintKanbanRun: async (_installationId, repoFullName, _repoId, mode) => grant(repoFullName, mode),
     mintKanbanPr: async (_installationId, repoFullName) => grant(repoFullName, 'read'),
+    mintKanbanActions: async (_installationId, repoFullName) => grant(repoFullName, 'read'),
     // A dev PAT needs project scope; missing scope fails closed like missing App org permission.
     mintKanbanProject: async (_installationId, repoFullName) => grant(repoFullName, 'write'),
     mintKanbanOrchestratorWrite: async (_installationId, repoFullName, _repoId) => grant(repoFullName, 'write')

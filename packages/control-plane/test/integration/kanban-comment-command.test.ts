@@ -122,7 +122,13 @@ async function boot(status: Status, permissions: Record<string, string> = { alic
       issueNumber: ISSUE.number,
       status,
       ...(status === 'blocked' ? { blockKind: 'needs_input' as const } : {}),
-      ...(status === 'done' ? { linkedPrNumber: 12, linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z') } : {})
+      ...(status === 'done'
+        ? {
+            linkedPrNumber: 12,
+            workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z'),
+            contractFlags: ['pr_unbound#11']
+          }
+        : {})
     }
   })
   app = buildApp({
@@ -210,7 +216,7 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     })
   })
 
-  it('/kanban reopen reopens a done issue, moves the card to ready, and drops the old PR link', async () => {
+  it('vera-415b3: /kanban reopen reopens a done issue, moves the card to ready, and ends the work episode', async () => {
     const { github, board, card, link } = await boot('done')
     await postGithubWebhook(link.webhookUrl, {
       secret: WEBHOOK_SECRET,
@@ -221,7 +227,8 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
       status: 'ready',
       linkedPrNumber: null,
-      linkedPrWorkStartedAt: null
+      workEpisodeStartedAt: null,
+      contractFlags: []
     })
     expect(github.state()).toBe('open')
     expect(writes(github.calls)).toContainEqual(
