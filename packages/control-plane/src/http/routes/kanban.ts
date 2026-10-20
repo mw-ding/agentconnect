@@ -72,6 +72,8 @@ function boardDto(board: KanbanBoardView, req: FastifyRequest): KanbanBoardDtoT 
     verifierAgentId: board.verifierAgentId,
     maxInProgress: board.maxInProgress,
     maxInProgressPerAgent: board.maxInProgressPerAgent,
+    epicMaxCards: board.epicMaxCards,
+    epicMaxActive: board.epicMaxActive,
     staleLeaseSec: board.staleLeaseSec,
     failureLimit: board.failureLimit,
     protocolRetryLimit: board.protocolRetryLimit,
@@ -441,6 +443,7 @@ export function kanbanRoutes(deps: HttpDeps) {
 
     // The dry run reads the SAME liveness the dispatcher gives the claim, and writes, locks, audits and calls GitHub never.
     const explainOpts = async () => ({
+      maxPerDaemon: deps.config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON,
       now: await deps.repos.kanbanDispatch.now(),
       isDaemonLive: (daemonId: string) => deps.daemonConns.get(daemonId)?.state === 'READY'
     })

@@ -274,6 +274,67 @@ describe('handleGitCredRequest — repoFullName passthrough (issue #457)', () =>
     expect(mintForKanbanComment).not.toHaveBeenCalled()
   })
 
+  it('mints an issues-only token for an orchestrator agent on its own board repo', async () => {
+    const mintForAgent = vi.fn()
+    const mintForKanbanOrchestratorWrite = vi.fn(async () => ({
+      token: 'ghs_orch',
+      ttlSec: 3540,
+      expiresAt: '2026-07-11T01:00:00.000Z',
+      repoFullName: 'acme/web',
+      access: 'write' as const
+    }))
+    const orchestratorRepoId = vi.fn(async () => 42n)
+    const deps = {
+      agent: { get: async () => PLACED_AGENT },
+      kanbanOrchestrator: { orchestratorRepoId },
+      github: { mintForAgent, mintForKanbanOrchestratorWrite }
+    } as unknown as DaemonWsDeps
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      purpose: 'kanban_orchestrator_write',
+      capabilities: ['issues'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(frame, conn, deps)
+    expect(orchestratorRepoId).toHaveBeenCalledWith(AGENT_ID, PLACED_AGENT.orgId, 'acme/web')
+    expect(mintForKanbanOrchestratorWrite).toHaveBeenCalledWith(
+      PLACED_AGENT,
+      'acme/web',
+      42n,
+      [`daemon:${DAEMON_ID}`, `org:org-a`],
+      false
+    )
+    expect(mintForAgent).not.toHaveBeenCalled()
+    expect(conn.replyTo).toHaveBeenCalledWith(
+      frame,
+      'gitcred/grant',
+      expect.objectContaining({ token: 'ghs_orch', access: 'write' })
+    )
+  })
+
+  it('refuses an orchestrator write token when no enabled board on the repo is orchestrated', async () => {
+    const mintForKanbanOrchestratorWrite = vi.fn()
+    const deps = {
+      agent: { get: async () => PLACED_AGENT },
+      kanbanOrchestrator: { orchestratorRepoId: vi.fn(async () => null) },
+      github: { mintForKanbanOrchestratorWrite }
+    } as unknown as DaemonWsDeps
+    const conn = fakeConn()
+    const frame = gitcredFrame({
+      purpose: 'kanban_orchestrator_write',
+      capabilities: ['issues'],
+      repoFullName: 'acme/web'
+    })
+    await handleGitCredRequest(frame, conn, deps)
+    expect(conn.sendError).toHaveBeenCalledWith(
+      frame.id,
+      'SCOPE_DENIED',
+      'this agent does not orchestrate a board on that repository',
+      false
+    )
+    expect(mintForKanbanOrchestratorWrite).not.toHaveBeenCalled()
+  })
+
   it('denies a malformed GithubPoster capability request before minting', async () => {
     const deps = {
       agent: { get: async () => PLACED_AGENT },

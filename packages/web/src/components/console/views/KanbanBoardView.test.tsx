@@ -259,8 +259,9 @@ describe('KanbanBoardView columns and titles', () => {
     await click(button('Show', column('done')))
     await settleUntil(() => tile(2) !== null)
     for (const numbers of titleNumbers()) {
-      expect(`;${numbers};`).not.toContain(';2;')
-      expect(`;${numbers};`).not.toContain(';3;')
+      const requested = (numbers ?? '').split(',').map(Number)
+      expect(requested).not.toContain(2)
+      expect(requested).not.toContain(3)
     }
     // Filtering to needs-attention drops the other cards from the request.
     await click(button('Needs attention', host.querySelector('h1')!.parentElement!))

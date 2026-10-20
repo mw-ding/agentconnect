@@ -3,13 +3,26 @@
 import type { ClaimEligibilityInput, ClaimGate, ClaimVerdict } from './claim-eligibility.js'
 
 /** The gates a claim cap can defer an otherwise eligible card behind, once earlier claims fill the room. */
-export type ClaimCapGate = 'board_cap' | 'agent_cap'
+export type ClaimCapGate = 'board_cap' | 'agent_cap' | 'epic_cap' | 'daemon_cap'
 
 /** Body-free facts behind a verdict: booleans, counts, ids and timestamps only, never an issue title or body. */
 export interface ClaimFacts {
   boardEnabled: boolean
   status: string
   assigneeAgentId: string | null
+  role: 'work' | 'verify'
+  targetAgentId: string | null
+  targetExists: boolean
+  targetPaused: boolean
+  targetPlaced: boolean
+  targetDaemonLive: boolean
+  verifierAgentId: string | null
+  verifiedAt: string | null
+  needsAttention: boolean
+  workAgentIds: string[]
+  openRunCountForVerifier: number
+  epicCapacity: NonNullable<ClaimEligibilityInput['epicCapacity']> | null
+  daemonCapacity: NonNullable<ClaimEligibilityInput['daemonCapacity']> | null
   promotionPending: boolean
   cooldownUntil: string | null
   notBefore: string | null
@@ -26,10 +39,25 @@ export interface ClaimFacts {
 
 export function claimFactsOf(input: ClaimEligibilityInput): ClaimFacts {
   const { board, card, assignee } = input
+  const role = card.status === 'review' ? 'verify' : 'work'
+  const target = role === 'verify' ? input.verifier : assignee
   return {
     boardEnabled: board.enabled,
     status: card.status,
     assigneeAgentId: card.assigneeAgentId,
+    role,
+    targetAgentId: role === 'verify' ? board.verifierAgentId : card.assigneeAgentId,
+    targetExists: target?.exists ?? false,
+    targetPaused: target?.paused ?? false,
+    targetPlaced: (target?.daemonId ?? null) !== null,
+    targetDaemonLive: target?.daemonLive ?? false,
+    verifierAgentId: board.verifierAgentId,
+    verifiedAt: card.verifiedAt?.toISOString() ?? null,
+    needsAttention: card.needsAttention,
+    workAgentIds: [...input.workAgentIds],
+    openRunCountForVerifier: input.openRunCountForVerifier,
+    epicCapacity: input.epicCapacity ?? null,
+    daemonCapacity: input.daemonCapacity ?? null,
     promotionPending: card.promotionPending,
     cooldownUntil: card.cooldownUntil?.toISOString() ?? null,
     notBefore: card.notBefore?.toISOString() ?? null,
@@ -48,18 +76,22 @@ export function claimFactsOf(input: ClaimEligibilityInput): ClaimFacts {
 // A Record over every gate: a gate Lane 3 adds fails to compile here until it gets a hint.
 const HINTS: Record<ClaimGate, (facts: ClaimFacts) => string> = {
   board_disabled: () => 'the board is disabled; enable it to dispatch cards',
-  status_not_claimable: (f) => `only ready cards are dispatched; this card is ${f.status}`,
+  status_not_claimable: (f) => `only ready (work) and review (verify) cards are dispatched; this card is ${f.status}`,
+  verified: () => 'the verifier approved this card; it is waiting for the completion contract',
+  needs_attention: () => 'this card needs human attention; a human status move clears the hold',
+  epic_cap: (f) => `the epic is at its limit of ${f.epicCapacity?.maxActive} in-progress run(s)`,
+  daemon_cap: (f) => `the target daemon is at its limit of ${f.daemonCapacity?.maxActive} in-progress run(s)`,
   promotion_pending: () => 'a promotion to ready is still being confirmed on GitHub',
   cooldown: (f) => `cooling down until ${f.cooldownUntil ?? 'later'} after a failed run`,
   not_before: (f) => `scheduled not to start before ${f.notBefore ?? 'later'}`,
   no_assignee: () => 'no agent is assigned to this card',
-  agent_missing: () => 'the assigned agent no longer exists in this organization',
-  agent_paused: () => 'the assigned agent is paused',
-  agent_unplaced: () => 'the assigned agent is not placed on a daemon',
-  daemon_offline: () => "the assigned agent's daemon is not connected",
+  agent_missing: () => 'the target agent no longer exists in this organization',
+  agent_paused: () => 'the target agent is paused',
+  agent_unplaced: () => 'the target agent is not placed on a daemon',
+  daemon_offline: () => "the target agent's daemon is not connected",
   open_lease: () => 'a run already holds this card',
   board_cap: (f) => `the board is at its limit of ${f.maxInProgress} in-progress run(s)`,
-  agent_cap: (f) => `the assigned agent is at its limit of ${f.maxInProgressPerAgent} in-progress run(s)`,
+  agent_cap: (f) => `the target agent is at its limit of ${f.maxInProgressPerAgent} in-progress run(s)`,
   verifier_unset: () => 'review cards need a verifier agent configured on the board',
   verifier_is_worker: () => 'the verifier must be a different agent than the one that did the work'
 }
@@ -78,6 +110,8 @@ export interface ClaimCandidate {
   priority: number
   createdAt: Date
   verdict: ClaimVerdict
+  epicCapacity?: { id: string; openRunCount: number; maxActive: number }
+  daemonCapacity?: { id: string; openRunCount: number; maxActive: number }
 }
 
 export interface ClaimSimulationCaps {
@@ -105,18 +139,16 @@ export function compareClaimOrder(a: ClaimCandidate, b: ClaimCandidate): number 
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
-/** Replays `PgKanbanDispatchRepo.claim`'s loop over the cards `explainClaim` finds eligible, with caps applied cumulatively.
- *  Candidates must arrive in the claim's SQL order (priority DESC, createdAt ASC, id ASC); see below for why. */
+// Replay cumulative caps over candidates in exact SQL order, preserving sub-millisecond age ties.
 export function simulateClaim(candidates: readonly ClaimCandidate[], caps: ClaimSimulationCaps): ClaimSimulation {
   const order: string[] = []
   const capBound = new Map<string, ClaimCapGate>()
   const perAgent = new Map(caps.openPerAgent)
   let inProgress = caps.openTotal
   const room = Math.min(caps.maxInProgress - inProgress, caps.limit ?? Number.POSITIVE_INFINITY)
-  // WHY no id tiebreak here: PG orders timestamptz(6) at microsecond precision while a JS Date carries milliseconds,
-  // so compareClaimOrder's id fallback would put a newer card with a smaller id ahead of an older one born less than
-  // a millisecond earlier. The input already arrives in exact SQL order and sort is stable, so sub-ms ties keep that
-  // order — which matches the claim exactly, including its id ASC rule for true microsecond ties.
+  // Stable sorting preserves the SQL microsecond order that JS Date cannot represent.
+  const perEpic = new Map<string, number>()
+  const perDaemon = new Map<string, number>()
   const eligible = candidates
     .filter((c) => c.verdict.eligible)
     .sort((a, b) => b.priority - a.priority || a.createdAt.getTime() - b.createdAt.getTime())
@@ -130,6 +162,18 @@ export function simulateClaim(candidates: readonly ClaimCandidate[], caps: Claim
       capBound.set(card.id, 'agent_cap')
       continue
     }
+    const epic = card.epicCapacity
+    if (epic && (perEpic.get(epic.id) ?? epic.openRunCount) >= epic.maxActive) {
+      capBound.set(card.id, 'epic_cap')
+      continue
+    }
+    const daemon = card.daemonCapacity
+    if (daemon && (perDaemon.get(daemon.id) ?? daemon.openRunCount) >= daemon.maxActive) {
+      capBound.set(card.id, 'daemon_cap')
+      continue
+    }
+    if (epic) perEpic.set(epic.id, (perEpic.get(epic.id) ?? epic.openRunCount) + 1)
+    if (daemon) perDaemon.set(daemon.id, (perDaemon.get(daemon.id) ?? daemon.openRunCount) + 1)
     order.push(card.id)
     perAgent.set(agentId, (perAgent.get(agentId) ?? 0) + 1)
     inProgress += 1

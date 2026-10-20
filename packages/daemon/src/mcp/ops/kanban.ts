@@ -2,7 +2,14 @@ import { z } from 'zod'
 import { KANBAN_BLOCK_KINDS, KANBAN_COMMENT_MAX_CHARS } from '@agentconnect.md/protocol'
 import { KANBAN_REASON_MAX_CHARS, KANBAN_SUMMARY_MAX_CHARS, type KanbanTerminal } from '../../kanban/kanban-worker.js'
 import type { SessionContext, ToolHandler } from './context.js'
-import { optionalBoundedInt, parseArgs, requiredEnum } from './args.js'
+import {
+  optionalBoundedInt,
+  optionalEnum,
+  optionalPositiveInt,
+  parseArgs,
+  requiredEnum,
+  requiredPositiveInt
+} from './args.js'
 
 /** A worker's terminal tool call; the lease is resolved from these trusted coordinates, never from tool input. */
 export interface KanbanTerminalReq {
@@ -25,6 +32,8 @@ export interface KanbanDeps {
   kanbanShow?: (req: KanbanSessionReq) => Promise<unknown>
   /** Posts one progress note on the session's own leased card; throws when refused or over the cap. */
   kanbanComment?: (req: KanbanSessionReq & { text: string }) => Promise<unknown>
+  /** The live lease's role for a session, or undefined when no lease holds it; gates the verifier-only tools. */
+  kanbanLeaseRole?: (req: KanbanSessionReq) => 'work' | 'verify' | undefined
 }
 
 const unexpectedKeys: { error: z.core.$ZodErrorMap } = {
@@ -59,6 +68,7 @@ export const KANBAN_COMMENT_ARGS = z.strictObject(
   unexpectedKeys
 )
 export const KANBAN_FAIL_ARGS = z.strictObject({ summary, reason }, unexpectedKeys)
+export const KANBAN_REQUEST_CHANGES_ARGS = z.strictObject({ reason }, unexpectedKeys)
 
 function sessionReq(ctx: SessionContext): KanbanSessionReq {
   return {
@@ -86,11 +96,28 @@ export const kanbanComplete: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
 }
 
 export const kanbanRequestReview: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  if (deps.kanbanLeaseRole?.(sessionReq(ctx)) === 'verify') {
+    throw new Error(
+      'verifier_cannot_request_review: a verifier cannot request review; call kanbanComplete to approve or kanbanRequestChanges.'
+    )
+  }
   const parsed = parseArgs(KANBAN_REQUEST_REVIEW_ARGS, args)
   return record(ctx, deps, {
     outcome: 'review_requested',
     summary: parsed.summary,
     ...(parsed.prNumber ? { prNumber: parsed.prNumber } : {})
+  })
+}
+
+export const kanbanRequestChanges: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
+  if (deps.kanbanLeaseRole?.(sessionReq(ctx)) !== 'verify') {
+    throw new Error('not_verifier: kanbanRequestChanges is only available to a verifier run reviewing this card.')
+  }
+  const parsed = parseArgs(KANBAN_REQUEST_CHANGES_ARGS, args)
+  return record(ctx, deps, {
+    outcome: 'changes_requested',
+    summary: '',
+    reason: parsed.reason
   })
 }
 
@@ -131,6 +158,7 @@ export const kanbanComment: ToolHandler<KanbanDeps> = (ctx, args, deps) => {
 export const KANBAN_HANDLERS: [string, ToolHandler<KanbanDeps>][] = [
   ['kanbanComplete', kanbanComplete],
   ['kanbanRequestReview', kanbanRequestReview],
+  ['kanbanRequestChanges', kanbanRequestChanges],
   ['kanbanBlock', kanbanBlock],
   ['kanbanFail', kanbanFail],
   ['kanbanShow', kanbanShow],
@@ -139,8 +167,169 @@ export const KANBAN_HANDLERS: [string, ToolHandler<KanbanDeps>][] = [
 export const KANBAN_ARG_SCHEMAS: [string, z.ZodType][] = [
   ['kanbanComplete', KANBAN_COMPLETE_ARGS],
   ['kanbanRequestReview', KANBAN_REQUEST_REVIEW_ARGS],
+  ['kanbanRequestChanges', KANBAN_REQUEST_CHANGES_ARGS],
   ['kanbanBlock', KANBAN_BLOCK_ARGS],
   ['kanbanFail', KANBAN_FAIL_ARGS],
   ['kanbanShow', KANBAN_SHOW_ARGS],
   ['kanbanComment', KANBAN_COMMENT_ARGS]
+]
+
+// ── Orchestrator tools (issue #2 M3): caller identity is ctx.agentId; the board is a uuid, and the CP gates the role. ──
+
+export interface KanbanOrchestratorToolDeps {
+  kanbanList?: (req: { agentId: string; board?: string; status?: string }) => Promise<unknown>
+  kanbanCreate?: (req: {
+    agentId: string
+    board: string
+    title: string
+    body: string
+    epic?: number
+    step?: string
+    assignee?: string
+    priority?: number
+    status?: 'triage' | 'todo'
+    blockedBy?: number[]
+  }) => Promise<unknown>
+  kanbanLink?: (req: {
+    agentId: string
+    board: string
+    issue: number
+    blockedBy?: number[]
+    parent?: number
+  }) => Promise<unknown>
+  kanbanUnblock?: (req: { agentId: string; board: string; issue: number; blockers?: number[] }) => Promise<unknown>
+  kanbanAssign?: (req: { agentId: string; board: string; issue: number; assignee: string | null }) => Promise<unknown>
+}
+
+const boardArg = z.string().uuid('argument board must be a board id (uuid)')
+const titleArg = z
+  .string('missing required string argument: title')
+  .transform((v) => v.trim())
+  .refine((v) => v.length > 0, 'missing required string argument: title')
+  .refine((v) => v.length <= 256, 'argument title must be at most 256 characters')
+const bodyArg = z
+  .string('missing required string argument: body')
+  .transform((v) => v.trim())
+  .refine((v) => v.length <= 60000, 'argument body must be at most 60000 characters')
+const stepArg = z
+  .string('argument step must be a string')
+  .regex(/^[a-z0-9][a-z0-9_.:-]{0,63}$/, 'argument step must be a short machine id')
+  .optional()
+const positiveIntItem = z.int('blockedBy must list positive integers').min(1, 'blockedBy must list positive integers')
+const blockersArg = z.array(positiveIntItem).max(20, 'argument blockedBy must list at most 20 issues').optional()
+
+export const KANBAN_LIST_ARGS = z.strictObject(
+  { board: boardArg.optional(), status: z.string().min(1).max(40).optional() },
+  unexpectedKeys
+)
+export const KANBAN_CREATE_ARGS = z.strictObject(
+  {
+    board: boardArg,
+    title: titleArg,
+    body: bodyArg,
+    epic: optionalPositiveInt('epic'),
+    step: stepArg,
+    assignee: z.string().min(1).max(64).optional(),
+    priority: optionalBoundedInt('priority', Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
+    status: optionalEnum('status', ['triage', 'todo']),
+    blockedBy: blockersArg
+  },
+  unexpectedKeys
+)
+export const KANBAN_LINK_ARGS = z.strictObject(
+  {
+    board: boardArg,
+    issue: requiredPositiveInt('issue'),
+    blockedBy: blockersArg,
+    parent: optionalPositiveInt('parent')
+  },
+  unexpectedKeys
+)
+export const KANBAN_UNBLOCK_ARGS = z.strictObject(
+  {
+    board: boardArg,
+    issue: requiredPositiveInt('issue'),
+    blockers: z.array(positiveIntItem).optional()
+  },
+  unexpectedKeys
+)
+export const KANBAN_ASSIGN_ARGS = z.strictObject(
+  { board: boardArg, issue: requiredPositiveInt('issue'), assignee: z.string().min(1).max(64).nullable() },
+  unexpectedKeys
+)
+
+export const kanbanListTool: ToolHandler<KanbanOrchestratorToolDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_LIST_ARGS, args)
+  if (!deps.kanbanList) throw new Error('Kanban orchestrator tools are unavailable on this daemon')
+  return deps.kanbanList({
+    agentId: ctx.agentId,
+    ...(parsed.board ? { board: parsed.board } : {}),
+    ...(parsed.status ? { status: parsed.status } : {})
+  })
+}
+
+export const kanbanCreateTool: ToolHandler<KanbanOrchestratorToolDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_CREATE_ARGS, args)
+  if (!deps.kanbanCreate) throw new Error('Kanban orchestrator tools are unavailable on this daemon')
+  return deps.kanbanCreate({
+    agentId: ctx.agentId,
+    board: parsed.board,
+    title: parsed.title,
+    body: parsed.body,
+    ...(parsed.epic !== undefined ? { epic: parsed.epic } : {}),
+    ...(parsed.step !== undefined ? { step: parsed.step } : {}),
+    ...(parsed.assignee !== undefined ? { assignee: parsed.assignee } : {}),
+    ...(parsed.priority !== undefined ? { priority: parsed.priority } : {}),
+    ...(parsed.status !== undefined ? { status: parsed.status } : {}),
+    ...(parsed.blockedBy !== undefined ? { blockedBy: parsed.blockedBy } : {})
+  })
+}
+
+export const kanbanLinkTool: ToolHandler<KanbanOrchestratorToolDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_LINK_ARGS, args)
+  if (!deps.kanbanLink) throw new Error('Kanban orchestrator tools are unavailable on this daemon')
+  return deps.kanbanLink({
+    agentId: ctx.agentId,
+    board: parsed.board,
+    issue: parsed.issue,
+    ...(parsed.blockedBy !== undefined ? { blockedBy: parsed.blockedBy } : {}),
+    ...(parsed.parent !== undefined ? { parent: parsed.parent } : {})
+  })
+}
+
+export const kanbanUnblockTool: ToolHandler<KanbanOrchestratorToolDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_UNBLOCK_ARGS, args)
+  if (!deps.kanbanUnblock) throw new Error('Kanban orchestrator tools are unavailable on this daemon')
+  return deps.kanbanUnblock({
+    agentId: ctx.agentId,
+    board: parsed.board,
+    issue: parsed.issue,
+    ...(parsed.blockers !== undefined ? { blockers: parsed.blockers } : {})
+  })
+}
+
+export const kanbanAssignTool: ToolHandler<KanbanOrchestratorToolDeps> = (ctx, args, deps) => {
+  const parsed = parseArgs(KANBAN_ASSIGN_ARGS, args)
+  if (!deps.kanbanAssign) throw new Error('Kanban orchestrator tools are unavailable on this daemon')
+  return deps.kanbanAssign({
+    agentId: ctx.agentId,
+    board: parsed.board,
+    issue: parsed.issue,
+    assignee: parsed.assignee
+  })
+}
+
+export const KANBAN_ORCHESTRATOR_HANDLERS: [string, ToolHandler<KanbanOrchestratorToolDeps>][] = [
+  ['kanbanList', kanbanListTool],
+  ['kanbanCreate', kanbanCreateTool],
+  ['kanbanLink', kanbanLinkTool],
+  ['kanbanUnblock', kanbanUnblockTool],
+  ['kanbanAssign', kanbanAssignTool]
+]
+export const KANBAN_ORCHESTRATOR_ARG_SCHEMAS: [string, z.ZodType][] = [
+  ['kanbanList', KANBAN_LIST_ARGS],
+  ['kanbanCreate', KANBAN_CREATE_ARGS],
+  ['kanbanLink', KANBAN_LINK_ARGS],
+  ['kanbanUnblock', KANBAN_UNBLOCK_ARGS],
+  ['kanbanAssign', KANBAN_ASSIGN_ARGS]
 ]

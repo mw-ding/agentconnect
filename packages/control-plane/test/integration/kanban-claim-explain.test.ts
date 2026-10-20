@@ -89,7 +89,56 @@ async function snapshot() {
 }
 
 describe('claim dry run parity (real Postgres)', () => {
-  // `open_lease` is deliberately absent: the SQL claim has no such gate (a second open run trips the unique index), so it cannot be compared by claiming.
+  it.each(['work', 'verify'] as const)('replays cumulative epic and daemon capacity for %s claims', async (role) => {
+    await seedAgents()
+    await seedAgent(prisma, A6, { daemonId: D2 })
+    const b = await board(100, 100)
+    await prisma.kanbanBoard.update({ where: { id: b.id }, data: { epicMaxActive: 1, verifierAgentId: A5 } })
+    const epic = await card(b.id, 100, { status: 'todo' })
+    const target = role === 'verify' ? { status: 'review' } : {}
+    const first = await card(b.id, 1, { ...target, priority: 10, epicCardId: epic.id })
+    const epicBound = await card(b.id, 2, { ...target, priority: 9, epicCardId: epic.id })
+    const second = await card(b.id, 3, { ...target, priority: 8 })
+    const daemonBound = await card(b.id, 4, { ...target, priority: 7 })
+    const independent = await card(b.id, 5, { assigneeAgentId: A6, priority: 6 })
+    const repo = new PgKanbanDispatchRepo(prisma)
+    const capacityOpts = { now: NOW, isDaemonLive: () => true, maxPerDaemon: 2 }
+    const explanation = (await repo.explainBoard(b.id, capacityOpts))!
+    expect(explanation.wouldClaimNext).toEqual([first.id, second.id, independent.id])
+    expect(explanation.cards.find((c) => c.cardId === epicBound.id)).toMatchObject({ capBound: 'epic_cap' })
+    expect(explanation.cards.find((c) => c.cardId === daemonBound.id)).toMatchObject({ capBound: 'daemon_cap' })
+    expect((await repo.claim(b.id, capacityOpts)).leases.map((l) => l.cardId)).toEqual(explanation.wouldClaimNext)
+  })
+
+  it('explains an open ready-card lease before agent gates and SQL skips it without rolling back other claims', async () => {
+    await seedAgents()
+    const b = await board(100, 100)
+    const held = await card(b.id, 1, { priority: 10 })
+    await prisma.kanbanRun.create({
+      data: {
+        cardId: held.id,
+        attempt: 1,
+        agentId: A1,
+        daemonId: D1,
+        leaseId: randomUUID(),
+        dispatchRevision: 1n,
+        dispatchedAt: NOW,
+        mode: 'read'
+      }
+    })
+    const free = await card(b.id, 2)
+    const repo = new PgKanbanDispatchRepo(prisma)
+    const explanation = (await repo.explainBoard(b.id, opts))!
+    expect(explanation.cards.find((c) => c.cardId === held.id)!.input.workAgentIds).toEqual([A1])
+    expect(explanation.cards.find((c) => c.cardId === held.id)!.verdict).toEqual({
+      eligible: false,
+      gate: 'open_lease'
+    })
+    expect((await repo.explainCard(b.id, held.id, opts))!.verdict).toEqual({ eligible: false, gate: 'open_lease' })
+    expect(explanation.wouldClaimNext).toEqual([free.id])
+    expect((await repo.claim(b.id, opts)).leases.map((l) => l.cardId)).toEqual([free.id])
+  })
+
   it('explainBoard agrees with the real claim: same set, same order, every skipped card explained', async () => {
     await seedAgents()
     const b = await board(4, 2)
@@ -102,7 +151,8 @@ describe('claim dry run parity (real Postgres)', () => {
       daemon_offline: await card(b.id, 25, { assigneeAgentId: A4 }),
       cooldown: await card(b.id, 26, { cooldownUntil: new Date(NOW.getTime() + 60_000) }),
       not_before: await card(b.id, 27, { notBefore: new Date(NOW.getTime() + 60_000) }),
-      promotion_pending: await card(b.id, 28, { promotionPending: true })
+      promotion_pending: await card(b.id, 28, { promotionPending: true }),
+      needs_attention: await card(b.id, 29, { needsAttention: true })
     }
     // A1 has three eligible cards but a per-agent cap of 2; A5's third meets the board cap of 4.
     const n1 = await card(b.id, 1, { priority: 5 })
@@ -127,7 +177,7 @@ describe('claim dry run parity (real Postgres)', () => {
       expect(byId.get(c.id)!.verdict, `card ${gate}`).toEqual({ eligible: false, gate })
     }
 
-    const claimed = await repo.claim(b.id, opts)
+    const { leases: claimed } = await repo.claim(b.id, opts)
     // A new gate in the SQL claim shows up here: it would claim a card the dry run called blocked, or skip one it called free.
     expect(claimed.map((l) => l.cardId)).toEqual(explanation.wouldClaimNext)
     const claimedIds = new Set(claimed.map((l) => l.cardId))
@@ -170,7 +220,7 @@ describe('claim dry run parity (real Postgres)', () => {
     const all = (await repo.explainBoard(b.id, opts))!
     expect(all.cards.map((c) => c.cardId)).toEqual([ready.id])
     expect(all.wouldClaimNext).toEqual([])
-    expect(await repo.claim(b.id, opts)).toEqual([])
+    expect((await repo.claim(b.id, opts)).leases).toEqual([])
   })
 
   it('counts open runs against the caps and flags a held card', async () => {
@@ -197,7 +247,7 @@ describe('claim dry run parity (real Postgres)', () => {
     expect(byId.get(held.id)!.input.card.hasOpenLease).toBe(true)
     expect(byId.get(waiting.id)!.input.openRunCount).toBe(1)
     expect(explanation.wouldClaimNext).toEqual([])
-    expect(await repo.claim(b.id, opts)).toEqual([])
+    expect((await repo.claim(b.id, opts)).leases).toEqual([])
   })
 
   it('treats an agent of another organization as missing, as the claim’s org join does', async () => {
@@ -208,15 +258,13 @@ describe('claim dry run parity (real Postgres)', () => {
     const c = await card(b.id, 1, { assigneeAgentId: A6 })
     const repo = new PgKanbanDispatchRepo(prisma)
     expect((await repo.explainCard(b.id, c.id, opts))!.verdict).toEqual({ eligible: false, gate: 'agent_missing' })
-    expect(await repo.claim(b.id, opts)).toEqual([])
+    expect((await repo.claim(b.id, opts)).leases).toEqual([])
   })
 
   it('vera-528: sub-millisecond age order matches the claim exactly', async () => {
     await seedAgents()
     const b = await board(1, 5)
-    // The older card carries the LARGER id and the newer one is 800µs younger: millisecond precision (plus the old id
-    // tiebreak) would order them backwards, while PG's timestamptz(6) does not. Prisma writes createdAt at ms
-    // precision, so both rows go in by raw SQL.
+    // Reversed ids and an 800µs age gap expose millisecond sorting that discards PostgreSQL’s exact order.
     const olderId = 'f0000000-0000-4000-8000-000000000001'
     const newerId = '10000000-0000-4000-8000-000000000001'
     await prisma.$executeRawUnsafe(
@@ -232,7 +280,7 @@ describe('claim dry run parity (real Postgres)', () => {
     const repo = new PgKanbanDispatchRepo(prisma)
     const explanation = (await repo.explainBoard(b.id, opts))!
     expect(explanation.wouldClaimNext).toEqual([olderId])
-    expect(await repo.claim(b.id, opts)).toMatchObject([{ cardId: olderId }])
+    expect((await repo.claim(b.id, opts)).leases).toMatchObject([{ cardId: olderId }])
   })
 
   it('vera-528: the dry run takes no row locks — it runs in a read-only transaction', async () => {

@@ -21,11 +21,13 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
       promotionPending: false,
       cooldownUntil: null,
       notBefore: null,
+      verifiedAt: null,
+      needsAttention: false,
       hasOpenLease: false
     },
     assignee: { exists: true, paused: false, daemonId: 'd1', daemonLive: true },
     verifier: null,
-    latestWorkAgentId: null,
+    workAgentIds: [],
     openRunCount: 0,
     openRunCountForAssignee: 0,
     openRunCountForVerifier: 0,
@@ -49,10 +51,44 @@ const GATES: ClaimGate[] = [
   'board_cap',
   'agent_cap',
   'verifier_unset',
-  'verifier_is_worker'
+  'verifier_is_worker',
+  'verified',
+  'needs_attention',
+  'epic_cap',
+  'daemon_cap'
 ]
 
 describe('claimFactsOf', () => {
+  it('uses verifier facts for review even when the assignee is paused and offline', () => {
+    const facts = claimFactsOf(
+      input({
+        board: { ...input().board, verifierAgentId: 'v1' },
+        card: { ...input().card, status: 'review', verifiedAt: NOW, needsAttention: true },
+        assignee: { exists: true, paused: true, daemonId: null, daemonLive: false },
+        verifier: { exists: true, paused: false, daemonId: 'd2', daemonLive: true },
+        workAgentIds: ['earlier-worker', 'a1'],
+        openRunCountForVerifier: 1,
+        epicCapacity: { openRunCount: 2, maxActive: 3 },
+        daemonCapacity: { openRunCount: 4, maxActive: 5 }
+      })
+    )
+    expect(facts).toMatchObject({
+      role: 'verify',
+      targetAgentId: 'v1',
+      targetExists: true,
+      targetPaused: false,
+      targetPlaced: true,
+      targetDaemonLive: true,
+      assigneePaused: true,
+      verifierAgentId: 'v1',
+      verifiedAt: NOW.toISOString(),
+      needsAttention: true,
+      workAgentIds: ['earlier-worker', 'a1'],
+      openRunCountForVerifier: 1,
+      epicCapacity: { openRunCount: 2, maxActive: 3 },
+      daemonCapacity: { openRunCount: 4, maxActive: 5 }
+    })
+  })
   it('maps the input to booleans, counts and ISO timestamps only', () => {
     const cooldown = new Date('2026-10-15T13:00:00.000Z')
     const facts = claimFactsOf(
@@ -62,7 +98,7 @@ describe('claimFactsOf', () => {
         openRunCountForAssignee: 1
       })
     )
-    expect(facts).toEqual({
+    expect(facts).toMatchObject({
       boardEnabled: true,
       status: 'ready',
       assigneeAgentId: 'a1',

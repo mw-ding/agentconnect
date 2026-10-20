@@ -1,12 +1,4 @@
-/**
- * `agentconnect dispatch --dry-run` — "why isn't this card running?". It calls the Control Plane's
- * read-only Kanban explain routes and prints each gate; nothing is dispatched or written. Card
- * titles never cross this path, so the output is ids, issue numbers, statuses and gate codes.
- *
- * Auth is a personal API key (`--api-key` or `AGENTCONNECT_API_KEY`), which the viewer-readable
- * explain routes accept. `login` saves the daemon key instead, which the console API refuses, so the
- * stored key is never used here; only the stored WebSocket URL seeds the REST base.
- */
+// Read-only dispatch diagnostics require a personal API key; login’s stored daemon key cannot read console routes.
 import { existsSync, readFileSync } from 'node:fs'
 import { configPath } from './paths.js'
 
@@ -116,8 +108,8 @@ async function resolveOrg(deps: DryRunDeps, opts: DryRunOpts): Promise<string> {
     return match.id
   }
   if (orgs.length === 1) return orgs[0]!.id
-  if (orgs.length === 0) throw new DispatchDryRunError('this key belongs to no organization')
-  throw new DispatchDryRunError(`this key belongs to ${orgs.length} organizations; pass --org <id|slug>`)
+  if (orgs.length === 0) throw new DispatchDryRunError('your user belongs to no organization')
+  throw new DispatchDryRunError(`your user can see ${orgs.length} organizations; pass --org <id|slug>`)
 }
 
 /** One card line: `#12 ready → ELIGIBLE (work → agent <id>)` or `#12 ready → blocked by <gate>: <hint>`. */

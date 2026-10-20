@@ -6,6 +6,7 @@ import { seedAgent, seedDaemon } from '../fixtures/seed.js'
 import { bearer, memberBearer, ownerBearer, startKanbanOidc, type KanbanOidc } from '../fixtures/kanban-oidc.js'
 import { ApiKeyCodec } from '../../src/registry/apiKey.js'
 import { PgUserRepo } from '../../src/persistence/repositories/user.repo.js'
+import { PgKanbanOrchestratorRepo } from '../../src/persistence/repositories/kanban-orchestrator.repo.js'
 import type { KanbanRepoResolution, KanbanRepoResolver } from '../../src/kanban/repo-resolver.js'
 import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
 
@@ -242,6 +243,83 @@ describe('Kanban board routes — an interactive owner', () => {
       expect((await app.inject({ method: 'PATCH', url, headers, payload: { defaultMode: 'write' } })).statusCode).toBe(
         400
       )
+    } finally {
+      await close()
+    }
+  })
+
+  it('sets, reads back, and bounds the B2 epic budgets; lowering below a count blocks only new creates', async () => {
+    const { app, close } = buildApp()
+    const headers = await ownerBearer(prisma, oidc)
+    try {
+      const plain = await app.inject({
+        method: 'POST',
+        url: BOARDS,
+        headers,
+        payload: { name: 'web', repoFullName: 'acme/web' }
+      })
+      expect(plain.json()).toMatchObject({ epicMaxCards: 100, epicMaxActive: 16 })
+      const res = await app.inject({
+        method: 'POST',
+        url: BOARDS,
+        headers,
+        payload: { name: 'api', repoFullName: 'acme/api', epicMaxCards: 3, epicMaxActive: 2 }
+      })
+      expect(res.statusCode).toBe(201)
+      const id = res.json().id as string
+      const read = await app.inject({ method: 'GET', url: `${BOARDS}/${id}`, headers })
+      expect(read.json()).toMatchObject({ epicMaxCards: 3, epicMaxActive: 2 })
+      expect((await app.inject({ method: 'GET', url: BOARDS, headers })).json().boards).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id, epicMaxCards: 3, epicMaxActive: 2 })])
+      )
+      for (const bad of [
+        { epicMaxCards: 0 },
+        { epicMaxCards: -1 },
+        { epicMaxCards: 1001 },
+        { epicMaxCards: 2.5 },
+        { epicMaxActive: 0 },
+        { epicMaxActive: 101 }
+      ]) {
+        const create = await app.inject({
+          method: 'POST',
+          url: BOARDS,
+          headers,
+          payload: { name: 'docs', repoFullName: 'Acme/Docs', ...bad }
+        })
+        expect(create.statusCode, JSON.stringify(bad)).toBe(400)
+        const patch = await app.inject({ method: 'PATCH', url: `${BOARDS}/${id}`, headers, payload: bad })
+        expect(patch.statusCode, JSON.stringify(bad)).toBe(400)
+      }
+      // An epic that already filed two children; lowering maxCards to 1 is allowed and only blocks the next create.
+      const epic = await prisma.kanbanCard.create({
+        data: { boardId: id, issueId: 7_001n, issueNumber: 1, status: 'todo', epicCardsCreated: 2 }
+      })
+      const lowered = await app.inject({
+        method: 'PATCH',
+        url: `${BOARDS}/${id}`,
+        headers,
+        payload: { epicMaxCards: 1 }
+      })
+      expect(lowered.statusCode).toBe(200)
+      expect(lowered.json()).toMatchObject({ epicMaxCards: 1, configRevision: '2' })
+      const orchestrator = new PgKanbanOrchestratorRepo(prisma)
+      const child = await orchestrator.createEpicChild({
+        boardId: id,
+        epicIssueNumber: 1,
+        upsert: {
+          boardId: id,
+          expectedRepoId: 4343n,
+          issueId: 7_002n,
+          issueNumber: 2,
+          idempotencyKey: 'lowered',
+          status: 'todo',
+          source: 'orchestrator'
+        }
+      })
+      expect(child).toEqual({ ok: false, reason: 'epic_budget_exhausted' })
+      expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: epic.id } })).epicCardsCreated).toBe(2)
+      const audit = (await boardAudit()).at(-1)!
+      expect(audit.details).toMatchObject({ change: 'updated', fields: ['epicMaxCards'] })
     } finally {
       await close()
     }

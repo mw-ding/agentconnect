@@ -5,7 +5,9 @@ import type { KanbanLeaseRef } from '../ports.js'
 import type { GitHubActor, KanbanSyncRepo, SyncCard } from '../../kanban/sync.js'
 import { isKanbanStatus, type KanbanStatus, type LabelPlan } from '../../kanban/card-state.js'
 import { auditCardTransition } from '../../kanban/audit.js'
+import { planNotification } from '../../kanban/notifier.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
+import { insertKanbanNotification } from './kanban-notify.repo.js'
 
 export class PgKanbanSyncRepo implements KanbanSyncRepo {
   constructor(private readonly db: PrismaLike) {}
@@ -104,6 +106,8 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
           status: plan.status,
           ...(changed ? { stateRevision: { increment: 1 }, cooldownUntil: null, blockKind: null } : {}),
           ...(human ? PROMOTION_CLEARED : {}),
+          // A human status move starts over, so an old approval never suppresses the next review.
+          ...(human && changed ? { verifiedAt: null } : {}),
           ...(revoked ? { dispatchRevision: { increment: 1 } } : {}),
           labelWritePending: repair || current.labelWritePending,
           syncEventCursor: cursor > current.syncEventCursor ? cursor : current.syncEventCursor,
@@ -120,6 +124,27 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         ...(revoked ? { leaseId: revoked.leaseId } : {}),
         ...(actor ? { actor } : {})
       })
+      // Live label moves notify in this transaction; (cardId, stateRevision) dedupes replays.
+      if (changed) {
+        const board = await tx.kanbanBoard.findUnique({
+          where: { id: card.boardId },
+          select: { targetChannel: true }
+        })
+        const decision = planNotification(
+          { cardId: card.id, boardId: card.boardId, issueNumber: card.issueNumber, from: card.status, to: plan.status },
+          { targetChannel: board?.targetChannel ?? null }
+        )
+        if (decision.notify)
+          await insertKanbanNotification(tx, {
+            boardId: card.boardId,
+            cardId: card.id,
+            issueNumber: card.issueNumber,
+            stateRevision: current.stateRevision + 1n,
+            from: card.status,
+            to: plan.status,
+            mention: decision.mention
+          })
+      }
       return { changed, revoked }
     })
   }
@@ -179,10 +204,10 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         !isKanbanStatus(current.status)
       )
         return null
-      // Only a dispatchable card moves: triage is never claimed, and every other status already needs a human to run.
+      // Keep review in place, but revoke every open run so no late report can lift the human hold.
       const from = current.status
       const to: KanbanStatus = from === 'ready' || from === 'running' ? 'triage' : from
-      const run = to !== from ? await tx.kanbanRun.findFirst({ where: { cardId: card.id, endedAt: null } }) : null
+      const run = await tx.kanbanRun.findFirst({ where: { cardId: card.id, endedAt: null } })
       let revoked: KanbanLeaseRef | null = null
       if (run) {
         await tx.kanbanRun.update({

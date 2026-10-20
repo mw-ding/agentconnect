@@ -133,6 +133,8 @@ import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
 import type { KanbanTitleSource } from '../kanban/card-titles.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
+  /** Match the dispatcher’s configured cross-board daemon cap. */
+  KANBAN_MAX_IN_PROGRESS_PER_DAEMON?: number
   SLACK_INSTALL_TTL_SEC?: number
   /** Drives browser CORS for the Web UI (see `buildHttpServer`). */
   NODE_ENV?: 'development' | 'test' | 'production'

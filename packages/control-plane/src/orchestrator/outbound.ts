@@ -55,6 +55,8 @@ import {
   KanbanRevokeOk,
   KanbanDispatch,
   KanbanDispatchOk,
+  KanbanNotify,
+  KanbanNotifyOk,
   IntegrationUpsert,
   IntegrationRemove,
   IntegrationForget,
@@ -657,6 +659,12 @@ export class ControlSender {
   async kanbanDispatch(daemonId: string, d: KanbanDispatch, opts?: RequestOpts): Promise<KanbanDispatchOk> {
     const c = this.must(daemonId)
     return c.conn.request<KanbanDispatchOk>('kanban/dispatch', d, { epoch: c.sessionEpoch }, opts)
+  }
+
+  /** Post one body-free Kanban transition notification in the board's anchor channel (issue #2 M4; REQ → `kanban/notify/ok`). */
+  async kanbanNotify(daemonId: string, n: KanbanNotify): Promise<KanbanNotifyOk> {
+    const c = this.must(daemonId)
+    return c.conn.request<KanbanNotifyOk>('kanban/notify', n, { epoch: c.sessionEpoch })
   }
 
   /** Read a daemon's local session projection (REQ → `session/list/page`).

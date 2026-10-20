@@ -426,7 +426,7 @@ describe.skipIf(!enabled)('kanban board view e2e (live GitHub)', () => {
         now: new Date(),
         isDaemonLive: (id) => id === daemonId
       })
-      expect(claimed.map((l) => l.cardId)).toEqual(explained.body.wouldClaimNext)
+      expect(claimed.leases.map((l) => l.cardId)).toEqual(explained.body.wouldClaimNext)
       const after = await api<{ wouldClaimNext: string[] }>('/explain')
       expect(after.body.wouldClaimNext).toEqual([])
     })

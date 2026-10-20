@@ -56,6 +56,33 @@ beforeEach(() => {
 })
 
 describe('vera-528: title TTL cache', () => {
+  it('starts freshness when a slow GitHub read finishes', async () => {
+    let now = 1_000_000
+    const fetchImpl = vi.fn(async () => {
+      now += TITLE_TTL_MS + 1
+      return issueResponse(1)
+    })
+    const { src } = source(fetchImpl, { clock: () => now })
+    await src.read(BOARD, [1])
+    expect((await src.read(BOARD, [1])).titles.get(1)?.title).toBe('title 1')
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses a 304 when a stale title had no ETag validator', async () => {
+    let now = 1_000_000
+    let reads = 0
+    const fetchImpl = vi.fn(async () =>
+      ++reads === 1 ? issueResponse(1, 'unvalidated', '') : new Response(null, { status: 304 })
+    )
+    const { src } = source(fetchImpl, { clock: () => now })
+    await src.read(BOARD, [1])
+    now += TITLE_TTL_MS + 1
+    const result = await src.read(BOARD, [1])
+    expect(result.titles.size).toBe(0)
+    expect(result.missing).toEqual([1])
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
   it('vera-528: a repeated board view within TTL makes zero second GitHub calls', async () => {
     const now = 1_000_000
     const fetchImpl = vi.fn(async (url: string) => issueResponse(Number(/\/issues\/(\d+)$/.exec(url)?.[1])))
@@ -126,16 +153,107 @@ describe('vera-528: title TTL cache', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(TITLE_CACHE_MAX + 10)
   })
 
-  it('vera-528: numbers GitHub no longer serves are not cached', async () => {
+  it('vera-528: missing numbers share the TTL and are retried after expiry', async () => {
+    let now = 1_000_000
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 }))
-    const { src } = source(fetchImpl)
+    const { src } = source(fetchImpl, { clock: () => now })
     expect((await src.read(BOARD, [9])).missing).toEqual([9])
+    expect((await src.read(BOARD, [9])).missing).toEqual([9])
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    now += TITLE_TTL_MS + 1
     expect((await src.read(BOARD, [9])).missing).toEqual([9])
     expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('isolates cached titles and ETags by installation even when the repository is the same', async () => {
+    const fetchImpl = vi.fn(async () => issueResponse(7, 'private title', 'W/"private"'))
+    const mint = vi.fn(async (id: bigint) => {
+      if (id === 11n) throw new Error('old installation has no access')
+      return { token: 'new-installation-token' }
+    })
+    const { src } = source(fetchImpl, {
+      installations: {
+        liveByOrgAndAccount: async (orgId) => ({ ...installation, installationId: orgId === BOARD.orgId ? 11n : 22n })
+      },
+      tokens: { mintKanbanCard: mint } as never
+    })
+    expect((await src.read({ ...BOARD, orgId: OrgId('org-2') }, [7])).titles.get(7)?.title).toBe('private title')
+    await expect(src.read(BOARD, [7])).rejects.toMatchObject({ code: 'github_unavailable' })
+    expect(mint.mock.calls.map(([id]) => id)).toEqual([22n, 11n])
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not join another installation’s in-flight title or validator', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>
+      if (headers.authorization?.includes('token-22')) await gate
+      expect(headers['if-none-match']).toBeUndefined()
+      return issueResponse(7, headers.authorization?.includes('token-22') ? 'new title' : 'old title')
+    })
+    const { src } = source(fetchImpl, {
+      installations: {
+        liveByOrgAndAccount: async (orgId) => ({ ...installation, installationId: orgId === BOARD.orgId ? 11n : 22n })
+      },
+      tokens: { mintKanbanCard: async (id: bigint) => ({ token: `token-${id}` }) } as never
+    })
+    const pending = src.read({ ...BOARD, orgId: OrgId('org-2') }, [7])
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1))
+    expect((await src.read(BOARD, [7])).titles.get(7)?.title).toBe('old title')
+    release()
+    expect((await pending).titles.get(7)?.title).toBe('new title')
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('rechecks fresh entries when queued reads reach a worker', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const fetchImpl = vi.fn(async (url: string) => {
+      const n = Number(/\/issues\/(\d+)$/.exec(url)?.[1])
+      if (n < 9) await gate
+      return issueResponse(n)
+    })
+    const { src } = source(fetchImpl)
+    const pending = src.read(
+      BOARD,
+      Array.from({ length: 9 }, (_, i) => i + 1)
+    )
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(8))
+    await src.read(BOARD, [9])
+    release()
+    expect((await pending).titles.get(9)?.title).toBe('title 9')
+    expect(fetchImpl).toHaveBeenCalledTimes(9)
   })
 })
 
 describe('vera-528: title abort-on-failure', () => {
+  it('stops successful workers from draining 100 numbers after the first read is rate limited', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const fetchImpl = vi.fn(async (url: string) => {
+      const n = Number(/\/issues\/(\d+)$/.exec(url)?.[1])
+      if (n === 1) return new Response('{}', { status: 429 })
+      await gate
+      return issueResponse(n)
+    })
+    const { src } = source(fetchImpl)
+    await expect(
+      src.read(
+        BOARD,
+        Array.from({ length: 100 }, (_, i) => i + 1)
+      )
+    ).rejects.toMatchObject({ code: 'github_rate_limited' })
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(fetchImpl).toHaveBeenCalledTimes(8)
+  })
   it('vera-528: a failing request stops the remaining workers', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ message: 'rate limited' }), { status: 429 }))
     const { src } = source(fetchImpl)

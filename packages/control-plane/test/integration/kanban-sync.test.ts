@@ -251,7 +251,9 @@ describe('Kanban synchronization transactions (Postgres)', () => {
       data: { status: 'ready', needsAttention: true, attentionReason: 'label_attribution_timeout' }
     })
     const claim = () =>
-      new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+      new PgKanbanDispatchRepo(prisma)
+        .claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+        .then((r) => r.leases)
     expect(await claim()).toHaveLength(0)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
       status: 'ready',
@@ -274,6 +276,55 @@ describe('Kanban synchronization transactions (Postgres)', () => {
       syncDeferredAt: null,
       syncDeferralCount: 0
     })
+  })
+
+  it('writes a label-adopted status move notification in the same transaction', async () => {
+    const f = await fixture()
+    await prisma.kanbanBoard.update({ where: { id: f.board.id }, data: { targetChannel: 'C0ANCHOR' } })
+    await prisma.kanbanCard.update({ where: { id: f.card.id }, data: { status: 'ready' } })
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const plan = planLabelReconcile(
+      { status: 'ready', leased: false },
+      { state: 'open', labels: ['ac/status:blocked'] }
+    )
+    expect(await f.repo.apply(snapshot, plan, 7n, true, 0n)).toMatchObject({ changed: true })
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: f.card.id } })).toMatchObject({
+      status: 'blocked',
+      stateRevision: 2n
+    })
+    // The sync owns every live human move, so the row must ride the move the way an ingested one does.
+    await expect(
+      prisma.kanbanNotification.findMany({ where: { cardId: f.card.id }, orderBy: { stateRevision: 'asc' } })
+    ).resolves.toMatchObject([
+      {
+        boardId: f.board.id,
+        cardId: f.card.id,
+        issueNumber: 1,
+        stateRevision: 2n,
+        fromStatus: 'ready',
+        toStatus: 'blocked',
+        mention: false
+      }
+    ])
+  })
+
+  it('writes no notification for a headless board or a move the table ignores', async () => {
+    const f = await fixture()
+    await prisma.kanbanCard.update({ where: { id: f.card.id }, data: { status: 'ready' } })
+    // Headless: the same adopted move records nothing.
+    const snapshot = (await f.repo.get(f.board.id, 1))!
+    const plan = planLabelReconcile(
+      { status: 'ready', leased: false },
+      { state: 'open', labels: ['ac/status:blocked'] }
+    )
+    expect(await f.repo.apply(snapshot, plan, 7n, true, 0n)).toMatchObject({ changed: true })
+    expect(await prisma.kanbanNotification.count({ where: { cardId: f.card.id } })).toBe(0)
+    // A triage revert on an anchored board is audited but not notification-worthy either.
+    await prisma.kanbanBoard.update({ where: { id: f.board.id }, data: { targetChannel: 'C0ANCHOR' } })
+    const next = (await f.repo.get(f.board.id, 1))!
+    const revert = planStatusWrite('triage', { state: 'open', labels: ['ac/status:blocked'] })
+    expect(await f.repo.apply(next, revert, 8n, false, 0n)).toMatchObject({ changed: true })
+    expect(await prisma.kanbanNotification.count({ where: { cardId: f.card.id } })).toBe(0)
   })
 })
 
@@ -351,7 +402,7 @@ describe('KanbanSync full pass (non-writer re-add)', () => {
       comment: expect.stringContaining('only collaborators with write access')
     })
     expect(
-      await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })
+      (await new PgKanbanDispatchRepo(prisma).claim(f.board.id, { now: new Date(), isDaemonLive: () => true })).leases
     ).toHaveLength(0)
     const audit = await prisma.auditEvent.findFirstOrThrow({ where: { kind: 'kanban_card_change' } })
     expect(audit.details).toMatchObject({ from: 'ready', to: 'triage', source: 'human_label', actorLogin: 'mallory' })
@@ -467,7 +518,7 @@ describe('KanbanSync full pass (invisible non-writer remove+re-add, doorbell sen
   }
 
   const claim = (boardId: string) =>
-    new PgKanbanDispatchRepo(prisma).claim(boardId, { now: new Date(), isDaemonLive: () => true })
+    new PgKanbanDispatchRepo(prisma).claim(boardId, { now: new Date(), isDaemonLive: () => true }).then((r) => r.leases)
 
   it('a tick alone cannot see the invisible re-add (the gap the doorbell sender closes)', async () => {
     const f = await syncFixture('ready', false)
@@ -742,7 +793,10 @@ describe('vera-r2: KanbanSync over Postgres', () => {
       now
     }
     const read = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: row.id } })
-    const claim = () => new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    const claim = () =>
+      new PgKanbanDispatchRepo(prisma)
+        .claim(board.id, { now: new Date(), isDaemonLive: () => true })
+        .then((r) => r.leases)
     return { board, row, state, writes, deps, cards, read, claim }
   }
 
@@ -860,7 +914,9 @@ describe('vera-r2: KanbanSync over Postgres', () => {
       status: 'ready',
       syncEventCursor: 10n
     })
-    const leases = await new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    const leases = (
+      await new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    ).leases
     expect(leases).toHaveLength(1)
     const sync = new KanbanSync({
       repo: new PgKanbanSyncRepo(prisma),
@@ -1104,7 +1160,10 @@ describe('vera-r3: same-snapshot writer status over Postgres', () => {
       log: { warn: () => {} }
     }
     const read = () => prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
-    const claim = () => new PgKanbanDispatchRepo(prisma).claim(board.id, { now: new Date(), isDaemonLive: () => true })
+    const claim = () =>
+      new PgKanbanDispatchRepo(prisma)
+        .claim(board.id, { now: new Date(), isDaemonLive: () => true })
+        .then((r) => r.leases)
     return { board, card, run, state, writes, revoked, deps, read, claim }
   }
 

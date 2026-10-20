@@ -44,6 +44,10 @@ export const KANBAN_REASON_NUDGE_DEFERRED = 'nudge_deferred'
 export const KanbanRunMode = z.enum(['read', 'write'])
 export type KanbanRunMode = z.infer<typeof KanbanRunMode>
 
+/** A dispatch's role: `work` runs a ready card, `verify` reviews one. Absent means work, so old peers interoperate. */
+export const KanbanDispatchRole = z.enum(['work', 'verify'])
+export type KanbanDispatchRole = z.infer<typeof KanbanDispatchRole>
+
 export const KANBAN_BLOCK_KINDS = ['dependency', 'needs_input', 'capability', 'transient'] as const
 export const KanbanBlockKind = z.enum(KANBAN_BLOCK_KINDS)
 export type KanbanBlockKind = z.infer<typeof KanbanBlockKind>
@@ -66,7 +70,9 @@ export const KanbanDispatch = z
     dispatchRevision: KanbanRevision,
     // `github:<repoId>` or a legacy `owner/repo`; the session key is `<prefix>#<issueNumber>`.
     sessionKeyPrefix: z.string().regex(/^[^#\s]{1,200}$/),
-    mode: KanbanRunMode
+    mode: KanbanRunMode,
+    // Trusted turn context (like leaseId): work (ready card) or verify (review card). Absent = work.
+    role: KanbanDispatchRole.optional()
   })
   .strict()
 export type KanbanDispatch = z.infer<typeof KanbanDispatch>
@@ -114,14 +120,16 @@ export const KanbanLeaseHeartbeatOk = z
   .strict()
 export type KanbanLeaseHeartbeatOk = z.infer<typeof KanbanLeaseHeartbeatOk>
 
-/** Terminal outcomes a worker run may report; `reclaimed` is CP-only (the reaper), so it is not on the wire. */
+/** Terminal outcomes a run may report; `reclaimed` is CP-only (the reaper), so it is not on the wire. */
 export const KanbanReportOutcome = z.enum([
   'completed',
   'review_requested',
   'blocked',
   'failed',
   'protocol_violation',
-  'transient'
+  'transient',
+  // A verifier asked the worker for changes; only emitted on verify runs, so only a new CP understands it (deploy CP first).
+  'changes_requested'
 ])
 export type KanbanReportOutcome = z.infer<typeof KanbanReportOutcome>
 
@@ -216,3 +224,268 @@ export const KanbanCardShowOk = z.discriminatedUnion('accepted', [
   z.object({ leaseId: z.string().uuid(), accepted: z.literal(false), reason: z.enum(['superseded']) }).strict()
 ])
 export type KanbanCardShowOk = z.infer<typeof KanbanCardShowOk>
+
+/** A short, body-free status or trip reason for a notification's `from`/`to`/`tripped` fields. */
+const KanbanNotifyCode = z
+  .string()
+  .min(1)
+  .max(40)
+  .regex(/^[a-z0-9_:-]+$/)
+
+/** `kanban/notify` (C→D REQ → `kanban/notify/ok`) — a body-free transition notification to post in the board's anchor channel. */
+export const KanbanNotify = z
+  .object({
+    notifyId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    cardId: z.string().uuid(),
+    repoFullName: z
+      .string()
+      .min(3)
+      .max(200)
+      .regex(/^[\w.-]+\/[\w.-]+$/),
+    issueNumber: z.number().int().positive(),
+    from: KanbanNotifyCode,
+    to: KanbanNotifyCode,
+    blockKind: KanbanBlockKind.optional(),
+    reasonCode: KanbanReasonCode.optional(),
+    tripped: KanbanNotifyCode.optional(),
+    /** Present only when the board owner's Slack user id resolved; never a GitHub login. */
+    mention: z.object({ slackUserId: z.string().min(1).max(40) }).optional(),
+    target: z
+      .object({
+        platform: z.string().min(1).max(20),
+        channel: z.string().min(1).max(200),
+        integrationId: z.string().uuid()
+      })
+      .strict()
+  })
+  .strict()
+export type KanbanNotify = z.infer<typeof KanbanNotify>
+
+export const KanbanNotifyOk = z
+  .object({ notifyId: z.string().uuid(), ok: z.boolean(), reason: z.string().max(100).optional() })
+  .strict()
+export type KanbanNotifyOk = z.infer<typeof KanbanNotifyOk>
+// ── kanban/orchestrate (issue #2 M3, Lane 2b): the orchestrator agent's create/link/assign surface.
+// Body-free like every other kanban frame: a spec digest, not spec text, crosses; the daemon files the issue body.
+
+/** A decomposition step id; short machine code only. */
+export const KanbanOrchestrateStep = z.string().regex(/^[a-z0-9][a-z0-9_.:-]{0,63}$/)
+/** sha256 of the masked title+body; the CP computes the B1 key from this, never from the spec text. */
+export const KanbanSpecDigest = z.string().regex(/^[0-9a-f]{64}$/)
+/** An orchestrator may only ever file into triage/todo; promotion past todo stays with humans/reconciler (D5). */
+export const KanbanOrchestrateStatus = z.enum(['triage', 'todo'])
+/** `ac/agent:<slug>` assignee; the CP resolves the slug against the board's org. */
+export const KanbanAssigneeSlug = z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/)
+export const KANBAN_ORCHESTRATE_MAX_BLOCKERS = 20
+/** A card's priority band; the DB column is int4, and a sane band keeps an agent from pinning the claim order. */
+export const KANBAN_ORCHESTRATE_PRIORITY_MIN = -1000
+export const KANBAN_ORCHESTRATE_PRIORITY_MAX = 1000
+/** `list` reply bounds: the CP stops at this many cards (setting `truncated`) and never lists more boards. */
+export const KANBAN_ORCHESTRATE_LIST_MAX_CARDS = 200
+export const KANBAN_ORCHESTRATE_LIST_MAX_BOARDS = 100
+const KanbanOrchestratePriority = z
+  .number()
+  .int()
+  .min(KANBAN_ORCHESTRATE_PRIORITY_MIN)
+  .max(KANBAN_ORCHESTRATE_PRIORITY_MAX)
+const KanbanOrchestrateIssueList = z.array(z.number().int().positive()).max(KANBAN_ORCHESTRATE_MAX_BLOCKERS)
+/** `owner/repo` as GitHub spells it: a login, a slash, and a repository name. */
+const KanbanRepoFullName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/)
+
+/** `list` → boards this agent orchestrates and their cards, bounded with a `truncated` flag. */
+export const KanbanOrchestrateList = z
+  .object({
+    op: z.literal('list'),
+    agentId: z.string().uuid(),
+    boardId: z.string().uuid().optional(),
+    status: z.string().min(1).max(40).optional()
+  })
+  .strict()
+export type KanbanOrchestrateList = z.infer<typeof KanbanOrchestrateList>
+
+/** Fields shared by the create op pair. */
+const KanbanOrchestrateCreateFields = {
+  agentId: z.string().uuid(),
+  boardId: z.string().uuid(),
+  epicIssueNumber: z.number().int().positive().optional(),
+  step: KanbanOrchestrateStep,
+  specDigest: KanbanSpecDigest,
+  assignee: KanbanAssigneeSlug.optional(),
+  priority: KanbanOrchestratePriority.optional(),
+  status: KanbanOrchestrateStatus.optional()
+}
+
+/** `prepare_create` asks whether to file, before anything is filed; an existing B1 key answers `existing`. */
+export const KanbanOrchestratePrepareCreate = z
+  .object({ op: z.literal('prepare_create'), ...KanbanOrchestrateCreateFields })
+  .strict()
+export type KanbanOrchestratePrepareCreate = z.infer<typeof KanbanOrchestratePrepareCreate>
+
+/** `commit_create` registers the issue the daemon just filed; `blockedBy` are same-repo card issue numbers. */
+export const KanbanOrchestrateCommitCreate = z
+  .object({
+    op: z.literal('commit_create'),
+    ...KanbanOrchestrateCreateFields,
+    issueNumber: z.number().int().positive(),
+    blockedBy: KanbanOrchestrateIssueList.optional()
+  })
+  .strict()
+export type KanbanOrchestrateCommitCreate = z.infer<typeof KanbanOrchestrateCommitCreate>
+
+export const KanbanOrchestrateLink = z
+  .object({
+    op: z.literal('link'),
+    agentId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    issueNumber: z.number().int().positive(),
+    blockedBy: KanbanOrchestrateIssueList.optional(),
+    parentIssueNumber: z.number().int().positive().optional()
+  })
+  .strict()
+export type KanbanOrchestrateLink = z.infer<typeof KanbanOrchestrateLink>
+
+export const KanbanOrchestrateUnblock = z
+  .object({
+    op: z.literal('unblock'),
+    agentId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    issueNumber: z.number().int().positive(),
+    blockers: KanbanOrchestrateIssueList.optional()
+  })
+  .strict()
+export type KanbanOrchestrateUnblock = z.infer<typeof KanbanOrchestrateUnblock>
+
+export const KanbanOrchestrateAssign = z
+  .object({
+    op: z.literal('assign'),
+    agentId: z.string().uuid(),
+    boardId: z.string().uuid(),
+    issueNumber: z.number().int().positive(),
+    assignee: z.union([z.literal(null), KanbanAssigneeSlug])
+  })
+  .strict()
+export type KanbanOrchestrateAssign = z.infer<typeof KanbanOrchestrateAssign>
+
+/** `kanban/orchestrate` (D→C REQ): discriminated by `op`, every arm strict and body-free. */
+export const KanbanOrchestrate = z.discriminatedUnion('op', [
+  KanbanOrchestrateList,
+  KanbanOrchestratePrepareCreate,
+  KanbanOrchestrateCommitCreate,
+  KanbanOrchestrateLink,
+  KanbanOrchestrateUnblock,
+  KanbanOrchestrateAssign
+])
+export type KanbanOrchestrate = z.infer<typeof KanbanOrchestrate>
+
+export const KANBAN_ORCHESTRATE_REFUSAL_CODES = [
+  'not_orchestrator',
+  'board_not_found',
+  'board_disabled',
+  'epic_not_found',
+  'epic_budget_exhausted',
+  'card_not_found',
+  'issue_not_found',
+  'issue_not_from_app',
+  'unknown_agent',
+  'agent_not_assignable',
+  'key_conflict',
+  'issue_mismatch',
+  'invalid_link',
+  'cross_repo',
+  'repo_mismatch',
+  'status_not_allowed',
+  'card_conflict',
+  'github_unavailable',
+  'github_partial'
+] as const
+export type KanbanOrchestrateRefusalCode = (typeof KANBAN_ORCHESTRATE_REFUSAL_CODES)[number]
+export const KanbanOrchestrateRefusalCode = z.enum(KANBAN_ORCHESTRATE_REFUSAL_CODES)
+
+/** Refusals-as-data: a stable code, never a message, so the daemon can translate it. */
+export const KanbanOrchestrateRefusal = z
+  .object({
+    ok: z.literal(false),
+    op: z.string().min(1).max(40),
+    code: KanbanOrchestrateRefusalCode
+  })
+  .strict()
+export type KanbanOrchestrateRefusal = z.infer<typeof KanbanOrchestrateRefusal>
+
+export const KanbanOrchestrateCard = z
+  .object({
+    issueNumber: z.number().int().positive(),
+    status: z.string().min(1).max(40),
+    assigneeAgentId: z.string().uuid().nullable(),
+    assigneeSlug: z.string().min(1).max(64).nullable(),
+    priority: z.number().int(),
+    blockKind: z.string().min(1).max(40).nullable(),
+    epicIssueNumber: z.number().int().positive().nullable(),
+    leased: z.boolean()
+  })
+  .strict()
+export type KanbanOrchestrateCard = z.infer<typeof KanbanOrchestrateCard>
+
+export const KanbanOrchestrateBoard = z
+  .object({
+    boardId: z.string().uuid(),
+    repoFullName: KanbanRepoFullName,
+    cards: z.array(KanbanOrchestrateCard).max(KANBAN_ORCHESTRATE_LIST_MAX_CARDS)
+  })
+  .strict()
+
+export const KanbanOrchestrateListOk = z
+  .object({
+    ok: z.literal(true),
+    op: z.literal('list'),
+    truncated: z.boolean(),
+    boards: z.array(KanbanOrchestrateBoard).max(KANBAN_ORCHESTRATE_LIST_MAX_BOARDS)
+  })
+  .strict()
+
+export const KanbanOrchestratePrepareCreateOk = z
+  .object({
+    ok: z.literal(true),
+    op: z.literal('prepare_create'),
+    verdict: z.enum(['existing', 'proceed']),
+    appLogin: z.string().min(1).max(100).nullable().optional(),
+    issueNumber: z.number().int().positive().optional()
+  })
+  .strict()
+
+export const KanbanOrchestrateCommitCreateOk = z
+  .object({
+    ok: z.literal(true),
+    op: z.literal('commit_create'),
+    cardId: z.string().uuid(),
+    issueNumber: z.number().int().positive()
+  })
+  .strict()
+
+export const KanbanOrchestrateLinkOk = z.object({ ok: z.literal(true), op: z.literal('link') }).strict()
+
+/** `truncated`: the blocked_by list ran past one page, so only the read edges were removed and the status stays. */
+export const KanbanOrchestrateUnblockOk = z
+  .object({
+    ok: z.literal(true),
+    op: z.literal('unblock'),
+    status: z.string().min(1).max(40),
+    truncated: z.literal(true).optional()
+  })
+  .strict()
+
+export const KanbanOrchestrateAssignOk = z
+  .object({ ok: z.literal(true), op: z.literal('assign'), assigned: z.boolean() })
+  .strict()
+
+/** `kanban/orchestrate/ok` (C→D REP): one ok shape per op, or a refusal-as-data. */
+export const KanbanOrchestrateOk = z.union([
+  KanbanOrchestrateRefusal,
+  KanbanOrchestrateListOk,
+  KanbanOrchestratePrepareCreateOk,
+  KanbanOrchestrateCommitCreateOk,
+  KanbanOrchestrateLinkOk,
+  KanbanOrchestrateUnblockOk,
+  KanbanOrchestrateAssignOk
+])
+export type KanbanOrchestrateOk = z.infer<typeof KanbanOrchestrateOk>

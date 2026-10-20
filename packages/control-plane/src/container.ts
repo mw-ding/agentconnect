@@ -87,7 +87,9 @@ import { kanbanTokenSource } from './kanban/tokens.js'
 import { githubKanbanTitleSource } from './kanban/card-titles.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
+import { KanbanOrchestrator } from './kanban/orchestrator.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
+import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
 import { GithubUserAuthzService } from './github/user-authz.js'
@@ -185,6 +187,8 @@ import {
   PgKanbanDispatchRepo,
   PgKanbanSyncRepo,
   PgKanbanCardRepo,
+  PgKanbanNotifyRepo,
+  PgKanbanOrchestratorRepo,
   PgRuntimeProfileRepo,
   PgAuditRepo,
   PgUserRepo,
@@ -564,6 +568,8 @@ export function buildContainer(
     kanbanBoard: new PgKanbanBoardRepo(prisma),
     kanbanDispatch: new PgKanbanDispatchRepo(prisma),
     kanbanCard: new PgKanbanCardRepo(prisma),
+    kanbanNotify: new PgKanbanNotifyRepo(prisma),
+    kanbanOrchestrator: new PgKanbanOrchestratorRepo(prisma),
     runtimeProfile: new PgRuntimeProfileRepo(prisma),
     audit: new PgAuditRepo(prisma),
     // Signup mints no org, so no repo here carries the preset-agent seam flag except
@@ -1790,6 +1796,21 @@ export function buildContainer(
         })
       : undefined
 
+  // Kanban transition notifier (issue #2 M4): drains the notification outbox to the board's anchor channel.
+  const kanbanNotifier = kanbanCardStore
+    ? new KanbanNotifier({
+        repo: repos.kanbanNotify,
+        integration: repos.integration,
+        agent: repos.agent,
+        // No CP linkage maps a CP user to a Slack user id today, so needs_input posts without a ping (known gap).
+        resolveMention: async () => null,
+        liveDaemonIds: () => connReg.readyDaemonIds(),
+        send: (daemonId, n) => sender.kanbanNotify(daemonId, n),
+        clock,
+        log: { warn: (o, m) => http.log.warn(o, m), info: (o, m) => http.log.info(o, m) }
+      })
+    : undefined
+
   const kanbanGraphLog = {
     debug: (o: unknown, m?: string) => http.log.debug(o, m),
     warn: (o: unknown, m?: string) => http.log.warn(o, m)
@@ -1843,7 +1864,6 @@ export function buildContainer(
           log: kanbanGraphLog
         })
       : undefined
-
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
   const kanbanDispatcher = kanbanCardStore
     ? new KanbanDispatcher({
@@ -1854,11 +1874,17 @@ export function buildContainer(
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
         isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
         clock,
+        ...(kanbanNotifier
+          ? {
+              notify: { drain: () => kanbanNotifier.drain() }
+            }
+          : {}),
         log: {
           debug: (o, m) => http.log.debug(o, m),
           info: (o, m) => http.log.info(o, m),
           warn: (o, m) => http.log.warn(o, m)
-        }
+        },
+        maxPerDaemon: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON
       })
     : undefined
 
@@ -1889,6 +1915,19 @@ export function buildContainer(
           kanbanDispatcher?.poke(board.id)
         },
         log: kanbanGraphLog
+      })
+    : undefined
+
+  // The role-gated orchestrator uses the Lane 1 repo API and CardStore; agents file issue bodies themselves.
+  const kanbanOrchestrator = kanbanCardStore
+    ? new KanbanOrchestrator({
+        cards: repos.kanbanCard,
+        orchestrator: repos.kanbanOrchestrator,
+        store: kanbanCardStore,
+        installations: repos.githubInstallation,
+        appSlug: githubAppCfg?.slug,
+        poke: (boardId) => kanbanDispatcher?.poke(boardId),
+        log: { warn: (o, m) => http.log.warn(o, m) }
       })
     : undefined
 
@@ -2852,6 +2891,7 @@ export function buildContainer(
     ...(codeHostNoteProjection ? { codeHostNoteProjection } : {}),
     giteaStatusProjection,
     ...(kanbanDispatcher ? { kanbanDispatcher } : {}),
+    ...(kanbanOrchestrator ? { kanbanOrchestrator } : {}),
     kanbanGrants: {
       openScopes: (agentId, daemonId) => repos.kanbanDispatch.openGrantScopes(agentId, daemonId)
     },
@@ -3355,6 +3395,7 @@ export function httpServerConfigFrom(
     ...(config.PUBLIC_CP_URL ? { PUBLIC_CP_URL: config.PUBLIC_CP_URL } : {}),
     ...(config.OPENAPI_PATH_PREFIX ? { OPENAPI_PATH_PREFIX: config.OPENAPI_PATH_PREFIX } : {}),
     ...(config.PUBLIC_MCP_URL ? { PUBLIC_MCP_URL: config.PUBLIC_MCP_URL } : {}),
+    KANBAN_MAX_IN_PROGRESS_PER_DAEMON: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON,
     ...(config.DAEMON_DIST_TAG ? { DAEMON_DIST_TAG: config.DAEMON_DIST_TAG } : {}),
     ...(config.OIDC_ISSUER ? { OIDC_ISSUER: config.OIDC_ISSUER } : {}),
     ...(config.LOGTO_MGMT_ENDPOINT ? { OIDC_UPSTREAM: config.LOGTO_MGMT_ENDPOINT } : {}),

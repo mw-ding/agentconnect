@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { canTransition } from './card-state.js'
 import {
   FAILURE_COOLDOWN_MAX_MS,
+  KANBAN_REVIEW_ROUND_LIMIT,
   PROVIDER_TRANSIENT_LIMIT,
   TRANSIENT_COOLDOWN_MS,
   failureCooldownMs,
@@ -27,8 +28,11 @@ const running: AccountingCard = {
   protocolViolations: 0,
   blockRecurrence: 0,
   cooldownUntil: null,
-  blockKind: null
+  blockKind: null,
+  reviewRounds: 0,
+  verifiedAt: null
 }
+const review: AccountingCard = { ...running, status: 'review' }
 
 const END_CASES: KanbanRunEnd[] = [
   { outcome: 'completed' },
@@ -39,7 +43,8 @@ const END_CASES: KanbanRunEnd[] = [
   { outcome: 'transient', provider: true },
   { outcome: 'reclaimed' },
   { outcome: 'blocked', blockKind: 'needs_input' },
-  { outcome: 'blocked', blockKind: 'capability' }
+  { outcome: 'blocked', blockKind: 'capability' },
+  { outcome: 'changes_requested' }
 ]
 
 describe('planRunEnd — failure, cooldown, and recurrence accounting', () => {
@@ -182,8 +187,10 @@ describe('staleLeaseReason — the reaper predicate', () => {
 describe('planRunEnd — provider outage backoff', () => {
   const outage: KanbanRunEnd = { outcome: 'transient', provider: true }
   const cooldown = (trailing: number) =>
-    planRunEnd(running, board, outage, NOW, { trailingProviderTransients: trailing }).cooldownUntil!.getTime() -
-    NOW.getTime()
+    planRunEnd(running, board, outage, NOW, {
+      trailingProviderTransients: trailing,
+      role: 'work'
+    }).cooldownUntil!.getTime() - NOW.getTime()
 
   it('doubles from one minute and caps at an hour without counting a failure', () => {
     expect([0, 1, 2, 3, 4, 5, 6].map(cooldown)).toEqual([
@@ -195,7 +202,7 @@ describe('planRunEnd — provider outage backoff', () => {
       1_920_000,
       FAILURE_COOLDOWN_MAX_MS
     ])
-    expect(planRunEnd(running, board, outage, NOW, { trailingProviderTransients: 3 })).toMatchObject({
+    expect(planRunEnd(running, board, outage, NOW, { trailingProviderTransients: 3, role: 'work' })).toMatchObject({
       status: 'ready',
       countsAsFailure: false,
       consecutiveFailures: 0
@@ -203,7 +210,10 @@ describe('planRunEnd — provider outage backoff', () => {
   })
 
   it('routes to triage once the bound is reached', () => {
-    const plan = planRunEnd(running, board, outage, NOW, { trailingProviderTransients: PROVIDER_TRANSIENT_LIMIT - 1 })
+    const plan = planRunEnd(running, board, outage, NOW, {
+      trailingProviderTransients: PROVIDER_TRANSIENT_LIMIT - 1,
+      role: 'work'
+    })
     expect(plan).toMatchObject({
       status: 'triage',
       tripped: 'transient_limit',
@@ -214,8 +224,131 @@ describe('planRunEnd — provider outage backoff', () => {
   })
 
   it('keeps the flat cooldown for an unclassified transient however many came before', () => {
-    const plan = planRunEnd(running, board, { outcome: 'transient' }, NOW, { trailingProviderTransients: 9 })
+    const plan = planRunEnd(running, board, { outcome: 'transient' }, NOW, {
+      trailingProviderTransients: 9,
+      role: 'work'
+    })
     expect(plan).toMatchObject({ status: 'ready' })
     expect(plan.cooldownUntil!.getTime() - NOW.getTime()).toBe(TRANSIENT_COOLDOWN_MS)
+  })
+})
+
+describe('planRunEnd — verify role and review cards', () => {
+  const verify = { trailingProviderTransients: 0, role: 'verify' as const }
+
+  it('a verifier approving on the close contract finishes the card', () => {
+    expect(
+      planRunEnd({ ...review, reviewRounds: 2, verifiedAt: NOW }, board, { outcome: 'completed' }, NOW, verify)
+    ).toMatchObject({
+      status: 'done',
+      reviewRounds: 0,
+      verifiedAt: null,
+      countsAsFailure: false
+    })
+  })
+
+  it('a verifier approving under a PR contract stays in review and stamps verifiedAt', () => {
+    const gated = { ...board, completionContract: 'pr_merged' as const }
+    const plan = planRunEnd(review, gated, { outcome: 'completed' }, NOW, verify)
+    expect(plan).toMatchObject({ status: 'review', verifiedAt: NOW, reviewRounds: 0 })
+  })
+
+  it('changes_requested returns the card to ready for the assignee, counting a round and no failure', () => {
+    const plan = planRunEnd({ ...review, reviewRounds: 1 }, board, { outcome: 'changes_requested' }, NOW, verify)
+    expect(plan).toMatchObject({ status: 'ready', reviewRounds: 2, countsAsFailure: false, consecutiveFailures: 0 })
+    expect(plan.cooldownUntil).toBeNull()
+  })
+
+  it('the review round limit routes to triage instead of looping forever', () => {
+    const plan = planRunEnd(
+      { ...review, reviewRounds: KANBAN_REVIEW_ROUND_LIMIT - 1 },
+      board,
+      { outcome: 'changes_requested' },
+      NOW,
+      verify
+    )
+    expect(plan).toMatchObject({
+      status: 'triage',
+      reviewRounds: KANBAN_REVIEW_ROUND_LIMIT,
+      tripped: 'review_round_limit'
+    })
+  })
+
+  it('a verifier failure/protocol/transient/reclaim stays in review with the same counters as a work run', () => {
+    expect(planRunEnd(review, board, { outcome: 'failed' }, NOW, verify)).toMatchObject({
+      status: 'review',
+      consecutiveFailures: 1,
+      countsAsFailure: true
+    })
+    expect(planRunEnd(review, board, { outcome: 'protocol_violation' }, NOW, verify)).toMatchObject({
+      status: 'review',
+      protocolViolations: 1
+    })
+    expect(planRunEnd(review, board, { outcome: 'transient' }, NOW, verify)).toMatchObject({ status: 'review' })
+    expect(planRunEnd(review, board, { outcome: 'reclaimed' }, NOW, verify)).toMatchObject({
+      status: 'review',
+      cooldownUntil: null,
+      countsAsFailure: false
+    })
+  })
+
+  it('a verifier block routes to blocked like a work run', () => {
+    expect(planRunEnd(review, board, { outcome: 'blocked', blockKind: 'needs_input' }, NOW, verify)).toMatchObject({
+      status: 'blocked',
+      blockKind: 'needs_input',
+      blockRecurrence: 1
+    })
+  })
+
+  it('only a review card moves for a verify run, and only a running card for a work run', () => {
+    expect(planRunEnd(running, board, { outcome: 'changes_requested' }, NOW, verify)).toEqual({
+      ...running,
+      countsAsFailure: false
+    })
+    expect(planRunEnd(review, board, { outcome: 'completed' }, NOW)).toEqual({ ...review, countsAsFailure: false })
+  })
+})
+
+describe('planRunEnd — the review loop stays bounded', () => {
+  const verify = { trailingProviderTransients: 0, role: 'verify' as const }
+  const gated = { ...board, verifierAgentId: 'a2222222-2222-4222-8222-222222222222' }
+
+  it('vera-414: a worker completing keeps the review round count, so a changes loop still trips the limit', () => {
+    const plan = planRunEnd({ ...running, reviewRounds: 2, verifiedAt: NOW }, gated, { outcome: 'completed' }, NOW)
+    expect(plan).toMatchObject({ status: 'review', reviewRounds: 2, verifiedAt: null })
+    const next = planRunEnd(plan, gated, { outcome: 'changes_requested' }, NOW, verify)
+    expect(next).toMatchObject({ status: 'triage', tripped: 'review_round_limit' })
+  })
+
+  it('vera-414: every path back to review clears the approval stamp', () => {
+    const stamped = { ...running, verifiedAt: NOW }
+    for (const outcome of ['completed', 'review_requested'] as const)
+      expect(planRunEnd(stamped, gated, { outcome }, NOW)).toMatchObject({ status: 'review', verifiedAt: null })
+    expect(
+      planRunEnd({ ...review, verifiedAt: NOW }, gated, { outcome: 'changes_requested' }, NOW, verify)
+    ).toMatchObject({ status: 'ready', verifiedAt: null })
+  })
+
+  it('vera-414-merge: 8 a human re-ready after a round-limit trip buys exactly one more verify round', () => {
+    // The trip left reviewRounds at the limit; a human move keeps it, and so does the worker's pass.
+    const tripped = { ...running, reviewRounds: KANBAN_REVIEW_ROUND_LIMIT }
+    const passed = planRunEnd(tripped, gated, { outcome: 'completed' }, NOW)
+    expect(passed).toMatchObject({ status: 'review', reviewRounds: KANBAN_REVIEW_ROUND_LIMIT })
+    expect(planRunEnd(passed, gated, { outcome: 'changes_requested' }, NOW, verify)).toMatchObject({
+      status: 'triage',
+      reviewRounds: KANBAN_REVIEW_ROUND_LIMIT + 1,
+      tripped: 'review_round_limit'
+    })
+    // An approval in that one extra round ends the loop and resets the count.
+    expect(planRunEnd(passed, gated, { outcome: 'completed' }, NOW, verify)).toMatchObject({
+      status: 'done',
+      reviewRounds: 0
+    })
+  })
+
+  it('vera-414: an approval under a PR contract ends the rounds as the close contract does', () => {
+    const prBoard = { ...gated, completionContract: 'pr_merged' as const }
+    const plan = planRunEnd({ ...review, reviewRounds: 2 }, prBoard, { outcome: 'completed' }, NOW, verify)
+    expect(plan).toMatchObject({ status: 'review', verifiedAt: NOW, reviewRounds: 0 })
   })
 })

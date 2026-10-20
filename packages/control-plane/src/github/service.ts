@@ -837,6 +837,19 @@ export class GithubService {
     )
   }
 
+  // Issues-write token for the issue the orchestrator's daemon files on its board repo; never enters the agent environment.
+  mintForKanbanOrchestratorWrite(
+    agent: AgentRecord,
+    repoFullName: string,
+    repoId: bigint,
+    bucketKeys: string[],
+    forceRefresh = false
+  ): Promise<MintedGitCred> {
+    return this.withKanbanInstallation(agent, repoFullName, bucketKeys, (installationId) =>
+      this.tokens.mintKanbanOrchestratorWrite(installationId, repoFullName, repoId)
+    )
+  }
+
   private async withKanbanInstallation(
     agent: AgentRecord,
     repoFullName: string,

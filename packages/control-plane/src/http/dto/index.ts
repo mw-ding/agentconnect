@@ -4404,6 +4404,8 @@ export const KanbanCardModeDto = z.object({
 })
 
 // ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
+export const KANBAN_EPIC_MAX_CARDS_CEILING = 1000
+export const KANBAN_EPIC_MAX_ACTIVE_CEILING = 100
 const KanbanRepoFullName = z
   .string()
   .regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'repoFullName must be "owner/repo"')
@@ -4414,6 +4416,9 @@ const KanbanBoardConfigFields = {
   verifierAgentId: z.string().uuid().nullable(),
   maxInProgress: z.number().int().min(1).max(100),
   maxInProgressPerAgent: z.number().int().min(1).max(100),
+  // B2 per-epic budgets (the DB CHECKs > 0): lifetime children an epic may file, and how many may run at once.
+  epicMaxCards: z.number().int().min(1).max(KANBAN_EPIC_MAX_CARDS_CEILING),
+  epicMaxActive: z.number().int().min(1).max(KANBAN_EPIC_MAX_ACTIVE_CEILING),
   staleLeaseSec: z
     .number()
     .int()
@@ -4437,6 +4442,8 @@ export const CreateKanbanBoardBody = z
     verifierAgentId: KanbanBoardConfigFields.verifierAgentId.optional(),
     maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
     maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
+    epicMaxCards: KanbanBoardConfigFields.epicMaxCards.optional(),
+    epicMaxActive: KanbanBoardConfigFields.epicMaxActive.optional(),
     staleLeaseSec: KanbanBoardConfigFields.staleLeaseSec.optional(),
     failureLimit: KanbanBoardConfigFields.failureLimit.optional(),
     protocolRetryLimit: KanbanBoardConfigFields.protocolRetryLimit.optional(),
@@ -4464,6 +4471,8 @@ export const KanbanBoardDto = z.object({
   verifierAgentId: z.string().nullable(),
   maxInProgress: z.number().int(),
   maxInProgressPerAgent: z.number().int(),
+  epicMaxCards: z.number().int(),
+  epicMaxActive: z.number().int(),
   staleLeaseSec: z.number().int(),
   failureLimit: z.number().int(),
   protocolRetryLimit: z.number().int(),
@@ -4498,6 +4507,19 @@ export const KanbanExplainFactsDto = z.object({
   boardEnabled: z.boolean(),
   status: z.string(),
   assigneeAgentId: z.string().nullable(),
+  role: z.enum(['work', 'verify']),
+  targetAgentId: z.string().nullable(),
+  targetExists: z.boolean(),
+  targetPaused: z.boolean(),
+  targetPlaced: z.boolean(),
+  targetDaemonLive: z.boolean(),
+  verifierAgentId: z.string().nullable(),
+  verifiedAt: z.string().nullable(),
+  needsAttention: z.boolean(),
+  workAgentIds: z.array(z.string()),
+  openRunCountForVerifier: z.number().int(),
+  epicCapacity: z.object({ openRunCount: z.number().int(), maxActive: z.number().int() }).nullable(),
+  daemonCapacity: z.object({ openRunCount: z.number().int(), maxActive: z.number().int() }).nullable(),
   promotionPending: z.boolean(),
   cooldownUntil: z.string().nullable(),
   notBefore: z.string().nullable(),
@@ -4523,7 +4545,7 @@ export const KanbanCardExplainDto = z.object({
   /** Board explain only: 1-based position in `wouldClaimNext`. */
   claimOrder: z.number().int().optional(),
   /** Board explain only: eligible now, but earlier cards fill this cap first. */
-  capBound: z.enum(['board_cap', 'agent_cap']).optional(),
+  capBound: z.enum(['board_cap', 'agent_cap', 'epic_cap', 'daemon_cap']).optional(),
   evaluatedAt: z.string()
 })
 export const KanbanBoardExplainDto = z.object({

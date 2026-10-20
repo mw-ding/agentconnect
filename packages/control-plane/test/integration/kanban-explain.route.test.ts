@@ -18,11 +18,11 @@ beforeAll(async () => {
 })
 afterAll(() => oidc.close())
 
-function buildApp(live = true) {
+function buildApp(live = true, maxPerDaemon?: number) {
   const resolver = { resolve: vi.fn() }
   const http = buildHttpApp(
     prisma,
-    { OIDC_ISSUER: oidc.issuer, OIDC_AUDIENCE: oidc.audience },
+    { OIDC_ISSUER: oidc.issuer, OIDC_AUDIENCE: oidc.audience, KANBAN_MAX_IN_PROGRESS_PER_DAEMON: maxPerDaemon },
     { get: () => (live ? { state: 'READY' } : undefined) } as never,
     undefined,
     { kanbanRepoResolver: resolver as never }
@@ -76,6 +76,36 @@ const stateOf = async () => ({
 })
 
 describe('Kanban explain routes', () => {
+  it('passes the configured daemon cap through to board and card explanations', async () => {
+    await seedPlacedAgent()
+    const board = await seedBoard({ repoId: 1n })
+    const first = await seedCard(board.id, 1, { priority: 10 })
+    const second = await seedCard(board.id, 2)
+    const { app, close } = buildApp(true, 1)
+    try {
+      const headers = await ownerBearer(prisma, oidc)
+      const boardRes = await app.inject({ method: 'GET', url: `${BOARDS}/${board.id}/explain`, headers })
+      expect(boardRes.statusCode).toBe(200)
+      expect(boardRes.json()).toMatchObject({ wouldClaimNext: [first.id] })
+      expect(boardRes.json().cards.find((c: { cardId: string }) => c.cardId === second.id)).toMatchObject({
+        capBound: 'daemon_cap',
+        facts: { daemonCapacity: { openRunCount: 0, maxActive: 1 } }
+      })
+      const cardRes = await app.inject({
+        method: 'GET',
+        url: `${BOARDS}/${board.id}/cards/${second.id}/explain`,
+        headers
+      })
+      expect(cardRes.statusCode).toBe(200)
+      expect(cardRes.json()).toMatchObject({
+        verdict: { eligible: true },
+        facts: { daemonCapacity: { openRunCount: 0, maxActive: 1 } }
+      })
+    } finally {
+      await close()
+    }
+  })
+
   it('explains a board: gates, hints, facts, claim order, and nothing else changes', async () => {
     await seedPlacedAgent()
     const board = await seedBoard({ repoId: 1n })

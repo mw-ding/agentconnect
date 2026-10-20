@@ -172,7 +172,7 @@ describe('PgKanbanCardRepo.setAssignee (real Postgres)', () => {
 
   async function leasedCard(boardId: string) {
     const { card } = await repo.upsertCard(issue(boardId, 20, { status: 'ready', assigneeAgentId: A1, ...WRITER }))
-    const [lease] = await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })
+    const [lease] = (await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).leases
     expect(lease).toBeDefined()
     return { card, lease: lease! }
   }

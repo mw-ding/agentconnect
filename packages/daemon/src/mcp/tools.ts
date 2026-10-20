@@ -1127,6 +1127,14 @@ export const KANBAN_TOOLS: ToolDescriptor[] = [
     inputSchema: obj({ summary: KANBAN_SUMMARY, prNumber: KANBAN_PR }, ['summary'])
   },
   {
+    name: 'kanbanRequestChanges',
+    description:
+      'Request changes on the dispatched Kanban card you are reviewing: the card returns to its worker with no ' +
+      'failure counted. Only available while a verifier run holds this session.' +
+      KANBAN_TOOL_NOTE,
+    inputSchema: obj({ reason: KANBAN_REASON }, ['reason'])
+  },
+  {
     name: 'kanbanBlock',
     description:
       'Report that the dispatched Kanban card cannot proceed until something outside this run changes: `dependency` ' +
@@ -1177,6 +1185,100 @@ export const KANBAN_TOOLS: ToolDescriptor[] = [
 
 export const KANBAN_TOOL_NAMES = new Set(KANBAN_TOOLS.map((t) => t.name))
 
+const KANBAN_BOARD = {
+  type: 'string',
+  description: 'The board id (uuid) of the Kanban board you orchestrate.'
+}
+const KANBAN_ISSUE = {
+  type: 'integer',
+  minimum: 1,
+  description: 'The GitHub issue number of the card.'
+}
+const KANBAN_EPIC = {
+  type: 'integer',
+  minimum: 1,
+  description: 'Optional issue number of the epic this card decomposes.'
+}
+const KANBAN_STEP = {
+  type: 'string',
+  description: 'Optional short machine id identifying the decomposition step, e.g. "split-auth".'
+}
+const KANBAN_ASSIGNEE = {
+  type: 'string',
+  description: 'Optional agent slug to assign the card to (its ac/agent:<slug>).'
+}
+const KANBAN_BLOCKED_BY = {
+  type: 'array',
+  items: { type: 'integer', minimum: 1 },
+  maxItems: 20,
+  description: 'Optional issue numbers of cards this one is blocked by.'
+}
+const KANBAN_ORCH_TOOL_NOTE =
+  ' Only available to the orchestrator of the board; the Control Plane enforces the role and the budgets.'
+
+/** Orchestrator tools (issue #2 §6): the agent files issue bodies directly; the CP writes only metadata. */
+export const KANBAN_ORCHESTRATOR_TOOLS: ToolDescriptor[] = [
+  {
+    name: 'kanbanList',
+    description:
+      'List the Kanban boards you orchestrate and their cards (status, assignee, priority, epic, blockers).' +
+      KANBAN_ORCH_TOOL_NOTE,
+    inputSchema: obj({
+      board: { ...KANBAN_BOARD, description: 'Optional board id to list one board.' },
+      status: { type: 'string' }
+    })
+  },
+  {
+    name: 'kanbanCreate',
+    description:
+      'File a new Kanban card issue on a board you orchestrate and register it as a card. The issue title and body ' +
+      'are filed to GitHub and the Control Plane stores only metadata.' +
+      KANBAN_ORCH_TOOL_NOTE,
+    inputSchema: obj(
+      {
+        board: KANBAN_BOARD,
+        title: { type: 'string', maxLength: 256 },
+        body: { type: 'string', maxLength: 60000 },
+        epic: KANBAN_EPIC,
+        step: KANBAN_STEP,
+        assignee: KANBAN_ASSIGNEE,
+        priority: { type: 'integer' },
+        status: { type: 'string', enum: ['triage', 'todo'] },
+        blockedBy: KANBAN_BLOCKED_BY
+      },
+      ['board', 'title', 'body']
+    )
+  },
+  {
+    name: 'kanbanLink',
+    description:
+      'Link cards on a board you orchestrate: add blocked_by dependencies or a parent epic.' + KANBAN_ORCH_TOOL_NOTE,
+    inputSchema: obj({ board: KANBAN_BOARD, issue: KANBAN_ISSUE, blockedBy: KANBAN_BLOCKED_BY, parent: KANBAN_EPIC }, [
+      'board',
+      'issue'
+    ])
+  },
+  {
+    name: 'kanbanUnblock',
+    description: 'Remove blocked_by dependencies from a card on a board you orchestrate.' + KANBAN_ORCH_TOOL_NOTE,
+    inputSchema: obj(
+      { board: KANBAN_BOARD, issue: KANBAN_ISSUE, blockers: { type: 'array', items: { type: 'integer', minimum: 1 } } },
+      ['board', 'issue']
+    )
+  },
+  {
+    name: 'kanbanAssign',
+    description:
+      'Assign (or unassign) a card on a board you orchestrate; a leased card is reassigned, restarting its run.' +
+      KANBAN_ORCH_TOOL_NOTE,
+    inputSchema: obj({ board: KANBAN_BOARD, issue: KANBAN_ISSUE, assignee: { type: ['string', 'null'] } }, [
+      'board',
+      'issue',
+      'assignee'
+    ])
+  }
+]
+
 export const ALL_TOOL_NAMES = [
   ...new Set(
     [
@@ -1201,6 +1303,7 @@ export const ALL_TOOL_NAMES = [
       ...COLLABORATION_TOOLS,
       ...GITHUB_REVIEW_TOOLS,
       ...KANBAN_TOOLS,
+      ...KANBAN_ORCHESTRATOR_TOOLS,
       ...CODE_HOST_EFFECT_TOOLS,
       ...CODE_HOST_RESEARCH_TOOLS,
       RECALL_TOOL,
