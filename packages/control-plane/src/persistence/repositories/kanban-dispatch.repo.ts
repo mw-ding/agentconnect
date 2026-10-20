@@ -4,9 +4,10 @@ import { randomUUID } from 'node:crypto'
 import { KANBAN_CARD_SHOW_MAX_RUNS, type KanbanReport } from '@agentconnect.md/protocol'
 import { Prisma } from '../../generated/prisma/client.js'
 import { OrgId } from '../../domain/ids.js'
-import type { KanbanStatus } from '../../kanban/card-state.js'
+import { endsEpisode, EPISODE_RESET, type KanbanStatus } from '../../kanban/card-state.js'
 import { explainClaim, type ClaimAgentFacts, type ClaimEligibilityInput } from '../../kanban/claim-eligibility.js'
 import { simulateClaim, type ClaimCandidate } from '../../kanban/claim-explain.js'
+import { FLAGGED_WAITS } from '../../kanban/contracts.js'
 import { leaseAcceptsWrite } from '../../kanban/reassign.js'
 import { planNotification } from '../../kanban/notifier.js'
 import { PROMOTION_CLEARED } from './kanban.repo.js'
@@ -22,6 +23,10 @@ import type {
   KanbanClaimOpts,
   KanbanClaimResult,
   KanbanClaimedLease,
+  KanbanContractCard,
+  KanbanContractFlagInput,
+  KanbanContractRepo,
+  KanbanContractSettleInput,
   KanbanExplainOpts,
   KanbanDispatchRepo,
   KanbanGrantScope,
@@ -57,6 +62,17 @@ const PENDING_UNLEASED = (id: string): Prisma.KanbanCardWhereInput => ({
 const PROMOTION_COLUMNS = Prisma.sql`c."promotionEventCursor", c."promotionPostAccepted", c."promotionStartedAt",
   c."promotionWatchUntil", c."promotionChecks", c."recoveryCheckAt"`
 
+/** Unheld, or held only by this PR's own contract flag: any other attention reason is a human's hold. */
+const CONTRACT_HOLD_OWN = Prisma.sql`(NOT c."needsAttention" OR (c."attentionReason" = ANY(${[...FLAGGED_WAITS]}::text[])
+  AND c."attentionReason" || '#' || c."linkedPrNumber" = ANY(c."contractFlags")))`
+/** An unleased review card with a linked PR on an enabled board under a PR completion contract. */
+const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."linkedPrNumber" IS NOT NULL
+  AND b."completionContract" <> 'close' AND ${CONTRACT_HOLD_OWN}
+  AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
+const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
+  c."linkedPrNumber", c."workEpisodeStartedAt", c."contractFlags", c."needsAttention", c."verifiedAt",
+  b."completionContract", b."verifierAgentId", b."configRevision"`
+
 interface BoardRow {
   id: string
   orgId: string
@@ -83,6 +99,7 @@ interface CandidateRow {
   /** The board's verifier wrote some work attempt on this card (B8 compares every attempt, not only the latest). */
   verifierDidWork: boolean
   epicCardId: string | null
+  workEpisodeStartedAt: Date | null
 }
 
 interface RunEndRow {
@@ -126,7 +143,7 @@ interface RunEndRow {
   verifierAgentId: string | null
 }
 
-export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
+export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractRepo {
   constructor(private readonly db: PrismaLike) {}
 
   private inTransaction<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
@@ -208,7 +225,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
         SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
-               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
                EXISTS (SELECT 1 FROM "kanban_run" w
                  WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
@@ -282,7 +299,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
               // A verify run keeps the card in `review`; a work run moves it to `running` and starts a fresh review round.
               status: card.role === 'verify' ? 'review' : 'running',
               // Only a work claim changes the status label; a verify claim leaves any label write already owed as it is.
-              ...(card.role === 'work' ? { verifiedAt: null, labelWritePending: true } : {}),
+              // The first work claim of an episode stamps its start (DB clock); rework claims keep it.
+              ...(card.role === 'work'
+                ? {
+                    verifiedAt: null,
+                    labelWritePending: true,
+                    ...(card.workEpisodeStartedAt ? {} : { workEpisodeStartedAt: opts.now })
+                  }
+                : {}),
               dispatchRevision: { increment: 1 },
               stateRevision: { increment: 1 },
               ...RECOVERY_RESET
@@ -423,7 +447,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           blockKind: null,
           // A human status move starts over, so an old approval never suppresses the next review.
           verifiedAt: null,
-          ...RECOVERY_RESET
+          ...RECOVERY_RESET,
+          ...(endsEpisode(from, to) ? EPISODE_RESET : {})
         }
       })
       await auditCardTransition(tx, { cardId: card.id, from, to, source: 'parked_ingest' })
@@ -509,6 +534,118 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
       },
       'promotion_attention'
     )
+  }
+
+  async listContractCards(
+    boardId: string,
+    opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
+  ): Promise<KanbanContractCard[]> {
+    const prs = opts.prNumbers ? Prisma.sql`AND c."linkedPrNumber" = ANY(${[...opts.prNumbers]}::int[])` : Prisma.empty
+    return this.db.$queryRaw<KanbanContractCard[]>(Prisma.sql`
+      SELECT ${CONTRACT_COLUMNS}
+      FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE c."boardId" = ${boardId}::uuid AND ${CONTRACT_DUE} ${prs}
+        AND c."issueNumber" > ${opts.afterIssueNumber ?? 0}
+      ORDER BY c."issueNumber" ASC
+      LIMIT ${opts.limit ?? 100}
+    `)
+  }
+
+  async getContractCard(cardId: string): Promise<KanbanContractCard | null> {
+    const [card] = await this.db.$queryRaw<KanbanContractCard[]>(Prisma.sql`
+      SELECT ${CONTRACT_COLUMNS}
+      FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE c."id" = ${cardId}::uuid AND ${CONTRACT_DUE}
+    `)
+    return card ?? null
+  }
+
+  async flagContract(input: KanbanContractFlagInput): Promise<boolean> {
+    const key = `${input.reason}#${input.prNumber}`
+    // Once per (card, reason, PR) in an episode; a card a human already holds keeps its own reason.
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: {
+        id: input.cardId,
+        stateRevision: input.expectedStateRevision,
+        status: 'review',
+        linkedPrNumber: input.prNumber,
+        needsAttention: false,
+        NOT: { contractFlags: { has: key } },
+        runs: { none: { endedAt: null } }
+      },
+      data: {
+        needsAttention: true,
+        attentionReason: input.reason,
+        contractFlags: { push: key },
+        stateRevision: { increment: 1 }
+      }
+    })
+    return count === 1
+  }
+
+  settleContract(input: KanbanContractSettleInput): Promise<boolean> {
+    return this.inTransaction(async (tx) => {
+      // FOR SHARE holds off a board edit (which locks FOR UPDATE) until this move commits under the judged config.
+      const [board] = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT b."id" FROM "kanban_board" b JOIN "kanban_card" c ON c."boardId" = b."id"
+        WHERE c."id" = ${input.cardId}::uuid AND b."enabled" AND b."configRevision" = ${input.expectedConfigRevision}
+        FOR SHARE OF b
+      `)
+      if (!board) return false
+      // Only an unleased review card at the judged revision and PR moves; a verify run still open re-judges on its own end.
+      const { count } = await tx.kanbanCard.updateMany({
+        where: {
+          id: input.cardId,
+          stateRevision: input.expectedStateRevision,
+          status: 'review',
+          linkedPrNumber: input.prNumber,
+          runs: { none: { endedAt: null } },
+          // A human hold (any reason but this PR's own contract flag) is never settled through.
+          OR: [
+            { needsAttention: false },
+            ...[...FLAGGED_WAITS].map((reason) => ({
+              attentionReason: reason,
+              contractFlags: { has: `${reason}#${input.prNumber}` }
+            }))
+          ]
+        },
+        data: {
+          status: input.to,
+          labelWritePending: true,
+          stateRevision: { increment: 1 },
+          cooldownUntil: null,
+          blockKind: null,
+          ...RECOVERY_RESET,
+          ...(input.to === 'triage'
+            ? { needsAttention: true, attentionReason: input.reason }
+            : { reviewRounds: 0, verifiedAt: null })
+        }
+      })
+      if (count !== 1) return false
+      const card = await tx.kanbanCard.findUniqueOrThrow({
+        where: { id: input.cardId },
+        select: { boardId: true, issueNumber: true, board: { select: { orgId: true } } }
+      })
+      await tx.auditEvent.create({
+        data: {
+          kind: 'kanban_card_change',
+          orgId: card.board.orgId,
+          message: `kanban card ${input.cardId} status changed by PR contract`,
+          details: {
+            boardId: card.boardId,
+            cardId: input.cardId,
+            issueNumber: card.issueNumber,
+            change: 'status',
+            from: 'review',
+            to: input.to,
+            reason: input.reason,
+            prNumber: input.prNumber,
+            source: 'pr_contract'
+          }
+        }
+      })
+      return true
+    })
   }
 
   async isCurrentLease(leaseId: string, mode: 'read' | 'write', epoch: bigint): Promise<boolean> {
@@ -644,7 +781,8 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo {
           status: plan.status,
           // A run end that keeps the status (a verify approval under a PR contract) owes GitHub no label write.
           ...(plan.status !== row.status ? { labelWritePending: true } : {}),
-          ...(input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
+          // A verifier report never replaces the linked PR.
+          ...(row.role === 'work' && input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,

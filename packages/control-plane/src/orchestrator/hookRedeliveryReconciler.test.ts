@@ -385,6 +385,44 @@ describe('HookRedeliveryReconciler', () => {
     })
   })
 
+  describe('Kanban comment-command (issue_comment) doorbell deliveries (TRD 4.4)', () => {
+    const comment = (over: Partial<GhHookDelivery> = {}) =>
+      delivery({ event: 'issue_comment', action: 'created', ...over })
+
+    it('redelivers an unlanded new comment for a board-watched repo, even with no github hook', async () => {
+      const h = make({ hooks: [], graph: { repoIds: [REPO_ID] }, deliveries: [comment({ id: 'c1', guid: 'g-c1' })] })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual(['c1'])
+    })
+
+    it('leaves landed ones, edits and deletions, and unwatched repos alone', async () => {
+      const h = make({
+        hooks: [],
+        graph: { repoIds: [REPO_ID], landed: ['g-landed'] },
+        deliveries: [
+          comment({ id: 'landed', guid: 'g-landed' }),
+          comment({ id: 'edited', guid: 'g-edited', action: 'edited' }),
+          comment({ id: 'deleted', guid: 'g-deleted', action: 'deleted' }),
+          comment({ id: 'foreign', guid: 'g-foreign', repository_id: 1 })
+        ]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual([])
+    })
+
+    it('keeps the existing hook semantics once the doorbell landed', async () => {
+      const h = make({
+        hooks: [ghHook({ events: ['issue_comment:created'] })],
+        landed: ['guid-1'],
+        graph: { repoIds: [REPO_ID], landed: ['guid-1'] },
+        deliveries: [comment()]
+      })
+      await h.reconciler.tick()
+      expect(h.redelivered).toEqual([])
+      expect(h.claimMock).toHaveBeenCalledOnce()
+    })
+  })
+
   it('the event:* wildcard widens the sieve', async () => {
     const h = make({
       hooks: [ghHook({ events: ['pull_request:*'] })],

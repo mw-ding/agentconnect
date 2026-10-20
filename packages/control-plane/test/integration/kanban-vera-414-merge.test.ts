@@ -8,6 +8,8 @@ import { FakeClock } from '../fakes/fake-clock.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 import { PgKanbanNotifyRepo } from '../../src/persistence/repositories/kanban-notify.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { attestHumanAuthority } from '../../src/kanban/human-authority.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { planLabelReconcile, type KanbanStatus } from '../../src/kanban/card-state.js'
 import { planRunEnd, type KanbanRunEnd } from '../../src/kanban/run-accounting.js'
@@ -259,6 +261,135 @@ describe('vera-414-merge: 8 a human re-ready keeps the review round count (Postg
     // Only an approval resets the count, so the next changes_requested trips straight back to triage (one more round).
     expect(await f.read(live.id)).toMatchObject({ status: 'ready', reviewRounds: 3 })
     expect(await f.read(parked.id)).toMatchObject({ status: 'ready', reviewRounds: 3, needsAttention: false })
+  })
+})
+
+describe("vera-414-merge: 9 #415's contract and comment-command moves keep their own behaviour (Postgres)", () => {
+  it('vera-414-merge: 9 a pr_merged settle keeps its stamp reset and audit beside the role-aware claim', async () => {
+    const f = await fixture()
+    const c = await f.card('review', { verifiedAt: APPROVED, reviewRounds: 2, linkedPrNumber: 7 })
+    const before = await f.read(c.id)
+    expect(
+      await f.dispatch.settleContract({
+        cardId: c.id,
+        expectedStateRevision: before.stateRevision,
+        expectedConfigRevision: (await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: f.board.id } }))
+          .configRevision,
+        to: 'done',
+        reason: 'pr_merged',
+        prNumber: 7
+      })
+    ).toBe(true)
+    // Settlement spends the approval and resets rounds; its label projection stays pending until repair.
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'done',
+      verifiedAt: null,
+      reviewRounds: 0,
+      labelWritePending: true,
+      stateRevision: before.stateRevision + 1n
+    })
+    expect(await f.audits(c.id)).toMatchObject([
+      { from: 'review', to: 'done', source: 'pr_contract', reason: 'pr_merged', prNumber: 7 }
+    ])
+    expect(await f.claim()).toEqual([])
+  })
+
+  it('vera-414-merge: 9 a /kanban unblock lands ready under its own audit, then claims as work with the role-aware audit', async () => {
+    const f = await fixture()
+    const c = await f.card('blocked', { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED })
+    const before = await f.read(c.id)
+    const recorded = await new PgKanbanCardRepo(prisma).recordCommand({
+      boardId: f.board.id,
+      cardId: c.id,
+      commentId: 414_009n,
+      command: 'unblock',
+      humanAuthority: attestHumanAuthority('octocat', 'write'),
+      actorLogin: 'octocat',
+      from: 'blocked',
+      expectedStateRevision: before.stateRevision,
+      to: 'ready'
+    })
+    expect(recorded).toMatchObject({ kind: 'recorded' })
+    expect(await f.read(c.id)).toMatchObject({ status: 'ready', linkedPrNumber: 7 })
+    const [lease] = await f.claim()
+    expect(lease).toMatchObject({ cardId: c.id, role: 'work', agentId: A1 })
+    expect(await f.audits(c.id)).toMatchObject([
+      { from: 'blocked', to: 'ready', source: 'comment_command', command: 'unblock' },
+      { from: 'ready', to: 'running', source: 'claim', role: 'work', leaseId: lease!.leaseId }
+    ])
+    // The work claim owes the running label; an unblock is not a reopen, so the work episode and its PR stay.
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'running',
+      labelWritePending: true,
+      verifiedAt: null,
+      linkedPrNumber: 7,
+      workEpisodeStartedAt: APPROVED
+    })
+  })
+})
+
+describe('vera-415b3: leaving done ends the work episode on every path (Postgres)', () => {
+  const OLD = { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED, contractFlags: ['pr_unbound#7'] }
+
+  it('vera-415b3: a human label move out of done clears the episode; the next work claim starts a new one', async () => {
+    const f = await fixture()
+    const c = await f.card('done', OLD)
+    expect(await f.humanMove(c.issueNumber, 'ready', 10n)).toMatchObject({ changed: true })
+    expect(await f.read(c.id)).toMatchObject({
+      status: 'ready',
+      linkedPrNumber: null,
+      workEpisodeStartedAt: null,
+      contractFlags: []
+    })
+    expect(await f.claim()).toMatchObject([{ cardId: c.id, role: 'work' }])
+    expect((await f.read(c.id)).workEpisodeStartedAt).toEqual(new Date(T0))
+    // An archived card reopened to triage starts over too.
+    const archived = await f.card('archived', OLD)
+    expect(await f.humanMove(archived.issueNumber, 'triage', 11n)).toMatchObject({ changed: true })
+    expect(await f.read(archived.id)).toMatchObject({ linkedPrNumber: null, workEpisodeStartedAt: null })
+  })
+
+  it('vera-415b3: flagContract wins once per (card, reason, PR), even after a human clears the flag', async () => {
+    const f = await fixture()
+    const c = await f.card('review', { linkedPrNumber: 7, workEpisodeStartedAt: APPROVED })
+    const flag = async () =>
+      f.dispatch.flagContract({
+        cardId: c.id,
+        expectedStateRevision: (await f.read(c.id)).stateRevision,
+        reason: 'pr_unbound',
+        prNumber: 7
+      })
+    expect(await flag()).toBe(true)
+    expect(await f.read(c.id)).toMatchObject({
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#7']
+    })
+    expect(await flag()).toBe(false)
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { needsAttention: false, attentionReason: null } })
+    expect(await flag()).toBe(false)
+    // A stale revision, another PR, or an open run never flags.
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { linkedPrNumber: 8 } })
+    const rev = (await f.read(c.id)).stateRevision
+    const at = (expectedStateRevision: bigint, prNumber: number) =>
+      f.dispatch.flagContract({ cardId: c.id, expectedStateRevision, reason: 'pr_unbound', prNumber })
+    expect(await at(rev - 1n, 8)).toBe(false)
+    expect(await at(rev, 7)).toBe(false)
+    const [lease] = await f.claim()
+    expect(lease).toMatchObject({ cardId: c.id, role: 'verify' })
+    expect(await at((await f.read(c.id)).stateRevision, 8)).toBe(false)
+  })
+
+  it('vera-415b3: the parked ingest out of done clears the episode, while a move inside the episode keeps it', async () => {
+    const f = await fixture()
+    const done = await f.card('done', { ...OLD, needsAttention: true })
+    expect(await f.dispatch.ingestStatus(f.board.id, done.issueNumber, 'done', 'ready')).toMatchObject({ moved: true })
+    expect(await f.read(done.id)).toMatchObject({ linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] })
+    const blocked = await f.card('blocked', { ...OLD, needsAttention: true })
+    expect(await f.dispatch.ingestStatus(f.board.id, blocked.issueNumber, 'blocked', 'ready')).toMatchObject({
+      moved: true
+    })
+    expect(await f.read(blocked.id)).toMatchObject(OLD)
   })
 })
 

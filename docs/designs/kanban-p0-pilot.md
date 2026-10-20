@@ -544,6 +544,44 @@ issue numbers cannot silently refer to another repository. Human status and
 assignment synchronization beyond mismatch-parked cards and periodic drift repair
 remain for the stacked M1 follow-up.
 
+Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
+
+- Label-driven unblock and reopen for non-parked cards belong to #194's label sync
+  (merged into this branch). This lane only puts the existing parked-card label
+  ingest behind the shared live write check (`authorizeHumanKanbanAction`). A `done`
+  card relabelled or reopened by hand is now ingested through the label sync;
+  `/kanban reopen` still covers explicit reopens.
+- The repository's own App bot is refused as a command sender. The CP has no
+  agent-to-GitHub-user mapping, so an agent running under a person's own token could
+  not be told apart from that person. Kanban agents only receive installation tokens.
+- The CP writes labels, reopen, or close after its commit, best effort, like every CP
+  status write.
+  - A comment command whose label write fails stays unsettled and is re-applied on
+    the next delivery of that comment.
+  - Both PR-contract moves (`done` and held `triage`) set `labelWritePending` in the
+    settlement transaction. A failed label write is repaired by the reconciler, including
+    held cards; a successful repair clears the flag without clearing the human hold.
+  - A tick that claims a just-unblocked card before its labels land parks it as a
+    `github_state_mismatch`.
+- `pr_checks_green` reads GitHub check runs only. Legacy commit statuses are not read,
+  because the App has no `statuses` permission. A head with no check runs, or more
+  than 300, is never green.
+- The card-to-PR link is `linkedPrNumber` from the worker's report, and it only counts
+  when the PR is bound to the card: App-authored, head `ac/card-<n>` in the board's
+  repository, base the default branch, created inside the card's work episode. No worker
+  creates `ac/card-<n>` branches until #416 (on hold) lands, so until then PR contracts are
+  inert: every `pr_merged` / `pr_checks_green` card waits in `review` on `pr_unbound`,
+  flagged once with `needsAttention` and one body-free comment. Use `close` with a verifier
+  for boards that need completion before #416.
+- A missed `pull_request`/`check_suite` doorbell is recovered by the redelivery sweep
+  (24 h look-back) and the 60 s sweep: 25 review cards per board per tick, with a
+  rotating cursor. A board with hundreds of cards in review can take several minutes
+  to converge.
+- Transition notifications (3a's outbox) for comment-command and PR-contract moves are
+  not wired yet. 3a's notifier has since landed (merged into this branch), but the
+  move paths still call `onApplied` / `onSettled` hooks, which only poke the
+  dispatcher today.
+
 Human status and assignment edits now synchronize on every card, not only
 mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
 labels, unlabels, closes, or reopens the issue is adopted through

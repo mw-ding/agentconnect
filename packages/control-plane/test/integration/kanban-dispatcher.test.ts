@@ -54,6 +54,9 @@ class FakeStore {
   }
   /** Issues whose event window cannot be read in full (for example 1,000+ events since the cursor). */
   readonly unreadable = new Set<number>()
+  async readLabelEvents(_repo: KanbanRepoRef, n: number): Promise<LabelEvent[]> {
+    return [...(this.events.get(n) ?? [])]
+  }
   async lastEventId(_repo: KanbanRepoRef, n: number): Promise<number> {
     return (this.events.get(n) ?? []).reduce((max, event) => Math.max(max, event.id), 0)
   }
@@ -123,7 +126,13 @@ class FakeStore {
   }
 }
 
-async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk> } = {}) {
+async function harness(
+  opts: {
+    reply?: (d: KanbanDispatch) => KanbanDispatchOk | Promise<KanbanDispatchOk>
+    unwiredHumanAuthz?: boolean
+    contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
+  } = {}
+) {
   await seedDaemon(prisma, D1, { sessionEpoch: 4n })
   await seedDaemon(prisma, D2, { sessionEpoch: 1n })
   await seedAgent(prisma, A1, { daemonId: D1 })
@@ -160,13 +169,17 @@ async function harness(opts: { reply?: (d: KanbanDispatch) => KanbanDispatchOk |
           : null
     },
     store,
+    ...(!opts.unwiredHumanAuthz
+      ? { humanAuthz: { appSlug: APP_SLUG, permissions: { permission: async () => 'write' as const } } }
+      : {}),
     send: async (daemonId, d) => {
       sent.push({ daemonId, d })
       return opts.reply ? opts.reply(d) : { leaseId: d.leaseId, accepted: true }
     },
     isDaemonLive: () => true,
     clock,
-    log
+    log,
+    ...(opts.contracts ? { contracts: opts.contracts } : {})
   })
   let issue = 1
   const addCard = async (labels: string[] = ['ac/status:ready'], mode: 'read' | 'write' | null = null) => {
@@ -248,6 +261,31 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
       reason: 'superseded'
     })
     expect((await h.card(c.id)).consecutiveFailures).toBe(0)
+  })
+
+  it('re-checks the PR contract when a run leaves its card in review, and sweeps contracts on the tick only', async () => {
+    const contracts = { sweep: vi.fn(async () => {}), onReview: vi.fn(async () => null) }
+    const h = await harness({ contracts })
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { completionContract: 'pr_merged' } })
+    const c = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(contracts.sweep).not.toHaveBeenCalled()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { prNumber: 12 }))
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).status).toBe('review')
+    expect(contracts.onReview).toHaveBeenCalledWith(c.id)
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(contracts.sweep).toHaveBeenCalledWith(h.board.id)
+    // A run that ends outside review never asks.
+    const d = await h.addCard()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const lease = h.sent.find((s) => s.d.cardId === d.id)!.d
+    await h.dispatcher.onReport(D1, 4, h.reportFor(lease, { outcome: 'failed' }))
+    await h.dispatcher.settle()
+    expect(contracts.onReview).toHaveBeenCalledOnce()
   })
 
   it('replays the same report without writing again and grants a comment only for that lease', async () => {
@@ -393,7 +431,8 @@ describe('KanbanDispatcher — dispatch (real Postgres)', () => {
     expect(await prisma.kanbanRun.count({ where: { endedAt: null } })).toBe(0)
     expect(h.store.writes).toEqual([])
     expect(h.store.issues.get(c.issueNumber)?.labels).toEqual([...labels, 'human-label'])
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready', 'human-label']
+    h.store.relabel(c.issueNumber, [], 'human')
+    h.store.relabel(c.issueNumber, ['ac/status:ready', 'human-label'], 'human')
     await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
     expect((await h.card(c.id)).status).toBe('ready')
     await h.dispatcher.tick()
@@ -577,10 +616,10 @@ it.each([
   // Reopening an archived card follows the existing archived -> triage -> ready transitions.
   issue.state = 'open'
   issue.stateReason = null
-  issue.labels = ['ac/status:triage', 'human-label']
+  h.store.relabel(c.issueNumber, ['ac/status:triage', 'human-label'], 'human')
   await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
   expect((await h.card(c.id)).status).toBe('triage')
-  issue.labels = ['ac/status:ready', 'human-label']
+  h.store.relabel(c.issueNumber, ['ac/status:ready', 'human-label'], 'human')
   await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
   expect((await h.card(c.id)).status).toBe('ready')
   expect(h.store.writes).toEqual([])
@@ -674,7 +713,7 @@ it('periodically recovers a blocked mismatch when a ready webhook was missed', a
   await h.dispatcher.tick()
   expect((await h.card(c.id)).status).toBe('blocked')
   expect(h.store.writes).toEqual([])
-  h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+  h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
   await h.dispatcher.tick()
   await h.dispatcher.settle()
   expect(h.sent).toHaveLength(1)
@@ -687,8 +726,7 @@ describe('KanbanDispatcher — mismatch recovery is human-only and bounded (real
     const c = await h.addCard(['ac/status:blocked'])
     await h.dispatcher.tick()
     expect((await h.card(c.id)).status).toBe('blocked')
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
-    h.store.statusActors.set(c.issueNumber, 'bot')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
     expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(false)
     for (let i = 0; i < 3; i++) {
       h.clock.advance(60 * 60_000)
@@ -701,7 +739,8 @@ describe('KanbanDispatcher — mismatch recovery is human-only and bounded (real
       expect.objectContaining({ issueNumber: c.issueNumber, from: 'blocked', to: 'ready' }),
       'kanban: recovery ignored a non-human status label'
     )
-    h.store.statusActors.set(c.issueNumber, 'human')
+    h.store.relabel(c.issueNumber, [], 'app')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
     expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(true)
     await h.dispatcher.tick()
     await h.dispatcher.settle()
@@ -732,7 +771,7 @@ describe('KanbanDispatcher — mismatch recovery is human-only and bounded (real
     await h.dispatcher.tick()
     expect(readsOf()).toBe(3)
     expect((await h.card(c.id)).recoveryChecks).toBe(2)
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:triage']
+    h.store.relabel(c.issueNumber, ['ac/status:triage'], 'human')
     h.clock.advance(60_000)
     await h.dispatcher.tick()
     expect(await h.card(c.id)).toMatchObject({ status: 'triage', recoveryChecks: 0, recoveryCheckAt: null })
@@ -776,7 +815,7 @@ describe('KanbanDispatcher — mismatch recovery is human-only and bounded (real
     await h.dispatcher.tick()
     expect((await h.card(c.id)).status).toBe('archived')
     issue.state = 'open'
-    issue.labels = ['ac/status:ready']
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
     expect(await h.dispatcher.ingestCard(h.board.id, c.issueNumber)).toBe(false)
     expect((await h.card(c.id)).status).toBe('archived')
     expect(h.log.info).toHaveBeenCalledWith(
@@ -879,7 +918,7 @@ describe('Kanban card-status doorbell un-parks a re-readied card at once (real P
   it('dispatches a human-re-readied card on the labeled webhook instead of after the backoff', async () => {
     const h = await graphHarness()
     const c = await parkAtCeiling(h)
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
     await h.ringLabel(c.issueNumber)
     expect(h.store.reads.at(-2)).toBe(c.issueNumber)
     expect(h.sent.map(({ d }) => d)).toEqual([expect.objectContaining({ cardId: c.id, attempt: 2 })])
@@ -890,8 +929,7 @@ describe('Kanban card-status doorbell un-parks a re-readied card at once (real P
   it('resets the backoff on the webhook even when the change cannot un-park the card', async () => {
     const h = await graphHarness()
     const c = await parkAtCeiling(h)
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
-    h.store.statusActors.set(c.issueNumber, 'bot')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'app')
     await h.ringLabel(c.issueNumber)
     expect(h.sent).toEqual([])
     expect(await h.card(c.id)).toMatchObject({ status: 'blocked', recoveryCheckAt: null, recoveryChecks: 0 })
@@ -899,7 +937,8 @@ describe('Kanban card-status doorbell un-parks a re-readied card at once (real P
     const reads = h.store.reads.length
     await h.dispatcher.tick()
     expect(h.store.reads.length).toBe(reads + 1)
-    h.store.statusActors.set(c.issueNumber, 'human')
+    h.store.relabel(c.issueNumber, [], 'app')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
     h.clock.advance(60_000)
     await h.dispatcher.tick()
     await h.dispatcher.settle()
@@ -909,7 +948,7 @@ describe('Kanban card-status doorbell un-parks a re-readied card at once (real P
   it('restarts the backoff when a tick read sees GitHub changed, even without a webhook', async () => {
     const h = await graphHarness()
     const c = await parkAtCeiling(h)
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked', 'ac/status:triage']
+    h.store.relabel(c.issueNumber, ['ac/status:blocked', 'ac/status:triage'], 'human')
     h.clock.advance(60 * 60_000)
     await h.dispatcher.tick()
     const card = await h.card(c.id)
@@ -979,7 +1018,8 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe(status)
     expect(h.sent).toEqual([])
     expect(h.store.writes).toEqual([])
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:ready']
+    h.store.relabel(c.issueNumber, [], 'human')
+    h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
     await h.ring(c.issueNumber, 'graph-2')
     expect(h.sent[0]?.d).toMatchObject({ cardId: c.id, attempt: 2 })
     expect((await h.card(c.id)).status).toBe('running')
@@ -1431,7 +1471,7 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     const cards = new PgKanbanCardRepo(prisma)
     const before = await cards.findByIssueNumber(h.board.id, c.issueNumber)
     expect(before?.status).toBe('todo')
-    h.store.issues.get(c.issueNumber)!.labels = ['ac/status:blocked']
+    h.store.relabel(c.issueNumber, ['ac/status:blocked'], 'human')
     await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
     expect(await cards.casStatus(c.id, before!.stateRevision, 'ready')).toBe(false)
     expect((await h.card(c.id)).status).toBe('blocked')
@@ -1643,4 +1683,15 @@ describe('KanbanDispatcher — card read and progress-note grant (real Postgres)
     expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, d.leaseId, 'acme/other')).toBeNull()
     expect(await h.dispatcher.liveCommentGrant(D1, 4, A1, D2, 'acme/web')).toBeNull()
   })
+})
+
+it('vera-415: unwired human authorization cannot release a parked card through labels', async () => {
+  const h = await harness({ unwiredHumanAuthz: true })
+  const c = await h.addCard(['ac/status:blocked'])
+  await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'blocked', needsAttention: true } })
+  h.store.relabel(c.issueNumber, ['ac/status:ready'], 'human')
+  await h.dispatcher.ingestCard(h.board.id, c.issueNumber)
+  await h.dispatcher.settle()
+  expect(await h.card(c.id)).toMatchObject({ status: 'blocked', needsAttention: true })
+  expect(h.sent).toEqual([])
 })

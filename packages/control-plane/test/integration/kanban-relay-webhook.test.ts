@@ -33,8 +33,9 @@ interface GithubCall {
   jwtValid?: boolean
 }
 
-// A ready-labelled issue whose latest status edit is a human's, who holds `level` on the repository.
-function fakeGithub(publicKeyPem: string, level: string) {
+// A ready-labelled issue whose latest status edit is a human's (the `labeler`); an explicit `level`
+// overrides that login's repository permission, otherwise alice writes and mallory reads.
+function fakeGithub(publicKeyPem: string, labeler: { type: string; login: string } = HUMAN, level?: string) {
   const calls: GithubCall[] = []
   const fetch = async (url: string, init?: RequestInit): Promise<Response> => {
     const { pathname } = new URL(url)
@@ -69,8 +70,15 @@ function fakeGithub(publicKeyPem: string, level: string) {
         }
       })
     }
-    if (pathname === `/repositories/${REPO_ID}/collaborators/${HUMAN.login}/permission`) {
-      return json(200, { permission: level, role_name: level })
+    // The label's human adder must hold live write access to un-park the card; `mallory` only reads.
+    const permission = pathname.match(new RegExp(`^/repositories/${REPO_ID}/collaborators/([^/]+)/permission$`))
+    if (permission) {
+      const login = permission[1]!
+      const resolved =
+        level && login === labeler.login
+          ? level
+          : ({ alice: 'write', mallory: 'read' } as Record<string, string>)[login]
+      return resolved ? json(200, { permission: resolved, role_name: resolved }) : json(404, { message: 'Not Found' })
     }
     const base = `/repositories/${REPO_ID}/issues/${ISSUE.number}`
     if (pathname === base) {
@@ -88,8 +96,8 @@ function fakeGithub(publicKeyPem: string, level: string) {
     if (pathname === `${base}/events`) {
       return json(200, [
         { id: 1, event: 'labeled', label: { name: 'ac/status:triage' }, actor: HUMAN },
-        { id: 2, event: 'labeled', label: { name: 'ac/status:ready' }, actor: HUMAN },
-        { id: 3, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: HUMAN }
+        { id: 2, event: 'labeled', label: { name: 'ac/status:ready' }, actor: labeler },
+        { id: 3, event: 'unlabeled', label: { name: 'ac/status:triage' }, actor: labeler }
       ])
     }
     if (pathname.startsWith(`${base}/`)) return pathname.endsWith('/parent') ? json(404, {}) : json(200, [])
@@ -127,9 +135,15 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot(level = 'write', opts: { project?: boolean; beforeFetch?: (url: string) => Promise<void> } = {}) {
+async function boot(
+  labeler: { type: string; login: string } | string = HUMAN,
+  opts: { project?: boolean; beforeFetch?: (url: string) => Promise<void> } = {}
+) {
   const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const github = fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, level)
+  const github =
+    typeof labeler === 'string'
+      ? fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, HUMAN, labeler)
+      : fakeGithub(publicKey.export({ type: 'spki', format: 'pem' }) as string, labeler)
   await prisma.githubInstallation.create({
     data: {
       orgId: DEFAULT_ORG_ID,
@@ -298,6 +312,22 @@ describe('Kanban webhook delivery through the real relay (real ports, real Postg
     })
     const saved = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })
     expect(saved).toMatchObject({ status: 'triage', syncEventCursor: 3n })
+  })
+
+  it('a human relabel by a non-writer leaves the parked card where it is (live write check, TRD 4.5)', async () => {
+    const mallory = { type: 'User', login: 'mallory' }
+    const { github, card, link } = await boot(mallory)
+    await postGithubWebhook(link.webhookUrl, {
+      secret: WEBHOOK_SECRET,
+      event: 'issues',
+      payload: issuesLabeled(mallory)
+    })
+    await until(
+      async () => github.calls.map((c) => c.path),
+      (paths) => paths.some((p) => p.endsWith('/collaborators/mallory/permission'))
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('triage')
   })
 
   it('forwards the same GUID after a dropped CP emit and persists the redelivered doorbell', async () => {

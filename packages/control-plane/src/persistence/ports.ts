@@ -8419,6 +8419,16 @@ export interface KanbanCardRepo {
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+  /** The ledger row of one `/kanban` comment command; null when this comment was never recorded. */
+  getCommand(boardId: string, commentId: bigint): Promise<KanbanCommandRecord | null>
+  /** Record a command; an applied one moves the unleased card by stateRevision CAS with an audit row, atomically. */
+  recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult>
+  /** The command's GitHub effect landed, so a later delivery of the same comment is a no-op. */
+  settleCommand(id: string): Promise<void>
+  /** Claim an unsettled command's GitHub effect (DB clock); null while settled or another claim is younger than ttlMs. */
+  claimCommandEffect(id: string, ttlMs: number): Promise<Date | null>
+  /** Drop this holder's claim after a failed effect, so the next delivery retries at once instead of after the TTL. */
+  releaseCommandEffect(id: string, claimedAt: Date): Promise<void>
   /** Remember the card's ProjectV2Item id and the project it belongs to, so later writes there skip the add. */
   setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void>
 }
@@ -8508,3 +8518,92 @@ export interface KanbanOrchestratorBoardView {
   repoFullName: string
   cards: KanbanOrchestrateCard[]
 }
+
+/** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */
+export interface KanbanContractCard {
+  cardId: string
+  boardId: string
+  issueNumber: number
+  status: KanbanStatus
+  stateRevision: bigint
+  linkedPrNumber: number | null
+  /** Start of the card's work episode (DB clock); a bound PR was created no earlier. */
+  workEpisodeStartedAt: Date | null
+  /** `<reason>#<pr>` keys already flagged once in this episode. */
+  contractFlags: string[]
+  needsAttention: boolean
+  verifiedAt: Date | null
+  completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  verifierAgentId: string | null
+  /** The board configuration the contract and verifier were read under; a board edit bumps it. */
+  configRevision: bigint
+}
+
+export interface KanbanContractSettleInput {
+  cardId: string
+  expectedStateRevision: bigint
+  /** The board's configRevision at the read: a contract or verifier edit (or a disable) since then refuses the move. */
+  expectedConfigRevision: bigint
+  to: 'done' | 'triage'
+  /** The contract that completed it, or why it went to triage; recorded on the audit row and attention flag. */
+  reason: string
+  prNumber: number
+}
+
+/** A contract wait that needs a human (pr_unbound, actions_read_missing, merged_by_app), flagged once per PR. */
+export interface KanbanContractFlagInput {
+  cardId: string
+  expectedStateRevision: bigint
+  reason: string
+  prNumber: number
+}
+
+export interface KanbanContractRepo {
+  /** Unleased `review` cards with a linked PR on an enabled board under a PR contract, by issue number. */
+  listContractCards(
+    boardId: string,
+    opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
+  ): Promise<KanbanContractCard[]>
+  getContractCard(cardId: string): Promise<KanbanContractCard | null>
+  /** CAS review → done/triage with an audit row; false when the card moved, was leased or held, or the board changed. */
+  settleContract(input: KanbanContractSettleInput): Promise<boolean>
+  /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */
+  flagContract(input: KanbanContractFlagInput): Promise<boolean>
+}
+
+/** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */
+export interface KanbanCommandRecord {
+  id: string
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  actorLogin: string
+  /** `applied`, or the refusal reason code. */
+  outcome: string
+  fromStatus: KanbanStatus
+  toStatus: KanbanStatus | null
+  settledAt: Date | null
+}
+
+export interface KanbanCommandInput {
+  boardId: string
+  cardId: string
+  commentId: bigint
+  command: string
+  /** The live-attested human; required for an applied move, absent only on a refusal. */
+  humanAuthority?: KanbanHumanAuthority
+  actorLogin: string
+  from: KanbanStatus
+  expectedStateRevision: bigint
+  /** Present for an applied move; absent records a refusal. */
+  to?: KanbanStatus
+  refusal?: string
+}
+
+export type KanbanCommandRecordResult =
+  | { kind: 'recorded'; record: KanbanCommandRecord }
+  /** This comment was already recorded (a concurrent or earlier delivery): its row, unchanged. */
+  | { kind: 'duplicate'; record: KanbanCommandRecord }
+  /** The card moved, gained a lease, or vanished since it was read; nothing was written. */
+  | { kind: 'stale' }

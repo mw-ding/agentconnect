@@ -1,5 +1,10 @@
 // Kanban doorbell (issue #2 spike §3): a body-free `rc/github-graph` poke makes the CP re-read a graph or card.
-import type { RcGithubGraph } from '@agentconnect.md/protocol'
+import type {
+  KanbanDoorbellCheckSuite,
+  KanbanDoorbellCommand,
+  KanbanDoorbellPullRequest,
+  RcGithubGraph
+} from '@agentconnect.md/protocol'
 import type { GithubInstallationRepo, KanbanBoardRecord, KanbanBoardRepo } from '../persistence/ports.js'
 import type { CardGraph, CardStore, KanbanRepoRef } from './card-store.js'
 import type { DoorbellSender } from './label-attribution.js'
@@ -38,6 +43,21 @@ export interface KanbanGraphDoorbellDeps {
     repo: KanbanRepoRef,
     issueNumber: number,
     doorbell: KanbanIssueDoorbell
+  ) => void | Promise<void>
+  /** A `/kanban` comment command; a throw leaves the GUID un-landed too. */
+  onCommand?: (
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    command: KanbanDoorbellCommand
+  ) => void | Promise<void>
+  /** A closed pull request (PR completion contracts); a throw leaves the GUID un-landed too. */
+  onPullRequest?: (board: KanbanBoardRecord, repo: KanbanRepoRef, pr: KanbanDoorbellPullRequest) => void | Promise<void>
+  /** A completed check suite (PR completion contracts); a throw leaves the GUID un-landed too. */
+  onCheckSuite?: (
+    board: KanbanBoardRecord,
+    repo: KanbanRepoRef,
+    suite: KanbanDoorbellCheckSuite
   ) => void | Promise<void>
   log: GraphDoorbellLog
 }
@@ -84,7 +104,8 @@ export class KanbanGraphDoorbell {
   }
 
   private async handle(m: RcGithubGraph): Promise<void> {
-    if (m.numbers.length === 0) {
+    const { pullRequest, checkSuite } = m
+    if (m.numbers.length === 0 && !pullRequest && !checkSuite) {
       // Cross-repo ids only (the periodic board tick reconciles those), or an `issues` seen-only marker: land it.
       this.deps.log.debug({ deliveryKey: m.deliveryKey }, 'kanban graph doorbell: no same-repo issue numbers')
       return
@@ -105,11 +126,18 @@ export class KanbanGraphDoorbell {
         repoId: board.repoId,
         repoFullName: board.repoFullName
       }
+      if (pullRequest) reads.push((async () => this.deps.onPullRequest?.(board, repo, pullRequest))())
+      if (checkSuite) reads.push((async () => this.deps.onCheckSuite?.(board, repo, checkSuite))())
       for (const issueNumber of m.numbers) {
+        const command = m.command
         reads.push(
-          m.event === 'issues'
-            ? (async () => this.deps.onCard?.(board, repo, issueNumber, issueDoorbell(m)))()
-            : this.schedule(board, repo, issueNumber)
+          m.event === 'issue_comment'
+            ? (async () => {
+                if (command) await this.deps.onCommand?.(board, repo, issueNumber, command)
+              })()
+            : m.event === 'issues'
+              ? (async () => this.deps.onCard?.(board, repo, issueNumber, issueDoorbell(m)))()
+              : this.schedule(board, repo, issueNumber)
         )
       }
     }

@@ -7,7 +7,9 @@ describe('kanbanTokenSource', () => {
       mintKanbanCard: vi.fn(),
       mintKanbanRun: vi.fn(),
       mintKanbanProject: vi.fn(),
-      mintKanbanOrchestratorWrite: vi.fn()
+      mintKanbanOrchestratorWrite: vi.fn(),
+      mintKanbanPr: vi.fn(),
+      mintKanbanActions: vi.fn()
     }
     const log = { warn: vi.fn() }
     expect(kanbanTokenSource({ app, injectedToken: 'ghp_test', log })).toBe(app)
@@ -24,6 +26,11 @@ describe('kanbanTokenSource', () => {
       access: 'write'
     })
     await expect(tokens!.mintKanbanRun(1n, 'acme/web', 7n, 'read')).resolves.toMatchObject({
+      token: 'ghp_test',
+      access: 'read'
+    })
+    await expect(tokens!.mintKanbanPr(1n, 'acme/web', 7n)).resolves.toMatchObject({ token: 'ghp_test', access: 'read' })
+    await expect(tokens!.mintKanbanActions(1n, 'acme/web', 7n)).resolves.toMatchObject({
       token: 'ghp_test',
       access: 'read'
     })

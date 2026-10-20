@@ -82,11 +82,14 @@ import { CodeHostNoteProjectionService } from './codehost/note-projection.servic
 import { githubHookRunSubject } from './github/hook-run-subject.js'
 import { githubProjectionIntent } from './github/projection-intent.js'
 import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
-import { GithubCardStore } from './kanban/card-store.js'
+import { GithubCardStore, type KanbanRepoRef } from './kanban/card-store.js'
 import { kanbanProjectHook, KanbanProjectWriter } from './kanban/project-writer.js'
 import { kanbanTokenSource } from './kanban/tokens.js'
 import { githubKanbanTitleSource } from './kanban/card-titles.js'
 import { KanbanGraphDoorbell } from './kanban/graph-doorbell.js'
+import { KanbanCommentCommands } from './kanban/comment-command.js'
+import { KanbanPrContracts } from './kanban/pr-contracts.js'
+import { GithubPrReader } from './kanban/pr-reader.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanOrchestrator } from './kanban/orchestrator.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
@@ -1826,6 +1829,25 @@ export function buildContainer(
         })
       : undefined
 
+  // PR completion contracts (TRD 4.7): CP-only pull_requests:read + checks:read reads; workflow lookup on its own actions:read token.
+  const kanbanPrContracts: KanbanPrContracts | undefined =
+    kanbanCardStore && kanbanTokens
+      ? new KanbanPrContracts({
+          appSlug: githubAppCfg?.slug,
+          repo: repos.kanbanDispatch,
+          prs: new GithubPrReader({
+            tokens: kanbanTokens,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          store: kanbanCardStore,
+          repoRef: (boardId): Promise<KanbanRepoRef | null> =>
+            kanbanDispatcher?.boardRepo(boardId) ?? Promise.resolve(null),
+          onSettled: (card) => kanbanDispatcher?.poke(card.boardId),
+          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) },
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
+        })
+      : undefined
+
   // Kanban transition notifier (issue #2 M4): drains the notification outbox to the board's anchor channel.
   const kanbanNotifier = kanbanCardStore
     ? new KanbanNotifier({
@@ -1893,12 +1915,28 @@ export function buildContainer(
         })
       : undefined
   // Kanban dispatcher (issue #2): claims, reports, and the reaper. The daemon posts the one summary after acceptance; this process only mints its kanban_card_write token.
-  const kanbanDispatcher = kanbanCardStore
+  const kanbanDispatcher: KanbanDispatcher | undefined = kanbanCardStore
     ? new KanbanDispatcher({
         repo: repos.kanbanDispatch,
         sync: kanbanSync,
         installations: repos.githubInstallation,
         store: kanbanCardStore,
+        ...(kanbanTokens
+          ? {
+              humanAuthz: {
+                permissions: new GithubRepoPermission({
+                  tokens: kanbanTokens,
+                  ttlMs: 0,
+                  ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+                }),
+                appSlug: githubAppCfg?.slug
+              }
+            }
+          : {}),
+        contracts: {
+          sweep: async (boardId): Promise<void> => kanbanPrContracts?.sweep(boardId),
+          onReview: async (cardId): Promise<unknown> => kanbanPrContracts?.onVerified(cardId)
+        },
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
         isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',
         clock,
@@ -1916,6 +1954,24 @@ export function buildContainer(
         maxPerDaemon: config.KANBAN_MAX_IN_PROGRESS_PER_DAEMON
       })
     : undefined
+
+  // `/kanban` comment commands: a live, uncached write check per command, so a revoked grant stops the next one.
+  const kanbanCommentCommands =
+    kanbanCardStore && kanbanTokens
+      ? new KanbanCommentCommands({
+          cards: repos.kanbanCard,
+          store: kanbanCardStore,
+          permissions: new GithubRepoPermission({
+            tokens: kanbanTokens,
+            ttlMs: 0,
+            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+          }),
+          appSlug: githubAppCfg?.slug,
+          onApplied: (board) => kanbanDispatcher?.poke(board.id),
+          log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) },
+          ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
+        })
+      : undefined
 
   // Promote unblocked cards before ingesting human edits and waking the board dispatcher.
   const kanbanGraphDoorbell = kanbanCardStore
@@ -1943,6 +1999,11 @@ export function buildContainer(
             )
           kanbanDispatcher?.poke(board.id)
         },
+        onCommand: async (board, repo, issueNumber, command) => {
+          await kanbanCommentCommands?.handle(board, repo, issueNumber, command)
+        },
+        onPullRequest: (board, repo, pr) => kanbanPrContracts?.onPullRequest(board, repo, pr),
+        onCheckSuite: (board, repo, suite) => kanbanPrContracts?.onCheckSuite(board, repo, suite),
         log: kanbanGraphLog
       })
     : undefined
