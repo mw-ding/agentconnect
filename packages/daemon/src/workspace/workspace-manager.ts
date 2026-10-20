@@ -2406,15 +2406,15 @@ export class WorkspaceManager {
           const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
           if (!path) continue
           const location = cardWorktreeLocation(path, cwd)
-          if (location === 'same') continue
           if (
-            location !== 'managed' ||
+            location === 'foreign' ||
             (await this.fsFor(agentId).stat(path)) !== 'missing' ||
             fields.some((field) => field.startsWith('locked'))
           ) {
             throw new Error(`card branch ${branch} is already checked out in another worktree`)
           }
-          await git().raw(['worktree', 'prune', '--expire', 'now'])
+          // Remove only the proven stale card registration; pruning also drops unrelated foreign registrations.
+          await git().raw(['worktree', 'remove', path])
         }
       }
       // No upstream: pushing the card must not target the repository's default branch.
@@ -2658,7 +2658,9 @@ export class WorkspaceManager {
     }
     if (!attached) {
       await fs.rmTree(cwd)
-      await this.runnerFor(agent.id, root.path).withEnv(workspaceGitLocalEnv()).raw(['worktree', 'prune'])
+      // Fixed card branches release only the registration their safety checks identify.
+      if (request.branch === undefined)
+        await this.runnerFor(agent.id, root.path).withEnv(workspaceGitLocalEnv()).raw(['worktree', 'prune'])
       await this.addRootSessionWorktree(agent.id, root, cwd, target, request.initiatedBy, request.branch)
     } else if (review) {
       // Tracked files alone follow the revision; untracked and ignored files (node_modules, a cargo target, build output) are the session's own intermediates and stay, so a re-review does not rebuild them.

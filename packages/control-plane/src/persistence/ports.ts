@@ -8548,7 +8548,10 @@ export interface KanbanOrchestratorBoardView {
 export interface KanbanCardControlOutcome {
   cardId: string
   issueNumber: number
+  from: KanbanStatus
   status: KanbanStatus
+  /** False for an idempotent skip or restart that wrote nothing. */
+  changed: boolean
   /** Board facts for the label/close write. */
   orgId: OrgId
   repoId: bigint

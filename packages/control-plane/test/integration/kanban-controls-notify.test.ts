@@ -67,7 +67,7 @@ async function harness(headless = false) {
 
 describe('control notification atomicity (real Postgres)', () => {
   it.each(['skip', 'restart'] as const)(
-    'enqueues %s in the same transaction as the state and lease revocation',
+    '416c: enqueues %s in the same transaction as the state and lease revocation',
     async (operation) => {
       const h = await harness()
       const result = operation === 'skip' ? await h.repo.skipCard(h.input) : await h.repo.restartCard(h.input)
@@ -90,36 +90,39 @@ describe('control notification atomicity (real Postgres)', () => {
     }
   )
 
-  it.each(['skip', 'restart'] as const)('rolls back %s state, fence, audit and outbox together', async (operation) => {
-    const h = await harness()
-    await expect(
-      prisma.$transaction(async (tx) => {
-        const repo = new PgKanbanCardRepo(tx)
-        const result = operation === 'skip' ? await repo.skipCard(h.input) : await repo.restartCard(h.input)
-        expect(result.ok).toBe(true)
-        expect(
-          await tx.$queryRaw`SELECT 1 FROM "kanban_notification" WHERE "cardId" = ${h.card.id}::uuid`
-        ).toHaveLength(1)
-        throw new Error('rollback probe')
+  it.each(['skip', 'restart'] as const)(
+    '416c: rolls back %s state, fence, audit and outbox together',
+    async (operation) => {
+      const h = await harness()
+      await expect(
+        prisma.$transaction(async (tx) => {
+          const repo = new PgKanbanCardRepo(tx)
+          const result = operation === 'skip' ? await repo.skipCard(h.input) : await repo.restartCard(h.input)
+          expect(result.ok).toBe(true)
+          expect(
+            await tx.$queryRaw`SELECT 1 FROM "kanban_notification" WHERE "cardId" = ${h.card.id}::uuid`
+          ).toHaveLength(1)
+          throw new Error('rollback probe')
+        })
+      ).rejects.toThrow('rollback probe')
+      expect(await h.outbox()).toEqual([])
+      expect(await prisma.auditEvent.count()).toBe(0)
+      expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.card.id } })).toMatchObject({
+        status: 'running',
+        stateRevision: 1n,
+        dispatchRevision: 1n
       })
-    ).rejects.toThrow('rollback probe')
-    expect(await h.outbox()).toEqual([])
-    expect(await prisma.auditEvent.count()).toBe(0)
-    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: h.card.id } })).toMatchObject({
-      status: 'running',
-      stateRevision: 1n,
-      dispatchRevision: 1n
-    })
-    expect((await prisma.kanbanRun.findUniqueOrThrow({ where: { id: h.run.id } })).endedAt).toBeNull()
-  })
+      expect((await prisma.kanbanRun.findUniqueOrThrow({ where: { id: h.run.id } })).endedAt).toBeNull()
+    }
+  )
 
-  it('keeps headless controls silent', async () => {
+  it('416c: keeps headless controls silent', async () => {
     const h = await harness(true)
     expect((await h.repo.skipCard(h.input)).ok).toBe(true)
     expect(await h.outbox()).toEqual([])
   })
 
-  it('enqueues synthesis exactly once at its CAS revision', async () => {
+  it('416c: enqueues synthesis exactly once at its CAS revision', async () => {
     const h = await harness()
     await prisma.kanbanRun.delete({ where: { id: h.run.id } })
     await prisma.kanbanCard.update({ where: { id: h.card.id }, data: { status: 'todo' } })
@@ -142,7 +145,7 @@ describe('control notification atomicity (real Postgres)', () => {
     })
   })
 
-  it('rolls back synthesis and its notification together', async () => {
+  it('416c: rolls back synthesis and its notification together', async () => {
     const h = await harness()
     await prisma.kanbanRun.delete({ where: { id: h.run.id } })
     await prisma.kanbanCard.update({ where: { id: h.card.id }, data: { status: 'todo', assigneeAgentId: null } })

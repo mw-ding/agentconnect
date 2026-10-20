@@ -86,7 +86,7 @@ const cardSkip = `${ORG}/kanban/boards/${BOARD}/cards/${CARD}/skip`
 const cardRestart = `${ORG}/kanban/boards/${BOARD}/cards/${CARD}/restart`
 
 describe('Kanban control routes — an interactive owner', () => {
-  it('pauses and resumes a board idempotently with one audit row each', async () => {
+  it('416c: pauses and resumes a board idempotently with one audit row each', async () => {
     await seedBoard()
     const { app, close } = buildApp()
     const headers = await ownerBearer(prisma, oidc)
@@ -112,7 +112,7 @@ describe('Kanban control routes — an interactive owner', () => {
     }
   })
 
-  it('skips a card and restarts it', async () => {
+  it('416c: skips a card and restarts it', async () => {
     await seedBoard()
     const poke = vi.fn()
     const { app, close } = buildApp(poke)
@@ -132,7 +132,7 @@ describe('Kanban control routes — an interactive owner', () => {
     }
   })
 
-  it('404s a missing board or card and 409s an illegal transition', async () => {
+  it('416c: 404s a missing board or card and 409s an illegal transition', async () => {
     await seedBoard()
     const { app, close } = buildApp()
     const headers = await ownerBearer(prisma, oidc)
@@ -179,21 +179,21 @@ describe('Kanban control routes — every non-interactive or non-owner caller is
     }
   }
 
-  it('no credentials → 401', async () => {
+  it('416c: no credentials → 401', async () => {
     await expectRefused(401, {})
   })
 
-  it('an interactive collaborator → 403', async () => {
+  it('416c: an interactive collaborator → 403', async () => {
     const { headers } = await memberBearer(prisma, oidc, 'collaborator', 'kanban-controls-collab')
     await expectRefused(403, headers)
   })
 
-  it('an interactive viewer → 403', async () => {
+  it('416c: an interactive viewer → 403', async () => {
     const { headers } = await memberBearer(prisma, oidc, 'viewer', 'kanban-controls-viewer')
     await expectRefused(403, headers)
   })
 
-  it('the devAuth stub (no OIDC configured) → 403', async () => {
+  it('416c: the devAuth stub (no OIDC configured) → 403', async () => {
     await seedBoard()
     const app = buildHttpApp(prisma, {}, undefined, undefined, { kanbanControls: controls() })
     try {

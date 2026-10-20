@@ -112,7 +112,7 @@ async function harness() {
 }
 
 describe('synthesizer parent re-evaluation (real Postgres)', () => {
-  it('promotes and assigns the parent on sub-issue close, replaces the agent label, and is idempotent', async () => {
+  it('416c: promotes and assigns the parent on sub-issue close, replaces the agent label, and is idempotent', async () => {
     const h = await harness()
     await h.ring()
     expect(await h.row()).toMatchObject({
@@ -128,7 +128,7 @@ describe('synthesizer parent re-evaluation (real Postgres)', () => {
   })
 
   it.each(['not_planned', 'open', 'truncated', 'no_synthesizer', 'already_ready'] as const)(
-    'does not promote on %s',
+    '416c: does not promote on %s',
     async (reason) => {
       const h = await harness()
       const graph = h.graphs.get(1)!

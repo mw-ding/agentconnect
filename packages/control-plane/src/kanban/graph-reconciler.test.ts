@@ -52,6 +52,14 @@ describe('planSynthesis', () => {
   it('holds when no synthesizer is configured', () => {
     expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub] }), null)).toBe('none')
   })
+  it('416c: an open or not_planned blocker holds synthesis even when every sub-issue completed', () => {
+    const subIssues = [completedSub]
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [link(5, 'open')] }), 'a1')).toBe('none')
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [link(5, 'closed', 'not_planned')] }), 'a1')
+    ).toBe('none')
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [done] }), 'a1')).toBe('promote')
+  })
   it('holds when the issue is not an epic or not todo', () => {
     expect(planSynthesis({ status: 'todo' }, graph(), 'a1')).toBe('none')
     expect(planSynthesis({ status: 'ready' }, graph({ subIssues: [completedSub] }), 'a1')).toBe('none')
@@ -413,6 +421,18 @@ describe('KanbanGraphReconciler', () => {
       expect(h.store.applyPlan).not.toHaveBeenCalled()
     }
   )
+
+  it('416c: a blocked epic is not synthesized when its last sub-issue closes', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make(
+      { 9: { status: 'running', labels: ['ac/status:running'] }, 7: { status: 'todo', labels: todoLabels } },
+      { 7: graph({ subIssues: [link(9, 'closed', 'completed')], blockedBy: [link(5, 'open')] }) }
+    )
+    await h.reconciler.apply(board, REPO, 9, graph({ parent: link(7, 'open') }))
+    expect(h.store.readGraph).toHaveBeenCalledWith(REPO, 7)
+    expect(h.cards.beginSynthesis).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
+  })
 
   it('re-evaluates the parent epic when a sub-issue closes', async () => {
     const board = { ...BOARD, synthesizerAgentId: 'a1' }

@@ -2,7 +2,7 @@
 import { AGENT_LABEL_PREFIX, agentLabel } from './agent-label.js'
 import type { KanbanBoardRecord, KanbanCardRepo } from '../persistence/ports.js'
 import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan } from './card-state.js'
-import type { CardGraph, CardIssue, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
+import type { CardGraph, CardIssue, CardLink, CardStore, KanbanRepoRef, LabelWriteObserver } from './card-store.js'
 import type { KanbanProjectHook } from './project-writer.js'
 
 export interface GraphReconcilerLog {
@@ -38,15 +38,15 @@ export function planGraphPromotion(cardStatus: KanbanStatus, graph: CardGraph): 
   return done ? 'promote' : 'none'
 }
 
-// Synthesis needs a configured agent, a todo epic, and an untruncated graph of completed sub-issues.
+// Synthesis needs a configured agent, a todo epic, and an untruncated graph whose sub-issues and blockers all completed.
 export function planSynthesis(
   epic: { status: KanbanStatus },
   graph: CardGraph,
   synthesizerAgentId: string | null
 ): GraphPromotion {
   if (epic.status !== 'todo' || graph.truncated || graph.subIssues.length === 0 || !synthesizerAgentId) return 'none'
-  const done = graph.subIssues.every((s) => s.state === 'closed' && s.stateReason === 'completed')
-  return done ? 'promote' : 'none'
+  const completed = (l: CardLink) => l.state === 'closed' && l.stateReason === 'completed'
+  return graph.subIssues.every(completed) && graph.blockedBy.every(completed) ? 'promote' : 'none'
 }
 
 export class KanbanGraphReconciler {

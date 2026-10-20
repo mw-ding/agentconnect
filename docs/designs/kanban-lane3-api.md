@@ -286,11 +286,10 @@ An applied move queues the Projects projection when it commits.
 
 ### PR completion contracts
 
-> **Inert until #416.** The binding below requires a head branch `ac/card-<issueNumber>`,
-> and no worker creates one before #416 (the write-card branch convention, on hold) lands.
-> Until then every `pr_merged` / `pr_checks_green` card that reaches `review` with a linked PR
-> waits on `pr_unbound`, flagged once (see below). Boards that need completion now should use
-> `close` with a verifier.
+Write-card sessions now create and reuse `ac/card-<issueNumber>` (#416), satisfying
+the branch binding below. PR contracts can complete cards when the live PR also meets
+the App-author, repository, default-base and work-episode checks. Upgrade the daemon
+before enabling these contracts; sessions using older session branches wait on `pr_unbound`.
 
 The pure planner is in `cp/src/kanban/contracts.ts`:
 `planContract(input) → done | triage(pr_closed_unmerged) | wait(reason)` and
@@ -379,7 +378,7 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   stamp, else their latest work claim); other cards stamp at their next work claim.
   A card in `ready` or `blocked` between rework rounds at deploy time therefore starts a new
   episode at its next claim, and attempt 1's PR is flagged `pr_unbound` once. That is
-  acceptable while contracts are inert.
+  a conservative deployment boundary; a human must start new work or report a new bound PR.
 - Known gap: a base branch renamed after merge leaves the merged PR's old `base.ref`,
   so the card waits as `pr_unbound` (flagged once). It fails closed; a human moves it.
 - `done` resets `reviewRounds` and `verifiedAt`.
@@ -417,13 +416,16 @@ reads a binding override from configuration or environment.
 
 - **1.4 (2026-10-20):** add the required `board.paused` fact and the `board_paused` gate
   immediately after `board_disabled` (#416), preserving 1.1 review routing, `verified`,
-  `needs_attention`, the 1.2 epic/daemon caps and any-attempt B8 ordering.
+  `needs_attention`, the 1.2 epic/daemon caps and any-attempt B8 ordering. Write-card
+  branches now satisfy the 3b PR binding. Controls revoke the daemon lease, reset the
+  work episode on restart, project status changes and leave failed label writes pending
+  for repair. Repeating a skip or a restart of an already-reset ready card is a no-op.
 
 - **1.3 (2026-10-20):** PR contracts bind against the card's work episode
   (`workEpisodeStartedAt`), not the reporting run; `pr_unbound`, `actions_read_missing`
   and `merged_by_app` are flagged once per `(card, reason, PR)`; the workflow lookup moves
   to its own `actions:read` token; check identity adds the triggering event. Contracts stay
-  inert until #416's branch convention lands.
+  inert at 1.3 until #416's branch convention (now supplied in 1.4) lands.
 
 - **1.2 (2026-10-19):** add optional epic and daemon capacity facts and matching gates for
   main's orchestrator caps. Work and verify claims share those caps and daemon locks.

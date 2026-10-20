@@ -230,7 +230,7 @@ function review(overrides: Partial<ClaimEligibilityInput> = {}, card: Partial<Cl
 }
 
 describe('explainClaim — review routing', () => {
-  it('checks board pause before review routing, approval and attention gates', () => {
+  it('416c: checks board pause before review routing, approval and attention gates', () => {
     const facts = review({ board: { ...review().board, paused: true } })
     expect(explainClaim(facts)).toEqual({ eligible: false, gate: 'board_paused' })
     expect(explainClaim({ ...facts, card: { ...facts.card, verifiedAt: NOW, needsAttention: true } })).toEqual({

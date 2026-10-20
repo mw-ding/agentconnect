@@ -206,7 +206,7 @@ async function expectParity(
 }
 
 describe('claim eligibility parity (real Postgres)', () => {
-  it('a paused board gates review cards before verifier, approval and attention checks', async () => {
+  it('416c: a paused board gates review cards before verifier, approval and attention checks', async () => {
     await seedDaemon(prisma, D1, { sessionEpoch: 1n })
     await seedAgent(prisma, A1, { daemonId: D1 })
     await seedAgent(prisma, A2, { daemonId: D1 })

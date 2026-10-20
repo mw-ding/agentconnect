@@ -595,7 +595,7 @@ export function kanbanRoutes(deps: HttpDeps) {
           tags: [Tag.Kanban],
           summary: 'Restart a Kanban card',
           description:
-            'Owner-only, interactive sign-in only. Resets the card to ready, clears its failure counters and flags, revokes any open lease, reopens a closed issue, writes the status label and one body-free comment, then re-arms the dispatcher.',
+            'Owner-only, interactive sign-in only. Resets the card to ready, clears its failure counters and flags, revokes any open lease, reopens a closed issue, writes the status label and one body-free comment, then re-arms the dispatcher. Repeating a restart of an already-reset ready card is a no-op.',
           operationId: 'restartKanbanCard',
           params: KanbanCardParams,
           response: { 200: KanbanCardControlDto, 401: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }

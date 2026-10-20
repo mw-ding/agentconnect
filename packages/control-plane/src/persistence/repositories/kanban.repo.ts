@@ -932,11 +932,11 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
   }
 
   skipCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult> {
-    return this.controlCard(input, 'archived', 'card_skipped', 'skipped')
+    return this.controlCard(input, 'archived', 'card_skipped', 'skipped', 'skip')
   }
 
   restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult> {
-    return this.controlCard(input, 'ready', 'card_restarted', 'restarted')
+    return this.controlCard(input, 'ready', 'card_restarted', 'restarted', 'restart')
   }
 
   /** The shared B5 control write: revoke any open lease (bumping the fence), move the card, and audit — all in one transaction. */
@@ -944,7 +944,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     input: KanbanCardControlInput,
     to: KanbanStatus,
     auditKind: 'card_skipped' | 'card_restarted',
-    reasonCode: string
+    reasonCode: string,
+    source: 'skip' | 'restart'
   ): Promise<KanbanCardControlResult> {
     return withAmbientTx(this.db, async (tx) => {
       // The card lock orders this write against a claim (which skips locked cards) and against run ends.
@@ -969,6 +970,18 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
       )
       if (!row) return { ok: false, reason: 'not_found' }
       if (!isKanbanStatus(row.status)) return { ok: false, reason: 'illegal_transition' }
+      const outcome = {
+        cardId: row.id,
+        issueNumber: row.issueNumber,
+        from: row.status,
+        status: to,
+        orgId: OrgId(row.orgId),
+        repoId: row.repoId,
+        repoFullName: row.repoFullName
+      }
+      // A repeated skip is idempotent: an archived card holds no lease, so there is nothing to revoke, move, audit or write.
+      if (to === 'archived' && row.status === 'archived')
+        return { ok: true, value: { ...outcome, changed: false, revokedLease: null } }
       // Restart routes archived→triage→ready (the table's two-hop path) in one write; everything else honors the table directly.
       const legal =
         to === 'ready'
@@ -993,8 +1006,23 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         blockRecurrence: 0,
         cooldownUntil: null,
         blockKind: null,
+        verifiedAt: null,
+        reviewRounds: 0,
+        // A restart starts a new work episode, so a PR bound to the old one can never complete the card.
+        ...EPISODE_RESET,
         ...PROMOTION_CLEARED
       }
+      // The row lock makes concurrent retries of an already-reset ready card no-ops without suppressing a new reset.
+      if (
+        to === 'ready' &&
+        row.status === 'ready' &&
+        !open &&
+        (await tx.kanbanCard.findFirst({
+          where: { id: row.id, ...reset, contractFlags: { equals: [] } },
+          select: { id: true }
+        }))
+      )
+        return { ok: true, value: { ...outcome, changed: false, revokedLease: null } }
       await tx.kanbanCard.update({
         where: { id: row.id },
         data: {
@@ -1002,8 +1030,17 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           stateRevision: { increment: 1 },
           dispatchRevision: { increment: 1 },
           githubSyncedAt: new Date(),
+          // The GitHub write runs after commit; a failed one stays pending for the label sync's repair.
+          labelWritePending: true,
           ...(to === 'ready' ? reset : {})
         }
+      })
+      await auditCardTransition(tx, {
+        cardId: row.id,
+        from: row.status,
+        to,
+        source,
+        ...(open ? { leaseId: open.leaseId } : {})
       })
       const transition = {
         cardId: row.id,
@@ -1037,18 +1074,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           }
         }
       })
-      return {
-        ok: true,
-        value: {
-          cardId: row.id,
-          issueNumber: row.issueNumber,
-          status: to,
-          orgId: OrgId(row.orgId),
-          repoId: row.repoId,
-          repoFullName: row.repoFullName,
-          revokedLease: open ?? null
-        }
-      }
+      return { ok: true, value: { ...outcome, changed: true, revokedLease: open ?? null } }
     })
   }
 

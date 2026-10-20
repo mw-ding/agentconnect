@@ -158,7 +158,7 @@ describe('Kanban board routes — an interactive owner', () => {
     }
   )
 
-  it('validates synthesizer agents on create and update and accepts an org agent or null', async () => {
+  it('416c: validates synthesizer agents on create and update and accepts an org agent or null', async () => {
     await seedDaemon(prisma, DAEMON)
     await seedAgent(prisma, AGENT, { daemonId: DAEMON })
     await seedOtherOrg()

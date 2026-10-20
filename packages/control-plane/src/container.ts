@@ -1967,6 +1967,10 @@ export function buildContainer(
         resolveLogin: async (userId) =>
           (await prisma.githubRepoIdentity.findFirst({ where: { userId }, select: { login: true } }))?.login ?? null,
         poke: (boardId) => kanbanDispatcher?.poke(boardId),
+        revoke: async (lease, cardId) => {
+          await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
+        },
+        ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {}),
         log: { warn: (o, m) => http.log.warn(o, m) }
       })
     : undefined

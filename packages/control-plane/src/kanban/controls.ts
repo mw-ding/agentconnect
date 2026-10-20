@@ -1,6 +1,7 @@
 // Kanban human controls (issue #2 B5): pause/resume a board, skip/restart a card; body-free, owner + interactive OIDC only.
 import type {
   GithubInstallationRepo,
+  KanbanLeaseRef,
   KanbanBoardAdminRepo,
   KanbanBoardWriteResult,
   KanbanCardControlOutcome,
@@ -10,6 +11,7 @@ import type {
 } from '../persistence/ports.js'
 import { planStatusWrite, type KanbanStatus } from './card-state.js'
 import type { CardStore, KanbanRepoRef } from './card-store.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 /** Fixed, body-free templates: names and reason codes only, never issue content. */
 export function skipComment(login: string | null): string {
@@ -28,6 +30,10 @@ export interface KanbanControlsDeps {
   /** Resolve the acting user's GitHub login for the body-free skip comment; undefined or null ⇒ no login in the comment. */
   resolveLogin?: (userId: string) => Promise<string | null>
   poke(boardId: string): void
+  /** Tells the revoked lease's daemon to stop now; the bumped dispatchRevision fences it either way. */
+  revoke?: (lease: KanbanLeaseRef, cardId: string) => Promise<void>
+  /** Post-commit Projects v2 seam for the committed status. */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
   log: { warn(obj: unknown, msg?: string): void }
 }
 
@@ -47,7 +53,8 @@ export class KanbanControls {
 
   async skip(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
     const result = await this.deps.cards.skipCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' })
-    if (!result.ok) return result
+    if (!result.ok || !result.value.changed) return result
+    await this.committed(boardId, result.value)
     const login = this.deps.resolveLogin ? await this.deps.resolveLogin(userId).catch(() => null) : null
     await this.writeIssue(result.value, 'archived', skipComment(login))
     return result
@@ -55,10 +62,19 @@ export class KanbanControls {
 
   async restart(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
     const result = await this.deps.cards.restartCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' })
-    if (!result.ok) return result
+    if (!result.ok || !result.value.changed) return result
+    await this.committed(boardId, result.value)
     await this.writeIssue(result.value, 'ready', restartComment())
     this.deps.poke(boardId)
     return result
+  }
+
+  private async committed(boardId: string, card: KanbanCardControlOutcome): Promise<void> {
+    if (card.from !== card.status) this.deps.project?.onStatusCommitted({ boardId, issueNumber: card.issueNumber })
+    if (!card.revokedLease || !this.deps.revoke) return
+    await this.deps.revoke(card.revokedLease, card.cardId).catch((err: unknown) => {
+      this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: immediate revocation failed; the fence still holds')
+    })
   }
 
   /** Best-effort label/close + comment after the DB write committed; a failure leaves drift for the reconciler. */
