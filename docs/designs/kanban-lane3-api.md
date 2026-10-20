@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.1 (2026-10-18)
+**Version:** 1.2 (2026-10-19)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -28,6 +28,8 @@ export type ClaimGate =
   | 'open_lease'
   | 'board_cap'
   | 'agent_cap'
+  | 'epic_cap'
+  | 'daemon_cap'
   | 'verifier_unset'
   | 'verifier_is_worker'
   | 'verified'
@@ -60,6 +62,8 @@ export interface ClaimEligibilityInput {
   openRunCount: number
   openRunCountForAssignee: number
   openRunCountForVerifier: number
+  epicCapacity?: { openRunCount: number; maxActive: number }
+  daemonCapacity?: { openRunCount: number; maxActive: number }
   now: Date
 }
 
@@ -97,7 +101,15 @@ A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a bo
 | 14  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
 | 15  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
 | 16  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
-| 17  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+| 17  | `epic_cap`             | the epic child has no active slot left (work and verify both count)                        |
+| 18  | `daemon_cap`           | the target daemon is at its cross-board active cap                                         |
+| 19  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+
+Main's orchestrator caps apply to work and verify alike. Supply `epicCapacity` for an epic
+child and `daemonCapacity` when a daemon cap is configured; both counts include every open
+work and verify run (the daemon count spans boards). After liveness, the claim checks the
+epic cap, then the daemon cap, then B8. The optional facts preserve callers with no caps.
+The SQL serializes capped work and verify claims using the target daemon's advisory lock.
 
 `verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
 its cap and liveness checks; that is also where it flags the card for a human.
@@ -119,9 +131,16 @@ starts a new review round clears the stamp:
   the label sync (`PgKanbanSyncRepo.apply`, any accepted change of status) and the parked
   human ingest (`PgKanbanDispatchRepo.ingestStatus`).
 
-A move the CP makes on its own (a non-writer's revert to `triage`, a fail-closed attribution
-timeout) keeps the stamp: neither moves a card into `review`, and the next work claim or human
-move clears it before another round can reach the verifier.
+A fail-closed attribution timeout moves `ready`/`running` to `triage` and leaves other
+statuses in place, including `review`. It revokes any open work or verify run and increments
+`dispatchRevision` with the revocation, so a late report cannot complete the card, set
+`verifiedAt`, or clear the `needsAttention: label_attribution_timeout` hold. An existing
+approval stamp remains stored, but the hold prevents dispatch until an attributed human
+status move clears it and the stamp. A non-writer's revert to `triage` also retains the stamp;
+the next work claim or human status move clears it before another review round.
+
+Timeout and run-end transactions lock the card before its run. A report waiting behind a
+timeout reads the committed revocation before testing its lease fence.
 
 `reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
 `triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
@@ -325,6 +344,9 @@ avoids merging scratch commits into the real default branch. Production never
 reads a binding override from configuration or environment.
 
 ## Changelog
+
+- **1.2 (2026-10-19):** add optional epic and daemon capacity facts and matching gates for
+  main's orchestrator caps. Work and verify claims share those caps and daemon locks.
 
 - **1.1 (2026-10-18):**
   - Review routing lands in the predicate: a `review` card is a `verify` claim to

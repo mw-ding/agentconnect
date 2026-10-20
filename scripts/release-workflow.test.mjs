@@ -28,6 +28,14 @@ test('release tags and release records cannot trigger another workflow run', () 
   assert.deepEqual(Object.keys(workflows['build.yaml'].on), ['workflow_call', 'workflow_dispatch'])
 })
 
+test('only test.yaml and conventional-pr.yaml start automatically; every other workflow is manual or called', () => {
+  for (const [name, workflow] of Object.entries(workflows)) {
+    if (['test.yaml', 'conventional-pr.yaml'].includes(name)) continue
+    for (const event of Object.keys(workflow.on))
+      assert.ok(['workflow_dispatch', 'workflow_call'].includes(event), `${name}: ${event}`)
+  }
+})
+
 test('one release/prepare job starts npm, images, and chart in parallel and all gate notification', () => {
   const release = workflows['release.yaml'].jobs.release
   assert.equal(release.uses, './.github/workflows/build.yaml')

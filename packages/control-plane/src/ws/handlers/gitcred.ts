@@ -285,6 +285,48 @@ export const handleGitCredRequest: Handler = async (frame, conn, deps) => {
       })
       return
     }
+    if (purpose === 'kanban_orchestrator_write') {
+      const requested = new Set(capabilities ?? [])
+      if (
+        !repoFullName ||
+        !deps.github ||
+        !deps.kanbanOrchestrator ||
+        requested.size !== 1 ||
+        !requested.has('issues')
+      ) {
+        conn.sendError(
+          frame.id,
+          'SCOPE_DENIED',
+          'kanban orchestrator credentials require one repo and issues only',
+          false
+        )
+        return
+      }
+      // The agent must orchestrate an enabled board on this repo; the repo id is resolved from that board, never the ask.
+      const repoId = await deps.kanbanOrchestrator.orchestratorRepoId(agentId, agent.orgId, repoFullName)
+      if (repoId === null) {
+        conn.sendError(frame.id, 'SCOPE_DENIED', 'this agent does not orchestrate a board on that repository', false)
+        return
+      }
+      const cred = await deps.github.mintForKanbanOrchestratorWrite(
+        agent,
+        repoFullName,
+        repoId,
+        [`daemon:${conn.daemonId}`, `org:${agent.orgId}`],
+        forceRefresh === true
+      )
+      conn.replyTo(frame, 'gitcred/grant', {
+        username: 'x-access-token',
+        token: cred.token,
+        ttlSec: cred.ttlSec,
+        expiresAt: cred.expiresAt,
+        repoFullName: cred.repoFullName,
+        // An issues:write token: the daemon caches it under its own orchestrator key and never serves it to git.
+        access: 'write',
+        ...githubEcho(githubQualified, repoId)
+      })
+      return
+    }
     if (purpose === 'github_hook_reply') {
       const requested = new Set(capabilities)
       const commentOnly =

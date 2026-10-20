@@ -1,5 +1,8 @@
 // Kanban lease frames (issue #2 M2): the authenticated connection's daemonId and epoch are the fence inputs, never the payload's.
 import { isFrame } from '@agentconnect.md/protocol'
+import { AgentId } from '../../domain/ids.js'
+import { PLACEMENT_ONLY } from '../../orchestrator/placementResolver.js'
+import { frameOrgId } from './frame-org.js'
 import type { Handler } from './index.js'
 
 export const handleKanbanLeaseHeartbeat: Handler = async (frame, conn, deps) => {
@@ -49,5 +52,30 @@ export const handleKanbanCard: Handler = async (frame, conn, deps) => {
     )
   } catch {
     conn.sendError(frame.id, 'INTERNAL', 'kanban card read failed', true)
+  }
+}
+
+export const handleKanbanOrchestrate: Handler = async (frame, conn, deps) => {
+  if (!isFrame('kanban/orchestrate')(frame)) return
+  if (!deps.kanbanOrchestrator) {
+    conn.sendError(frame.id, 'SCOPE_DENIED', 'kanban orchestration is not enabled', false)
+    return
+  }
+  const orgId = frameOrgId(frame, conn)
+  if (!orgId) {
+    conn.sendError(frame.id, 'SCOPE_DENIED', 'organization is required', false)
+    return
+  }
+  try {
+    // The caller identity is the authenticated connection's agent placement, never the payload's agentId alone.
+    const req = frame.payload
+    const agent = await deps.agent.get(orgId, AgentId(req.agentId))
+    if (!agent || !(await (deps.placementResolver ?? PLACEMENT_ONLY).mayAct(agent, conn.daemonId))) {
+      conn.replyTo(frame, 'kanban/orchestrate/ok', { ok: false, op: req.op, code: 'not_orchestrator' })
+      return
+    }
+    conn.replyTo(frame, 'kanban/orchestrate/ok', await deps.kanbanOrchestrator.orchestrate(orgId, req.agentId, req))
+  } catch {
+    conn.sendError(frame.id, 'INTERNAL', 'kanban orchestration failed', true)
   }
 }

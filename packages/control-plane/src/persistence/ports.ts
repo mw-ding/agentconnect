@@ -1,6 +1,8 @@
 // Lightweight repository ports: services and edges depend on these interfaces, never Prisma models.
 import type { MemoryHomeUpdate } from '../agent-memory/home.js'
 import type { KanbanStatus } from '../kanban/card-state.js'
+import type { ClaimEligibilityInput, ClaimVerdict } from '../kanban/claim-eligibility.js'
+import type { ClaimCapGate } from '../kanban/claim-explain.js'
 import type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 export type { KanbanHumanAuthority } from '../kanban/human-authority.js'
 import type {
@@ -47,6 +49,7 @@ import type {
   OrganizationSuggestionInfo,
   KanbanCardShowOk,
   KanbanReport,
+  KanbanOrchestrateCard,
   CodeHostReviewLeasePhase,
   CodeHostReviewOpKind,
   CodeHostReviewOpMethod,
@@ -7860,12 +7863,19 @@ export interface KanbanBoardView {
   verifierAgentId: string | null
   maxInProgress: number
   maxInProgressPerAgent: number
+  /** B2: lifetime children per epic (default 100); lowering it below a count blocks new creates, never existing cards. */
+  epicMaxCards: number
+  /** B2: open runs per epic's children (default 16). */
+  epicMaxActive: number
   staleLeaseSec: number
   failureLimit: number
   protocolRetryLimit: number
   blockRecurrenceLimit: number
   defaultMode: 'read' | 'write'
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  /** Projects v2 Status projection target (org-owned project); both set or both null. */
+  projectNodeId: string | null
+  statusFieldId: string | null
   enabled: boolean
   configRevision: bigint
   visibility: 'org' | 'restricted'
@@ -7885,11 +7895,15 @@ export interface KanbanBoardConfigInput {
   verifierAgentId?: string | null
   maxInProgress?: number
   maxInProgressPerAgent?: number
+  epicMaxCards?: number
+  epicMaxActive?: number
   staleLeaseSec?: number
   failureLimit?: number
   protocolRetryLimit?: number
   blockRecurrenceLimit?: number
   completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+  projectNodeId?: string | null
+  statusFieldId?: string | null
   enabled?: boolean
   visibility?: 'org' | 'restricted'
   sharedWith?: string[]
@@ -7898,7 +7912,7 @@ export interface KanbanBoardConfigInput {
 export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
 
 export type KanbanBoardWriteRefusal =
-  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards'
+  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards' | 'stale'
 
 export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
 
@@ -7915,7 +7929,8 @@ export interface KanbanBoardAdminRepo {
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
   /** Refused while any card holds an open lease: disable the board and let its runs end first. */
   deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>
@@ -7985,6 +8000,8 @@ export interface KanbanClaimOpts {
   limit?: number
   /** Live-connection check; a card whose agent's daemon is offline stays ready. */
   isDaemonLive(daemonId: string): boolean
+  /** Per-daemon cap across all boards (audit 2.2); absent means uncapped. */
+  maxPerDaemon?: number
 }
 
 /** What a daemon-originated write must echo to pass the lease fence. */
@@ -8123,6 +8140,77 @@ export interface KanbanDispatchRepo {
   listOpenLeases(limit: number, afterLeaseId?: string): Promise<KanbanOpenLease[]>
   /** Open runs for one agent on one daemon: the repos whose daemon grants must follow the run mode. */
   openGrantScopes(agentId: string, daemonId: string): Promise<KanbanGrantScope[]>
+  /** Read-only dry run of the claim for one card; null when the card is not on the board. No locks, no writes. */
+  explainCard(boardId: string, cardId: string, opts: KanbanExplainOpts): Promise<KanbanCardExplanation | null>
+  /** Read-only dry run for every non-terminal card plus the ordered ids the claim would take now; null for a missing board. */
+  explainBoard(boardId: string, opts: KanbanExplainOpts): Promise<KanbanBoardExplanation | null>
+  /** Body-free metadata of up to `limit` cards of one board (console board view), plus the board's total card count. */
+  listBoardCards(
+    boardId: string,
+    limit: number,
+    numbers?: readonly number[]
+  ): Promise<{ cards: KanbanBoardCardRow[]; total: number }>
+  /** Which of these issue numbers are cards of this board; the titles route reads only those. */
+  cardNumbersOnBoard(boardId: string, numbers: readonly number[]): Promise<number[]>
+}
+
+/** One card as the console board lists it: CP metadata only, never a title; the assignee's name comes from the agent table. */
+export interface KanbanBoardCardRow {
+  id: string
+  issueNumber: number
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  assigneeName: string | null
+  assigneeDisplayName: string | null
+  priority: number
+  /** The card's own override; null inherits the board default. */
+  mode: 'read' | 'write' | null
+  needsAttention: boolean
+  attentionReason: string | null
+  blockKind: KanbanBlockKind | null
+  consecutiveFailures: number
+  protocolViolations: number
+  blockRecurrence: number
+  cooldownUntil: Date | null
+  notBefore: Date | null
+  promotionPending: boolean
+  linkedPrNumber: number | null
+  stateRevision: bigint
+  openRun: {
+    attempt: number
+    agentId: string
+    dispatchedAt: Date
+    ackedAt: Date | null
+    heartbeatAt: Date | null
+  } | null
+}
+
+export interface KanbanExplainOpts {
+  /** The same cross-board daemon cap the dispatcher passes to claim. */
+  maxPerDaemon?: number
+  now: Date
+  /** The SAME liveness check the dispatcher hands the claim, so a daemon is online here exactly when the claim sees it so. */
+  isDaemonLive(daemonId: string): boolean
+}
+
+/** One card's claim facts and verdict. Body-free: ids, status and metadata, never an issue title. */
+export interface KanbanCardExplanation {
+  cardId: string
+  issueNumber: number
+  input: ClaimEligibilityInput
+  verdict: ClaimVerdict
+  /** 1-based position in `wouldClaimNext` (board explain only). */
+  claimOrder?: number
+  /** Eligible, but earlier cards fill a cap first (board explain only). */
+  capBound?: ClaimCapGate
+}
+
+export interface KanbanBoardExplanation {
+  boardId: string
+  now: Date
+  cards: KanbanCardExplanation[]
+  /** Card ids the claim would take now, in order, with caps applied cumulatively. */
+  wouldClaimNext: string[]
 }
 
 // ── Kanban notifications (M4) — a body-free outbox drained to the board's anchor channel ──
@@ -8207,6 +8295,10 @@ export interface KanbanCardRow {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  /** Cached ProjectV2Item id on the board's project, so later Status writes skip the add; null until first projected. */
+  projectItemId: string | null
+  /** The project `projectItemId` belongs to; an item cached for any other project is never reused. */
+  projectItemProjectId: string | null
   /** B1 key for orchestrator-filed cards (`cardIdempotencyKey`); null for human-filed or imported cards. */
   idempotencyKey: string | null
   status: KanbanStatus
@@ -8333,6 +8425,94 @@ export interface KanbanCardRepo {
   recordCommand(input: KanbanCommandInput): Promise<KanbanCommandRecordResult>
   /** The command's GitHub effect landed, so a later delivery of the same comment is a no-op. */
   settleCommand(id: string): Promise<void>
+  /** Remember the card's ProjectV2Item id and the project it belongs to, so later writes there skip the add. */
+  setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void>
+}
+
+// ── Kanban orchestrator (issue #2 M3, Lane 2b) — B2 epic budgets and card writes under the epic row lock ──
+
+/** The card being filed under an epic; `upsert` is the Lane 1 create-or-return, composed under the epic's lock. */
+export interface KanbanEpicChildInput {
+  boardId: string
+  /** The epic card's issue number on this board; undefined files a top-level card with no epic. */
+  epicIssueNumber?: number
+  upsert: KanbanCardUpsertInput
+}
+
+export type KanbanEpicChildResult =
+  | { ok: true; card: KanbanCardRow; created: boolean; matchedBy: 'created' | 'issue' | 'idempotency_key' }
+  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' }
+
+/** Adopt an existing card into an epic (link parent); B2 maxCards applies exactly as create does. */
+export interface KanbanAdoptEpicInput {
+  cardId: string
+  epicIssueNumber: number
+}
+
+export type KanbanAdoptEpicResult =
+  | { ok: true; changed: boolean; card: KanbanCardRow }
+  | { ok: false; reason: 'epic_not_found' | 'epic_budget_exhausted' | 'card_not_found' | 'invalid_link' }
+
+export interface KanbanOrchestratorRepo {
+  /** File a card as an epic child (or top-level) in one tx: lock the epic, upsert, and only a real create is budget-gated. */
+  createEpicChild(input: KanbanEpicChildInput): Promise<KanbanEpicChildResult>
+  /** Link an unparented card under an epic: refuses self/cycle/re-parent (`invalid_link`), then B2 check + counter. */
+  adoptEpic(input: KanbanAdoptEpicInput): Promise<KanbanAdoptEpicResult>
+  /** The board as this orchestrator sees it; unknown/other-org boards are indistinguishable (`board_not_found`). */
+  boardForOrchestrator(
+    agentId: string,
+    orgId: string,
+    boardId: string
+  ): Promise<
+    | { ok: true; board: KanbanOrchestratorBoard }
+    | { ok: false; reason: 'board_not_found' | 'board_disabled' | 'not_orchestrator' }
+  >
+  /** Boards this agent orchestrates (optionally one id) with their cards, bounded by `limit`. */
+  orchestratorBoards(
+    agentId: string,
+    boardId: string | undefined,
+    status: string | undefined,
+    limit: number
+  ): Promise<{ truncated: boolean; boards: KanbanOrchestratorBoardView[] }>
+  /** One card by issue number on a board, with the fields link/assign/unblock need. */
+  cardByIssueNumber(boardId: string, issueNumber: number): Promise<KanbanOrchestratorCard | null>
+  /** Why `resolveAgentSlug` (the Lane 1 policy) returned null for this slug: no such agent, or a restricted one. */
+  unassignableReason(orgId: string, slug: string): Promise<'unknown_agent' | 'agent_not_assignable'>
+  /** B2 pre-check for prepare: the epic's lifetime counter against the board's maxCards. */
+  epicBudget(boardId: string, epicIssueNumber: number): Promise<'ok' | 'epic_not_found' | 'epic_budget_exhausted'>
+  /** The board repo this agent orchestrates in its org on `repoFullName` (case-insensitive); null gates the grant. */
+  orchestratorRepoId(agentId: string, orgId: string, repoFullName: string): Promise<bigint | null>
+}
+
+/** The board facts the orchestrator service needs, after the role gate passed. */
+export interface KanbanOrchestratorBoard {
+  id: string
+  orgId: OrgId
+  repoId: bigint
+  repoFullName: string
+  epicMaxCards: number
+}
+
+export interface KanbanOrchestratorCard {
+  cardId: string
+  /** The GitHub numeric issue id; sub-issue and dependency writes take this, never the number. */
+  issueId: bigint
+  issueNumber: number
+  status: KanbanStatus
+  assigneeAgentId: string | null
+  assigneeSlug: string | null
+  priority: number
+  blockKind: KanbanBlockKind | null
+  epicCardId: string | null
+  epicIssueNumber: number | null
+  leased: boolean
+  stateRevision: bigint
+}
+
+export interface KanbanOrchestratorBoardView {
+  boardId: string
+  repoFullName: string
+  cards: KanbanOrchestrateCard[]
 }
 
 /** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */

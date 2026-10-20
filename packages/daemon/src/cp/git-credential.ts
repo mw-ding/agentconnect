@@ -87,6 +87,10 @@ const GITEA_EFFECT_KEY = (agentId: string, repoId: string): string => `fxgitea\u
 const KANBAN_KEY = (agentId: string, repo: string, leaseId: string): string =>
   `kanban\u0000${agentId}\u0000${repo.toLowerCase()}\u0000${leaseId}`
 
+/** Cache key for the orchestrator's issue-file token. One per (agent, repo); the CP gates on the board role. */
+const KANBAN_ORCH_KEY = (agentId: string, repo: string): string =>
+  `kanbanorch\u0000${agentId}\u0000${repo.toLowerCase()}`
+
 export class GitCredUnavailableError extends Error {
   constructor(
     message: string,
@@ -421,6 +425,41 @@ export class GitCredentialCache {
     if (presentedToken !== undefined && entry.token !== presentedToken) return
     this.entries.delete(key)
     this.refreshKanban.add(key)
+  }
+
+  /** The orchestrator's issues-only token for filing a card on its board repo; the CP gates on the board role. */
+  async getKanbanOrchestratorToken(agentId: string, repo: string): Promise<Entry> {
+    const key = KANBAN_ORCH_KEY(agentId, repo)
+    const forceRefresh = this.refreshKanban.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper' as const,
+      capabilities: ['issues' as const],
+      repoFullName: repo,
+      purpose: 'kanban_orchestrator_write' as const,
+      ...this.githubProvider(),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshKanban.delete(key)
+    return entry
+  }
+
+  // Only evict the rejected grant; a concurrent mint may already have replaced it.
+  invalidateKanbanOrchestrator(agentId: string, repo: string, presentedToken?: string): void {
+    const key = KANBAN_ORCH_KEY(agentId, repo)
+    if (presentedToken !== undefined && this.entries.get(key)?.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshKanban.add(key)
+  }
+
+  // A role refusal before board resolution names no repo, so drop every orchestrator grant for the agent.
+  invalidateAllKanbanOrchestrator(agentId: string): void {
+    const prefix = `kanbanorch\0${agentId}\0`
+    for (const key of [...this.entries.keys()]) {
+      if (!key.startsWith(prefix)) continue
+      this.entries.delete(key)
+      this.refreshKanban.add(key)
+    }
   }
 
   /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */

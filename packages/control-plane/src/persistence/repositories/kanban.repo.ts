@@ -39,6 +39,8 @@ const CARD_ROW_SELECT = {
   issueId: true,
   issueNumber: true,
   issueNodeId: true,
+  projectItemId: true,
+  projectItemProjectId: true,
   idempotencyKey: true,
   status: true,
   assigneeAgentId: true,
@@ -59,12 +61,16 @@ const BOARD_VIEW_SELECT = {
   verifierAgentId: true,
   maxInProgress: true,
   maxInProgressPerAgent: true,
+  epicMaxCards: true,
+  epicMaxActive: true,
   staleLeaseSec: true,
   failureLimit: true,
   protocolRetryLimit: true,
   blockRecurrenceLimit: true,
   defaultMode: true,
   completionContract: true,
+  projectNodeId: true,
+  statusFieldId: true,
   enabled: true,
   configRevision: true,
   visibility: true,
@@ -188,7 +194,8 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
     try {
       return await withAmbientTx(this.db, async (tx) => {
@@ -204,6 +211,9 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
         if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
         const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
         if (!current) return { ok: false, reason: 'not_found' }
+        // The route's GitHub guard must still describe the configuration locked here.
+        if (expectedConfigRevision !== undefined && current.configRevision !== expectedConfigRevision)
+          return { ok: false, reason: 'stale' }
         if (
           patch.repoId !== undefined &&
           patch.repoId !== current.repoId &&
@@ -779,6 +789,14 @@ export class PgKanbanCardRepo implements KanbanCardRepo {
       }
     })
   }
+
+  // Best-effort projection cache: a lost item id only costs one more idempotent add, never a missed Status write.
+  async setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void> {
+    await this.db.kanbanCard.updateMany({
+      where: { id: cardId },
+      data: { projectItemId, projectItemProjectId: projectNodeId }
+    })
+  }
 }
 
 function toCardRow(row: {
@@ -787,6 +805,8 @@ function toCardRow(row: {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  projectItemId: string | null
+  projectItemProjectId: string | null
   idempotencyKey: string | null
   status: string
   assigneeAgentId: string | null

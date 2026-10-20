@@ -18,6 +18,7 @@ export const CLI_OWNED_COMMANDS = new Set([
   'uninstall-service',
   'instances',
   'login',
+  'dispatch',
   'version',
   'upgrade',
   'help'
@@ -53,7 +54,7 @@ const VALUE_OPTS = new Set([
  * version there, so a scan that reads it as an option would let that value steer
  * the CLI.
  */
-const SUBCOMMAND_VALUE_OPTS = new Set(['--to', '--channel', '--keep'])
+const SUBCOMMAND_VALUE_OPTS = new Set(['--to', '--channel', '--keep', '--board', '--card', '--issue', '--org'])
 
 /** The first positional token (the subcommand), honoring option values and `--`. */
 export function firstPositional(argv: string[]): string | undefined {

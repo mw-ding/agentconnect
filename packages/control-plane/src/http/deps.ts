@@ -73,6 +73,7 @@ import type {
   OAuthRepo,
   KanbanModeAdminRepo,
   KanbanBoardAdminRepo,
+  KanbanDispatchRepo,
   WebchatMcpOperationRepo
 } from '../persistence/ports.js'
 import type { Clock } from '../domain/clock.js'
@@ -129,8 +130,12 @@ import type { SessionAccessPlugin } from './session-access-plugin.js'
 import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
 import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
+import type { KanbanTitleSource } from '../kanban/card-titles.js'
+import type { KanbanProjectVerifier } from '../kanban/project-guard.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
+  /** Match the dispatcher’s configured cross-board daemon cap. */
+  KANBAN_MAX_IN_PROGRESS_PER_DAEMON?: number
   SLACK_INSTALL_TTL_SEC?: number
   /** Drives browser CORS for the Web UI (see `buildHttpServer`). */
   NODE_ENV?: 'development' | 'test' | 'production'
@@ -331,6 +336,11 @@ export interface HttpDeps {
     kanbanMode: KanbanModeAdminRepo
     /** Kanban board CRUD; writes recheck owner membership in their own transaction. */
     kanbanBoards: KanbanBoardAdminRepo
+    /** Kanban dispatch reads only (dry-run explain, board card list); never the claim or any lease write. */
+    kanbanDispatch: Pick<
+      KanbanDispatchRepo,
+      'now' | 'explainBoard' | 'explainCard' | 'listBoardCards' | 'cardNumbersOnBoard'
+    >
   }
   registry: DaemonRegistry
   /**
@@ -471,6 +481,10 @@ export interface HttpDeps {
   github?: GithubService
   /** Board repository resolution for Kanban CRUD; absent ⇒ derived from `github` and the installation repo. */
   kanbanRepoResolver?: KanbanRepoResolver
+  /** Live issue titles for the board view; absent ⇒ the titles route answers 409 `github_app_not_configured`. */
+  kanbanTitles?: KanbanTitleSource
+  /** Org-only guard for a board's Projects v2 projection; absent ⇒ derived from `github`. */
+  kanbanProjectVerifier?: KanbanProjectVerifier
   /** Resolves a typed login to the host's numeric user id for the "Trusted users" list; per-provider arms
    *  are present only where that host is configured, so an unconfigured host answers 409 rather than 404. */
   trustedActors: CodeHostTrustedActorService

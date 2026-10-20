@@ -124,8 +124,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         ...(revoked ? { leaseId: revoked.leaseId } : {}),
         ...(actor ? { actor } : {})
       })
-      // A label-adopted status move notifies like an ingested one; the (cardId, stateRevision) key dedupes replays.
-      // The sync owns every live human move, so without this the ingest-path row would never be written.
+      // Live label moves notify in this transaction; (cardId, stateRevision) dedupes replays.
       if (changed) {
         const board = await tx.kanbanBoard.findUnique({
           where: { id: card.boardId },
@@ -205,10 +204,10 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         !isKanbanStatus(current.status)
       )
         return null
-      // Only a dispatchable card moves: triage is never claimed, and every other status already needs a human to run.
+      // Keep review in place, but revoke every open run so no late report can lift the human hold.
       const from = current.status
       const to: KanbanStatus = from === 'ready' || from === 'running' ? 'triage' : from
-      const run = to !== from ? await tx.kanbanRun.findFirst({ where: { cardId: card.id, endedAt: null } }) : null
+      const run = await tx.kanbanRun.findFirst({ where: { cardId: card.id, endedAt: null } })
       let revoked: KanbanLeaseRef | null = null
       if (run) {
         await tx.kanbanRun.update({

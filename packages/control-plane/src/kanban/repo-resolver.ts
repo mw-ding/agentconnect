@@ -5,7 +5,7 @@ import type { GithubService } from '../github/service.js'
 import type { GithubInstallationRepo } from '../persistence/ports.js'
 
 export type KanbanRepoResolution =
-  | { ok: true; repoId: bigint; repoFullName: string; installationId: bigint }
+  | { ok: true; repoId: bigint; repoFullName: string; installationId: bigint; ownerType?: string }
   | { ok: false; status: 400 | 409 | 429 | 502; message: string }
 
 /** The board CRUD seam: production asks GitHub through the org's installation; tests and E2E inject their own. */
@@ -36,7 +36,13 @@ export function githubKanbanRepoResolver(deps: {
       try {
         const ref = await deps.github.repoRefFor(ins, owner, repo)
         if (!ref) return NOT_COVERED
-        return { ok: true, repoId: ref.repoId, repoFullName: ref.fullName, installationId: ins.installationId }
+        return {
+          ok: true,
+          repoId: ref.repoId,
+          repoFullName: ref.fullName,
+          installationId: ins.installationId,
+          ownerType: ins.accountType
+        }
       } catch (e) {
         // GitHub being unreachable is upstream trouble, not a policy verdict.
         if (e instanceof GithubApiError) {

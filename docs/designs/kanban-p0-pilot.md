@@ -5,6 +5,8 @@
 
 Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2) §9 Phase 0 — validate board UX and worker prompts using GitHub labels and existing GitHub hooks, before Kanban MCP tools and control-plane automation land in later milestones.
 
+Consolidated as-built design: [kanban-swarm.md](kanban-swarm.md) (this pilot doc stays the history).
+
 ## What P0 is
 
 - A **board repo** whose issues are cards; **humans** move cards by adding/removing labels.
@@ -605,8 +607,10 @@ Known gaps update (M1 label sync attribution): an edit is adopted only when the
 visible issue events attribute the live label to a human writer; when the events
 API lags the live labels, the pass is deferred and neither adopts, reverts, nor
 advances the cursor. A deferred card is retried on later passes and fails closed
-10 minutes after its first deferral: a `ready` or `running` card moves to `triage`,
-revoking any active lease; other statuses remain unchanged. The card is flagged
+10 minutes after its first deferral: a `ready` or `running` card moves to `triage`;
+other statuses remain unchanged, including `review`. Any active work or verify lease
+is revoked and its dispatch revision fenced, even when the status stays the same.
+A late report cannot complete the card, stamp approval, or clear the hold. The card is flagged
 with `needsAttention`, its status label is projected with one timeout comment,
 and a claim neither takes the card nor clears the flag. Failed label writes
 remain eligible for repair; only a cleanly attributed human writer edit releases
@@ -626,3 +630,24 @@ the newer visible label event through the normal attribution path.
 An agent using a writer's own host `gh` credentials is indistinguishable from
 that human (the shared-GitHub-login limit): label attribution trusts the events
 API's actor, which reports the credential's login, not the process behind it.
+
+Known gaps update (M5 projection): every committed status change now reaches the
+Projects v2 `Status` field, but the mirror stays one-way. Edits made in the
+Project UI are not reconciled; the card's next committed status change overwrites
+them. Contract: [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
+
+Known gaps (M3 orchestrator): the orchestrator tools (kanbanList/Create/Link/
+Unblock/Assign) are role-gated on `board.orchestratorAgentId`. The daemon files
+the issue body directly with a purpose-bound `kanban_orchestrator_write` token,
+and the CP registers only metadata; a daemon crash between the file and the
+commit_create is a documented window (an in-memory pending map re-commits the
+same issue within a process, but a restart can file a duplicate). The GitHub
+sub_issues and issue-dependencies (`blocked_by`) WRITE endpoints are not exposed
+on every repository (they 404 on user-owned repos), so those link writes are
+best-effort and validated by the CP tests rather than live. The per-epic
+`epicMaxCards` budget is a lifetime counter that archiving a child never
+refunds; `epicMaxActive` bounds concurrent children at claim time. See
+docs/designs/kanban-lane2-orchestrator.md for the frame, codes, and B2 semantics.
+
+Known gaps (M5 board view, Lane 4b): the console cannot clear `needsAttention` yet; that waits on Lane 3's restart route. Titles are fetched per visit with one REST read per card (at most 100 per request), so a very large board costs one GitHub call per visible card until a GraphQL batch or an ETag cache is justified; the CP never caches them.
+Known gaps correction (Vera #528 review, Lane 4b follow-up): the line above understated the cost — the console polled titles every 60 s for every card including done/archived, about 60x per hour. After the fix the console fetches titles once per visible card set only (rendered, non-terminal cards; never done/archived or collapsed columns; no polling), and the CP caches titles in memory for 60 s (bounded, single-flight, ETag-revalidated) with an abort flag that stops the remaining workers on a rate-limit/5xx failure; the cache is memory-only, never persisted or logged. The card list is capped at 500 cards per board view. The dry run reads the live connection registry of the CP replica that serves it, so on a multi-replica deployment `daemon_offline` can differ from what the dispatching replica sees. The board adopts main’s shared claim predicate, including open leases, review routing, attention flags, and epic and cross-board daemon capacity.

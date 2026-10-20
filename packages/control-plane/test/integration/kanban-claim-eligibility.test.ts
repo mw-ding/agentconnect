@@ -90,7 +90,7 @@ async function danglingAssigneeCard(boardId: string, n: number): Promise<{ id: s
 }
 
 /** The same facts the SQL claim reads, reconstructed from the database for one card. */
-async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibilityInput> {
+async function factsFor(boardId: string, cardId: string, maxPerDaemon?: number): Promise<ClaimEligibilityInput> {
   const b = await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: boardId } })
   const c = await prisma.kanbanCard.findUniqueOrThrow({ where: { id: cardId } })
   const agentFor = async (agentId: string | null): Promise<ClaimAgentFacts | null> => {
@@ -108,6 +108,7 @@ async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibili
     where: { endedAt: null, card: { boardId } },
     select: { agentId: true }
   })
+  const target = await agentFor(c.status === 'review' ? b.verifierAgentId : c.assigneeAgentId)
   return {
     board: {
       enabled: b.enabled,
@@ -133,16 +134,51 @@ async function factsFor(boardId: string, cardId: string): Promise<ClaimEligibili
     openRunCount: open.length,
     openRunCountForAssignee: open.filter((r) => r.agentId === c.assigneeAgentId).length,
     openRunCountForVerifier: open.filter((r) => r.agentId === b.verifierAgentId).length,
+    ...(c.epicCardId
+      ? {
+          epicCapacity: {
+            maxActive: b.epicMaxActive,
+            openRunCount: await prisma.kanbanRun.count({ where: { endedAt: null, card: { epicCardId: c.epicCardId } } })
+          }
+        }
+      : {}),
+    ...(maxPerDaemon !== undefined
+      ? {
+          daemonCapacity: {
+            maxActive: maxPerDaemon,
+            openRunCount: target?.daemonId
+              ? await prisma.kanbanRun.count({ where: { endedAt: null, daemonId: target.daemonId } })
+              : 0
+          }
+        }
+      : {}),
     now: NOW
   }
 }
 
 /** Snapshot every card's facts, run one claim, and assert the predicate's verdict (and gate) matches what SQL did. */
-async function expectParity(boardId: string, cards: Record<string, { id: string }>, expected: Record<string, string>) {
+async function expectParity(
+  boardId: string,
+  cards: Record<string, { id: string }>,
+  expected: Record<string, string>,
+  maxPerDaemon?: number
+) {
   const repo = new PgKanbanDispatchRepo(prisma)
   const snapshots = new Map<string, ClaimEligibilityInput>()
-  for (const c of Object.values(cards)) snapshots.set(c.id, await factsFor(boardId, c.id))
-  const claimed = await repo.claim(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id) })
+  for (const c of Object.values(cards)) snapshots.set(c.id, await factsFor(boardId, c.id, maxPerDaemon))
+  const boardExplanation = (await repo.explainBoard(boardId, {
+    now: NOW,
+    isDaemonLive: (id) => LIVE.has(id),
+    maxPerDaemon
+  }))!
+  for (const c of Object.values(cards)) {
+    expect(boardExplanation.cards.find((e) => e.cardId === c.id)!.verdict).toEqual(explainClaim(snapshots.get(c.id)!))
+    expect(
+      (await repo.explainCard(boardId, c.id, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!.verdict
+    ).toEqual(explainClaim(snapshots.get(c.id)!))
+  }
+  const claimed = await repo.claim(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon })
+  expect(boardExplanation.wouldClaimNext).toEqual(claimed.leases.map((l) => l.cardId))
   const leases = new Map(claimed.leases.map((l) => [l.cardId, l]))
   for (const [name, c] of Object.entries(cards)) {
     const verdict = explainClaim(snapshots.get(c.id)!)
@@ -154,10 +190,44 @@ async function expectParity(boardId: string, cards: Record<string, { id: string 
     if (verdict.eligible) expect(verdict, name).toEqual({ eligible: true, role: lease!.role, agentId: lease!.agentId })
     expect(verdict.eligible ? 'eligible' : verdict.gate, name).toBe(expected[name])
   }
+  for (const flagged of claimed.flaggedSelfVerify) {
+    expect(
+      (await repo.explainCard(boardId, flagged.cardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!
+        .verdict
+    ).toEqual({ eligible: false, gate: 'needs_attention' })
+    expect(
+      (await repo.explainBoard(boardId, { now: NOW, isDaemonLive: (id) => LIVE.has(id), maxPerDaemon }))!.cards.find(
+        (entry) => entry.cardId === flagged.cardId
+      )!.verdict
+    ).toEqual({ eligible: false, gate: 'needs_attention' })
+  }
   return claimed
 }
 
 describe('claim eligibility parity (real Postgres)', () => {
+  it.each(['ready', 'review'] as const)(
+    'vera-414-cutover: %s parity includes epic and cross-board daemon caps',
+    async (status) => {
+      await seedDaemon(prisma, D1, { sessionEpoch: 1n })
+      await seedAgent(prisma, A1, { daemonId: D1 })
+      await seedAgent(prisma, A2, { daemonId: D1 })
+      const b = await board(100, 100, true, A2)
+      await prisma.kanbanBoard.update({ where: { id: b.id }, data: { epicMaxActive: 1 } })
+      const epic = await card(b.id, 1, { status: 'todo' })
+      const held = await card(b.id, 2, { status: 'running', epicCardId: epic.id })
+      const ownRun = await run(held.id, 1, A1, { open: true })
+      const candidate = await card(b.id, 3, { status, epicCardId: epic.id })
+      const otherBoard = await board()
+      const other = await card(otherBoard.id, 1, { status: 'running' })
+      const otherRun = await run(other.id, 1, A1, { open: true })
+      await expectParity(b.id, { candidate }, { candidate: 'epic_cap' }, 1)
+      await prisma.kanbanRun.update({ where: { id: ownRun.id }, data: { endedAt: NOW } })
+      await expectParity(b.id, { candidate }, { candidate: 'daemon_cap' }, 1)
+      await prisma.kanbanRun.update({ where: { id: otherRun.id }, data: { endedAt: NOW } })
+      await expectParity(b.id, { candidate }, { candidate: 'eligible' }, 1)
+    }
+  )
+
   it('vera-414: agrees with the SQL claim on review cards routed to the verifier', async () => {
     await seedDaemon(prisma, D1, { sessionEpoch: 1n })
     await seedDaemon(prisma, D2, { sessionEpoch: 1n })
