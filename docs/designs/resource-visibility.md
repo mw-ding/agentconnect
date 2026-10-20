@@ -350,7 +350,7 @@ defined at `version.ts:26`. Public paths are
   `openapi.ts:55-69`. Do **not** declare `orgId` in params because
   `backfillPrefixPathParams` at `openapi.ts:138-162` adds it automatically. Place
   `SharingDto` and `UpdateSharingBody` in `http/dto/index.ts`.
-- This repository does not publish releases or public API documentation.
+- The release workflow runs only manually; this repository does not publish automatically.
 - Existing `UpdateAgentBody` is `.strict()`, so putting `visibility` or
   `sharedWith` into the existing PATCH returns 400; see
   `dto/index.ts:141-153`. That confirms the section 13.1 decision to use

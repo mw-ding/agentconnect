@@ -1,0 +1,32 @@
+name: Release
+
+# Manual only: nothing in this repository starts a release automatically.
+on:
+  workflow_dispatch:
+
+jobs:
+  # Keep quality gates independent while publication waits for every test leg.
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yaml
+    with:
+      defer_summaries: true
+
+  release:
+    needs: test
+    # Hold the channel through artifact publication so older runs cannot move dist-tags backwards.
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/build.yaml
+    with:
+      create_release: true
+      build_test_summary: ${{ needs.test.outputs.build_test_summary }}
+      integration_test_summary: ${{ needs.test.outputs.integration_test_summary }}
+    secrets: inherit

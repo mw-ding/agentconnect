@@ -929,9 +929,10 @@ The release images are currently Linux amd64; an arm64 daemon must configure
 a compatible image explicitly. The full image's Antigravity binary requires
 AVX in the guest CPU; amd64 emulation without AVX cannot run that runtime.
 
-To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile`. This repository
-does not build or publish runtime base images or releases; the two base ARGs in the release
-Dockerfile are updated to digest-pinned references from wherever you publish your own bases.
+To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile`. The **Build runtime
+bases** workflow exists but runs only manually, and this repository does not publish automatically;
+the two base ARGs in the release Dockerfile are updated to digest-pinned references from wherever
+you publish your own bases.
 
 For a local build, use a new tag and an amd64 host with AVX for full application
 verification. Nothing references a new tag until the release Dockerfile pins it.
@@ -976,7 +977,7 @@ After both variants pass and you publish the base tags yourself, update both `AR
 `docker/runtime-sandbox.Dockerfile` to the published `tag@sha256:digest` references in
 the dependency update PR. Do not overwrite an existing base tag.
 Changing only the base Dockerfile does not publish a daemon or release image;
-changing a base digest in the release Dockerfile does; this repository does not publish either.
+changing a base digest in the release Dockerfile does; nothing here publishes automatically.
 
 An explicit daemon image overrides this metadata. Development builds remove
 release metadata and require an explicit image; they do not derive a default

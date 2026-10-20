@@ -1,0 +1,777 @@
+name: Build & Publish Artifacts
+
+# Publishes service, pool-runtime, and full daemon-runtime images to GHCR at each release tag.
+# Stable releases also move `:latest`, release candidates `:rc`.
+#
+# Release versioning and preparation share one job, followed by parallel npm, image, and chart publication.
+# Manual image rebuilds select an existing release tag; npm retries stay in Release for its OIDC identity.
+#
+# Per-component effective versions: most releases don't touch every component,
+# and a component whose build inputs are unchanged since the previous release
+# on its channel would ship a behaviorally identical image under a new tag —
+# creating redundant downstream workflow work. For the service and daemon
+# images, scripts/component-versions.sh computes, per component, the most
+# recent same-channel tag (rc walks rc tags, stable walks stable tags) whose
+# release changed the component's path closure. The prepare job verifies that
+# each unchanged component's effective image exists; a missing source is
+# rebuilt at the current release instead of poisoning later aliases. Required
+# components build concurrently on separate GitHub-hosted runners.
+# `docker-bake.hcl` remains the source of truth for each target's Dockerfile,
+# args, labels, contexts, tags, and platform. Unchanged components with a valid
+# source skip the build and instead get this release's tag as an ALIAS of their
+# effective image (same manifest digest), so `<comp>:<version>` exists for every
+# component at every release regardless.
+#
+# The two runtime images are decided by CONTENT, not paths: their path closure
+# was both too coarse (a protocol change rebuilt a byte-identical shim) and
+# impossible to keep complete (the shim bundle inlines daemon modules from
+# outside src/shim, and a change there once shipped pods a shim older than
+# their daemon). Their legs always run. Each builds only the cached shim stages,
+# exports the payload digest computed inside them (scripts/tree-digest.mjs),
+# hashes the recipe — the Dockerfile plus the build inputs it is given
+# (scripts/runtime-image-fingerprint.sh) — and compares both with the labels of
+# the previous same-channel image (scripts/runtime-image-effective.sh). A match
+# skips build, verification and push, and the effective version is the build
+# the previous tag points at (its `io.agentconnect.image.version` label, which
+# an alias shares). A mismatch, a missing previous image or missing labels build
+# as before; a built image carries `io.agentconnect.shim.digest` and
+# `io.agentconnect.recipe.digest` for the next release to compare against. Each
+# leg hands its decision to `finalize` through a per-target artifact, because
+# matrix job outputs merge across legs and an empty one can clobber another's.
+#
+# The daemon image is verified against the loaded build before publication. The runtime images
+# are verified INSIDE their build: the Dockerfile's `<target>-verify` stage runs the runtime-table
+# probe, the shim smoke test (the image's own entrypoint started the way the pod starts it, the
+# daemon side dialling it over loopback, the real ACP runtime answering `initialize` and
+# `session/new`) and the static in-image assertions, each cached by BuildKit on its inputs, so a
+# release that changed only the shim does not re-probe; a host script checks what only the image
+# config says against the digest-pinned base the Dockerfile names, the release stage having added
+# one COPY and no config of its own. Only then does the leg push, from the same builder, so the
+# image a release publishes is the image that was verified. A component skipped as unchanged is
+# not re-verified: it was verified at the release that built it.
+#
+# After pushing, mints a short-lived GitHub App token for the configured
+# workflow repository and fires an `images-pushed` repository_dispatch
+# (payload `{version, sha, components: {controlPlane, web, relay, mem0, runtimeSandbox,
+# runtimeSandboxFull, mem0Backend, daemon}}` — the per-component tags the downstream workflow should
+# consume; `== version` for components built by this release, whether changed or
+# recovered from a missing source image). It reports artifact facts, not an
+# instruction — what happens next is the workflow repository's concern and is
+# documented there.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Existing release tag to rebuild'
+        type: string
+        default: ''
+      create_release:
+        description: 'Create a release and publish changed npm packages alongside the images and chart'
+        type: boolean
+        default: false
+      build_test_summary:
+        type: string
+        default: ''
+      integration_test_summary:
+        type: string
+        default: ''
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  prepare:
+    name: Release & Prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      latest: ${{ steps.meta.outputs.latest }}
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      previousTag: ${{ steps.components.outputs.previousTag }}
+      controlPlane: ${{ steps.build-matrix.outputs.controlPlane }}
+      web: ${{ steps.build-matrix.outputs.web }}
+      relay: ${{ steps.build-matrix.outputs.relay }}
+      mem0: ${{ steps.build-matrix.outputs.mem0 }}
+      mem0Backend: ${{ steps.build-matrix.outputs.mem0Backend }}
+      daemon: ${{ steps.build-matrix.outputs.daemon }}
+    steps:
+      - name: Mint GitHub App token
+        if: inputs.create_release
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      # Keep the triggering commit unless explicitly rebuilding an existing release tag.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.version }}
+      - uses: pnpm/action-setup@v6
+        if: inputs.create_release
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v7
+        if: inputs.create_release
+        with:
+          node-version-file: .nvmrc
+      - name: Restore release dependencies
+        if: inputs.create_release
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/release-pnpm-store
+          key: ${{ runner.os }}-release-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-release-pnpm-
+      # The workspace root's production dependencies are the release toolchain only.
+      - name: Install release dependencies
+        if: inputs.create_release
+        run: pnpm --filter agentconnect install --prod --frozen-lockfile --ignore-scripts --store-dir "${{ runner.temp }}/release-pnpm-store"
+      - name: Semantic Release
+        if: inputs.create_release
+        id: release
+        run: pnpm exec semantic-release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Append Unit Test summary
+        if: ${{ !cancelled() && inputs.build_test_summary != '' }}
+        env:
+          TEST_SUMMARY: ${{ inputs.build_test_summary }}
+        run: printf '\n---\n\n%s\n' "$TEST_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+      - name: Append integration test summary
+        if: ${{ !cancelled() && inputs.integration_test_summary != '' }}
+        env:
+          TEST_SUMMARY: ${{ inputs.integration_test_summary }}
+        run: printf '\n---\n\n%s\n' "$TEST_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      # A no-release result skips publication; manual rebuilds still require a release tag.
+      - name: Resolve release version
+        if: ${{ !inputs.create_release || steps.release.outputs.version != '' }}
+        id: meta
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version || inputs.version }}
+        run: |
+          version="$RELEASE_VERSION"
+          if [ -z "$version" ]; then
+            if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+              echo "::error::Must run at a release tag ref, got ${GITHUB_REF}. Re-run picking a vX.Y.Z(-rc.N) tag."
+              exit 1
+            fi
+            version="$GITHUB_REF_NAME"
+          fi
+          case "$version" in
+            v[0-9]*) ;;
+            *) echo "::error::'${version}' is not a vX.Y.Z(-rc.N) release tag."; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Only stable releases (no prerelease suffix) move `:latest`.
+          case "$version" in
+            *-*) echo "latest=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "latest=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      # Service versions follow path changes; runtime legs compare content against the previous channel tag.
+      - name: Resolve per-component effective versions
+        if: steps.meta.outputs.version != ''
+        id: components
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: bash scripts/component-versions.sh "$VERSION" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.meta.outputs.version != ''
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        if: steps.meta.outputs.version != ''
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Retry Buildx setup
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@v4
+
+      # Rebuild missing effective images at this version; runtime legs always keep the matrix nonempty.
+      - name: Select required image builds
+        if: steps.meta.outputs.version != ''
+        id: build-matrix
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          LATEST: ${{ steps.meta.outputs.latest }}
+          GIT_SHA: ${{ github.sha }}
+          CP_EFFECTIVE: ${{ steps.components.outputs.controlPlane }}
+          WEB_EFFECTIVE: ${{ steps.components.outputs.web }}
+          RELAY_EFFECTIVE: ${{ steps.components.outputs.relay }}
+          MEM0_EFFECTIVE: ${{ steps.components.outputs.mem0 }}
+          MEM0_BACKEND_EFFECTIVE: ${{ steps.components.outputs.mem0Backend }}
+          DAEMON_EFFECTIVE: ${{ steps.components.outputs.daemon }}
+          SETUP_VERSION: ${{ steps.components.outputs.setup }}
+        run: |
+          set -euo pipefail
+          changed='[]'
+          add_changed() {
+            changed="$(jq -cn \
+              --argjson current "$changed" \
+              --arg target "$1" \
+              '$current + [$target]')"
+          }
+
+          resolve_effective() {
+            local output="$1" image="$2" target="$3" effective="$4" source_ref
+            if [ "$effective" != "$VERSION" ]; then
+              source_ref="${REGISTRY}/${OWNER}/${image}:${effective}"
+              if docker buildx imagetools inspect "$source_ref" >/dev/null 2>&1; then
+                echo "${image} unchanged since ${effective} — source image found"
+              else
+                echo "::warning::${source_ref} is unavailable; rebuilding ${image}:${VERSION}"
+                effective="$VERSION"
+              fi
+            fi
+            echo "${output}=${effective}" >> "$GITHUB_OUTPUT"
+            if [ "$effective" = "$VERSION" ]; then
+              add_changed "$target"
+            fi
+          }
+
+          resolve_effective controlPlane control-plane control-plane "$CP_EFFECTIVE"
+          resolve_effective web web web "$WEB_EFFECTIVE"
+          resolve_effective relay relay relay "$RELAY_EFFECTIVE"
+          resolve_effective mem0 memory-plugin-mem0 mem0 "$MEM0_EFFECTIVE"
+          resolve_effective mem0Backend mem0-server mem0-backend "$MEM0_BACKEND_EFFECTIVE"
+          # The runtime sandbox is what agent runtimes execute inside, not a service, and its legs always run:
+          # each decides by the shim payload's content whether to build or alias (see the header).
+          add_changed runtime-sandbox
+          add_changed runtime-sandbox-full
+          # The daemon pod image. Separate from the runtime sandbox: this runs the daemon, that
+          # one is what an agent runtime executes inside.
+          resolve_effective daemon daemon daemon "$DAEMON_EFFECTIVE"
+
+          # Render the existing Bake definition so image-specific configuration
+          # stays centralized even though each target builds in its own job.
+          bake_config="${RUNNER_TEMP}/agentconnect-image-bake.json"
+          docker buildx bake --print > "$bake_config"
+          matrix="$(jq -c --argjson targets "$changed" '
+            [
+              $targets[] as $name
+              | .target[$name] as $config
+              | {
+                  target: $name,
+                  context: ($config.context // "."),
+                  dockerfile: ($config.dockerfile // "Dockerfile"),
+                  build_target: ($config.target // ""),
+                  platforms: (($config.platforms // []) | join(",")),
+                  tags: (($config.tags // []) | join("\n")),
+                  build_args: (
+                    ($config.args // {})
+                    | to_entries
+                    | map("\(.key)=\(.value)")
+                    | join("\n")
+                  ),
+                  build_contexts: (
+                    ($config.contexts // {})
+                    | to_entries
+                    | map("\(.key)=\(.value)")
+                    | join("\n")
+                  ),
+                  labels: (
+                    ($config.labels // {})
+                    | to_entries
+                    | map("\(.key)=\(.value)")
+                    | join("\n")
+                  ),
+                  cache_ref: (
+                    $config.tags[0]
+                    | sub(":[^/]+$"; ":buildcache")
+                  ),
+                  image: ($config.tags[0] | sub(":[^/]+$"; "")),
+                  # Runtime legs fingerprint their payload and record the decision under this payload key.
+                  component: ({"runtime-sandbox": "runtimeSandbox", "runtime-sandbox-full": "runtimeSandboxFull"}[$name] // ""),
+                  # Daemon and runtime targets require image verification before publication.
+                  verify: ({"daemon": "daemon", "runtime-sandbox": "runtime-sandbox", "runtime-sandbox-full": "runtime-sandbox-full"}[$name] // "")
+                }
+            ]
+          ' "$bake_config")"
+
+          echo "matrix=$(jq -cn --argjson include "$matrix" '{include: $include}')" >> "$GITHUB_OUTPUT"
+
+  publish-npm:
+    name: Publish npm packages
+    needs: prepare
+    if: inputs.create_release && needs.prepare.outputs.version != ''
+    runs-on: ubuntu-latest
+    # Serialize npm retries with other release runs on the same channel.
+    concurrency:
+      group: npm-${{ contains(needs.prepare.outputs.version, '-') && 'rc' || 'latest' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.version }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.19.0
+          cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Build and publish changed packages
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.version }}
+        run: node scripts/publish-npm.mjs "$RELEASE_TAG"
+
+  build-images:
+    name: Build & push ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # Registry cache refs are mutable performance hints. Serialize each target
+    # across release runs so two channels cannot overwrite one simultaneously.
+    concurrency:
+      group: image-build-${{ matrix.target }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.version }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Retry Buildx setup
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@v4
+
+      # Build the shim and hash its output; the same builder retains these layers for verification and publication.
+      - name: Build shim and calculate its content hash
+        if: matrix.component != ''
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: runtime-payload-digest-export
+          platforms: ${{ matrix.platforms }}
+          build-args: ${{ matrix.build_args }}
+          build-contexts: ${{ matrix.build_contexts }}
+          outputs: type=local,dest=${{ runner.temp }}/payload-digest
+          cache-from: |
+            type=registry,ref=${{ matrix.cache_ref }}
+            type=registry,ref=${{ matrix.cache_ref }}-verify
+            type=registry,ref=${{ matrix.cache_ref }}-shim
+
+      - name: Fingerprint the runtime image inputs
+        if: matrix.component != ''
+        id: fingerprint
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          BUILD_TARGET: ${{ matrix.build_target }}
+          PLATFORMS: ${{ matrix.platforms }}
+          BUILD_ARGS: ${{ matrix.build_args }}
+          BUILD_CONTEXTS: ${{ matrix.build_contexts }}
+        run: >-
+          bash scripts/runtime-image-fingerprint.sh "${RUNNER_TEMP}/payload-digest/payload-digest"
+          "$DOCKERFILE" "$BUILD_TARGET" "$PLATFORMS" "$BUILD_ARGS" "$BUILD_CONTEXTS" | tee -a "$GITHUB_OUTPUT"
+
+      # Service legs never run this, so their empty `unchanged` output leaves every step below unconditional there.
+      - name: Decide whether the runtime image changed
+        if: matrix.component != ''
+        id: decision
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previousTag }}
+          SHIM: ${{ steps.fingerprint.outputs.shim }}
+          RECIPE: ${{ steps.fingerprint.outputs.recipe }}
+        run: >-
+          bash scripts/runtime-image-effective.sh "$IMAGE" "$VERSION" "$PREVIOUS_TAG" "$SHIM" "$RECIPE"
+          | tee -a "$GITHUB_OUTPUT"
+
+      # Check inherited system-base config and the final application USER before pulling any image layers.
+      - name: Verify the runtime sandbox image configuration
+        if: startsWith(matrix.verify, 'runtime-sandbox') && steps.decision.outputs.unchanged != 'true'
+        env:
+          VARIANT: ${{ matrix.build_target }}
+          BUILD_ARGS: ${{ matrix.build_args }}
+        run: |
+          set -eu
+          set -- "$VARIANT"
+          while IFS= read -r arg; do
+            [ -z "$arg" ] || set -- "$@" --build-arg "$arg"
+          done <<< "$BUILD_ARGS"
+          node scripts/verify-runtime-image.mjs "$@"
+
+      # Build applications and run the runtime-table, shim-session and filesystem checks before publication.
+      - name: Build and verify runtime applications
+        if: startsWith(matrix.verify, 'runtime-sandbox') && steps.decision.outputs.unchanged != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.build_target }}-verify
+          platforms: ${{ matrix.platforms }}
+          outputs: type=cacheonly
+          build-args: ${{ matrix.build_args }}
+          build-contexts: ${{ matrix.build_contexts }}
+          cache-from: |
+            type=registry,ref=${{ matrix.cache_ref }}
+            type=registry,ref=${{ matrix.cache_ref }}-verify
+            type=registry,ref=${{ matrix.cache_ref }}-shim
+
+      # Export once per runtime leg; a shim-only cache must never replace the complete verification graph.
+      - name: Save runtime build cache
+        if: matrix.component != ''
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ steps.decision.outputs.unchanged == 'true' && 'runtime-payload-digest-export' || format('{0}-verify', matrix.build_target) }}
+          platforms: ${{ matrix.platforms }}
+          outputs: type=cacheonly
+          build-args: ${{ matrix.build_args }}
+          build-contexts: ${{ matrix.build_contexts }}
+          cache-from: |
+            type=registry,ref=${{ matrix.cache_ref }}
+            type=registry,ref=${{ matrix.cache_ref }}-verify
+            type=registry,ref=${{ matrix.cache_ref }}-shim
+          cache-to: type=registry,ref=${{ matrix.cache_ref }}-${{ steps.decision.outputs.unchanged == 'true' && 'shim' || 'verify' }},mode=max,compression=gzip,compression-level=1
+
+      # Publish the verified runtime from the same builder; service and daemon cache exports retain their existing path.
+      - name: Build
+        if: steps.decision.outputs.unchanged != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.build_target }}
+          platforms: ${{ matrix.platforms }}
+          push: ${{ matrix.verify != 'daemon' }}
+          load: ${{ matrix.verify == 'daemon' }}
+          tags: ${{ matrix.tags }}
+          build-args: ${{ matrix.build_args }}
+          build-contexts: ${{ matrix.build_contexts }}
+          labels: |
+            ${{ matrix.labels }}
+            ${{ steps.fingerprint.outputs.labels }}
+          cache-from: type=registry,ref=${{ matrix.cache_ref }}
+          cache-to: ${{ matrix.component == '' && format('type=registry,ref={0},mode=max', matrix.cache_ref) || '' }}
+
+      - name: Resolve the built image reference
+        if: matrix.verify == 'daemon'
+        id: image
+        env:
+          TAGS: ${{ matrix.tags }}
+        run: printf 'ref=%s\n' "$(printf '%s\n' "$TAGS" | head -1)" >> "$GITHUB_OUTPUT"
+
+      # Against the BUILT image: non-root, tini as PID 1, git and CA certs present, no ACP runtime
+      # smuggled in, and — the one that matters — `--k8s` refusing to start outside a pod instead
+      # of quietly running agent code on the daemon's own host.
+      - name: Verify the daemon image
+        if: matrix.verify == 'daemon'
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: node scripts/verify-daemon-image.mjs "$IMAGE" "$VERSION"
+
+      # Publish the daemon image once its checks have passed. Same inputs against the same builder,
+      # so this re-exports from cache rather than rebuilding. It goes out through the action's own
+      # push path deliberately: a plain `docker push` of the loaded image would publish it
+      # without the provenance attestation every directly-pushed target carries.
+      - name: Push
+        if: matrix.verify == 'daemon'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.build_target }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ matrix.tags }}
+          build-args: ${{ matrix.build_args }}
+          build-contexts: ${{ matrix.build_contexts }}
+          labels: |
+            ${{ matrix.labels }}
+            ${{ steps.fingerprint.outputs.labels }}
+          cache-from: type=registry,ref=${{ matrix.cache_ref }}
+
+      # finalize reads the decision from an artifact: a matrix job's outputs merge across legs, and a leg that leaves
+      # a key empty can clobber another leg's value.
+      - name: Record the runtime image decision
+        if: matrix.component != ''
+        env:
+          COMPONENT: ${{ matrix.component }}
+          EFFECTIVE: ${{ steps.decision.outputs.effective }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/image-decision"
+          echo "${COMPONENT}=${EFFECTIVE}" | tee "${RUNNER_TEMP}/image-decision/${COMPONENT}"
+      - uses: actions/upload-artifact@v7
+        if: matrix.component != ''
+        with:
+          name: image-decision-${{ matrix.component }}
+          path: ${{ runner.temp }}/image-decision/${{ matrix.component }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  finalize:
+    name: Finalize image tags
+    needs:
+      - prepare
+      - build-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ needs.prepare.outputs.version }}
+      controlPlane: ${{ needs.prepare.outputs.controlPlane }}
+      web: ${{ needs.prepare.outputs.web }}
+      relay: ${{ needs.prepare.outputs.relay }}
+      mem0: ${{ needs.prepare.outputs.mem0 }}
+      mem0Backend: ${{ needs.prepare.outputs.mem0Backend }}
+      runtimeSandbox: ${{ steps.runtime.outputs.runtimeSandbox }}
+      runtimeSandboxFull: ${{ steps.runtime.outputs.runtimeSandboxFull }}
+      daemon: ${{ needs.prepare.outputs.daemon }}
+    steps:
+      # The runtime legs' decisions (see the header). Naming both files makes a missing one fail here, loudly,
+      # instead of aliasing blind.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-decision-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/image-decision
+      - name: Read the runtime image decisions
+        id: runtime
+        run: >-
+          cat "${RUNNER_TEMP}/image-decision/runtimeSandbox" "${RUNNER_TEMP}/image-decision/runtimeSandboxFull"
+          | tee -a "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Retry Buildx setup
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@v4
+
+      # Components skipped above still get this release's tag: an alias of the
+      # effective image (imagetools create adds tags to the SAME manifest
+      # digest — no build, no storage). So `--set image.tag=<version>` (manual
+      # full syncs, rollbacks) resolves for every component at every release
+      # tag, while the per-component tags in the dispatch payload remain the
+      # restart-avoiding references. On stable releases the alias also moves
+      # `:latest`, keeping parity with the built components. The prepare job has
+      # already promoted unavailable effective images to this release's build,
+      # and a runtime leg only names a version whose image it resolved.
+      #
+      # Baked build fingerprints (web's VERSION/GIT_SHA/BUILD_TIME → the
+      # profile-page fingerprint) are intrinsic to the image and therefore stay
+      # at the EFFECTIVE version's commit in an aliased tag — deliberately: the bits
+      # ARE that commit's build, and the pod's image tag says the same thing.
+      # Re-baking the train's sha into byte-identical code would relabel an
+      # unchanged image and force the pointless rebuild this step exists to
+      # avoid.
+      - name: Alias unchanged components to this release tag
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          LATEST: ${{ needs.prepare.outputs.latest }}
+          CP_EFFECTIVE: ${{ needs.prepare.outputs.controlPlane }}
+          WEB_EFFECTIVE: ${{ needs.prepare.outputs.web }}
+          RELAY_EFFECTIVE: ${{ needs.prepare.outputs.relay }}
+          MEM0_EFFECTIVE: ${{ needs.prepare.outputs.mem0 }}
+          MEM0_BACKEND_EFFECTIVE: ${{ needs.prepare.outputs.mem0Backend }}
+          RUNTIME_SANDBOX_EFFECTIVE: ${{ steps.runtime.outputs.runtimeSandbox }}
+          RUNTIME_SANDBOX_FULL_EFFECTIVE: ${{ steps.runtime.outputs.runtimeSandboxFull }}
+          DAEMON_EFFECTIVE: ${{ needs.prepare.outputs.daemon }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          alias_unchanged() {
+            comp="$1"; effective="$2"
+            if [ -z "$effective" ]; then
+              echo "::error::${comp} has no effective version to alias"
+              exit 1
+            fi
+            if [ "$effective" = "$VERSION" ]; then
+              return 0
+            fi
+            echo "${comp} unchanged since ${effective} — aliasing ${comp}:${VERSION} to it"
+            set -- -t "${REGISTRY}/${OWNER}/${comp}:${VERSION}"
+            if [ "$LATEST" = "true" ]; then
+              set -- "$@" -t "${REGISTRY}/${OWNER}/${comp}:latest"
+            fi
+            docker buildx imagetools create "$@" "${REGISTRY}/${OWNER}/${comp}:${effective}"
+          }
+          alias_unchanged control-plane "$CP_EFFECTIVE"
+          alias_unchanged web "$WEB_EFFECTIVE"
+          alias_unchanged relay "$RELAY_EFFECTIVE"
+          alias_unchanged memory-plugin-mem0 "$MEM0_EFFECTIVE"
+          alias_unchanged mem0-server "$MEM0_BACKEND_EFFECTIVE"
+          alias_unchanged runtime-sandbox "$RUNTIME_SANDBOX_EFFECTIVE"
+          alias_unchanged runtime-sandbox-full "$RUNTIME_SANDBOX_FULL_EFFECTIVE"
+          alias_unchanged daemon "$DAEMON_EFFECTIVE"
+
+      # Every component resolves at this release's tag by now, so `:rc` moves for all of them together, after every leg passed.
+      - name: Point rc at this release
+        if: contains(needs.prepare.outputs.version, '-rc.')
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # Finalizers of overlapping or re-run releases can land out of order, so only the newest candidate moves `:rc`.
+          newest="$(git ls-remote --tags --refs "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" 'v*-rc.*' | sed 's|.*refs/tags/||' | sort -V | tail -1)"
+          if [ "$newest" != "$VERSION" ]; then
+            echo "${newest} is newer than ${VERSION}; leaving :rc to it"
+            exit 0
+          fi
+          for comp in control-plane web relay memory-plugin-mem0 mem0-server runtime-sandbox runtime-sandbox-full daemon; do
+            docker buildx imagetools create -t "${REGISTRY}/${OWNER}/${comp}:rc" "${REGISTRY}/${OWNER}/${comp}:${VERSION}"
+          done
+
+  # Publish chart metadata independently; consumers wait for workflow success before using its image tags.
+  publish-chart:
+    name: Publish Helm chart
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.version }}
+
+      - name: Log in to GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin <<< "$TOKEN"
+
+      - name: Package and push the chart
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          chart_version="${VERSION#v}"
+          helm package charts/agentconnect \
+            --version "$chart_version" --app-version "$VERSION" \
+            --destination "$RUNNER_TEMP"
+          helm push "${RUNNER_TEMP}/agentconnect-${chart_version}.tgz" "oci://${REGISTRY}/${OWNER}/charts"
+
+  notify-workflow:
+    name: Notify workflow
+    needs:
+      - finalize
+      - publish-chart
+      - publish-npm
+    if: >-
+      ${{ !cancelled() && needs.finalize.result == 'success' && needs.publish-chart.result == 'success'
+          && (!inputs.create_release || needs.publish-npm.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve workflow repository
+        id: workflow-repository
+        shell: bash
+        env:
+          WORKFLOW_REPOSITORY: ${{ secrets.WORKFLOW_REPOSITORY }}
+        run: |
+          if [[ ! "${WORKFLOW_REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::WORKFLOW_REPOSITORY must be set to owner/repository"
+            exit 1
+          fi
+          workflow_owner="${WORKFLOW_REPOSITORY%%/*}"
+          workflow_name="${WORKFLOW_REPOSITORY#*/}"
+          echo "::add-mask::${workflow_owner}"
+          echo "::add-mask::${workflow_name}"
+          echo "owner=${workflow_owner}" >> "$GITHUB_OUTPUT"
+          echo "name=${workflow_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint workflow repository GitHub App token
+        id: workflow-app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.workflow-repository.outputs.owner }}
+          repositories: ${{ steps.workflow-repository.outputs.name }}
+
+      # `components` carries each component's effective tag on this channel
+      # (== version for components built because they changed or their source
+      # image was unavailable). Workflows that pin per-component tags can
+      # consume the independent values;
+      # consumers without per-component support can keep using `version` because
+      # the alias step above guarantees every component resolves at it.
+      - name: Notify workflow repository of pushed images
+        env:
+          DISPATCH_TOKEN: ${{ steps.workflow-app-token.outputs.token }}
+          WORKFLOW_REPOSITORY: ${{ secrets.WORKFLOW_REPOSITORY }}
+          VERSION: ${{ needs.finalize.outputs.version }}
+          SHA: ${{ github.sha }}
+          CP: ${{ needs.finalize.outputs.controlPlane }}
+          WEB: ${{ needs.finalize.outputs.web }}
+          RELAY: ${{ needs.finalize.outputs.relay }}
+          MEM0: ${{ needs.finalize.outputs.mem0 }}
+          MEM0_BACKEND: ${{ needs.finalize.outputs.mem0Backend }}
+          RUNTIME_SANDBOX: ${{ needs.finalize.outputs.runtimeSandbox }}
+          RUNTIME_SANDBOX_FULL: ${{ needs.finalize.outputs.runtimeSandboxFull }}
+          DAEMON: ${{ needs.finalize.outputs.daemon }}
+        run: |
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${WORKFLOW_REPOSITORY}/dispatches" \
+            -d "{\"event_type\":\"images-pushed\",\"client_payload\":{\"version\":\"${VERSION}\",\"sha\":\"${SHA}\",\"components\":{\"controlPlane\":\"${CP}\",\"web\":\"${WEB}\",\"relay\":\"${RELAY}\",\"mem0\":\"${MEM0}\",\"mem0Backend\":\"${MEM0_BACKEND}\",\"runtimeSandbox\":\"${RUNTIME_SANDBOX}\",\"runtimeSandboxFull\":\"${RUNTIME_SANDBOX_FULL}\",\"daemon\":\"${DAEMON}\"}}}"

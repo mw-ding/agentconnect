@@ -181,7 +181,7 @@ command, and create your first agent. The default stack listens only on
 
 ### Kubernetes
 
-This repository does not publish releases or Helm charts; install from the chart source in
+The release workflows in this repository run only manually and nothing publishes automatically; install from the chart source in
 [`charts/agentconnect`](charts/agentconnect).
 
 A cluster install is three steps — create the namespace and its secrets, write
