@@ -145,6 +145,14 @@ export * from './frames/automerge.js'
 export * from './frames/sandbox-keepalive.js'
 export * from './frames/memory.js'
 export { memoryChannelKey, memoryPersonKey } from './memory-layer-key.js'
+export {
+  kanbanCardKey,
+  kanbanCardKeyEpic,
+  kanbanOrchestrateCardKey,
+  kanbanCardKeyMarker,
+  parseKanbanCardKeyMarker,
+  type KanbanCardKeyInput
+} from './kanban-card-key.js'
 export * from './members-directory.js'
 export * from './frames/memory-store.js'
 export * from './frames/organization-knowledge.js'

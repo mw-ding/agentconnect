@@ -1,7 +1,9 @@
 // Kanban CardStore (issue #2 M1): where cards live; the GitHub store reads body-free issue facts and the dependency graph.
 import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
+import { checkWriteAccess, type RepoPermissionLookup } from '../github/repo-permission.js'
 import { isStatusLabel, statusLabel, type KanbanStatus, type LabelPlan, type ObservedIssue } from './card-state.js'
+import { labelAddedByWriter } from './label-attribution.js'
 import { KanbanLabelWriter } from './label-writer.js'
 
 /** The repository a board watches; installationId is resolved live by the caller, never trusted from a webhook. */
@@ -45,11 +47,14 @@ export interface CardGraph {
 export interface CardStore {
   /** Null when the number is missing, transferred away, or a pull request. */
   readCard(repo: KanbanRepoRef, issueNumber: number): Promise<CardIssue | null>
+  managedEdits(repo: KanbanRepoRef, issueNumber: number): Promise<ManagedEdits>
   readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph>
   /** True only when a human `User` added `status` and made the latest status-label change; unknown history is false. */
   statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean>
   /** Body-free issue events, oldest first; throws when the history runs past the page bound, so callers fail closed. */
   readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]>
+  /** The repository's current `owner/name`, read by numeric id (it follows a rename); null when GitHub omits it. */
+  readRepositoryFullName(repo: KanbanRepoRef): Promise<string | null>
   /** The newest visible issue-event id (0 for none): the pre-POST cursor bounding which events can be our write. */
   lastEventId(repo: KanbanRepoRef, issueNumber: number): Promise<number>
   /** Judge a pending promotion from the events after `cursor`; an unreadable window is inconclusive. */
@@ -67,6 +72,22 @@ export interface CardStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void>
+  /** Add the issue with GitHub id `subIssueId` (the numeric id, NOT its number) as a sub-issue of `issueNumber`. */
+  addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void>
+  /** Add the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) to the issue's blocked_by. */
+  addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
+  /** Remove the issue with GitHub id `blockerIssueId` (the numeric id, NOT its number) from the issue's blocked_by. */
+  removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void>
+  /** Close an issue as not planned (the duplicate-create and B2-trip paths); throws on any GitHub failure. */
+  closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void>
+}
+
+/** The issue's event history runs past the page bound, so nothing on it can be attributed; sync defers, then fails closed. */
+export class KanbanEventHistoryBoundError extends Error {
+  constructor() {
+    super('kanban: issue events run past the page bound')
+    this.name = 'KanbanEventHistoryBoundError'
+  }
 }
 
 /** Called after a label POST returns success, before any later write in the same plan. */
@@ -82,8 +103,31 @@ export interface LabelEvent {
   event: string
   created_at?: string
   label?: { name?: string }
-  actor?: { type?: string; login?: string } | null
+  actor?: { type?: string; login?: string; id?: number } | null
   performed_via_github_app?: unknown
+}
+
+export interface ManagedEdits {
+  status: LabelEvent | null
+  assignee: LabelEvent | null
+  cursor: number
+}
+
+// Preserve the latest actor, including bots and unknown actors, so an earlier human edit cannot authorize a later write.
+export function latestManagedEdits(events: readonly LabelEvent[]): ManagedEdits {
+  const result: ManagedEdits = { status: null, assignee: null, cursor: 0 }
+  for (const event of events) {
+    result.cursor = Math.max(result.cursor, event.id)
+    const labelEdit = event.event === 'labeled' || event.event === 'unlabeled'
+    const status =
+      event.event === 'closed' ||
+      event.event === 'reopened' ||
+      (labelEdit && event.label?.name !== undefined && isStatusLabel(event.label.name))
+    const assignee = labelEdit && event.label?.name?.toLowerCase().startsWith('ac/agent:')
+    if (status && (!result.status || result.status.id < event.id)) result.status = event
+    if (assignee && (!result.assignee || result.assignee.id < event.id)) result.assignee = event
+  }
+  return result
 }
 
 /** A person acting directly: not a bot account, not an App, and not an App acting on a user's behalf. */
@@ -160,6 +204,8 @@ export interface GithubCardStoreDeps {
   tokens: Pick<InstallationTokenService, 'mintKanbanCard'>
   /** This deployment's App slug; without it no App write is ever attributed to us. */
   appSlug?: string
+  /** Live lookup for the human-writer gate; uncached (ttlMs: 0) so a revoked grant stops moving cards on the next read. */
+  permissions: RepoPermissionLookup
   fetchImpl?: FetchLike
   baseUrl?: string
 }
@@ -179,9 +225,8 @@ export class GithubCardStore implements CardStore {
       if (err instanceof GithubApiError && (err.status === 404 || err.status === 410)) return null
       throw err
     }
-    // A transfer redirect can land on another issue: refuse a different number or a different numeric repository.
+    // A transfer redirect can land on another issue: refuse a different number; the importer fences the repository name.
     if (issue.pull_request !== undefined || issue.number !== issueNumber) return null
-    if (issue.repository?.id !== undefined && BigInt(issue.repository.id) !== repo.repoId) return null
     const labels = (issue.labels ?? []).map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter(Boolean)
     return {
       issueId: BigInt(issue.id),
@@ -197,6 +242,11 @@ export class GithubCardStore implements CardStore {
     }
   }
 
+  async readRepositoryFullName(repo: KanbanRepoRef): Promise<string | null> {
+    const repository = await this.get<{ full_name?: string }>(repo, '')
+    return typeof repository.full_name === 'string' && repository.full_name.includes('/') ? repository.full_name : null
+  }
+
   async readGraph(repo: KanbanRepoRef, issueNumber: number): Promise<CardGraph> {
     const [parent, subIssues, blockedBy, blocking] = await Promise.all([
       this.get<GhIssue>(repo, `/issues/${issueNumber}/parent`).catch((err: unknown) => {
@@ -208,12 +258,21 @@ export class GithubCardStore implements CardStore {
       this.get<GhIssue[]>(repo, `/issues/${issueNumber}/dependencies/blocking?per_page=${PAGE}`)
     ])
     return {
-      parent: parent ? toLink(parent) : null,
-      subIssues: subIssues.map(toLink),
-      blockedBy: blockedBy.map(toLink),
-      blocking: blocking.map(toLink),
+      parent: parent ? toLink(parent, repo) : null,
+      subIssues: subIssues.map((issue) => toLink(issue, repo)),
+      blockedBy: blockedBy.map((issue) => toLink(issue, repo)),
+      blocking: blocking.map((issue) => toLink(issue, repo)),
       truncated: subIssues.length >= PAGE || blockedBy.length >= PAGE || blocking.length >= PAGE
     }
+  }
+
+  async managedEdits(repo: KanbanRepoRef, issueNumber: number): Promise<ManagedEdits> {
+    const events = await this.recentEvents(repo, issueNumber, (seen) => {
+      const latest = latestManagedEdits(seen)
+      return latest.status !== null && latest.assignee !== null
+    })
+    if (!events) throw new Error('kanban: managed edit attribution exceeded the issue-event page bound')
+    return latestManagedEdits(events)
   }
 
   async statusSetByHuman(repo: KanbanRepoRef, issueNumber: number, status: KanbanStatus): Promise<boolean> {
@@ -224,19 +283,22 @@ export class GithubCardStore implements CardStore {
     // Newest pages first, so a long history still finds the latest status change.
     const events = await this.recentEvents(repo, issueNumber, (seen) => seen.some(isStatus) && seen.some(isTargetAdd))
     if (!events) return false
-    let latest: LabelEvent | undefined
-    let latestAdd: LabelEvent | undefined
-    for (const event of events) {
-      if (!isStatus(event)) continue
-      if (!latest || event.id > latest.id) latest = event
-      if (isTargetAdd(event) && (!latestAdd || event.id > latestAdd.id)) latestAdd = event
-    }
-    return !!latest && !!latestAdd && isHumanActor(latest) && isHumanActor(latestAdd)
+    // The latest status-label change overall must be human (an agent writes as the App bot).
+    let latestStatus: LabelEvent | undefined
+    for (const event of events)
+      if (isStatus(event) && (!latestStatus || event.id > latestStatus.id)) latestStatus = event
+    if (!latestStatus || !isHumanActor(latestStatus)) return false
+    // The add that produced the target label must be a live human writer (per-label rule + write access, fail closed).
+    const added = await labelAddedByWriter(events, target, this.deps.appSlug, async (login) => {
+      const check = await checkWriteAccess(this.deps.permissions, repo, login)
+      return { write: check.write, level: check.level }
+    })
+    return added !== null
   }
 
   async readLabelEvents(repo: KanbanRepoRef, issueNumber: number): Promise<LabelEvent[]> {
     const events = await this.recentEvents(repo, issueNumber, () => false)
-    if (!events) throw new Error('kanban: issue events run past the page bound')
+    if (!events) throw new KanbanEventHistoryBoundError()
     // Keep attribution fields only: a `renamed` event would otherwise carry the issue title.
     return events
       .map((e) => ({
@@ -244,7 +306,7 @@ export class GithubCardStore implements CardStore {
         event: e.event,
         ...(e.created_at !== undefined ? { created_at: e.created_at } : {}),
         ...(e.label?.name !== undefined ? { label: { name: e.label.name } } : {}),
-        actor: e.actor ? { type: e.actor.type, login: e.actor.login } : null,
+        actor: e.actor ? { type: e.actor.type, login: e.actor.login, id: e.actor.id } : null,
         ...(e.performed_via_github_app ? { performed_via_github_app: true } : {})
       }))
       .sort((a, b) => a.id - b.id)
@@ -310,6 +372,41 @@ export class GithubCardStore implements CardStore {
     return this.writer.apply(repo, issueNumber, observed, plan, onLabelAdded)
   }
 
+  async addSubIssue(repo: KanbanRepoRef, issueNumber: number, subIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/sub_issues`, 'POST', { sub_issue_id: Number(subIssueId) })
+  }
+
+  async addBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by`, 'POST', {
+      issue_id: Number(blockerIssueId)
+    })
+  }
+
+  async removeBlockedBy(repo: KanbanRepoRef, issueNumber: number, blockerIssueId: bigint): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}/dependencies/blocked_by/${blockerIssueId}`, 'DELETE')
+  }
+
+  async closeIssue(repo: KanbanRepoRef, issueNumber: number): Promise<void> {
+    await this.write(repo, `/issues/${issueNumber}`, 'PATCH', { state: 'closed', state_reason: 'not_planned' })
+  }
+
+  /** A metadata write with the CP-only card token (issues write); repo-id addressed so a rename can't misroute it. */
+  private async write(
+    repo: KanbanRepoRef,
+    path: string,
+    method: 'POST' | 'PATCH' | 'DELETE',
+    body?: unknown
+  ): Promise<void> {
+    const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'write')
+    await githubRequest<unknown>(`/repositories/${repo.repoId}${path}`, {
+      method,
+      auth: grant.token,
+      ...(body !== undefined ? { body } : {}),
+      fetchImpl: this.deps.fetchImpl,
+      baseUrl: this.deps.baseUrl
+    })
+  }
+
   private async get<T>(repo: KanbanRepoRef, path: string, fetchImpl = this.deps.fetchImpl): Promise<T> {
     const grant = await this.deps.tokens.mintKanbanCard(repo.installationId, repo.repoFullName, repo.repoId, 'read')
     return githubRequest<T>(`/repositories/${repo.repoId}${path}`, {
@@ -320,11 +417,16 @@ export class GithubCardStore implements CardStore {
   }
 }
 
-function toLink(issue: GhIssue): CardLink {
+function toLink(issue: GhIssue, repo: KanbanRepoRef): CardLink {
   return {
     issueId: BigInt(issue.id),
     number: issue.number,
-    repoId: issue.repository?.id !== undefined ? BigInt(issue.repository.id) : null,
+    repoId:
+      issue.repository?.id !== undefined
+        ? BigInt(issue.repository.id)
+        : issue.repository_url?.toLowerCase() === `https://api.github.com/repos/${repo.repoFullName}`.toLowerCase()
+          ? repo.repoId
+          : null,
     state: issue.state,
     stateReason: issue.state_reason ?? null
   }

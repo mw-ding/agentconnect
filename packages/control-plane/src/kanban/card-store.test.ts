@@ -12,6 +12,7 @@ import {
 } from './card-store.js'
 import { planLabelReconcile, statusLabel } from './card-state.js'
 import { cardIdempotencyKey } from './card-key.js'
+import type { RepoPermissionLevel } from '../github/repo-permission.js'
 
 const REPO: KanbanRepoRef = { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }
 
@@ -22,7 +23,7 @@ interface Call {
   body: unknown
 }
 
-function harness(routes: Record<string, () => Response>, appSlug?: string) {
+function harness(routes: Record<string, () => Response>, appSlug?: string, level: RepoPermissionLevel = 'write') {
   const calls: Call[] = []
   const fetchImpl: FetchLike = async (url, init) => {
     const method = init?.method ?? 'GET'
@@ -46,6 +47,7 @@ function harness(routes: Record<string, () => Response>, appSlug?: string) {
   }))
   const store = new GithubCardStore({
     tokens: { mintKanbanCard },
+    permissions: { permission: async () => level },
     fetchImpl,
     baseUrl: 'https://api.test',
     ...(appSlug ? { appSlug } : {})
@@ -109,13 +111,20 @@ describe('GithubCardStore reads', () => {
     expect(await h.store.readCard(REPO, 8)).toBeNull()
   })
 
-  it.each([{ number: 8 }, { repository: { id: 99 } }])(
-    'refuses a redirected issue outside the requested identity: %j',
-    async (over) => {
-      const h = harness({ 'GET /repositories/42/issues/7': () => json(issue(over)) })
-      expect(await h.store.readCard(REPO, 7)).toBeNull()
-    }
-  )
+  // The issue GET carries repository_url, not repository.id, so the number is the only identity fenced here.
+  it('refuses a redirected issue with a different number', async () => {
+    const h = harness({ 'GET /repositories/42/issues/7': () => json(issue({ number: 8 })) })
+    expect(await h.store.readCard(REPO, 7)).toBeNull()
+  })
+
+  it.each([
+    [{ full_name: 'acme/web-renamed' }, 'acme/web-renamed'],
+    [{}, null],
+    [{ full_name: 'no-slash' }, null]
+  ])('reads the repository current name by numeric id: %j', async (body, name) => {
+    const h = harness({ 'GET /repositories/42': () => json(body) })
+    expect(await h.store.readRepositoryFullName(REPO)).toBe(name)
+  })
 
   // Repo-id addressing survives a rename, so a new name still reads; only the importer fences on the name.
   it.each([
@@ -322,6 +331,11 @@ describe('status label attribution', () => {
     expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(expected)
     expect(h.calls.every((c) => c.method === 'GET')).toBe(true)
     expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'read')
+  })
+
+  it('refuses a human add when the actor lacks live write access', async () => {
+    const h = harness({ [EVENTS]: () => json([ev(1, human)]) }, undefined, 'read')
+    expect(await h.store.statusSetByHuman(REPO, 7, 'ready')).toBe(false)
   })
 
   it('reads the last page first and finds a later bot write without walking the history', async () => {
@@ -592,5 +606,104 @@ describe('half-landed promotion attribution (events after the pre-POST cursor)',
     const h = harness(routes, 'agentconnect')
     expect(await h.store.promotionVerdict(REPO, 7, 50, true)).toBe('inconclusive')
     expect(h.calls).toHaveLength(10)
+  })
+})
+
+describe('GithubCardStore link writes', () => {
+  it('adds a sub-issue with a write-scoped card token over the repo-id endpoint', async () => {
+    const h = harness({ 'POST /repositories/42/issues/7/sub_issues': () => json({}, 201) })
+    await h.store.addSubIssue(REPO, 7, 3001n)
+    expect(h.mintKanbanCard).toHaveBeenCalledWith(111n, 'acme/web', 42n, 'write')
+    expect(h.calls).toHaveLength(1)
+    expect(h.calls[0]).toMatchObject({ method: 'POST', url: 'https://api.test/repositories/42/issues/7/sub_issues' })
+    // The numeric issue id, never the issue number.
+    expect(h.calls[0]!.body).toEqual({ sub_issue_id: 3001 })
+  })
+
+  it('adds and removes blocked_by edges', async () => {
+    const h = harness({
+      'POST /repositories/42/issues/7/dependencies/blocked_by': () => json({}, 201),
+      'DELETE /repositories/42/issues/7/dependencies/blocked_by/3002': () => json({})
+    })
+    await h.store.addBlockedBy(REPO, 7, 3002n)
+    await h.store.removeBlockedBy(REPO, 7, 3002n)
+    expect(h.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'POST https://api.test/repositories/42/issues/7/dependencies/blocked_by',
+      'DELETE https://api.test/repositories/42/issues/7/dependencies/blocked_by/3002'
+    ])
+    expect(h.calls[0]!.body).toEqual({ issue_id: 3002 })
+  })
+
+  it('closes an issue as not planned', async () => {
+    const h = harness({ 'PATCH /repositories/42/issues/7': () => json(issue()) })
+    await h.store.closeIssue(REPO, 7)
+    expect(h.calls[0]).toMatchObject({ method: 'PATCH', url: 'https://api.test/repositories/42/issues/7' })
+    expect(h.calls[0]!.body).toEqual({ state: 'closed', state_reason: 'not_planned' })
+  })
+
+  it('propagates a GitHub failure', async () => {
+    const h = harness({ 'POST /repositories/42/issues/7/sub_issues': () => json({ message: 'boom' }, 500) })
+    await expect(h.store.addSubIssue(REPO, 7, 3001n)).rejects.toThrow()
+  })
+})
+
+describe('vera-415r3: refusal marker recovery', () => {
+  const marker = '<!-- agentconnect-kanban:command:uuid -->'
+  const plan = {
+    outcome: 'noop' as const,
+    status: 'triage' as const,
+    releaseLease: false,
+    addLabels: [],
+    removeLabels: [],
+    comment: 'fixed refusal',
+    commentKey: 'command:uuid'
+  }
+  const observed = { labels: [], state: 'open' as const }
+  const path = '/repositories/42/issues/7/comments?per_page=100'
+
+  it('vera-415r3: finds its own marker on a later page without a POST', async () => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () =>
+          new Response('[]', {
+            headers: { link: '<https://api.test/repositories/42/issues/7/comments?per_page=100&page=2>; rel="next"' }
+          }),
+        [`GET ${path}&page=2`]: () =>
+          json([{ body: `fixed refusal\n\n${marker}`, user: { login: 'agentconnect[bot]', type: 'Bot' } }])
+      },
+      'agentconnect'
+    )
+    await h.store.applyPlan(REPO, 7, observed, plan)
+    expect(h.calls.map((call) => call.method)).toEqual(['GET', 'GET'])
+  })
+
+  it.each(['alice', 'other[bot]'])('vera-415r3: a marker copied by %s cannot suppress the refusal', async (login) => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () => json([{ body: marker, user: { login, type: login === 'alice' ? 'User' : 'Bot' } }]),
+        'POST /repositories/42/issues/7/comments': () => json({ id: 1 }, 201)
+      },
+      'agentconnect'
+    )
+    await h.store.applyPlan(REPO, 7, observed, plan)
+    expect(h.calls.at(-1)).toMatchObject({ method: 'POST', body: { body: `fixed refusal\n\n${marker}` } })
+  })
+
+  it('vera-415r3: an unreadable comment history fails closed without posting', async () => {
+    const h = harness({ [`GET ${path}`]: () => json({ message: 'Forbidden' }, 403) }, 'agentconnect')
+    await expect(h.store.applyPlan(REPO, 7, observed, plan)).rejects.toThrow()
+    expect(h.calls.map((call) => call.method)).toEqual(['GET'])
+  })
+
+  it('vera-415r3: a truncated comment history fails closed without posting', async () => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () => new Response('[]', { headers: { link: `<https://api.test${path}>; rel="next"` } })
+      },
+      'agentconnect'
+    )
+    await expect(h.store.applyPlan(REPO, 7, observed, plan)).rejects.toThrow('page bound')
+    expect(h.calls).toHaveLength(10)
+    expect(h.calls.every((call) => call.method === 'GET')).toBe(true)
   })
 })

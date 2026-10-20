@@ -21,6 +21,8 @@ export type ClaimGate =
   | 'open_lease'
   | 'board_cap'
   | 'agent_cap'
+  | 'epic_cap'
+  | 'daemon_cap'
   // Review routing: a review card needs a configured verifier that is not its worker (B8 self-approval guard).
   | 'verifier_unset'
   | 'verifier_is_worker'
@@ -76,6 +78,10 @@ export interface ClaimEligibilityInput {
   openRunCount: number
   openRunCountForAssignee: number
   openRunCountForVerifier: number
+  /** Present for an epic child; counts every open work or verify run in that epic. */
+  epicCapacity?: { openRunCount: number; maxActive: number }
+  /** Present when the daemon cap is configured; counts the target daemon across boards. */
+  daemonCapacity?: { openRunCount: number; maxActive: number }
   now: Date
 }
 
@@ -108,11 +114,17 @@ export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   if (facts.paused) return { eligible: false, gate: 'agent_paused' }
   if (facts.daemonId === null) return { eligible: false, gate: 'agent_unplaced' }
 
-  // Then the claim loop's checks, in its order: the board's room, the target's own share, daemon liveness, B8.
+  // Match the claim loop: board and agent room, liveness, epic and daemon caps, then B8.
   if (input.openRunCount >= board.maxInProgress) return { eligible: false, gate: 'board_cap' }
   const own = role === 'verify' ? input.openRunCountForVerifier : input.openRunCountForAssignee
   if (own >= board.maxInProgressPerAgent) return { eligible: false, gate: 'agent_cap' }
   if (!facts.daemonLive) return { eligible: false, gate: 'daemon_offline' }
+  if (input.epicCapacity && input.epicCapacity.openRunCount >= input.epicCapacity.maxActive) {
+    return { eligible: false, gate: 'epic_cap' }
+  }
+  if (input.daemonCapacity && input.daemonCapacity.openRunCount >= input.daemonCapacity.maxActive) {
+    return { eligible: false, gate: 'daemon_cap' }
+  }
   if (role === 'verify' && (agentId === card.assigneeAgentId || input.workAgentIds.includes(agentId))) {
     return { eligible: false, gate: 'verifier_is_worker' }
   }

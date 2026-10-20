@@ -1,8 +1,4 @@
-/**
- * GitCredentialCache — monotonic expiry + the 10min handout threshold,
- * per-agent single-flight, serve-cached degradation while the CP is down,
- * terminal SCOPE_DENIED, and password-matched invalidation (the `erase` hook).
- */
+// GitCredentialCache covers expiry, scoped grants, outage behavior, and token-matched invalidation.
 import { describe, it, expect } from 'vitest'
 import type { GitCredGrant } from '@agentconnect.md/protocol'
 import {
@@ -204,6 +200,22 @@ describe('GitCredentialCache', () => {
       const refreshed = await h.cache.getKanbanCommentToken(AGENT, 'acme/web', leaseId)
       expect(refreshed.token).toBe('ghs_3')
       expect(h.payloads[2]).toMatchObject({ purpose: 'kanban_card_write', leaseId, forceRefresh: true })
+    })
+
+    it('refreshes only the rejected orchestrator grant and bypasses the CP token cache', async () => {
+      const h = buildRecording()
+      await h.cache.getKanbanOrchestratorToken(AGENT, 'acme/web')
+      h.cache.invalidateKanbanOrchestrator(AGENT, 'acme/web', 'stale')
+      expect((await h.cache.getKanbanOrchestratorToken(AGENT, 'acme/web')).token).toBe('ghs_1')
+      h.cache.invalidateKanbanOrchestrator(AGENT, 'acme/web', 'ghs_1')
+      expect((await h.cache.getKanbanOrchestratorToken(AGENT, 'acme/web')).token).toBe('ghs_2')
+      expect(h.payloads[1]).toMatchObject({
+        purpose: 'kanban_orchestrator_write',
+        capabilities: ['issues'],
+        repoFullName: 'acme/web',
+        forceRefresh: true
+      })
+      expect(h.calls()).toBe(2)
     })
 
     it('revalidates live Kanban tool grants on every call even with a cached token', async () => {

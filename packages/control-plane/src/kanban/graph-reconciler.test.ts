@@ -427,3 +427,75 @@ describe('KanbanGraphReconciler', () => {
     expect(h.labels.get(7)).toContain('ac/agent:synthesizer')
   })
 })
+
+describe('vera-474 B2: graph promotion reaches the projection seam', () => {
+  it('vera-474: B2 a graph promotion todo→ready projects once its intent clears', async () => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
+    const project = { onStatusCommitted: vi.fn() }
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
+    await reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(project.onStatusCommitted).toHaveBeenCalledTimes(1)
+    expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'b1', issueNumber: 7, issueNodeId: 'n' })
+    expect(h.cards.clearPromotionIntent.mock.invocationCallOrder[0]).toBeLessThan(
+      project.onStatusCommitted.mock.invocationCallOrder[0]!
+    )
+  })
+
+  it('vera-474: B2 a rolled-back promotion projects the todo it returned to', async () => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
+    h.store.applyPlan.mockRejectedValueOnce(new Error('label POST failed'))
+    const project = { onStatusCommitted: vi.fn() }
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
+    await expect(reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('label POST failed')
+    expect(h.db.get(7)!.status).toBe('todo')
+    expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'b1', issueNumber: 7, issueNodeId: 'n' })
+  })
+
+  it('vera-474: B2 no promotion means no projection', async () => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
+    const project = { onStatusCommitted: vi.fn() }
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
+    await reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [link(2, 'open')] }))
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  })
+})
+
+it.each(['lost CAS', 'DB error'] as const)(
+  'vera-474r2: a graph rollback with %s never projects an uncommitted revert',
+  async (failure) => {
+    const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
+    h.store.applyPlan.mockRejectedValueOnce(new Error('label POST failed'))
+    if (failure === 'lost CAS') h.cards.revertPromotion.mockResolvedValueOnce(false)
+    else h.cards.revertPromotion.mockRejectedValueOnce(new Error('DB offline'))
+    const project = { onStatusCommitted: vi.fn() }
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
+    await expect(reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('label POST failed')
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  }
+)

@@ -69,7 +69,11 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
     createdAt: new Date(0)
   }
   const log = { debug: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
-  const realStore = () => new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+  const realStore = () =>
+    new GithubCardStore({
+      tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+      permissions: { permission: async () => 'none' }
+    })
 
   function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>) {
     const reconciler = new KanbanGraphReconciler({

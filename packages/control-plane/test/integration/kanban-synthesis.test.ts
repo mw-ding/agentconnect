@@ -80,8 +80,8 @@ async function harness() {
         ({ orgId: board.orgId, installationId: 77n, revokedAt: null, suspendedAt: null }) as never
     },
     store,
-    onCard: async (b, repo, n, action) => {
-      if (action === 'closed' || action === 'reopened')
+    onCard: async (b, repo, n, doorbell) => {
+      if (doorbell.action === 'closed' || doorbell.action === 'reopened')
         await reconciler.apply(b, repo, n, await store.readGraph(repo, n))
     },
     log

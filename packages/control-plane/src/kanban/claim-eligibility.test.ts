@@ -344,3 +344,33 @@ describe('explainClaim — cards held for a human', () => {
     expect(explainClaim(review({}, { needsAttention: false }))).toEqual({ eligible: true, role: 'verify', agentId: A2 })
   })
 })
+
+describe('vera-414-main2: merged claim caps apply to work and verify', () => {
+  it.each(['ready', 'review'] as const)('vera-414-main2: %s checks epic then daemon capacity', (status) => {
+    const f = input()
+    f.card.status = status
+    f.board.verifierAgentId = 'verifier'
+    f.verifier = liveAgent()
+    f.epicCapacity = { openRunCount: 1, maxActive: 1 }
+    f.daemonCapacity = { openRunCount: 1, maxActive: 1 }
+    expect(explainClaim(f)).toEqual({ eligible: false, gate: 'epic_cap' })
+    f.epicCapacity.openRunCount = 0
+    expect(explainClaim(f)).toEqual({ eligible: false, gate: 'daemon_cap' })
+    f.daemonCapacity.openRunCount = 0
+    expect(explainClaim(f)).toMatchObject({ eligible: true, role: status === 'review' ? 'verify' : 'work' })
+  })
+
+  it('vera-414-main2: liveness precedes caps, and caps precede B8 as in the SQL loop', () => {
+    const f = input()
+    f.card.status = 'review'
+    f.board.verifierAgentId = A1
+    f.verifier = liveAgent()
+    f.verifier.daemonLive = false
+    f.daemonCapacity = { openRunCount: 1, maxActive: 1 }
+    expect(explainClaim(f)).toEqual({ eligible: false, gate: 'daemon_offline' })
+    f.verifier.daemonLive = true
+    expect(explainClaim(f)).toEqual({ eligible: false, gate: 'daemon_cap' })
+    f.daemonCapacity.openRunCount = 0
+    expect(explainClaim(f)).toEqual({ eligible: false, gate: 'verifier_is_worker' })
+  })
+})

@@ -4422,10 +4422,15 @@ export const KanbanCardControlDto = z.object({
 export type KanbanCardControlDtoT = z.infer<typeof KanbanCardControlDto>
 
 // ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
+export const KANBAN_EPIC_MAX_CARDS_CEILING = 1000
+export const KANBAN_EPIC_MAX_ACTIVE_CEILING = 100
 const KanbanRepoFullName = z
   .string()
   .regex(/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, 'repoFullName must be "owner/repo"')
   .max(200)
+// Projects v2 GraphQL node ids are opaque base64-ish strings; bound the length, never parse them.
+const KanbanProjectId = z.string().min(1).max(200)
+const KANBAN_PROJECT_PAIR = 'projectNodeId and statusFieldId must be set together (or cleared together with null)'
 const KanbanBoardConfigFields = {
   name: z.string().trim().min(1).max(100),
   orchestratorAgentId: z.string().uuid().nullable(),
@@ -4433,6 +4438,9 @@ const KanbanBoardConfigFields = {
   synthesizerAgentId: z.string().uuid().nullable(),
   maxInProgress: z.number().int().min(1).max(100),
   maxInProgressPerAgent: z.number().int().min(1).max(100),
+  // B2 per-epic budgets (the DB CHECKs > 0): lifetime children an epic may file, and how many may run at once.
+  epicMaxCards: z.number().int().min(1).max(KANBAN_EPIC_MAX_CARDS_CEILING),
+  epicMaxActive: z.number().int().min(1).max(KANBAN_EPIC_MAX_ACTIVE_CEILING),
   staleLeaseSec: z
     .number()
     .int()
@@ -4457,22 +4465,38 @@ export const CreateKanbanBoardBody = z
     synthesizerAgentId: KanbanBoardConfigFields.synthesizerAgentId.optional(),
     maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
     maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
+    epicMaxCards: KanbanBoardConfigFields.epicMaxCards.optional(),
+    epicMaxActive: KanbanBoardConfigFields.epicMaxActive.optional(),
     staleLeaseSec: KanbanBoardConfigFields.staleLeaseSec.optional(),
     failureLimit: KanbanBoardConfigFields.failureLimit.optional(),
     protocolRetryLimit: KanbanBoardConfigFields.protocolRetryLimit.optional(),
     blockRecurrenceLimit: KanbanBoardConfigFields.blockRecurrenceLimit.optional(),
     completionContract: KanbanBoardConfigFields.completionContract.optional(),
+    projectNodeId: KanbanProjectId.optional(),
+    statusFieldId: KanbanProjectId.optional(),
     enabled: KanbanBoardConfigFields.enabled.optional(),
     visibility: KanbanBoardConfigFields.visibility.default('org'),
     sharedWith: KanbanBoardConfigFields.sharedWith.default([])
   })
   .strict()
+  .refine((body) => (body.projectNodeId === undefined) === (body.statusFieldId === undefined), KANBAN_PROJECT_PAIR)
 export type CreateKanbanBoardBodyT = z.infer<typeof CreateKanbanBoardBody>
 export const UpdateKanbanBoardBody = z
-  .object({ repoFullName: KanbanRepoFullName, ...KanbanBoardConfigFields })
+  .object({
+    repoFullName: KanbanRepoFullName,
+    ...KanbanBoardConfigFields,
+    projectNodeId: KanbanProjectId.nullable(),
+    statusFieldId: KanbanProjectId.nullable()
+  })
   .partial()
   .strict()
   .refine((body) => Object.keys(body).length > 0, 'at least one field is required')
+  .refine(
+    (body) =>
+      (body.projectNodeId === undefined) === (body.statusFieldId === undefined) &&
+      (body.projectNodeId === null) === (body.statusFieldId === null),
+    KANBAN_PROJECT_PAIR
+  )
 export type UpdateKanbanBoardBodyT = z.infer<typeof UpdateKanbanBoardBody>
 export const KanbanBoardDto = z.object({
   id: z.string(),
@@ -4485,12 +4509,18 @@ export const KanbanBoardDto = z.object({
   synthesizerAgentId: z.string().nullable(),
   maxInProgress: z.number().int(),
   maxInProgressPerAgent: z.number().int(),
+  epicMaxCards: z.number().int(),
+  epicMaxActive: z.number().int(),
   staleLeaseSec: z.number().int(),
   failureLimit: z.number().int(),
   protocolRetryLimit: z.number().int(),
   blockRecurrenceLimit: z.number().int(),
   defaultMode: KanbanRunModeDto,
   completionContract: z.enum(['close', 'pr_merged', 'pr_checks_green']),
+  /** Projects v2 node id of the org-owned project mirrored from card status; null when no projection is configured. */
+  projectNodeId: z.string().nullable(),
+  /** Node id of that project's single-select Status field; set exactly when `projectNodeId` is. */
+  statusFieldId: z.string().nullable(),
   enabled: z.boolean(),
   paused: z.boolean(),
   pausedAt: z.string().nullable(),
@@ -4507,6 +4537,136 @@ export const KanbanBoardDto = z.object({
 })
 export type KanbanBoardDtoT = z.infer<typeof KanbanBoardDto>
 export const KanbanBoardListDto = z.object({ boards: z.array(KanbanBoardDto) })
+
+// ── kanban dry-run explain (read-only, body-free: ids, statuses, counts and timestamps, never an issue title) ──
+export const KanbanExplainVerdictDto = z.object({
+  eligible: z.boolean(),
+  /** Present when eligible: which agent role the claim would dispatch. */
+  role: z.enum(['work', 'verify']).optional(),
+  /** Present when eligible: the agent the claim would dispatch to. */
+  agentId: z.string().optional(),
+  /** Present when not eligible: the first gate, in claim precedence, that blocks the card (a stable code). */
+  gate: z.string().optional()
+})
+export const KanbanExplainFactsDto = z.object({
+  boardEnabled: z.boolean(),
+  boardPaused: z.boolean(),
+  status: z.string(),
+  assigneeAgentId: z.string().nullable(),
+  role: z.enum(['work', 'verify']),
+  targetAgentId: z.string().nullable(),
+  targetExists: z.boolean(),
+  targetPaused: z.boolean(),
+  targetPlaced: z.boolean(),
+  targetDaemonLive: z.boolean(),
+  verifierAgentId: z.string().nullable(),
+  verifiedAt: z.string().nullable(),
+  needsAttention: z.boolean(),
+  workAgentIds: z.array(z.string()),
+  openRunCountForVerifier: z.number().int(),
+  epicCapacity: z.object({ openRunCount: z.number().int(), maxActive: z.number().int() }).nullable(),
+  daemonCapacity: z.object({ openRunCount: z.number().int(), maxActive: z.number().int() }).nullable(),
+  promotionPending: z.boolean(),
+  cooldownUntil: z.string().nullable(),
+  notBefore: z.string().nullable(),
+  hasOpenLease: z.boolean(),
+  assigneeExists: z.boolean(),
+  assigneePaused: z.boolean(),
+  assigneePlaced: z.boolean(),
+  assigneeDaemonLive: z.boolean(),
+  openRunCount: z.number().int(),
+  openRunCountForAssignee: z.number().int(),
+  maxInProgress: z.number().int(),
+  maxInProgressPerAgent: z.number().int()
+})
+export const KanbanCardExplainDto = z.object({
+  boardId: z.string(),
+  cardId: z.string(),
+  issueNumber: z.number().int(),
+  status: z.string(),
+  verdict: KanbanExplainVerdictDto,
+  /** A human sentence from a static table keyed by the gate; no issue text. */
+  hint: z.string(),
+  facts: KanbanExplainFactsDto,
+  /** Board explain only: 1-based position in `wouldClaimNext`. */
+  claimOrder: z.number().int().optional(),
+  /** Board explain only: eligible now, but earlier cards fill this cap first. */
+  capBound: z.enum(['board_cap', 'agent_cap', 'epic_cap', 'daemon_cap']).optional(),
+  evaluatedAt: z.string()
+})
+export const KanbanBoardExplainDto = z.object({
+  boardId: z.string(),
+  evaluatedAt: z.string(),
+  /** Every card that is not done or archived, in claim order. */
+  cards: z.array(KanbanCardExplainDto),
+  /** Card ids the next claim would take, in order, with the board and per-agent caps applied cumulatively. */
+  wouldClaimNext: z.array(z.string()),
+  wouldClaimNextIssueNumbers: z.array(z.number().int())
+})
+
+// ── kanban board view (CP metadata; titles are a separate live pass-through and are never stored) ──
+export const KanbanCardMetaDto = z.object({
+  id: z.string(),
+  issueNumber: z.number().int(),
+  status: z.enum(['triage', 'todo', 'ready', 'running', 'blocked', 'review', 'done', 'archived']),
+  assigneeAgentId: z.string().nullable(),
+  /** Agent slug and display name, from the agent table; null when unassigned. */
+  assignee: z.object({ name: z.string(), displayName: z.string().nullable() }).nullable(),
+  priority: z.number().int(),
+  /** Effective run mode: the card's own override, else the board default. */
+  mode: KanbanRunModeDto,
+  /** The card's own override; null inherits the board default. */
+  modeOverride: KanbanRunModeDto.nullable(),
+  needsAttention: z.boolean(),
+  /** Short body-free reason code recovery recorded when it flagged the card. */
+  attentionReason: z.string().nullable(),
+  blockKind: z.enum(['dependency', 'needs_input', 'capability', 'transient']).nullable(),
+  consecutiveFailures: z.number().int(),
+  protocolViolations: z.number().int(),
+  blockRecurrence: z.number().int(),
+  cooldownUntil: z.string().nullable(),
+  notBefore: z.string().nullable(),
+  promotionPending: z.boolean(),
+  linkedPrNumber: z.number().int().nullable(),
+  stateRevision: z.string(),
+  /** The run holding the card now, if any. */
+  openRun: z
+    .object({
+      attempt: z.number().int(),
+      agentId: z.string(),
+      dispatchedAt: z.string(),
+      ackedAt: z.string().nullable(),
+      heartbeatAt: z.string().nullable()
+    })
+    .nullable()
+})
+export const KanbanBoardCardsDto = z.object({
+  boardId: z.string(),
+  cards: z.array(KanbanCardMetaDto),
+  /** Cards on the board in total; `cards` holds at most 500, in priority then age order. */
+  total: z.number().int(),
+  truncated: z.boolean()
+})
+export const KanbanBoardCardsQuery = z.object({
+  /** A by-number lookup: at most 500 distinct issue numbers (400 `too_many_numbers` beyond), so it is never truncated. */
+  numbers: z.string().min(1).max(2000).optional()
+})
+export const KanbanTitlesQuery = z.object({
+  /** Comma-separated issue numbers, at most 100, each a card of this board. */
+  numbers: z.string().min(1).max(2000)
+})
+export const KanbanLiveTitleDto = z.object({
+  /** UNTRUSTED external text from GitHub, read live and never stored: render as plain text only. */
+  title: z.string(),
+  state: z.enum(['open', 'closed']),
+  htmlUrl: z.string()
+})
+export const KanbanTitlesDto = z.object({
+  /** Keyed by issue number. */
+  titles: z.record(z.string(), KanbanLiveTitleDto),
+  /** Requested numbers that are not cards of this board, or that GitHub no longer serves as an issue. */
+  missing: z.array(z.number().int())
+})
 
 // ── shared ────────────────────────────────────────────────────────────────
 export const IdParam = z.object({ id: z.string() })

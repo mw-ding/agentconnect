@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import { KANBAN_STATUSES } from './card-state.js'
 import {
   checksVerdict,
+  contractAttentionComment,
+  FLAGGED_WAITS,
   planContract,
   prClosedUnmergedComment,
   type ChecksVerdict,
@@ -23,14 +25,20 @@ const OPEN: LivePullRequest = {
   headRepoId: 42n,
   baseRef: 'main',
   defaultBranch: 'main',
-  createdAt: new Date('2026-10-16T00:00:00Z')
+  createdAt: new Date('2026-10-16T00:00:00Z'),
+  mergedByLogin: null
 }
-const MERGED: LivePullRequest = { ...OPEN, state: 'closed', merged: true }
+const MERGED: LivePullRequest = { ...OPEN, state: 'closed', merged: true, mergedByLogin: 'octocat' }
 const CLOSED: LivePullRequest = { ...OPEN, state: 'closed', merged: false }
 
 const input = (over: Partial<ContractInput> = {}): ContractInput => ({
   status: 'review',
-  binding: { appSlug: 'agentconnect', repoId: 42n, issueNumber: 7, workStartedAt: new Date('2026-10-15T00:00:00Z') },
+  binding: {
+    appSlug: 'agentconnect',
+    repoId: 42n,
+    issueNumber: 7,
+    workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z')
+  },
   contract: 'pr_merged',
   verifierAgentId: null,
   verifiedAt: null,
@@ -131,7 +139,7 @@ describe('planContract', () => {
                 appSlug: 'agentconnect',
                 repoId: 42n,
                 issueNumber: 7,
-                workStartedAt: new Date('2026-10-15T00:00:00Z')
+                workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z')
               }
             })
           )
@@ -142,8 +150,8 @@ describe('planContract', () => {
   it('vera-415: missing App identity or work provenance cannot bind a PR', () => {
     for (const binding of [
       undefined,
-      { appSlug: undefined, repoId: 42n, issueNumber: 7, workStartedAt: new Date(0) },
-      { appSlug: 'agentconnect', repoId: 42n, issueNumber: 7, workStartedAt: null }
+      { appSlug: undefined, repoId: 42n, issueNumber: 7, workEpisodeStartedAt: new Date(0) },
+      { appSlug: 'agentconnect', repoId: 42n, issueNumber: 7, workEpisodeStartedAt: null }
     ])
       expect(planContract(input({ pr: MERGED, binding }))).toEqual(wait('pr_unbound'))
   })
@@ -194,6 +202,50 @@ describe('planContract', () => {
       expect(planContract(input({ ...base, pr: CLOSED, checks: { headSha: HEAD, verdict: 'green' } }))).toEqual(TRIAGE)
     })
   }
+
+  it('vera-415b3: a PR created inside the episode binds however late the reporting run started', () => {
+    // Rework: the PR came from attempt 1, and the episode began at attempt 1's claim.
+    const binding = {
+      appSlug: 'agentconnect',
+      repoId: 42n,
+      issueNumber: 7,
+      workEpisodeStartedAt: new Date('2026-10-15T23:59:30Z')
+    }
+    expect(planContract(input({ pr: MERGED, binding }))).toEqual(DONE)
+    const later = { ...binding, workEpisodeStartedAt: new Date('2026-10-16T00:00:01Z') }
+    expect(planContract(input({ pr: MERGED, binding: later }))).toEqual(wait('pr_unbound'))
+  })
+
+  it('vera-415 merged_by: an App-bot merge with no verifier waits; a verifier or a human merge completes', () => {
+    const byApp = { ...MERGED, mergedByLogin: 'AgentConnect[bot]' }
+    expect(planContract(input({ pr: byApp }))).toEqual(wait('merged_by_app'))
+    expect(planContract(input({ pr: byApp, verifierAgentId: 'v1', verifiedAt: new Date(0) }))).toEqual(DONE)
+    expect(planContract(input({ pr: MERGED }))).toEqual(DONE)
+    // pr_checks_green does not depend on who merged.
+    expect(
+      planContract(input({ contract: 'pr_checks_green', pr: byApp, checks: { headSha: HEAD, verdict: 'green' } }))
+    ).toEqual(DONE)
+  })
+
+  it('vera-415 actions:read: unreadable workflows never go green, but a visible failure still reads as failed', () => {
+    const at = (verdict: ChecksVerdict) =>
+      planContract(
+        input({ contract: 'pr_checks_green', pr: OPEN, checks: { headSha: HEAD, verdict, actionsUnreadable: true } })
+      )
+    expect(at('green')).toEqual(wait('actions_read_missing'))
+    expect(at('pending')).toEqual(wait('actions_read_missing'))
+    expect(at('failed')).toEqual(wait('checks_failed'))
+  })
+
+  it('vera-415b3: each flagged wait has a one-line body-free note naming the PR and the reason code', () => {
+    expect([...FLAGGED_WAITS].sort()).toEqual(['actions_read_missing', 'merged_by_app', 'pr_unbound'])
+    for (const reason of FLAGGED_WAITS) {
+      const text = contractAttentionComment(reason, 12)
+      expect(text).toContain('#12')
+      expect(text).toContain(`(${reason})`)
+      expect(text.includes('\n')).toBe(false)
+    }
+  })
 
   it('the unmerged-close note is one body-free line naming the PR number and the reason code', () => {
     const text = prClosedUnmergedComment(12)

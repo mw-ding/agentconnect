@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { z } from 'zod'
 import { SEND_MESSAGE_ACTION_SCHEMAS, TOOL_ARG_SCHEMAS } from '../src/mcp/ops.js'
-import { CODE_HOST_EFFECT_TOOLS, GITHUB_REVIEW_TOOLS, KANBAN_TOOLS, toolsForIntegrations } from '../src/mcp/tools.js'
+import {
+  CODE_HOST_EFFECT_TOOLS,
+  GITHUB_REVIEW_TOOLS,
+  KANBAN_ORCHESTRATOR_TOOLS,
+  KANBAN_TOOLS,
+  toolsForIntegrations
+} from '../src/mcp/tools.js'
 import { externalMemoryTools } from '../src/memory/tools.js'
 import { FOLLOW_UP_TOOL, PROPOSE_TOOL, RECORD_CHECK_TOOL } from '../src/mcp/ops/assistant-items.js'
 import { ASSISTANT_REMINDER_TOOLS } from '../src/mcp/ops/assistant-reminders.js'
@@ -73,6 +79,7 @@ const advertised: ToolDescriptor[] = [
   ...CODE_HOST_EFFECT_TOOLS,
   ...CODE_HOST_RESEARCH_TOOLS,
   ...KANBAN_TOOLS,
+  ...KANBAN_ORCHESTRATOR_TOOLS,
   FOLLOW_UP_TOOL,
   FIRST_LOOK_TOOL,
   RECORD_CHECK_TOOL,

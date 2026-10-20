@@ -12,7 +12,7 @@ import type {
 } from '../persistence/ports.js'
 import { statusLabel, type KanbanStatus, type LabelPlan, type ObservedIssue } from './card-state.js'
 import type { CardIssue } from './card-store.js'
-import { KanbanCommentCommands } from './comment-command.js'
+import { COMMAND_EFFECT_TTL_MS, KanbanCommentCommands } from './comment-command.js'
 import { isAttestedHumanAuthority } from './human-authority.js'
 
 const BOARD: KanbanBoardRecord = {
@@ -50,6 +50,8 @@ function make(
     level?: RepoPermissionLevel | Error
     staleTimes?: number
     applyFails?: number
+    /** Each applyPlan waits on this gate first, so a test can hold a GitHub write in flight. */
+    gate?: Promise<void>
   } = {}
 ) {
   const card: KanbanCardRecord = {
@@ -67,6 +69,9 @@ function make(
   const inputs: KanbanCommandInput[] = []
   let stale = opts.staleTimes ?? 0
   let applyFails = opts.applyFails ?? 0
+  // Mirrors the PG effect claim: one holder per unsettled row until its claim is older than the TTL.
+  const clock = { now: Date.parse('2026-10-20T00:00:00Z') }
+  const claims = new Map<string, number>()
   const cards = {
     findByIssueNumber: vi.fn(async (_b: string, n: number) => (n === 7 ? { ...card } : null)),
     getCommand: vi.fn(async (_b: string, id: bigint) => ledger.get(id) ?? null),
@@ -100,6 +105,16 @@ function make(
     }),
     settleCommand: vi.fn(async (id: string) => {
       for (const r of ledger.values()) if (r.id === id) r.settledAt = new Date()
+    }),
+    claimCommandEffect: vi.fn(async (id: string, ttlMs: number) => {
+      const row = [...ledger.values()].find((r) => r.id === id)
+      const held = claims.get(id)
+      if (!row || row.settledAt || (held !== undefined && clock.now - held < ttlMs)) return null
+      claims.set(id, clock.now)
+      return new Date(clock.now)
+    }),
+    releaseCommandEffect: vi.fn(async (id: string, claimedAt: Date) => {
+      if (claims.get(id) === claimedAt.getTime()) claims.delete(id)
     })
   }
   let observed: CardIssue = issueFor(card.status)
@@ -107,6 +122,7 @@ function make(
   const store = {
     readCard: vi.fn(async () => observed),
     applyPlan: vi.fn(async (_r: unknown, _n: number, _o: ObservedIssue, plan: LabelPlan) => {
+      await opts.gate
       if (applyFails > 0) {
         applyFails -= 1
         throw new Error('github 502')
@@ -121,15 +137,17 @@ function make(
     return level
   })
   const onApplied = vi.fn()
+  const project = { onStatusCommitted: vi.fn() }
   const handler = new KanbanCommentCommands({
     cards,
     store,
     permissions: { permission },
     appSlug: 'agentconnect',
     onApplied,
+    project,
     log: { info: vi.fn(), warn: vi.fn() }
   })
-  return { handler, card, cards, store, plans, permission, onApplied, ledger, inputs }
+  return { handler, card, cards, store, plans, permission, onApplied, project, ledger, inputs, clock }
 }
 
 describe('KanbanCommentCommands', () => {
@@ -257,4 +275,64 @@ it('vera-415: a non-writer is silently recorded once even across duplicate deliv
   expect(h.plans).toEqual([])
   expect(h.ledger.size).toBe(1)
   expect(h.ledger.get(9001n)).toMatchObject({ outcome: 'no_write', settledAt: expect.any(Date) })
+})
+
+describe('vera-415r2: one GitHub effect per comment, even across overlapping deliveries', () => {
+  it('vera-415r2: B6 a delivery overlapping an in-flight refusal posts nothing and stays unlanded', async () => {
+    let release!: () => void
+    const h = make({ status: 'ready', gate: new Promise<void>((resolve) => (release = resolve)) })
+    const first = h.handler.handle(BOARD, REPO, 7, cmd('unblock'))
+    await vi.waitFor(() => expect(h.store.applyPlan).toHaveBeenCalledOnce())
+    const second = h.handler.handle(BOARD, REPO, 7, cmd('unblock'))
+    const [a, b] = await Promise.allSettled([
+      first,
+      (async () => {
+        try {
+          return await second
+        } finally {
+          release()
+        }
+      })()
+    ])
+    expect(a).toEqual({ status: 'fulfilled', value: 'wrong_status' })
+    expect(b).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ message: expect.stringMatching(/in flight/) })
+    })
+    expect(h.plans.map((p) => p.comment)).toEqual([expect.stringContaining('(wrong_status)')])
+    // Once the holder settles, the redelivery of the unlanded GUID is a plain duplicate.
+    expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('duplicate')
+    expect(h.plans).toHaveLength(1)
+  })
+
+  it('vera-415r2: B6 a claim whose holder died blocks the effect until the TTL, then exactly one delivery retries it', async () => {
+    const h = make({ status: 'ready', applyFails: 1 })
+    await expect(h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).rejects.toThrow('github 502')
+    const id = h.ledger.get(9001n)!.id
+    // A holder claims and then dies without settling or releasing.
+    expect(await h.cards.claimCommandEffect(id, COMMAND_EFFECT_TTL_MS)).not.toBeNull()
+    await expect(h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).rejects.toThrow(/in flight/)
+    expect(h.plans).toEqual([])
+    h.clock.now += COMMAND_EFFECT_TTL_MS
+    expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('duplicate')
+    expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('duplicate')
+    expect(h.plans.map((p) => p.comment)).toEqual([expect.stringContaining('(wrong_status)')])
+  })
+
+  it('vera-415r2: a failed effect releases its own claim, so the next delivery retries at once', async () => {
+    const h = make({ status: 'ready', applyFails: 1 })
+    await expect(h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).rejects.toThrow('github 502')
+    expect(h.cards.releaseCommandEffect).toHaveBeenCalledOnce()
+    expect(await h.handler.handle(BOARD, REPO, 7, cmd('unblock'))).toBe('duplicate')
+    expect(h.plans).toHaveLength(1)
+  })
+
+  it('vera-415r2: 🟡2 an applied move queues the Projects projection; a refusal does not', async () => {
+    const applied = make({ status: 'blocked' })
+    await applied.handler.handle(BOARD, REPO, 7, cmd('unblock'))
+    expect(applied.project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({ boardId: BOARD.id, issueNumber: 7 })
+    const refused = make({ status: 'ready' })
+    await refused.handler.handle(BOARD, REPO, 7, cmd('unblock'))
+    expect(refused.project.onStatusCommitted).not.toHaveBeenCalled()
+  })
 })

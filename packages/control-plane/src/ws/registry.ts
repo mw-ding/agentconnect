@@ -174,6 +174,11 @@ export class ConnectionRegistry {
     this.byDaemon.delete(daemonId)
   }
 
+  /** Daemons whose control connection to this replica is READY (the same test as a `get(id)?.state` liveness check). */
+  readyDaemonIds(): string[] {
+    return [...this.byDaemon.values()].filter((s) => s.state === 'READY').map((s) => s.daemonId)
+  }
+
   /** Placement candidate pool — reachable, connected daemons. */
   reachableDaemons(): DaemonConnState[] {
     return [...this.byDaemon.values()].filter((s) => s.reachable)

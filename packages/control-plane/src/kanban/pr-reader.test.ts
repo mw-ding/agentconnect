@@ -1,5 +1,6 @@
 // GithubPrReader over a fake fetch: repo-id addressing, the PR-contract token, 404 handling, and bounded check-run paging.
 import { describe, expect, it, vi } from 'vitest'
+import { GithubApiError } from '../github/api.js'
 import { checksVerdict } from './contracts.js'
 import { GithubPrReader } from './pr-reader.js'
 
@@ -14,9 +15,11 @@ const PR_FIELDS = {
 
 function harness(routes: Record<string, (url: URL) => { status: number; body: unknown }>) {
   const urls: URL[] = []
-  const fetchImpl = vi.fn(async (input: string) => {
+  const auths = new Map<string, string>()
+  const fetchImpl = vi.fn(async (input: string, init?: RequestInit) => {
     const url = new URL(input)
     urls.push(url)
+    auths.set(url.pathname, new Headers(init?.headers).get('authorization') ?? '')
     const route =
       routes[url.pathname] ??
       (url.pathname === '/repositories/42' ? () => ({ status: 200, body: { default_branch: 'main' } }) : undefined)
@@ -30,8 +33,15 @@ function harness(routes: Record<string, (url: URL) => { status: number; body: un
     repoFullName: 'acme/web',
     access: 'read' as const
   }))
-  const reader = new GithubPrReader({ tokens: { mintKanbanPr }, fetchImpl: fetchImpl as never })
-  return { reader, urls, mintKanbanPr }
+  const mintKanbanActions = vi.fn(async () => ({
+    token: 'ghs_actions',
+    ttlSec: 3600,
+    expiresAt: '',
+    repoFullName: 'acme/web',
+    access: 'read' as const
+  }))
+  const reader = new GithubPrReader({ tokens: { mintKanbanPr, mintKanbanActions }, fetchImpl: fetchImpl as never })
+  return { reader, urls, auths, mintKanbanPr, mintKanbanActions }
 }
 
 describe('GithubPrReader', () => {
@@ -39,7 +49,15 @@ describe('GithubPrReader', () => {
     const h = harness({
       '/repositories/42/pulls/12': () => ({
         status: 200,
-        body: { number: 12, state: 'closed', merged: true, title: 'secret', body: 'secret', ...PR_FIELDS }
+        body: {
+          number: 12,
+          state: 'closed',
+          merged: true,
+          title: 'secret',
+          body: 'secret',
+          merged_by: { login: 'octocat', name: 'secret' },
+          ...PR_FIELDS
+        }
       })
     })
     expect(await h.reader.readPullRequest(REPO, 12)).toEqual({
@@ -53,9 +71,11 @@ describe('GithubPrReader', () => {
       headRepoId: 42n,
       baseRef: 'main',
       defaultBranch: 'main',
-      createdAt: new Date(PR_FIELDS.created_at)
+      createdAt: new Date(PR_FIELDS.created_at),
+      mergedByLogin: 'octocat'
     })
     expect(h.mintKanbanPr).toHaveBeenCalledWith(9n, 'acme/web', 42n)
+    expect(h.mintKanbanActions).not.toHaveBeenCalled()
   })
 
   it('treats merged_at as merged (list-shaped payloads omit `merged`) and a missing PR as null', async () => {
@@ -286,4 +306,82 @@ it('vera-415: the hosted Actions app id identifies workflow reruns when app slug
   const result = await h.reader.readCheckRuns(REPO, SHA)
   expect(result.runs).toHaveLength(1)
   expect(checksVerdict(result.runs)).toBe('green')
+})
+
+it('vera-415 event key: a push success on the same workflow and job cannot hide a pull_request failure', async () => {
+  const h = harness({
+    [`/repositories/42/commits/${SHA}/check-runs`]: () => ({
+      status: 200,
+      body: { total_count: 2, check_runs: [actionsRun(100, 1, 'failure'), actionsRun(200, 2, 'success')] }
+    }),
+    '/repositories/42/actions/runs': () => ({
+      status: 200,
+      body: {
+        total_count: 2,
+        workflow_runs: [
+          { check_suite_id: 1, path: '.github/workflows/ci.yml', event: 'pull_request' },
+          { check_suite_id: 2, path: '.github/workflows/ci.yml', event: 'push' }
+        ]
+      }
+    })
+  })
+  const result = await h.reader.readCheckRuns(REPO, SHA)
+  expect(result.runs).toHaveLength(2)
+  expect(checksVerdict(result.runs)).toBe('failed')
+})
+
+it('vera-415 actions:read: only the workflow lookup uses the separate actions token', async () => {
+  const h = harness({
+    [`/repositories/42/commits/${SHA}/check-runs`]: () => ({
+      status: 200,
+      body: { total_count: 1, check_runs: [actionsRun(1, 1, 'success')] }
+    }),
+    '/repositories/42/actions/runs': () => ({
+      status: 200,
+      body: { total_count: 1, workflow_runs: [{ check_suite_id: 1, path: 'ci.yml', event: 'pull_request' }] }
+    })
+  })
+  const result = await h.reader.readCheckRuns(REPO, SHA)
+  expect(result).toEqual({ runs: [{ status: 'completed', conclusion: 'success' }], complete: true })
+  expect(h.auths.get(`/repositories/42/commits/${SHA}/check-runs`)).toBe('Bearer ghs_pr')
+  expect(h.auths.get('/repositories/42/actions/runs')).toBe('Bearer ghs_actions')
+  expect(h.mintKanbanActions).toHaveBeenCalledWith(9n, 'acme/web', 42n)
+})
+
+it('vera-415 actions:read: a refused actions mint or a 403 runs list reads as actionsUnreadable, never complete', async () => {
+  const routes = {
+    [`/repositories/42/commits/${SHA}/check-runs`]: () => ({
+      status: 200,
+      body: { total_count: 1, check_runs: [actionsRun(1, 1, 'success')] }
+    })
+  }
+  const refusedMint = harness(routes)
+  refusedMint.mintKanbanActions.mockRejectedValue(new GithubApiError('not granted', 422, 'INTERNAL', false))
+  expect(await refusedMint.reader.readCheckRuns(REPO, SHA)).toMatchObject({ complete: false, actionsUnreadable: true })
+  const forbidden = harness({
+    ...routes,
+    '/repositories/42/actions/runs': () => ({
+      status: 403,
+      body: { message: 'Resource not accessible by integration' }
+    })
+  })
+  expect(await forbidden.reader.readCheckRuns(REPO, SHA)).toMatchObject({ complete: false, actionsUnreadable: true })
+  // A transient failure is not a missing permission: it throws so the sweep retries.
+  const flaky = harness({ ...routes, '/repositories/42/actions/runs': () => ({ status: 502, body: {} }) })
+  await expect(flaky.reader.readCheckRuns(REPO, SHA)).rejects.toThrow()
+  const limited = harness(routes)
+  limited.mintKanbanActions.mockRejectedValue(new GithubApiError('slow down', 403, 'RATE_LIMITED', true))
+  await expect(limited.reader.readCheckRuns(REPO, SHA)).rejects.toThrow()
+})
+
+it('vera-415 actions:read: a PR read never needs the actions token', async () => {
+  const h = harness({
+    '/repositories/42/pulls/12': () => ({
+      status: 200,
+      body: { number: 12, state: 'closed', merged: true, ...PR_FIELDS }
+    })
+  })
+  h.mintKanbanActions.mockRejectedValue(new GithubApiError('not granted', 422, 'INTERNAL', false))
+  expect((await h.reader.readPullRequest(REPO, 12))?.merged).toBe(true)
+  expect(h.mintKanbanActions).not.toHaveBeenCalled()
 })

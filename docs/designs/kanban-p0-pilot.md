@@ -5,6 +5,8 @@
 
 Parent tracking: [issue #2](https://github.com/mw-ding/agentconnect/issues/2) §9 Phase 0 — validate board UX and worker prompts using GitHub labels and existing GitHub hooks, before Kanban MCP tools and control-plane automation land in later milestones.
 
+Consolidated as-built design: [kanban-swarm.md](kanban-swarm.md) (this pilot doc stays the history).
+
 ## What P0 is
 
 - A **board repo** whose issues are cards; **humans** move cards by adding/removing labels.
@@ -588,10 +590,11 @@ agent is provisioned. Slack delivery is tested with fakes only.
 
 Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
 
-- Label-driven unblock and reopen for non-parked cards belong to #194's label sync.
-  This lane only puts the existing parked-card label ingest behind the shared live
-  write check (`authorizeHumanKanbanAction`). A `done` card relabelled or reopened
-  by hand is not ingested until #194 lands; `/kanban reopen` covers that case today.
+- Label-driven unblock and reopen for non-parked cards belong to #194's label sync
+  (merged into this branch). This lane only puts the existing parked-card label
+  ingest behind the shared live write check (`authorizeHumanKanbanAction`). A `done`
+  card relabelled or reopened by hand is now ingested through the label sync;
+  `/kanban reopen` still covers explicit reopens.
 - The repository's own App bot is refused as a command sender. The CP has no
   agent-to-GitHub-user mapping, so an agent running under a person's own token could
   not be told apart from that person. Kanban agents only receive installation tokens.
@@ -599,19 +602,102 @@ Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
   status write.
   - A comment command whose label write fails stays unsettled and is re-applied on
     the next delivery of that comment.
-  - A PR-contract move whose label write fails leaves label drift for the reconciler
-    (#194's projection).
+  - Both PR-contract moves (`done` and held `triage`) set `labelWritePending` in the
+    settlement transaction. A failed label write is repaired by the reconciler, including
+    held cards; a successful repair clears the flag without clearing the human hold.
   - A tick that claims a just-unblocked card before its labels land parks it as a
     `github_state_mismatch`.
 - `pr_checks_green` reads GitHub check runs only. Legacy commit statuses are not read,
   because the App has no `statuses` permission. A head with no check runs, or more
   than 300, is never green.
-- The card-to-PR link is `linkedPrNumber` from the worker's report. Matching a PR by
-  its `ac/card-<n>` head branch (3c's convention) is not implemented.
+- The card-to-PR link is `linkedPrNumber` from the worker's report, and it only counts
+  when the PR is bound to the card: App-authored, head `ac/card-<n>` in the board's
+  repository, base the default branch, created inside the card's work episode. No worker
+  creates `ac/card-<n>` branches until #416 (on hold) lands, so until then PR contracts are
+  inert: every `pr_merged` / `pr_checks_green` card waits in `review` on `pr_unbound`,
+  flagged once with `needsAttention` and one body-free comment. Use `close` with a verifier
+  for boards that need completion before #416.
 - A missed `pull_request`/`check_suite` doorbell is recovered by the redelivery sweep
   (24 h look-back) and the 60 s sweep: 25 review cards per board per tick, with a
   rotating cursor. A board with hundreds of cards in review can take several minutes
   to converge.
 - Transition notifications (3a's outbox) for comment-command and PR-contract moves are
-  not wired yet. 3a's notifier landed after this lane's commits. The move paths call
-  `onApplied` / `onSettled` hooks, which only poke the dispatcher today.
+  not wired yet. 3a's notifier has since landed (merged into this branch), but the
+  move paths still call `onApplied` / `onSettled` hooks, which only poke the
+  dispatcher today.
+
+Human status and assignment edits now synchronize on every card, not only
+mismatch-parked ones. A human `User` (never a bot, App, or unknown actor) who
+labels, unlabels, closes, or reopens the issue is adopted through
+`planLabelReconcile`: one legal status moves the card, several status labels are
+drift repaired to one with an explanatory comment, and a missing label restores
+the committed status. A leased card accepts only `blocked`, `triage`, and
+`archived`; every other edit reverts with the explanatory comment. An
+`ac/agent:<slug>` change maps to an assignee through the organization's agents;
+on a leased card it kills the lease (never transfers it), bumps the dispatch
+revision, posts a "reassigned from X to Y" comment, and the next dispatch opens
+a fresh session. Reopening a `done` card via a label moves it back through the
+state machine. A periodic drift reconciler, driven by the same 60-second tick,
+repairs a CP status write that failed (a card left with `labelWritePending` is
+re-applied) and re-checks a completed blocker's dependents on `issues.closed`.
+Every transition writes one body-free `kanban_card_change` audit row.
+
+Known gaps update (M1 label sync permission): a human edit is adopted only after
+a live, uncached check that the actor holds `admin`, `maintain`, or `write` on
+the repository; a failed lookup counts as no access. An edit by a `triage`,
+`read`, or non-collaborator actor is consumed without a transition: the status
+label (or a closed issue) is restored to the committed status, a refused
+`ac/agent:<slug>` add or removal is undone, and one fixed-template comment
+explains the revert. Edits by the deployment App bot, any other bot, an App
+acting on a user's behalf, or an unknown actor are ignored without a lookup.
+Agents have no GitHub identity of their own: they write only through App
+installation tokens, so the App check covers them.
+
+Known gaps update (M1 label sync attribution): an edit is adopted only when the
+visible issue events attribute the live label to a human writer; when the events
+API lags the live labels, the pass is deferred and neither adopts, reverts, nor
+advances the cursor. A deferred card is retried on later passes and fails closed
+10 minutes after its first deferral: a `ready` or `running` card moves to `triage`;
+other statuses remain unchanged, including `review`. Any active work or verify lease
+is revoked and its dispatch revision fenced, even when the status stays the same.
+A late report cannot complete the card, stamp approval, or clear the hold. The card is flagged
+with `needsAttention`, its status label is projected with one timeout comment,
+and a claim neither takes the card nor clears the flag. Failed label writes
+remain eligible for repair; only a cleanly attributed human writer edit releases
+the hold.
+
+The close reason (`archived` versus `done`) comes from the live issue's
+`stateReason`, rather than the visible `closed` event's `state_reason`. A later
+close whose event is still lagging can therefore supply the reason for an earlier
+attributed close. This pre-existing gap has low impact: both outcomes are terminal
+and non-dispatchable.
+
+Roll out the CP before the relay: the strict doorbell schema on an older CP
+rejects the new fields. During the CP-before-relay window, a `labeled` doorbell
+without a sender or label imports as unassigned `triage` (fail closed). The
+relay's optional `at` timestamp lets sync ignore a superseded doorbell and judge
+the newer visible label event through the normal attribution path.
+An agent using a writer's own host `gh` credentials is indistinguishable from
+that human (the shared-GitHub-login limit): label attribution trusts the events
+API's actor, which reports the credential's login, not the process behind it.
+
+Known gaps update (M5 projection): every committed status change now reaches the
+Projects v2 `Status` field, but the mirror stays one-way. Edits made in the
+Project UI are not reconciled; the card's next committed status change overwrites
+them. Contract: [kanban-lane4-api.md](kanban-lane4-api.md) `## 4a`.
+
+Known gaps (M3 orchestrator): the orchestrator tools (kanbanList/Create/Link/
+Unblock/Assign) are role-gated on `board.orchestratorAgentId`. The daemon files
+the issue body directly with a purpose-bound `kanban_orchestrator_write` token,
+and the CP registers only metadata; a daemon crash between the file and the
+commit_create is a documented window (an in-memory pending map re-commits the
+same issue within a process, but a restart can file a duplicate). The GitHub
+sub_issues and issue-dependencies (`blocked_by`) WRITE endpoints are not exposed
+on every repository (they 404 on user-owned repos), so those link writes are
+best-effort and validated by the CP tests rather than live. The per-epic
+`epicMaxCards` budget is a lifetime counter that archiving a child never
+refunds; `epicMaxActive` bounds concurrent children at claim time. See
+docs/designs/kanban-lane2-orchestrator.md for the frame, codes, and B2 semantics.
+
+Known gaps (M5 board view, Lane 4b): the console cannot clear `needsAttention` yet; that waits on Lane 3's restart route. Titles are fetched per visit with one REST read per card (at most 100 per request), so a very large board costs one GitHub call per visible card until a GraphQL batch or an ETag cache is justified; the CP never caches them.
+Known gaps correction (Vera #528 review, Lane 4b follow-up): the line above understated the cost — the console polled titles every 60 s for every card including done/archived, about 60x per hour. After the fix the console fetches titles once per visible card set only (rendered, non-terminal cards; never done/archived or collapsed columns; no polling), and the CP caches titles in memory for 60 s (bounded, single-flight, ETag-revalidated) with an abort flag that stops the remaining workers on a rate-limit/5xx failure; the cache is memory-only, never persisted or logged. The card list is capped at 500 cards per board view. The dry run reads the live connection registry of the CP replica that serves it, so on a multi-replica deployment `daemon_offline` can differ from what the dispatching replica sees. The board adopts main’s shared claim predicate, including open leases, review routing, attention flags, and epic and cross-board daemon capacity.

@@ -58,6 +58,7 @@ async function worker() {
     start: async () => ({ accepted: true, sessionKey: KEY, done: new Promise(() => {}) }),
     nudge: async () => ({ accepted: false, reason: 'busy' }),
     cancel: () => {},
+    forget: async () => {},
     probe: { turnActive: () => true, liveBackgroundTasks: () => 0 },
     outbox: {
       has: async () => false,
@@ -633,6 +634,15 @@ describe('truncateUtf16Safe', () => {
     expect(truncateUtf16Safe('😀', 2)).toBe('😀')
   })
 
+  it('returns uncut text unchanged, even with a trailing lone high surrogate', () => {
+    // Nothing was cut, so nothing was split: trimming here would silently drop input.
+    expect(truncateUtf16Safe('ab\uD83D', 3)).toBe('ab\uD83D')
+    expect(truncateUtf16Safe('ab\uD83D', 10)).toBe('ab\uD83D')
+    expect(truncateUtf16Safe('', 0)).toBe('')
+    // A real cut that lands on a high surrogate still trims it.
+    expect(truncateUtf16Safe('ab\uD83D\uDE00', 3)).toBe('ab')
+  })
+
   it('never leaves a lone surrogate at any cap', () => {
     for (const max of [2, 3, 300, 2000, 8000, KANBAN_SHOW_CONTENT_MAX]) {
       const out = truncateUtf16Safe('x'.repeat(max - 1) + '😀', max)
@@ -666,25 +676,27 @@ describe('neutralizeFenceMarkers performance', () => {
     expect(elapsed).toBeLessThan(50)
   })
 
-  it('neutralizes 200k ZWSP-interleaved mark groups in under 1500 ms', () => {
+  it('neutralizes 200k ZWSP-interleaved mark groups in under 250 ms', () => {
     // Groups of <=30 marks split by U+200B used to dodge the cap and hit ICU's quadratic reordering; stripping first keeps them bounded.
-    const group = '\u0345'.repeat(30)
+    // The marks alternate canonical combining classes (240 and 1) so a merged run really needs reordering; one class would not.
+    const group = '\u0345\u0334'.repeat(15)
     const input = (group + '\u200B').repeat(Math.floor(200_000 / 31))
     const start = performance.now()
     neutralizeFenceMarkers(input)
     const elapsed = performance.now() - start
     console.log(`Fence performance: 200k ZWSP-interleaved mark groups: ${elapsed.toFixed(3)} ms`)
-    expect(elapsed).toBeLessThan(1500)
+    expect(elapsed).toBeLessThan(250)
   })
 
-  it('neutralizes 200k halfwidth voiced marks in under 1500 ms', () => {
+  it('neutralizes 200k halfwidth voiced marks in under 250 ms', () => {
     // U+FF9E NFKC-normalizes to a combining mark, so an unbroken run used to bypass the cap; folding it first makes it count.
-    const input = '\uFF9E'.repeat(200_000)
+    // Interleaving U+0334 (ccc 1) with the folded U+3099 (ccc 8) forces real reordering, so the old path goes quadratic.
+    const input = '\uFF9E\u0334'.repeat(100_000)
     const start = performance.now()
     neutralizeFenceMarkers(input)
     const elapsed = performance.now() - start
     console.log(`Fence performance: 200k halfwidth voiced marks: ${elapsed.toFixed(3)} ms`)
-    expect(elapsed).toBeLessThan(1500)
+    expect(elapsed).toBeLessThan(250)
   })
 
   it('neutralizes 200k mixed interleaved marks in under 1500 ms', () => {

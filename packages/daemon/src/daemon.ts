@@ -3,6 +3,7 @@ import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
 import { kanbanCardBranch } from './kanban/card-branch.js'
 import { buildKanbanMessage, kanbanNotifyText } from './messages/kanban-message.js'
+import { KanbanOrchestratorTools } from './kanban/orchestrator-tools.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
 import {
   MEMORY_ENTRIES_V1_FEATURE,
@@ -200,6 +201,7 @@ import {
   resolveRoot,
   statePath,
   agentRemovalObligationsDir,
+  kanbanPendingCreatesPath,
   mcpSocketPath,
   daemonEntryForShims,
   runtimeStoreDir
@@ -345,6 +347,7 @@ import {
   CODE_HOST_EFFECT_TOOLS,
   GITHUB_REVIEW_TOOLS,
   KANBAN_TOOLS,
+  KANBAN_ORCHESTRATOR_TOOLS,
   KNOWLEDGE_TOOLS
 } from './mcp/tools.js'
 import {
@@ -1493,6 +1496,7 @@ export class Daemon {
   private kanban?: KanbanWorker
   private kanbanCommentPoster?: KanbanCommentPublisher
   private kanbanCardToolset?: KanbanCardTools
+  private kanbanOrchestratorToolset?: KanbanOrchestratorTools
   // Effective agents combine user-authored agent.json files with the in-memory CP
   // registries. Everything (routing, dispatch, hosts) reads `agents`; `fileAgents`
   // mirrors only the loaded local files and is rebuilt each reconcile.
@@ -4403,6 +4407,17 @@ export class Daemon {
       kanbanLeaseRole: (req) =>
         this.kanban?.forSession(sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope))
           ?.role ?? 'work',
+      kanbanList: (req) => this.kanbanOrchestratorTools().list(req),
+      kanbanCreate: (req) =>
+        // Mask before marker neutralization, digesting, or filing agent text.
+        this.kanbanOrchestratorTools().create({
+          ...req,
+          title: this.maskAgentSecrets(req.agentId, req.title),
+          body: this.maskAgentSecrets(req.agentId, req.body)
+        }),
+      kanbanLink: (req) => this.kanbanOrchestratorTools().link(req),
+      kanbanUnblock: (req) => this.kanbanOrchestratorTools().unblock(req),
+      kanbanAssign: (req) => this.kanbanOrchestratorTools().assign(req),
       codeHostEffect: (req) =>
         this.runCodeHostEffect({ ...req, operation: this.maskCodeHostOperation(req.agentId, req.operation) }),
       codeHostResearch: {
@@ -9416,7 +9431,7 @@ export class Daemon {
       consoleImages: this.relays?.supportsWebchatImages?.() === true
     })
     // Static descriptor, dynamic authority: the call resolves the current daemon-private turn and fails closed elsewhere.
-    tools = [...tools, ...GITHUB_REVIEW_TOOLS]
+    tools = [...tools, ...GITHUB_REVIEW_TOOLS, ...KANBAN_ORCHESTRATOR_TOOLS]
     // Kanban cards share the GitHub issue thread session (D4); the call binds to the live lease or fails closed.
     if (platform === 'hook' && at.transportScope?.startsWith('github:')) tools = [...tools, ...KANBAN_TOOLS]
     // Assistant mode's follow-ups (assistant-mode.md §5.12); each call re-checks the mode, since this list is fixed per session.
@@ -26731,6 +26746,7 @@ export class Daemon {
       sessionMetadataOutbox: () => this.sessionMetadataOutbox,
       cronReportOutbox: () => this.cronReportOutbox,
       kanbanTick: () => this.kanban?.tick() ?? Promise.resolve(),
+      kanbanRevoke: (req) => this.kanbanWorker().revoke(req.leaseId, req.cardId),
       kanbanDispatch: (dispatch) => this.kanbanWorker().dispatch(dispatch),
       kanbanNotify: (notify) => this.kanbanNotify(notify),
       webchatMcpRevocations: () => this.webchatMcpRevocations,
@@ -27191,14 +27207,17 @@ export class Daemon {
         const agentId = lease.dispatch.agentId
         const session = await this.store.getSession(lease.sessionKey)
         const acpSessionId = session?.acpSessionId ?? undefined
-        void this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
+        await this.interruptTurn(agentId, lease.sessionKey, 'superseded', acpSessionId)
         // SDK background work has no Pending turn for interruptTurn to cancel; stop its host before admitting another writer.
         if (!this.sessionSdkQuiescent(this.sessionOwnerKey(agentId, lease.sessionKey), acpSessionId)) {
-          void this.stopHost(agentId).catch((err) =>
+          await this.stopHost(agentId).catch((err) =>
             this.log.warn(`kanban: superseded host stop failed (${formatErr(err)})`)
           )
         }
+        // A revoked lease is reassignment (issue #2 §5): the next dispatch opens a fresh session, never resumes the dead one.
+        await this.forgetKanbanSession(agentId, lease.sessionKey)
       },
+      forget: (agentId, sessionKey) => this.forgetKanbanSession(agentId, sessionKey),
       probe: {
         turnActive: (key) => this.inflight.has(key) || this.activeDispatchDoneByKey.has(key),
         liveBackgroundTasks: async (agentId, _sessionId, sessionKey) => {
@@ -27285,6 +27304,122 @@ export class Daemon {
     }
   }
 
+  private kanbanOrchestratorTools(): KanbanOrchestratorTools {
+    return (this.kanbanOrchestratorToolset ??= new KanbanOrchestratorTools({
+      orchestrate: (payload) => {
+        const cp = this.cpClient
+        if (!cp) throw new Error('control plane is not connected')
+        return cp.kanbanOrchestrate(payload)
+      },
+      repoFullNameFor: (agentId, board) => this.kanbanBoardRepo(agentId, board),
+      findIssue: (agentId, repoFullName, marker, appLogin, rejected) =>
+        this.findKanbanIssue(agentId, repoFullName, marker, appLogin, rejected),
+      invalidateToken: (agentId, repo) => this.gitCreds.invalidateKanbanOrchestrator(agentId, repo),
+      invalidateAllTokens: (agentId) => this.gitCreds.invalidateAllKanbanOrchestrator(agentId),
+      fileIssue: (agentId, repoFullName, title, body) => this.fileKanbanIssue(agentId, repoFullName, title, body),
+      journalPath: kanbanPendingCreatesPath(this.root),
+      log: { warn: (m) => this.log.warn(m) }
+    }))
+  }
+
+  /** Resolves a board id to its `owner/repo` via the CP list, so the daemon files the issue on the right repository. */
+  private async kanbanBoardRepo(agentId: string, board: string): Promise<string | null> {
+    const cp = this.cpClient
+    if (!cp) return null
+    const reply = await cp.kanbanOrchestrate({ op: 'list', agentId, boardId: board })
+    if (!reply.ok) return null
+    return (reply as Extract<typeof reply, { op: 'list' }>).boards[0]?.repoFullName ?? null
+  }
+
+  // Recovery reads stay on the data plane and require a trusted author as well as a trailing marker.
+  private async findKanbanIssue(
+    agentId: string,
+    repoFullName: string,
+    marker: string,
+    appLogin?: string | null,
+    rejected: number[] = []
+  ): Promise<number | null> {
+    const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
+    const headers = {
+      authorization: `Bearer ${grant.token}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28'
+    }
+    const read = async (url: string): Promise<unknown> => {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(30_000) })
+      if (res.status === 401 || res.status === 403) {
+        this.gitCreds.invalidateKanbanOrchestrator(agentId, repoFullName, grant.token)
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => undefined)
+        throw new Error(`GitHub issue lookup failed (${res.status})`)
+      }
+      return res.json()
+    }
+    // PAT recovery only trusts the identity authenticated by this very token.
+    const login = appLogin ?? ((await read('https://api.github.com/user')) as { login?: string }).login
+    if (typeof login !== 'string' || !login) throw new Error('GitHub recovery identity unavailable')
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    type Issue = {
+      number: number
+      body: string | null
+      pull_request?: unknown
+      user?: { type: string; login: string }
+      created_at?: string
+    }
+    let found: Issue | undefined
+    for (let page = 1; page <= 3; page++) {
+      const issues = (await read(
+        `https://api.github.com/repos/${repoFullName}/issues?state=all&sort=created&direction=desc&since=${encodeURIComponent(since)}&per_page=100&page=${page}`
+      )) as Issue[]
+      for (const issue of issues) {
+        if (
+          issue.pull_request ||
+          rejected.includes(issue.number) ||
+          (appLogin && issue.user?.type !== 'Bot') ||
+          issue.user?.login?.toLowerCase() !== login.toLowerCase() ||
+          !issue.body?.trimEnd().endsWith(marker)
+        )
+          continue
+        const time = Date.parse(issue.created_at ?? '')
+        const oldest = Date.parse(found?.created_at ?? '')
+        if (
+          !found ||
+          (Number.isFinite(time) && Number.isFinite(oldest) && time < oldest) ||
+          ((!Number.isFinite(time) || !Number.isFinite(oldest) || time === oldest) && issue.number < found.number)
+        )
+          found = issue
+      }
+      if (issues.length < 100) break
+    }
+    return found?.number ?? null
+  }
+
+  /** Files the issue body with the orchestrator's issues-only token; the CP writes only metadata. */
+  private async fileKanbanIssue(agentId: string, repoFullName: string, title: string, body: string): Promise<number> {
+    const grant = await this.gitCreds.getKanbanOrchestratorToken(agentId, repoFullName)
+    const res = await fetch(`https://api.github.com/repos/${repoFullName}/issues`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${grant.token}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ title, body }),
+      signal: AbortSignal.timeout(30_000)
+    })
+    if (res.status === 401 || res.status === 403) {
+      this.gitCreds.invalidateKanbanOrchestrator(agentId, repoFullName, grant.token)
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined)
+      throw new Error(`GitHub issue create failed (${res.status})`)
+    }
+    const issue = (await res.json()) as { number: number }
+    return issue.number
+  }
+
   /** A worker terminal tool call: the lease comes from the session's own live run, never from the model. */
   private async recordKanbanTerminal(req: KanbanTerminalReq): Promise<unknown> {
     const key = sessionKey(req.platform, req.channel, req.thread, req.agentId, req.transportScope)
@@ -27329,6 +27464,20 @@ export class Daemon {
     const rec = await this.store.getSession(key)
     if (!this.sessionSdkQuiescent(this.sessionOwnerKey(d.agentId, key), rec?.acpSessionId)) return 'busy'
     return undefined
+  }
+
+  // A revoked or superseded lease never resumes: drop the host's claim and clear the row so the next dispatch opens fresh.
+  private async forgetKanbanSession(agentId: string, sessionKey: string): Promise<void> {
+    const session = await this.store.getSession(sessionKey)
+    if (!session?.acpSessionId) return
+    this.hostForOwner(this.sessionOwnerKey(agentId, sessionKey))?.forgetSession(session.acpSessionId)
+    await this.store.upsertSession({
+      ...session,
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: this.clock.now()
+    })
   }
 
   // Admission settles before the turn runs, so the lease is accepted only once the gate owns the entry.

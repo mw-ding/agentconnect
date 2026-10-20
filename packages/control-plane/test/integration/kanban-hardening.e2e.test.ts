@@ -13,6 +13,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_ORG_ID, openSeedClient, seed } from '../../prisma/seed.js'
 import { OrgId } from '../../src/domain/ids.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { systemClock } from '../../src/domain/clock.js'
@@ -97,7 +98,13 @@ describe.skipIf(!(process.env.KANBAN_E2E === '1' && process.env.GITHUB_TOKEN) ||
       return { b, card }
     }
     function bell(db = prisma) {
-      const store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+      const store = new GithubCardStore({
+        tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+        permissions: new GithubRepoPermission({
+          tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+          ttlMs: 0
+        })
+      })
       const dispatcher = new KanbanDispatcher({
         repo: new PgKanbanDispatchRepo(db),
         store,
@@ -257,7 +264,13 @@ describe.skipIf(!(process.env.KANBAN_E2E === '1' && process.env.GITHUB_TOKEN) ||
         try {
           const url = `${await relay.listen({ port: 0, host: '127.0.0.1' })}/webhooks/github`
           const real = await gh<Issue>('GET', `/repos/${FULL}/issues/${issue.number}`)
-          const store = new GithubCardStore({ tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never })
+          const store = new GithubCardStore({
+            tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+            permissions: new GithubRepoPermission({
+              tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
+              ttlMs: 0
+            })
+          })
           await vi.waitFor(
             async () =>
               expect(

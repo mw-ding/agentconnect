@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.2 (2026-10-18)
+**Version:** 1.4 (2026-10-20)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -8,8 +8,6 @@ The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.t
 `cp/src/persistence/repositories/kanban-dispatch.repo.ts` `claim()` remains the
 authority; this predicate mirrors it gate for gate and must never disagree on
 whether a card is claimable.
-
-Changelog: 1.2 adds `board.paused` and the `board_paused` gate immediately after `board_disabled`, preserving v1.1 review routing, `verified`, `needs_attention`, and any-attempt B8 ordering.
 
 ## Signature
 
@@ -31,6 +29,8 @@ export type ClaimGate =
   | 'open_lease'
   | 'board_cap'
   | 'agent_cap'
+  | 'epic_cap'
+  | 'daemon_cap'
   | 'verifier_unset'
   | 'verifier_is_worker'
   | 'verified'
@@ -63,6 +63,8 @@ export interface ClaimEligibilityInput {
   openRunCount: number
   openRunCountForAssignee: number
   openRunCountForVerifier: number
+  epicCapacity?: { openRunCount: number; maxActive: number }
+  daemonCapacity?: { openRunCount: number; maxActive: number }
   now: Date
 }
 
@@ -101,13 +103,54 @@ A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a bo
 | 15  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
 | 16  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
 | 17  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
-| 18  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+| 18  | `epic_cap`             | the epic child has no active slot left (work and verify both count)                        |
+| 19  | `daemon_cap`           | the target daemon is at its cross-board active cap                                         |
+| 20  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+
+Main's orchestrator caps apply to work and verify alike. Supply `epicCapacity` for an epic
+child and `daemonCapacity` when a daemon cap is configured; both counts include every open
+work and verify run (the daemon count spans boards). After liveness, the claim checks the
+epic cap, then the daemon cap, then B8. The optional facts preserve callers with no caps.
+The SQL serializes capped work and verify claims using the target daemon's advisory lock.
 
 `verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
 its cap and liveness checks; that is also where it flags the card for a human.
 `needs_attention` holds a flagged card in any status: B8 leaves its card in `review`, and
 a human-attributed status label the dispatcher ingests or an authorized owner restart clears the flag. Skip archives the card. Editing the board, such as fixing `verifierAgentId`, never
 releases it on its own.
+
+## The approval stamp and review rounds
+
+`verifiedAt` is the verifier's approval under `pr_merged`/`pr_checks_green`; the `verified`
+gate keeps such a card in `review` for its PR instead of verifying it again. Every path that
+starts a new review round clears the stamp:
+
+- a work claim (`claim()` in `kanban-dispatch.repo.ts`);
+- a worker's `completed` or `review_requested` run end, and a verifier's `changes_requested`
+  (`planRunEnd` in `cp/src/kanban/run-accounting.ts`);
+- a human status move, on both of its paths: a live human-attributed status label adopted by
+  the label sync (`PgKanbanSyncRepo.apply`, any accepted change of status) and the parked
+  human ingest (`PgKanbanDispatchRepo.ingestStatus`).
+
+A fail-closed attribution timeout moves `ready`/`running` to `triage` and leaves other
+statuses in place, including `review`. It revokes any open work or verify run and increments
+`dispatchRevision` with the revocation, so a late report cannot complete the card, set
+`verifiedAt`, or clear the `needsAttention: label_attribution_timeout` hold. An existing
+approval stamp remains stored, but the hold prevents dispatch until an attributed human
+status move clears it and the stamp. A non-writer's revert to `triage` also retains the stamp;
+the next work claim or human status move clears it before another review round.
+
+Timeout and run-end transactions lock the card before its run. A report waiting behind a
+timeout reads the committed revocation before testing its lease fence.
+
+`reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
+`triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
+approval resets it; a worker's pass and every human move keep it. So after a trip, a human
+who moves the card back to `ready` buys exactly **one more verify round**: the worker runs,
+the verifier reviews once, and a further `changes_requested` (round 4) sends the card straight
+back to `triage`, while an approval ends the loop and resets the count. This is deliberate:
+an agent can never reset the count, and a human who wants a full fresh budget must decide so
+again after each extra round.
 
 ## SQL/predicate parity rule
 
@@ -227,33 +270,76 @@ A `no_write` refusal is recorded and settled silently, with no GitHub reply or l
 write, so untrusted comments cannot amplify into App posts. `settledAt` marks it done. A redelivery of an unsettled row re-runs
 the effect; it does not re-decide. A lost CAS is re-read up to three times.
 
+One delivery at a time runs the effect. It first claims the row with a CAS on
+`effectClaimedAt` (migration `20261123200130_kanban_command_effect_claim`, DB clock): unsettled, and
+unclaimed or claimed longer ago than `COMMAND_EFFECT_TTL_MS` (5 minutes). A delivery that
+overlaps a live claim posts nothing and throws, so its GUID stays unlanded; the redelivery
+sweep (10-minute ticks) re-asks it, and by then the row is settled (`duplicate`). A failed effect
+releases its own claim so the next delivery retries at once; a holder that died is taken over
+after the TTL. Refusal plans carry the stable command-row id in a hidden marker.
+Before every refusal POST, including recovery after a crash, a lost POST response, or a
+failed `settledAt` write, the writer scans the issue's comments for this App bot's marker.
+A match skips the POST and lets settlement finish. A failed read or a history beyond ten
+100-comment pages fails closed without posting. Human or other bots' copies do not count.
+The marker is GitHub-side recovery metadata; no comment body is persisted in the CP.
+An applied move queues the Projects projection when it commits.
+
 ### PR completion contracts
+
+> **Inert until #416.** The binding below requires a head branch `ac/card-<issueNumber>`,
+> and no worker creates one before #416 (the write-card branch convention, on hold) lands.
+> Until then every `pr_merged` / `pr_checks_green` card that reaches `review` with a linked PR
+> waits on `pr_unbound`, flagged once (see below). Boards that need completion now should use
+> `close` with a verifier.
 
 The pure planner is in `cp/src/kanban/contracts.ts`:
 `planContract(input) → done | triage(pr_closed_unmerged) | wait(reason)` and
 `checksVerdict(runs) → green | pending | failed | none`.
 
 - The planner only judges cards that meet all of these: status `review`,
-  `completionContract` ≠ `close`, `linkedPrNumber` set, and no open run.
+  `completionContract` ≠ `close`, `linkedPrNumber` set, no open run, and no human hold.
+  A card with `needsAttention` is judged only when its reason is one of this PR's own
+  contract flags (`pr_unbound`, `actions_read_missing`, `merged_by_app` with
+  `<reason>#<linkedPrNumber>` in `contractFlags`). Any other reason, such as
+  `label_attribution_timeout` or `verifier_is_worker`, stays until a human moves the card.
+- The settle (`settleContract`) is one CAS on the judged card `stateRevision` and linked PR,
+  no open run, and the same hold rule, under a `FOR SHARE` lock on the board row at the
+  judged `configRevision` with `enabled` still set. A board edit (contract, verifier, or
+  disable) during the GitHub read therefore refuses the move, and the next judgement reads
+  the new configuration. A committed settle queues the Projects projection.
 - Before either completion or unmerged-close triage, the live PR must be bound to
   this card: author login `<appSlug>[bot]` with type `Bot`, head branch
   `ac/card-<issueNumber>` in the board's repository (no fork), and base equal to
   the repository's live default branch. Its `created_at` must be at or after
-  `linkedPrWorkStartedAt`, the start of the work run that reported this PR.
-  Missing provenance or any binding mismatch means `wait(pr_unbound)`, logged
-  with metadata only; it never completes or triages. Issue-closing references
-  alone are not authority. No PR bodies or issue text are read into CP state.
+  `workEpisodeStartedAt`, the start of the card's current work episode.
+  Missing provenance or any binding mismatch means `wait(pr_unbound)`; it never
+  completes or triages. Issue-closing references alone are not authority. No PR
+  bodies or issue text are read into CP state.
+- Waits no event can end on their own are raised once: `pr_unbound`,
+  `actions_read_missing`, and `merged_by_app` set `needsAttention` with that reason
+  and post one fixed-template, body-free App comment (PR number and reason code only).
+  The flag is a CAS on an unflagged, unleased `review` card at the judged
+  `stateRevision` that also records `<reason>#<pr>` in `kanban_card.contractFlags`, so
+  sweeps, doorbell redeliveries, and verifier re-checks never flag or comment twice for
+  the same `(card, reason, PR)`. Only the CAS winner comments (best effort, like every
+  post-commit write). A card a human already holds is not re-flagged; a newly reported
+  PR is. Other waits stay unflagged and are logged with metadata only.
 - A bound linked PR closed unmerged → `triage`, `needsAttention` with reason
   `pr_closed_unmerged`, and one comment. This happens whether or not a verifier is set.
 - `pr_merged`: the PR is merged and no verifier is configured, or `verifiedAt` is set
-  → `done`, and the issue closes as completed.
+  → `done`, and the issue closes as completed. With no verifier, a PR whose
+  `merged_by` is the App bot waits as `merged_by_app`: a write run's token can merge
+  its own PR on an unprotected base, so that merge proves nothing. A `pr_merged` board
+  needs branch protection on the default branch (required reviews) or a verifier.
 - `pr_checks_green`: the newest run of every check on the PR's live head has
   completed with `success`, `neutral`, or `skipped`, including at least one
   `success` → `done`, under the same verifier
   condition.
   - "Newest run of every check" means the highest run id for GitHub Actions per
-    `(app.id, workflowPath, name)`. The reader maps `check_suite.id` to
-    a workflow path through `GET /repositories/{id}/actions/runs?head_sha=<sha>`.
+    `(app.id, workflowPath, event, name)`. The reader maps `check_suite.id` to
+    a workflow path and its triggering event through
+    `GET /repositories/{id}/actions/runs?head_sha=<sha>`, so a `push` success never
+    hides a `pull_request` failure of the same job.
     Same-named jobs in different workflows stay independent; a new run in the
     same workflow supersedes its earlier run. Non-Actions apps and unmapped
     suites use `(app.id, check_suite.id, name)`, preserving `filter=latest`'s
@@ -261,19 +347,41 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   - A failure anywhere means `wait` (no flapping).
   - Neutral/skipped-only lists wait; at least one success is required.
   - No runs, or a check/workflow list truncated past 300 entries, never counts as green.
+  - The workflow lookup uses its own CP-only token, `mintKanbanActions`
+    (`actions:read` only). If that mint is refused or the runs list answers
+    403/404/422 (not a rate limit), the head is never green: the card waits as
+    `actions_read_missing`, flagged once. A visible failure still reads as
+    `checks_failed`. Transient errors throw and the sweep retries.
+  - Known gap: a required check that has not started yet is invisible, so one green
+    job can read as green. Rulesets' required contexts are readable with metadata
+    access, but a required context can be met by a commit status, which needs
+    `statuses:read` (a new permission); treating missing contexts as pending would
+    deadlock status-based repositories. The verifier remains the guard.
   - Configure an independent verifier for `pr_checks_green` boards: workers can
     edit workflows, and green checks alone do not prove the card's requirements.
   - A suite doorbell whose `headSha` is not the live head is ignored (`stale_doorbell`).
 - The CP re-reads the PR and its runs live, by repository id, with
-  `mintKanbanPr` (`pull_requests:read` + `checks:read` + `actions:read`, CP-only).
-- Migration `20261123200110_kanban_pr_binding` adds nullable
-  `kanban_card.linkedPrWorkStartedAt`. A fenced work report commits the linked PR
-  and its dispatch start together. A new work claim invalidates old provenance
-  until that work reports a PR, so a report omitting its PR cannot inherit an
-  earlier completion. Verifier reports cannot replace that binding;
-  `/kanban reopen` clears both. Existing links with no provenance wait for a new
-  work report. The conservative reporting-run boundary may require a fresh PR
-  after a retry, even when a prior attempt opened one.
+  `mintKanbanPr` (`pull_requests:read` + `checks:read`, CP-only), so `pr_merged`
+  never depends on `actions:read`.
+- The work episode (migration `20261123200120_kanban_work_episode`, which replaces
+  `20261123200110`'s `linkedPrWorkStartedAt`): the first work claim with no episode
+  stamps `workEpisodeStartedAt` from the claim's DB clock, under the card's row lock.
+  Rework claims (`changes_requested → ready → work`) and reassignment restarts keep it,
+  because the episode is per card and so is `ac/card-<n>`: a PR opened by attempt 1 still
+  binds when attempt 2 reports it (Vera's R2). A fenced work report sets
+  `linkedPrNumber`; a report omitting it keeps the episode's PR. Verifier reports never
+  replace it. Leaving `done` (or `archived`) ends the episode, clearing `workEpisodeStartedAt`,
+  `linkedPrNumber`, and `contractFlags`, on every path: `/kanban reopen`, the label sync's
+  `apply` (a human status move or an issue reopened on GitHub), the parked ingest, and every
+  `applyCardTransition` write, which includes `casStatus` (the orchestrator's epic-budget
+  fallback to `triage`).
+  The migration backfills `running`/`review` cards conservatively (the old reporting-run
+  stamp, else their latest work claim); other cards stamp at their next work claim.
+  A card in `ready` or `blocked` between rework rounds at deploy time therefore starts a new
+  episode at its next claim, and attempt 1's PR is flagged `pr_unbound` once. That is
+  acceptable while contracts are inert.
+- Known gap: a base branch renamed after merge leaves the merged PR's old `base.ref`,
+  so the card waits as `pr_unbound` (flagged once). It fails closed; a human moves it.
 - `done` resets `reviewRounds` and `verifiedAt`.
 - Triggers:
   - the `pull_request` and `check_suite` doorbells;
@@ -289,8 +397,12 @@ the frame, and keeps the link up; the redelivery sweep re-asks the delivery once
 CP is upgraded. An old relay simply never sends these frames.
 
 The App manifest already subscribes `issue_comment`, `pull_request`, `check_run`, and
-`check_suite`, and already grants `checks`, `pull_requests`, and `actions`.
-No re-consent is needed. Apply the new migration before starting the new CP, and
+`check_suite`, and the setup manifest grants `checks`, `pull_requests`, and `actions`.
+⚠️ A live App or installation created before that grant needs App permission re-consent
+for `actions:read`: MD's approval of the permission change, and every installation
+accepting it, come **before** this deploys. Without it `pr_merged` still works, and
+`pr_checks_green` cards with Actions checks wait as `actions_read_missing`. Apply the
+migrations (`20261123200100`, `…200110`, `…200120`, `…200130`) before starting the new CP, and
 upgrade the CP before emitting `command.viaApp` from the relay. Its optional
 boolean is additive for new decoders; an old strict decoder rejects it, leaving
 the delivery eligible for redelivery after upgrade.
@@ -303,20 +415,37 @@ reads a binding override from configuration or environment.
 
 ## Changelog
 
+- **1.4 (2026-10-20):** add the required `board.paused` fact and the `board_paused` gate
+  immediately after `board_disabled` (#416), preserving 1.1 review routing, `verified`,
+  `needs_attention`, the 1.2 epic/daemon caps and any-attempt B8 ordering.
+
+- **1.3 (2026-10-20):** PR contracts bind against the card's work episode
+  (`workEpisodeStartedAt`), not the reporting run; `pr_unbound`, `actions_read_missing`
+  and `merged_by_app` are flagged once per `(card, reason, PR)`; the workflow lookup moves
+  to its own `actions:read` token; check identity adds the triggering event. Contracts stay
+  inert until #416's branch convention lands.
+
+- **1.2 (2026-10-19):** add optional epic and daemon capacity facts and matching gates for
+  main's orchestrator caps. Work and verify claims share those caps and daemon locks.
+
 - **1.1 (2026-10-18):**
   - Review routing lands in the predicate: a `review` card is a `verify` claim to
     `verifierAgentId` with the verifier's agent facts and `openRunCountForVerifier`, and
     `verifier_unset`/`verifier_is_worker` now fire.
   - New `verified` gate (input `card.verifiedAt`): a card the verifier approved under
     `pr_merged`/`pr_checks_green` stays in `review` for the PR and is never re-verified. A work
-    claim, a worker's pass, `changes_requested`, and a human status move clear the stamp, so the
-    next review round is verifiable again.
+    claim, a worker's pass, `changes_requested`, and a human status move (the label sync's
+    `apply` and the parked ingest alike) clear the stamp, so the next review round is
+    verifiable again. See "The approval stamp and review rounds".
   - B8 compares the verifier against every work attempt on the card: input `latestWorkAgentId`
     is replaced by `workAgentIds`.
   - New `needs_attention` gate (input `card.needsAttention`): the claim no longer takes a flagged
     card, so a board edit alone cannot lift a B8 park; only the human status move clears the flag.
   - Gates are reordered to the SQL claim's order: `open_lease` joins the row filters before the
     agent gates, and `daemon_offline` follows `agent_cap`, with `verifier_is_worker` last.
+- **1.1 erratum (2026-10-18):** the 1.1 entry said every human status move clears
+  `verifiedAt`, but only the parked ingest did; after the merge with the label sync (#194), its
+  `apply` clears it too, so the statement now holds. The predicate and its inputs are unchanged.
 - **1.0 (2026-10-17):** initial frozen contract.
 
 ## 3c

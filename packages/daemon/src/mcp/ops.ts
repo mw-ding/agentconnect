@@ -166,7 +166,14 @@ import {
   ASSISTANT_SUBSESSION_HANDLERS,
   type AssistantSubsessionDeps
 } from './ops/assistant-subsessions.js'
-import { KANBAN_ARG_SCHEMAS, KANBAN_HANDLERS, type KanbanDeps } from './ops/kanban.js'
+import {
+  KANBAN_ARG_SCHEMAS,
+  KANBAN_HANDLERS,
+  KANBAN_ORCHESTRATOR_ARG_SCHEMAS,
+  KANBAN_ORCHESTRATOR_HANDLERS,
+  type KanbanDeps,
+  type KanbanOrchestratorToolDeps
+} from './ops/kanban.js'
 
 export type { McpContentResult, MessageGateway, SendIdentity, SessionContext } from './ops/context.js'
 export type { ChannelAgentsRequest } from './ops/directory.js'
@@ -218,7 +225,8 @@ export interface OpsDeps
     AssistantItemDeps,
     AssistantReminderDeps,
     AssistantSubsessionDeps,
-    KanbanDeps {
+    KanbanDeps,
+    KanbanOrchestratorToolDeps {
   /** Rejected tool arguments are logged here at debug, key names only — the sole trace of them (#1921). */
   log?: Pick<Logger, 'debug'>
   /** Fail-closed turn gate checked before every daemon bridge tool. Used to make
@@ -330,7 +338,8 @@ const HANDLERS: Map<string, ToolHandler<OpsDeps>> = new Map<string, ToolHandler<
   ['firstLook', firstLook],
   ...ASSISTANT_REMINDER_HANDLERS,
   ...ASSISTANT_SUBSESSION_HANDLERS,
-  ...KANBAN_HANDLERS
+  ...KANBAN_HANDLERS,
+  ...KANBAN_ORCHESTRATOR_HANDLERS
 ])
 
 /**
@@ -404,6 +413,7 @@ export const TOOL_ARG_SCHEMAS: Map<string, ZodType> = new Map<string, ZodType>([
   ...ASSISTANT_REMINDER_ARG_SCHEMAS,
   ...ASSISTANT_SUBSESSION_ARG_SCHEMAS,
   ...KANBAN_ARG_SCHEMAS,
+  ...KANBAN_ORCHESTRATOR_ARG_SCHEMAS,
   // The session's own conversation is read from trusted context alone — no arguments.
   ['getCurrentChannel', z.object({})],
   // One body serves every platform's credentialed attachment read, so one schema does too.

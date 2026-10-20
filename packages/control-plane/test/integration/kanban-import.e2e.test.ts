@@ -40,8 +40,8 @@ describe.skipIf(!enabled)('Kanban import E2E (live GitHub)', () => {
       })
       boards.push(board.id)
       const cards = new PgKanbanCardRepo(prisma)
-      const store = new GithubCardStore({ tokens })
       const live = new GithubRepoPermission({ tokens, ttlMs: 0 })
+      const store = new GithubCardStore({ tokens, permissions: live })
       expect(await live.permission(repoRef, 'mw-ding')).toBe('admin')
       if (level === 'read') expect(hasWriteAccess(await live.permission(repoRef, 'octocat'))).toBe(false)
       const permission = vi.fn((r: typeof repoRef, login: string) =>

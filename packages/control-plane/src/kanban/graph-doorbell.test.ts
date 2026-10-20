@@ -94,16 +94,26 @@ describe('KanbanGraphDoorbell', () => {
 
   it('hands an issues status poke to onCard without reading the graph', async () => {
     const h = make()
-    h.doorbell.poke(poke({ event: 'issues', action: 'labeled', ids: ['9001'], numbers: [7] }))
+    h.doorbell.poke(
+      poke({
+        event: 'issues',
+        action: 'labeled',
+        ids: ['9001'],
+        numbers: [7],
+        sender: { login: 'alice', id: '12345', type: 'User' },
+        label: 'ac/status:ready',
+        at: '2026-10-17T12:34:56.000Z'
+      })
+    )
     await h.doorbell.settle()
     expect(h.readGraph).not.toHaveBeenCalled()
     expect(h.onGraph).not.toHaveBeenCalled()
-    expect(h.onCard).toHaveBeenCalledWith(
-      BOARD,
-      { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' },
-      7,
-      'labeled'
-    )
+    expect(h.onCard).toHaveBeenCalledWith(BOARD, { installationId: 111n, repoId: 42n, repoFullName: 'acme/web' }, 7, {
+      action: 'labeled',
+      sender: { login: 'alice', id: 12345, type: 'User' },
+      label: 'ac/status:ready',
+      at: '2026-10-17T12:34:56.000Z'
+    })
     expect(h.doorbell.landedDeliveryKeys(['guid-1'])).toEqual(new Set(['guid-1']))
   })
 

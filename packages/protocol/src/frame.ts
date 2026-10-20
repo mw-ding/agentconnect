@@ -73,6 +73,8 @@ import {
   CodeHostReviewResultReport
 } from './frames/codehost-review.js'
 import {
+  KanbanRevoke,
+  KanbanRevokeOk,
   KanbanCardShow,
   KanbanCardShowOk,
   KanbanDispatch,
@@ -81,6 +83,8 @@ import {
   KanbanLeaseHeartbeatOk,
   KanbanNotify,
   KanbanNotifyOk,
+  KanbanOrchestrate,
+  KanbanOrchestrateOk,
   KanbanReport,
   KanbanReportOk
 } from './frames/kanban.js'
@@ -413,6 +417,8 @@ export const FRAME_SCHEMAS = {
   'codehost/review-result': CodeHostReviewResultReport,
   'codehost/review-result/ok': CodeHostReviewResultOk,
   // ── kanban dispatch (issue #2 M2; body-free ids + lease fence only) ──
+  'kanban/revoke': KanbanRevoke,
+  'kanban/revoke/ok': KanbanRevokeOk,
   'kanban/dispatch': KanbanDispatch,
   'kanban/dispatch/ok': KanbanDispatchOk,
   'kanban/lease-heartbeat': KanbanLeaseHeartbeat,
@@ -423,6 +429,8 @@ export const FRAME_SCHEMAS = {
   'kanban/card/ok': KanbanCardShowOk,
   'kanban/notify': KanbanNotify,
   'kanban/notify/ok': KanbanNotifyOk,
+  'kanban/orchestrate': KanbanOrchestrate,
+  'kanban/orchestrate/ok': KanbanOrchestrateOk,
   // ── integrations (platform config distribution; token-bearing — never log) ──
   'integration/upsert': IntegrationUpsert,
   'integration/remove': IntegrationRemove,
@@ -801,6 +809,8 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('codehost/review-lease-renew/ok', FRAME_SCHEMAS['codehost/review-lease-renew/ok']),
   frame('codehost/review-result', FRAME_SCHEMAS['codehost/review-result']),
   frame('codehost/review-result/ok', FRAME_SCHEMAS['codehost/review-result/ok']),
+  frame('kanban/revoke', FRAME_SCHEMAS['kanban/revoke']),
+  frame('kanban/revoke/ok', FRAME_SCHEMAS['kanban/revoke/ok']),
   frame('kanban/dispatch', FRAME_SCHEMAS['kanban/dispatch']),
   frame('kanban/dispatch/ok', FRAME_SCHEMAS['kanban/dispatch/ok']),
   frame('kanban/lease-heartbeat', FRAME_SCHEMAS['kanban/lease-heartbeat']),
@@ -811,6 +821,8 @@ export const AnyFrame = z.discriminatedUnion('type', [
   frame('kanban/card/ok', FRAME_SCHEMAS['kanban/card/ok']),
   frame('kanban/notify', FRAME_SCHEMAS['kanban/notify']),
   frame('kanban/notify/ok', FRAME_SCHEMAS['kanban/notify/ok']),
+  frame('kanban/orchestrate', FRAME_SCHEMAS['kanban/orchestrate']),
+  frame('kanban/orchestrate/ok', FRAME_SCHEMAS['kanban/orchestrate/ok']),
   frame('integration/upsert', FRAME_SCHEMAS['integration/upsert']),
   frame('integration/remove', FRAME_SCHEMAS['integration/remove']),
   frame('integration/channels', FRAME_SCHEMAS['integration/channels']),

@@ -11,6 +11,9 @@ import {
   PROVIDER_CREDENTIALS_V1_FEATURE
 } from '@agentconnect.md/protocol'
 import { CpClient, type CpClientDeps } from '../../src/cp/client.js'
+import { CONTROL_HANDLERS } from '../../src/cp/control/registry.js'
+import { kanbanDispatch, kanbanNotify, kanbanRevoke } from '../../src/cp/control/kanban.js'
+import { KANBAN_HANDLERS, kanbanRequestChanges } from '../../src/mcp/ops/kanban.js'
 import { WorkspaceConflictError, WorkspaceViolationError } from '../../src/cp/workspace-reader.js'
 import {
   MemoryHistoryNotLocalError,
@@ -402,6 +405,62 @@ describe('CpClient dispatch', () => {
       frame('kanban/report/ok', { leaseId: DAEMON_ID, accepted: false, reason: 'superseded' }, { corr: report.id })
     )
     await expect(reporting).resolves.toMatchObject({ accepted: false, reason: 'superseded' })
+    await client.stop()
+  })
+
+  it("vera-414-merge: 4 registers both sides' kanban frames: #194's revoke pair, #414's notify, and request-changes", async () => {
+    expect(CONTROL_HANDLERS.get('kanban/revoke')).toBe(kanbanRevoke)
+    expect(CONTROL_HANDLERS.get('kanban/dispatch')).toBe(kanbanDispatch)
+    expect(CONTROL_HANDLERS.get('kanban/notify')).toBe(kanbanNotify)
+    expect(new Map(KANBAN_HANDLERS).get('kanbanRequestChanges')).toBe(kanbanRequestChanges)
+    const revoke = vi.fn(async () => {})
+    const notify = vi.fn(async (n: { notifyId: string }) => ({ notifyId: n.notifyId, ok: true }))
+    const { t, client } = await readyClient({ kanbanRevoke: revoke, kanbanNotify: notify })
+
+    const revocation = buildEnvelope('kanban/revoke', { leaseId: DAEMON_ID, cardId: MOVE_ID })
+    t.pushInbound(JSON.stringify(revocation))
+    await tick()
+    expect(revoke).toHaveBeenCalledWith({ leaseId: DAEMON_ID, cardId: MOVE_ID })
+    expect(t.lastSent()).toMatchObject({
+      type: 'kanban/revoke/ok',
+      corr: revocation.id,
+      payload: { leaseId: DAEMON_ID }
+    })
+
+    const note = {
+      notifyId: CRON_ID,
+      boardId: CRON_ID,
+      cardId: MOVE_ID,
+      repoFullName: 'acme/web',
+      issueNumber: 42,
+      from: 'review',
+      to: 'ready',
+      target: { platform: 'slack', channel: 'C0ANCHOR', integrationId: CRON_AGENT_ID }
+    }
+    const notification = buildEnvelope('kanban/notify', note as never)
+    t.pushInbound(JSON.stringify(notification))
+    await tick()
+    expect(notify).toHaveBeenCalledWith(note)
+    expect(t.lastSent()).toMatchObject({
+      type: 'kanban/notify/ok',
+      corr: notification.id,
+      payload: { notifyId: CRON_ID, ok: true }
+    })
+
+    // A verifier's kanbanRequestChanges ends as a changes_requested report the wire schema accepts.
+    const reporting = client.kanbanReport({
+      boardId: CRON_ID,
+      cardId: MOVE_ID,
+      agentId: CRON_AGENT_ID,
+      leaseId: DAEMON_ID,
+      attempt: 2,
+      dispatchRevision: '4',
+      outcome: 'changes_requested'
+    })
+    const report = t.lastSent()
+    expect(report).toMatchObject({ type: 'kanban/report', payload: { outcome: 'changes_requested' } })
+    t.pushInbound(frame('kanban/report/ok', { leaseId: DAEMON_ID, accepted: true }, { corr: report.id }))
+    await expect(reporting).resolves.toMatchObject({ accepted: true })
     await client.stop()
   })
 

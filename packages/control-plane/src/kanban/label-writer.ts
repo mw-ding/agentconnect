@@ -1,5 +1,5 @@
 // Kanban label/close writer (issue #2 D3/D5): the only CP path that writes card metadata to GitHub, via the CP-only card token.
-import { GithubApiError, githubRequest, type FetchLike } from '../github/api.js'
+import { GithubApiError, githubRequest, githubRequestPage, type FetchLike, type GithubPage } from '../github/api.js'
 import type { InstallationTokenService } from '../github/installation-token.service.js'
 import type { LabelPlan, ObservedIssue } from './card-state.js'
 import type { KanbanRepoRef, LabelWriteObserver } from './card-store.js'
@@ -8,6 +8,12 @@ export interface KanbanLabelWriterDeps {
   tokens: Pick<InstallationTokenService, 'mintKanbanCard'>
   fetchImpl?: FetchLike
   baseUrl?: string
+  appSlug?: string
+}
+
+interface MarkedComment {
+  body?: string
+  user?: { login?: string; type?: string }
 }
 
 export class KanbanLabelWriter {
@@ -50,6 +56,35 @@ export class KanbanLabelWriter {
     } else if (plan.issueState?.state === 'open') {
       await call('', 'PATCH', { state: 'open', state_reason: 'reopened' })
     }
-    if (plan.comment) await call('/comments', 'POST', { body: plan.comment })
+    if (plan.comment) {
+      const marker = plan.commentKey ? `<!-- agentconnect-kanban:${plan.commentKey} -->` : undefined
+      if (marker && (await this.hasComment(repo, issueNumber, marker, grant.token))) return
+      await call('/comments', 'POST', { body: marker ? `${plan.comment}\n\n${marker}` : plan.comment })
+    }
+  }
+
+  // A failed or incomplete read never authorizes a POST; writes are never retried blind by githubRequest.
+  private async hasComment(repo: KanbanRepoRef, issueNumber: number, marker: string, token: string): Promise<boolean> {
+    if (!this.deps.appSlug) throw new Error('kanban: App identity required for comment recovery')
+    let path: string | undefined = `/repositories/${repo.repoId}/issues/${issueNumber}/comments?per_page=100`
+    for (let page = 0; path && page < 10; page++) {
+      const result: GithubPage<MarkedComment[]> = await githubRequestPage<MarkedComment[]>(path, {
+        auth: token,
+        fetchImpl: this.deps.fetchImpl,
+        baseUrl: this.deps.baseUrl
+      })
+      if (
+        result.data.some(
+          (comment) =>
+            comment.user?.type === 'Bot' &&
+            comment.user.login?.toLowerCase() === `${this.deps.appSlug}[bot]`.toLowerCase() &&
+            comment.body?.split('\n').includes(marker)
+        )
+      )
+        return true
+      path = result.nextPath
+    }
+    if (path) throw new Error('kanban: comment recovery exceeded the page bound')
+    return false
   }
 }

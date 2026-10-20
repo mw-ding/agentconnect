@@ -2548,12 +2548,18 @@ model KanbanBoard {
   targetIntegrationId   String?                  @db.Uuid
   maxInProgress         Int                      @default(1)
   maxInProgressPerAgent Int                      @default(1)
+  // B2 per-epic budgets: how many children an epic may decompose (lifetime) and run concurrently.
+  epicMaxCards          Int                      @default(100)
+  epicMaxActive         Int                      @default(16)
   staleLeaseSec         Int                      @default(14400)
   failureLimit          Int                      @default(2)
   protocolRetryLimit    Int                      @default(3)
   blockRecurrenceLimit  Int                      @default(2)
   defaultMode           KanbanRunMode            @default(read)
   completionContract    KanbanCompletionContract @default(close)
+  // Optional one-way Projects v2 `Status` projection (org-owned projects only); both set or both null (CHECK).
+  projectNodeId         String?
+  statusFieldId         String?
   enabled               Boolean                  @default(true)
   // A paused board claims nothing, but its reaper, reports, heartbeats, label sync, graph promotion and doorbells keep running.
   paused                Boolean                  @default(false)
@@ -2590,9 +2596,14 @@ model KanbanCard {
   boardId             String           @db.Uuid
   issueId             BigInt // GitHub numeric issue id (what graph webhooks name)
   issueNodeId         String? // GraphQL node id, filled on first GitHub read
+  projectItemId       String? // cached ProjectV2Item id on the board's project, so later Status writes skip the add
+  projectItemProjectId String? // the project projectItemId belongs to; an item cached for another project is never reused
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?
+  // B2: the epic card this card decomposes; archiving a child never refunds epicCardsCreated.
+  epicCardId          String?          @db.Uuid
+  epicCardsCreated    Int              @default(0)
   mode                KanbanRunMode?
   modeRevision        Int              @default(0)
   status              KanbanCardStatus @default(triage)
@@ -2627,27 +2638,40 @@ model KanbanCard {
   needsAttention          Boolean   @default(false)
   attentionReason         String?
   linkedPrNumber      Int?
-  // The work run that reported this PR is its conservative creation-time boundary.
-  linkedPrWorkStartedAt DateTime? @db.Timestamptz(6)
+  // DB-clock start of the current work episode (first work claim since creation or reopen); only PRs created after it bind.
+  workEpisodeStartedAt DateTime? @db.Timestamptz(6)
+  // `<reason>#<pr>` keys of contract waits already flagged once in this episode (pr_unbound, actions_read_missing, …).
+  contractFlags        String[]  @default([])
   // Bumped on every reassignment so a superseded run's late writes fail the fence (spike §5).
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
+  labelWritePending Boolean @default(false)
+  syncEventCursor BigInt @default(0)
+  syncAgentCursor BigInt @default(0)
+  syncCheckedAt DateTime? @db.Timestamptz(6)
+  // Label-sync deferral: a pass that cannot attribute a live label yet is retried until this bound fails closed.
+  syncDeferredAt DateTime? @db.Timestamptz(6)
+  syncDeferralCount Int @default(0)
   githubSyncedAt      DateTime?        @db.Timestamptz(6)
   createdAt           DateTime         @default(now()) @db.Timestamptz(6)
   updatedAt           DateTime         @updatedAt @db.Timestamptz(6)
 
   board         KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)
   assigneeAgent Agent?      @relation(fields: [assigneeAgentId], references: [id], onDelete: SetNull)
+  epicCard      KanbanCard? @relation("KanbanCardEpic", fields: [epicCardId], references: [id], onDelete: SetNull)
+  epicChildren  KanbanCard[] @relation("KanbanCardEpic")
   runs          KanbanRun[]
   commands      KanbanCommand[]
   notifications KanbanNotification[]
 
   @@unique([boardId, issueId])
   @@unique([boardId, issueNumber])
+  @@index([boardId, syncCheckedAt])
   @@unique([boardId, idempotencyKey])
   @@index([issueId]) // graph doorbell lookup
   @@index([boardId, status])
   @@index([assigneeAgentId])
+  @@index([epicCardId])
   @@map("kanban_card")
 }
 
@@ -2693,6 +2717,8 @@ model KanbanCommand {
   toStatus   KanbanCardStatus?
   // The GitHub effect (label/reopen write or the one refusal comment) landed; null re-runs it on the next delivery.
   settledAt  DateTime?         @db.Timestamptz(6)
+  // The delivery running the effect (DB clock); another waits until it settles, releases, or its claim outlives the TTL.
+  effectClaimedAt DateTime? @db.Timestamptz(6)
   createdAt  DateTime          @default(now()) @db.Timestamptz(6)
 
   board KanbanBoard @relation(fields: [boardId], references: [id], onDelete: Cascade)

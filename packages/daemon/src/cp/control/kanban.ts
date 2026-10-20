@@ -3,11 +3,13 @@ import type {
   KanbanDispatch,
   KanbanDispatchOk,
   KanbanNotify,
-  KanbanNotifyOk
+  KanbanNotifyOk,
+  KanbanRevoke
 } from '@agentconnect.md/protocol'
 import type { ControlHandler } from './context.js'
 
 export interface KanbanControlDeps {
+  kanbanRevoke?: (req: KanbanRevoke) => Promise<void>
   /** Admit one leased Kanban card (issue #2 M2); absent ⇒ every dispatch is refused as `no_agent`. */
   kanbanDispatch?: (dispatch: KanbanDispatch) => Promise<KanbanDispatchOk>
   /** Post one Kanban transition notification in the anchor channel (issue #2 M4). */
@@ -39,5 +41,16 @@ export const kanbanNotify: ControlHandler<KanbanControlDeps> = async (frame: Any
     )
   } catch {
     wire.sendError(frame.id, 'INTERNAL', 'kanban notification failed', true)
+  }
+}
+
+export const kanbanRevoke: ControlHandler<KanbanControlDeps> = async (frame, deps, wire) => {
+  const req = frame.payload as KanbanRevoke
+  try {
+    if (!deps.kanbanRevoke) return wire.sendError(frame.id, 'INTERNAL', 'kanban revocation unavailable', true)
+    await deps.kanbanRevoke(req)
+    wire.reply(frame, 'kanban/revoke/ok', { leaseId: req.leaseId })
+  } catch {
+    wire.sendError(frame.id, 'INTERNAL', 'kanban revocation failed', true)
   }
 }

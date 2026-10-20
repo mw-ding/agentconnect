@@ -1,14 +1,7 @@
 name: Release
 
-# Only branch pushes start releases; tag pushes must not start another workflow run.
+# Manual only: nothing in this repository starts a release automatically.
 on:
-  push:
-    branches:
-      - main
-      - release
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
   workflow_dispatch:
 
 jobs:

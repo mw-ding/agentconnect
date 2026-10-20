@@ -14,10 +14,18 @@ import {
   KanbanLeaseHeartbeat,
   KanbanNotify,
   KanbanNotifyOk,
+  KanbanOrchestrate,
+  KanbanOrchestrateOk,
   KanbanReasonCode,
   KanbanReport,
   KanbanReportOk,
+  KanbanRevoke,
+  KANBAN_ORCHESTRATE_REFUSAL_CODES,
   buildEnvelope,
+  kanbanCardKey,
+  kanbanCardKeyMarker,
+  kanbanOrchestrateCardKey,
+  parseKanbanCardKeyMarker,
   decodeEnvelope,
   isFrame
 } from '../index.js'
@@ -53,6 +61,14 @@ const report = {
 }
 
 describe('kanban wire (issue #2 M2)', () => {
+  it('kanban/revoke addresses only a card lease and rejects free text', () => {
+    const req = { cardId: CARD, leaseId: LEASE }
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/revoke', req))).ok).toBe(true)
+    expect(KanbanRevoke.safeParse({ ...req, body: 'secret' }).success).toBe(false)
+    expect(KanbanRevoke.safeParse({ ...req, leaseId: 'invalid' }).success).toBe(false)
+    expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/revoke/ok', { leaseId: LEASE }))).ok).toBe(true)
+  })
+
   it('kanban/dispatch is a body-free lease grant (ids + fence only, strict)', () => {
     const decoded = decodeEnvelope(JSON.stringify(buildEnvelope('kanban/dispatch', dispatch)))
     expect(decoded.ok).toBe(true)
@@ -205,6 +221,165 @@ describe('kanban wire (issue #2 M2)', () => {
       }).success
     ).toBe(false)
   })
+
+  it('kanban/orchestrate is discriminated by op and body-free (title/body/text rejected everywhere)', () => {
+    const create = {
+      agentId: AGENT,
+      boardId: BOARD,
+      step: 'decompose.login',
+      specDigest: 'a'.repeat(64)
+    }
+    const commit = { ...create, issueNumber: 42 }
+    const cases: Array<Record<string, unknown>> = [
+      { op: 'list', agentId: AGENT },
+      { op: 'list', agentId: AGENT, boardId: BOARD, status: 'todo' },
+      { op: 'prepare_create', ...create },
+      { op: 'prepare_create', ...create, assignee: 'ash', priority: 2, status: 'todo' },
+      { op: 'commit_create', ...commit },
+      { op: 'commit_create', ...commit, blockedBy: [1, 2] },
+      { op: 'link', agentId: AGENT, boardId: BOARD, issueNumber: 7, blockedBy: [3], parentIssueNumber: 1 },
+      { op: 'unblock', agentId: AGENT, boardId: BOARD, issueNumber: 7 },
+      { op: 'unblock', agentId: AGENT, boardId: BOARD, issueNumber: 7, blockers: [3] },
+      { op: 'assign', agentId: AGENT, boardId: BOARD, issueNumber: 7, assignee: 'ash' },
+      { op: 'assign', agentId: AGENT, boardId: BOARD, issueNumber: 7, assignee: null }
+    ]
+    for (const payload of cases) {
+      expect(KanbanOrchestrate.safeParse(payload).success, JSON.stringify(payload)).toBe(true)
+      expect(decodeEnvelope(JSON.stringify(buildEnvelope('kanban/orchestrate', payload))).ok).toBe(true)
+    }
+    // Every request carries the agent id and (except list) the board id; no issue text of any kind crosses.
+    const list = { op: 'list' }
+    expect(KanbanOrchestrate.safeParse(list).success).toBe(false)
+    const noBoard = { op: 'prepare_create', agentId: AGENT, step: 's', specDigest: 'a'.repeat(64) }
+    expect(KanbanOrchestrate.safeParse(noBoard).success).toBe(false)
+    for (const key of ['title', 'body', 'text']) {
+      expect(KanbanOrchestrate.safeParse({ ...commit, [key]: 'secret' }).success, key).toBe(false)
+      expect(KanbanOrchestrate.safeParse({ ...create, [key]: 'secret' }).success, key).toBe(false)
+    }
+    // Malformed identities: bad step, non-hex spec digest, oversized blocker list, bad slug.
+    expect(KanbanOrchestrate.safeParse({ ...create, step: 'Bad Step!' }).success).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ ...create, step: 'x'.repeat(65) }).success).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ ...create, specDigest: 'ZZ'.repeat(32) }).success).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ ...create, specDigest: 'a'.repeat(63) }).success).toBe(false)
+    expect(
+      KanbanOrchestrate.safeParse({ ...commit, blockedBy: Array.from({ length: 21 }, (_, i) => i + 1) }).success
+    ).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ ...create, assignee: 'UPPER CASE' }).success).toBe(false)
+    expect(
+      KanbanOrchestrate.safeParse({ op: 'assign', agentId: AGENT, boardId: BOARD, issueNumber: 1, assignee: 'UPPER' })
+        .success
+    ).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ ...create, status: 'ready' }).success).toBe(false)
+  })
+
+  it('kanban/orchestrate bounds blockers, priority, and the list reply', () => {
+    const base = { agentId: AGENT, boardId: BOARD, issueNumber: 7 }
+    const many = Array.from({ length: 21 }, (_, i) => i + 1)
+    expect(KanbanOrchestrate.safeParse({ op: 'unblock', ...base, blockers: many }).success).toBe(false)
+    expect(KanbanOrchestrate.safeParse({ op: 'unblock', ...base, blockers: many.slice(0, 20) }).success).toBe(true)
+    expect(KanbanOrchestrate.safeParse({ op: 'link', ...base, blockedBy: many }).success).toBe(false)
+    const create = { op: 'prepare_create', agentId: AGENT, boardId: BOARD, step: 's', specDigest: 'a'.repeat(64) }
+    for (const priority of [-1000, 0, 1000]) {
+      expect(KanbanOrchestrate.safeParse({ ...create, priority }).success, String(priority)).toBe(true)
+    }
+    for (const priority of [-1001, 1001, 2 ** 31, 1.5]) {
+      expect(KanbanOrchestrate.safeParse({ ...create, priority }).success, String(priority)).toBe(false)
+    }
+    const list = (boards: unknown[]) => KanbanOrchestrateOk.safeParse({ ok: true, op: 'list', truncated: true, boards })
+    const card = {
+      issueNumber: 1,
+      status: 'todo',
+      assigneeAgentId: null,
+      assigneeSlug: null,
+      priority: 0,
+      blockKind: null,
+      epicIssueNumber: null,
+      leased: false
+    }
+    const board = (over: Record<string, unknown> = {}) => ({
+      boardId: BOARD,
+      repoFullName: 'acme/web',
+      cards: [],
+      ...over
+    })
+    expect(list([board({ cards: Array.from({ length: 200 }, () => card) })]).success).toBe(true)
+    expect(list([board({ cards: Array.from({ length: 201 }, () => card) })]).success).toBe(false)
+    expect(list(Array.from({ length: 101 }, () => board())).success).toBe(false)
+    for (const repoFullName of ['acme', 'acme/web/x', '-acme/web', 'acme/we b', '']) {
+      expect(list([board({ repoFullName })]).success, repoFullName).toBe(false)
+    }
+    expect(list([board({ repoFullName: 'Acme-Org/web.site_2' })]).success).toBe(true)
+  })
+
+  it('every refusal code rides kanban/orchestrate/ok', () => {
+    for (const code of KANBAN_ORCHESTRATE_REFUSAL_CODES) {
+      expect(KanbanOrchestrateOk.safeParse({ ok: false, op: 'commit_create', code }).success, code).toBe(true)
+    }
+    expect(KANBAN_ORCHESTRATE_REFUSAL_CODES).toEqual(
+      expect.arrayContaining(['repo_mismatch', 'status_not_allowed', 'card_conflict'])
+    )
+  })
+
+  it('the B1 key helper keys on the epic issue number (or the board) and its marker round-trips', () => {
+    const digest = 'b'.repeat(64)
+    expect(kanbanOrchestrateCardKey({ boardId: BOARD, epicIssueNumber: 5, step: 's', specDigest: digest })).toBe(
+      kanbanCardKey({ epic: '5', step: 's', spec: digest })
+    )
+    expect(kanbanOrchestrateCardKey({ boardId: BOARD, step: 's', specDigest: digest })).toBe(
+      kanbanCardKey({ epic: `board:${BOARD}`, step: 's', spec: digest })
+    )
+    const key = kanbanOrchestrateCardKey({ boardId: BOARD, step: 's', specDigest: digest })
+    expect(parseKanbanCardKeyMarker(`body text\n\n${kanbanCardKeyMarker(key)}\n`)).toBe(key)
+    expect(parseKanbanCardKeyMarker('no marker')).toBeNull()
+    expect(parseKanbanCardKeyMarker(null)).toBeNull()
+    expect(parseKanbanCardKeyMarker('<!-- agentconnect:kanban-card-key:XYZ -->')).toBeNull()
+    expect(() => kanbanCardKeyMarker('not-hex')).toThrow()
+  })
+
+  it('kanban/orchestrate/ok answers data or a stable refusal code', () => {
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'prepare_create', verdict: 'proceed' }).success).toBe(true)
+    expect(
+      KanbanOrchestrateOk.safeParse({ ok: true, op: 'prepare_create', verdict: 'existing', issueNumber: 5 }).success
+    ).toBe(true)
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'commit_create', cardId: CARD, issueNumber: 5 }).success).toBe(
+      true
+    )
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'link' }).success).toBe(true)
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'unblock', status: 'todo' }).success).toBe(true)
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'unblock', status: 'todo', truncated: true }).success).toBe(
+      true
+    )
+    expect(KanbanOrchestrateOk.safeParse({ ok: true, op: 'assign', assigned: false }).success).toBe(true)
+    expect(
+      KanbanOrchestrateOk.safeParse({
+        ok: true,
+        op: 'list',
+        truncated: false,
+        boards: [{ boardId: BOARD, repoFullName: 'acme/web', cards: [] }]
+      }).success
+    ).toBe(true)
+    expect(
+      KanbanOrchestrateOk.safeParse({ ok: false, op: 'prepare_create', code: 'epic_budget_exhausted' }).success
+    ).toBe(true)
+    expect(KanbanOrchestrateOk.safeParse({ ok: false, op: 'prepare_create', code: 'not_a_code' }).success).toBe(false)
+    expect(KanbanOrchestrateOk.safeParse({ ok: false, op: 'prepare_create' }).success).toBe(false)
+    // The reply is body-free too: a title on any ok shape is rejected.
+    expect(
+      KanbanOrchestrateOk.safeParse({ ok: true, op: 'commit_create', cardId: CARD, issueNumber: 5, title: 'x' }).success
+    ).toBe(false)
+  })
+})
+
+it('vera-349: prepare advertises optional nullable App identity in a strict body-free reply', () => {
+  const reply = { ok: true, op: 'prepare_create', verdict: 'proceed' }
+  for (const appLogin of ['acme-app[bot]', null]) {
+    expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin }).success).toBe(true)
+  }
+  expect(KanbanOrchestrateOk.safeParse(reply).success).toBe(true)
+  for (const appLogin of ['', 123, {}, 'a'.repeat(101)]) {
+    expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin }).success).toBe(false)
+  }
+  expect(KanbanOrchestrateOk.safeParse({ ...reply, appLogin: 'app[bot]', body: 'secret' }).success).toBe(false)
 })
 
 describe('kanban/notify', () => {

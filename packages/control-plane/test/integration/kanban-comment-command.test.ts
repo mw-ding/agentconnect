@@ -1,13 +1,17 @@
 // `/kanban` comment commands end to end: signed issue_comment -> real relay -> rc/github-graph -> CP -> Postgres + GitHub writes.
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { generateKeyPairSync, randomUUID } from 'node:crypto'
 import { prisma } from '../setup.db.js'
 import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
+import { OrgId } from '../../src/domain/ids.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
+import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { COMMAND_EFFECT_TTL_MS, KanbanCommentCommands } from '../../src/kanban/comment-command.js'
 
 const RELAY_TOKEN = 'relay-shared-secret-0123456789abcdef'
 const WEBHOOK_SECRET = 'kanban-webhook-secret-0123456789'
@@ -25,8 +29,14 @@ interface GithubCall {
 type Status = 'triage' | 'todo' | 'ready' | 'running' | 'blocked' | 'review' | 'done' | 'archived'
 
 // One issue whose labels and state follow the CP's writes; the permission API answers per login.
-function fakeGithub(start: { status: Status; permissions: Record<string, string> }) {
+function fakeGithub(start: {
+  status: Status
+  permissions: Record<string, string>
+  // Called per comment POST; resolves to the HTTP status GitHub answers, so a test can hold or fail the write.
+  onComment?: () => Promise<number>
+}) {
   const calls: GithubCall[] = []
+  const comments: Array<{ body: string; user: { login: string; type: string } }> = []
   let labels = [`ac/status:${start.status}`, 'bug']
   let state: 'open' | 'closed' = start.status === 'done' || start.status === 'archived' ? 'closed' : 'open'
   let stateReason: string | null = start.status === 'done' ? 'completed' : null
@@ -73,7 +83,13 @@ function fakeGithub(start: { status: Status; permissions: Record<string, string>
       labels = labels.filter((l) => l !== name)
       return json(200, [])
     }
-    if (pathname === `${base}/comments` && method === 'POST') return json(201, { id: 1 })
+    if (pathname === `${base}/comments` && method === 'GET') return json(200, comments)
+    if (pathname === `${base}/comments` && method === 'POST') {
+      const status = (await start.onComment?.()) ?? 201
+      if (status === 201)
+        comments.push({ body: body!.body as string, user: { login: `${APP_SLUG}[bot]`, type: 'Bot' } })
+      return status === 201 ? json(201, { id: 1 }) : json(status, { message: 'Server Error' })
+    }
     return json(404, { message: 'Not Found' })
   }
   return { calls, fetch, labels: () => labels, state: () => state }
@@ -100,9 +116,13 @@ afterEach(async () => {
   app = undefined
 })
 
-async function boot(status: Status, permissions: Record<string, string> = { alice: 'admin' }) {
+async function boot(
+  status: Status,
+  permissions: Record<string, string> = { alice: 'admin' },
+  onComment?: () => Promise<number>
+) {
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const github = fakeGithub({ status, permissions })
+  const github = fakeGithub({ status, permissions, ...(onComment ? { onComment } : {}) })
   await prisma.githubInstallation.create({
     data: {
       orgId: DEFAULT_ORG_ID,
@@ -122,7 +142,13 @@ async function boot(status: Status, permissions: Record<string, string> = { alic
       issueNumber: ISSUE.number,
       status,
       ...(status === 'blocked' ? { blockKind: 'needs_input' as const } : {}),
-      ...(status === 'done' ? { linkedPrNumber: 12, linkedPrWorkStartedAt: new Date('2026-10-15T00:00:00Z') } : {})
+      ...(status === 'done'
+        ? {
+            linkedPrNumber: 12,
+            workEpisodeStartedAt: new Date('2026-10-15T00:00:00Z'),
+            contractFlags: ['pr_unbound#11']
+          }
+        : {})
     }
   })
   app = buildApp({
@@ -210,7 +236,7 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     })
   })
 
-  it('/kanban reopen reopens a done issue, moves the card to ready, and drops the old PR link', async () => {
+  it('vera-415b3: /kanban reopen reopens a done issue, moves the card to ready, and ends the work episode', async () => {
     const { github, board, card, link } = await boot('done')
     await postGithubWebhook(link.webhookUrl, {
       secret: WEBHOOK_SECRET,
@@ -221,7 +247,8 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).toMatchObject({
       status: 'ready',
       linkedPrNumber: null,
-      linkedPrWorkStartedAt: null
+      workEpisodeStartedAt: null,
+      contractFlags: []
     })
     expect(github.state()).toBe('open')
     expect(writes(github.calls)).toContainEqual(
@@ -269,6 +296,103 @@ describe('Kanban comment commands through the real relay (real ports, real Postg
     expect((await prisma.kanbanCard.findUniqueOrThrow({ where: { id: card.id } })).status).toBe('ready')
     const comments = writes(github.calls).filter((c) => c.path.endsWith('/comments'))
     expect(comments.map((c) => (c.body as { body: string }).body)).toEqual([expect.stringContaining('(wrong_status)')])
+  })
+
+  it('vera-415r2: B6 a redelivery overlapping an in-flight refusal posts no second comment', async () => {
+    let release!: () => void
+    const held = new Promise<number>((resolve) => (release = () => resolve(201)))
+    const { github, board, link } = await boot('ready', { alice: 'admin' }, () => held)
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    await postGithubWebhook(link.webhookUrl, request)
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    await until(
+      async () => posts().length,
+      (n) => n === 1
+    )
+    // The first POST is still in flight when GitHub redelivers the same GUID.
+    expect((await postGithubWebhook(link.webhookUrl, request)).status).toBe(202)
+    await until(
+      async () => link.graphPokes.length,
+      (n) => n === 2
+    )
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    release()
+    const [row] = await settled(board.id)
+    expect(row!.outcome).toBe('wrong_status')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(posts()).toHaveLength(1)
+    expect(await prisma.kanbanCommand.count()).toBe(1)
+  })
+
+  it('vera-415r2: B6 a failed refusal POST releases its claim, so the next delivery posts it once', async () => {
+    const answers = [502, 201]
+    const { github, board, link } = await boot('ready', { alice: 'admin' }, async () => answers.shift() ?? 201)
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    await postGithubWebhook(link.webhookUrl, request)
+    await until(
+      async () => posts().length,
+      (n) => n === 1
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+    await postGithubWebhook(link.webhookUrl, request)
+    await settled(board.id)
+    expect(posts()).toHaveLength(2)
+    expect(answers).toEqual([])
+    expect(await prisma.kanbanCommand.count()).toBe(1)
+  })
+
+  it('vera-415r2: B6 an effect claim whose holder died is retried only after the TTL, exactly once', async () => {
+    const { github, board, link } = await boot('ready')
+    const request = {
+      secret: WEBHOOK_SECRET,
+      event: 'issue_comment',
+      payload: commentCreated('/kanban reopen', { login: 'alice', type: 'User' }),
+      deliveryId: randomUUID()
+    }
+    const posts = () => writes(github.calls).filter((c) => c.path.endsWith('/comments'))
+    // A holder that claimed the effect and then died: the ledger row is recorded, claimed just now, never settled.
+    const card = await prisma.kanbanCard.findFirstOrThrow({ where: { boardId: board.id } })
+    await prisma.kanbanCommand.create({
+      data: {
+        id: randomUUID(),
+        boardId: board.id,
+        cardId: card.id,
+        commentId: 5001n,
+        command: 'reopen',
+        actorLogin: 'alice',
+        outcome: 'wrong_status',
+        fromStatus: 'ready',
+        effectClaimedAt: new Date()
+      }
+    })
+    await postGithubWebhook(link.webhookUrl, request)
+    await until(
+      async () => link.graphPokes.length,
+      (n) => n === 1
+    )
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    expect(posts()).toHaveLength(0)
+    expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+    // Past the TTL the claim is stale: the redelivery takes it over and posts the one refusal.
+    await prisma.kanbanCommand.updateMany({
+      data: { effectClaimedAt: new Date(Date.now() - COMMAND_EFFECT_TTL_MS - 1_000) }
+    })
+    await postGithubWebhook(link.webhookUrl, request)
+    await settled(board.id)
+    expect(posts()).toHaveLength(1)
+    expect((posts()[0]!.body as { body: string }).body).toContain('(wrong_status)')
   })
 
   it('a duplicate delivery of an applied command has exactly one effect', async () => {
@@ -322,4 +446,56 @@ it('vera-415: an App-on-behalf-of-writer comment reaches the CP with viaApp and 
   expect(JSON.stringify(link.graphPokes)).not.toContain('private app name')
   expect(await prisma.kanbanCommand.count({ where: { boardId: board.id } })).toBe(0)
   expect(writes(github.calls)).toEqual([])
+})
+
+describe('vera-415r3: B7 durable refusal recovery', () => {
+  it.each(['immediate', 'expired claim', 'lost POST response'])(
+    'vera-415r3: B7 %s recovery finds the landed refusal and settles without reposting',
+    async (boundary) => {
+      const { github, board: row } = await boot('ready')
+      const board = { ...row, orgId: OrgId(row.orgId) }
+      const cards = new PgKanbanCardRepo(prisma)
+      let loseResponse = boundary === 'lost POST response'
+      const fetchImpl = async (url: string, init?: RequestInit) => {
+        const response = await github.fetch(url, init)
+        if (loseResponse && init?.method === 'POST' && new URL(url).pathname.endsWith('/comments')) {
+          loseResponse = false
+          throw new Error('POST response lost after GitHub accepted it')
+        }
+        return response
+      }
+      const create = () =>
+        new KanbanCommentCommands({
+          cards,
+          store: new GithubCardStore({
+            tokens: { mintKanbanCard: async () => ({ token: 't' }) } as never,
+            appSlug: APP_SLUG,
+            fetchImpl,
+            permissions: { permission: async () => 'write' }
+          }),
+          permissions: { permission: async () => 'write' },
+          appSlug: APP_SLUG,
+          log: { info: () => {}, warn: () => {} }
+        })
+      const command = { name: 'unblock' as const, commentId: '98765', sender: { login: 'alice', type: 'User' } }
+      const repo = { installationId: BigInt(INSTALLATION_ID), repoId: BigInt(REPO_ID), repoFullName: 'acme/board' }
+      if (boundary !== 'lost POST response')
+        vi.spyOn(cards, 'settleCommand').mockRejectedValueOnce(new Error('settle failed'))
+      await expect(create().handle(board, repo, ISSUE.number, command)).rejects.toThrow(
+        boundary === 'lost POST response' ? 'POST response lost' : 'settle failed'
+      )
+      expect(writes(github.calls).filter((c) => c.path.endsWith('/comments'))).toHaveLength(1)
+      expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+      if (boundary === 'expired claim') {
+        // Simulate the dead process leaving its claim behind, then a fresh process recovering after the TTL.
+        await prisma.kanbanCommand.updateMany({
+          data: { effectClaimedAt: new Date(Date.now() - COMMAND_EFFECT_TTL_MS - 1000) }
+        })
+      }
+      await create().handle(board, repo, ISSUE.number, command)
+      await create().handle(board, repo, ISSUE.number, command)
+      expect(writes(github.calls).filter((c) => c.path.endsWith('/comments'))).toHaveLength(1)
+      expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeInstanceOf(Date)
+    }
+  )
 })

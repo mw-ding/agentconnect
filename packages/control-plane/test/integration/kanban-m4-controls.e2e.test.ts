@@ -18,6 +18,7 @@ import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanGraphDoorbell } from '../../src/kanban/graph-doorbell.js'
 import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
 import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
 import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { seedAgent, seedDaemon } from '../fixtures/seed.js'
@@ -92,8 +93,10 @@ describe.skipIf(!enabled)('kanban M4 controls e2e (live GitHub)', () => {
   }
   let sent: Array<{ daemonId: string; d: KanbanDispatch }>
 
+  const cardTokens = { mintKanbanCard: async () => ({ token: process.env.GITHUB_TOKEN! }) } as never
   const store = new GithubCardStore({
-    tokens: { mintKanbanCard: async () => ({ token: process.env.GITHUB_TOKEN! }) } as never
+    tokens: cardTokens,
+    permissions: new GithubRepoPermission({ tokens: cardTokens, ttlMs: 0 })
   })
   const log = {
     debug: vi.fn(),
@@ -417,8 +420,8 @@ describe.skipIf(!enabled)('kanban M4 controls e2e (live GitHub)', () => {
         boards: new PgKanbanBoardRepo(prisma),
         installations: { getByInstallationId: async () => installation },
         store,
-        onCard: async (board, repo, n, action) => {
-          if (action === 'closed') await reconciler.apply(board, repo, n, await store.readGraph(repo, n))
+        onCard: async (board, repo, n, doorbell) => {
+          if (doorbell.action === 'closed') await reconciler.apply(board, repo, n, await store.readGraph(repo, n))
         },
         log: { debug: vi.fn(), warn: (_o, m) => console.log('warn', m) }
       })

@@ -74,6 +74,7 @@ const SEARCH_PAGE_LABEL_KEYS: Record<string, Parameters<ReturnType<typeof useTra
     '/agents': 'pages.agents',
     '/sessions': 'pages.sessions',
     '/crons': 'pages.schedules',
+    '/kanban': 'pages.kanban',
     '/decisions': 'pages.decisions',
     '/tools': 'pages.tools',
     '/integrations': 'pages.integrations',

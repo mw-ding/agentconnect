@@ -113,6 +113,7 @@ export { PgHookRepo, PgHookSecretStore } from './repositories/hook.repo.js'
 export { PgKanbanBoardRepo, PgKanbanCardRepo } from './repositories/kanban.repo.js'
 export { PgKanbanDispatchRepo } from './repositories/kanban-dispatch.repo.js'
 export { PgKanbanNotifyRepo } from './repositories/kanban-notify.repo.js'
+export { PgKanbanOrchestratorRepo } from './repositories/kanban-orchestrator.repo.js'
 export { PgRuntimeProfileRepo } from './repositories/runtime-profile.repo.js'
 export { PgAuditRepo } from './repositories/audit.repo.js'
 export { PgUserRepo } from './repositories/user.repo.js'
@@ -124,3 +125,5 @@ export { PgDeploymentConfigRepository, PgDeploymentConfigStore } from './reposit
 export { PgAgentMemoryTransactionRepo } from './repositories/agent-memory-transaction.repo.js'
 
 export { PgProviderKeyStore } from './repositories/provider-key.repo.js'
+
+export { PgKanbanSyncRepo } from './repositories/kanban-sync.repo.js'

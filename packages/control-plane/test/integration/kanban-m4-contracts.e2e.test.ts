@@ -51,7 +51,11 @@ let e2eBinding: { authorLogin: string; authorType: string; defaultBranch: string
 const log = { debug: vi.fn(), info: vi.fn(), warn: (o: unknown, m?: string) => console.log('warn', m, o) }
 
 function harness() {
-  const store = new GithubCardStore({ tokens: tokenSource as never })
+  // Label sync re-checks the actor's live write grant, so the store needs the permission reader even in E2E.
+  const store = new GithubCardStore({
+    tokens: tokenSource as never,
+    permissions: new GithubRepoPermission({ tokens: tokenSource as never, ttlMs: 0 })
+  })
   const commands = new KanbanCommentCommands({
     cards: new PgKanbanCardRepo(prisma),
     store,
@@ -320,7 +324,7 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     const { card } = await seed(issue, 'review', { completionContract: 'pr_merged' })
     await prisma.kanbanCard.update({
       where: { id: card.id },
-      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+      data: { linkedPrNumber: pr.number, workEpisodeStartedAt: new Date(started) }
     })
     // Mergeability is computed asynchronously; retry the merge briefly.
     await poll(
@@ -360,7 +364,7 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     const { card } = await seed(issue, 'review', { completionContract: 'pr_merged' })
     await prisma.kanbanCard.update({
       where: { id: card.id },
-      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+      data: { linkedPrNumber: pr.number, workEpisodeStartedAt: new Date(started) }
     })
     await gh('PATCH', `/repos/${FULL}/pulls/${pr.number}`, { state: 'closed' })
     const poke = githubPullRequestDoorbell('pull_request', (await pullPayload(pr.number)) as never, `k2-${ts}`)
@@ -397,7 +401,7 @@ describe.skipIf(!enabled)('kanban M4 contracts e2e (live GitHub)', () => {
     const { card } = await seed(issue, 'review', { completionContract: 'pr_checks_green' })
     await prisma.kanbanCard.update({
       where: { id: card.id },
-      data: { linkedPrNumber: pr.number, linkedPrWorkStartedAt: new Date(started) }
+      data: { linkedPrNumber: pr.number, workEpisodeStartedAt: new Date(started) }
     })
     interface Suites {
       check_suites: Array<{

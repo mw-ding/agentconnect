@@ -1,12 +1,19 @@
 // Kanban repos (issue #2 M1): PgKanbanBoardRepo serves the doorbell and redelivery sweep; PgKanbanCardRepo the graph reconciler.
 import { insertKanbanNotification } from './kanban-notify.repo.js'
 import { planNotification } from '../../kanban/notifier.js'
+import { applyCardTransition, auditCardTransition } from '../../kanban/audit.js'
 import { randomUUID } from 'node:crypto'
 import { OrgId } from '../../domain/ids.js'
 import { Prisma } from '../../generated/prisma/client.js'
 import { withAmbientTx, type PrismaLike } from '../prisma.js'
 import { lockResourceWriteMemberships } from '../resource-membership-lock.js'
-import { canTransition, isKanbanStatus, type KanbanStatus } from '../../kanban/card-state.js'
+import {
+  canTransition,
+  endsEpisode,
+  EPISODE_RESET,
+  isKanbanStatus,
+  type KanbanStatus
+} from '../../kanban/card-state.js'
 import { isAttestedHumanAuthority } from '../../kanban/human-authority.js'
 import { hasWriteAccess } from '../../github/repo-permission.js'
 import {
@@ -50,6 +57,8 @@ const CARD_ROW_SELECT = {
   issueId: true,
   issueNumber: true,
   issueNodeId: true,
+  projectItemId: true,
+  projectItemProjectId: true,
   idempotencyKey: true,
   status: true,
   assigneeAgentId: true,
@@ -71,12 +80,16 @@ const BOARD_VIEW_SELECT = {
   synthesizerAgentId: true,
   maxInProgress: true,
   maxInProgressPerAgent: true,
+  epicMaxCards: true,
+  epicMaxActive: true,
   staleLeaseSec: true,
   failureLimit: true,
   protocolRetryLimit: true,
   blockRecurrenceLimit: true,
   defaultMode: true,
   completionContract: true,
+  projectNodeId: true,
+  statusFieldId: true,
   enabled: true,
   paused: true,
   pausedAt: true,
@@ -203,7 +216,8 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>> {
     try {
       return await withAmbientTx(this.db, async (tx) => {
@@ -219,6 +233,9 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
         if (!(await isOwner(tx, orgId, userId))) return { ok: false, reason: 'not_found' }
         const current = await tx.kanbanBoard.findFirst({ where: { id: boardId, orgId }, select: BOARD_VIEW_SELECT })
         if (!current) return { ok: false, reason: 'not_found' }
+        // The route's GitHub guard must still describe the configuration locked here.
+        if (expectedConfigRevision !== undefined && current.configRevision !== expectedConfigRevision)
+          return { ok: false, reason: 'stale' }
         if (
           patch.repoId !== undefined &&
           patch.repoId !== current.repoId &&
@@ -385,6 +402,24 @@ export class PgKanbanBoardRepo implements KanbanBoardRepo, KanbanModeAdminRepo, 
     return rows.map((r) => ({ ...r, orgId: OrgId(r.orgId) }))
   }
 
+  async refreshRepoFullName(boardId: string, repoId: bigint, repoFullName: string): Promise<boolean> {
+    return withAmbientTx(this.db, async (tx) => {
+      const current = await tx.kanbanBoard.findFirst({
+        where: { id: boardId, repoId },
+        select: { orgId: true, repoFullName: true }
+      })
+      if (!current) return false
+      if (current.repoFullName === repoFullName) return true
+      // Compare-and-set on the name read above, so two replicas observing one rename audit it once.
+      const { count } = await tx.kanbanBoard.updateMany({
+        where: { id: boardId, repoId, repoFullName: current.repoFullName },
+        data: { repoFullName }
+      })
+      if (count === 1) await auditBoard(tx, current.orgId, null, boardId, 'repo_renamed', ['repoFullName'], repoId)
+      return count === 1
+    })
+  }
+
   async listEnabledRepoIds(): Promise<bigint[]> {
     const rows = await this.db.kanbanBoard.findMany({
       where: { enabled: true },
@@ -419,11 +454,12 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
   }
 
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision },
-      data: { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED }
-    })
-    return count === 1
+    return applyCardTransition(
+      this.db,
+      { id: cardId, stateRevision: expectedStateRevision },
+      { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED },
+      'cas_status'
+    )
   }
 
   async beginPromotion(
@@ -433,15 +469,16 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     startedAt: Date
   ): Promise<boolean> {
     // One write for the ready CAS and the intent; an open intent keeps its caps, and a flagged card is a human's.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: {
+    return applyCardTransition(
+      this.db,
+      {
         id: cardId,
         stateRevision: expectedStateRevision,
         status: 'todo',
         promotionPending: false,
         needsAttention: false
       },
-      data: {
+      {
         status: 'ready',
         stateRevision: { increment: 1 },
         githubSyncedAt: new Date(),
@@ -453,9 +490,9 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         // A minute out, so a tick cannot settle the card while this write is still in flight.
         recoveryCheckAt: new Date(startedAt.getTime() + 60_000),
         recoveryChecks: 0
-      }
-    })
-    return count === 1
+      },
+      'graph_promotion'
+    )
   }
 
   async notePromotionPosted(cardId: string): Promise<void> {
@@ -528,24 +565,25 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
   async clearPromotionIntent(cardId: string): Promise<boolean> {
     const { count } = await this.db.kanbanCard.updateMany({
       where: { id: cardId, status: 'ready', promotionPending: true },
-      data: PROMOTION_CLEARED
+      data: { ...PROMOTION_CLEARED, labelWritePending: false }
     })
     return count === 1
   }
 
   async revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean> {
     // The timed-out POST can still land after this rollback, so the watch restarts from now.
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
-      data: {
+    return applyCardTransition(
+      this.db,
+      { id: cardId, stateRevision: expectedStateRevision, status: 'ready', promotionPending: true },
+      {
         status: 'todo',
         stateRevision: { increment: 1 },
         promotionWatchUntil: new Date(revertedAt.getTime() + PROMOTION_WATCH_MS),
         recoveryCheckAt: null,
         recoveryChecks: 0
-      }
-    })
-    return count === 1
+      },
+      'graph_rollback'
+    )
   }
 
   async getCommand(boardId: string, commentId: bigint): Promise<KanbanCommandRecord | null> {
@@ -610,8 +648,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
             recoveryChecks: 0,
             recoveryObserved: null,
             ...PROMOTION_CLEARED,
-            // A reopened card starts a new piece of work; the old PR must not complete it.
-            ...(input.from === 'done' ? { linkedPrNumber: null, linkedPrWorkStartedAt: null } : {})
+            ...(endsEpisode(input.from, input.to!) ? EPISODE_RESET : {})
           }
         })
         if (count !== 1) throw STALE_COMMAND
@@ -649,6 +686,25 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
 
   async settleCommand(id: string): Promise<void> {
     await this.db.kanbanCommand.updateMany({ where: { id, settledAt: null }, data: { settledAt: new Date() } })
+  }
+
+  async claimCommandEffect(id: string, ttlMs: number): Promise<Date | null> {
+    const ttlSec = ttlMs / 1000
+    // Millisecond precision, so the holder's JS Date matches the row exactly when it releases.
+    const [row] = await this.db.$queryRaw<Array<{ effectClaimedAt: Date }>>(Prisma.sql`
+      UPDATE "kanban_command" SET "effectClaimedAt" = date_trunc('milliseconds', now())
+      WHERE "id" = ${id}::uuid AND "settledAt" IS NULL
+        AND ("effectClaimedAt" IS NULL OR "effectClaimedAt" <= now() - make_interval(secs => ${ttlSec}::float8))
+      RETURNING "effectClaimedAt"
+    `)
+    return row?.effectClaimedAt ?? null
+  }
+
+  async releaseCommandEffect(id: string, claimedAt: Date): Promise<void> {
+    await this.db.kanbanCommand.updateMany({
+      where: { id, settledAt: null, effectClaimedAt: claimedAt },
+      data: { effectClaimedAt: null }
+    })
   }
 
   async upsertCard(input: KanbanCardUpsertInput): Promise<KanbanCardUpsertResult> {
@@ -698,6 +754,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
               status,
               assigneeAgentId: input.assigneeAgentId ?? null,
               priority: input.priority ?? 0,
+              syncEventCursor: input.syncEventCursor ?? 0n,
               // Never from the input, even a cast one: only setCardMode (audited, revisioned) sets an override.
               mode: null
             }
@@ -829,9 +886,18 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           assigneeAgentId: input.agentId,
           // A new generation fences every late write of the superseded holder, as a claim or run end does.
           dispatchRevision: { increment: 1 },
-          ...(restart ? { status: 'ready', stateRevision: { increment: 1 }, ...PROMOTION_CLEARED } : {})
+          ...(restart
+            ? { status: 'ready', stateRevision: { increment: 1 }, labelWritePending: true, ...PROMOTION_CLEARED }
+            : {})
         },
         select: CARD_ROW_SELECT
+      })
+      await auditCardTransition(tx, {
+        cardId: card.id,
+        from: current.status,
+        to: updated.status,
+        source: input.source,
+        ...(open ? { leaseId: open.leaseId } : {})
       })
       await tx.auditEvent.create({
         data: {
@@ -850,7 +916,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
             revokedLeaseId: open?.leaseId ?? null,
             from: current.status,
             to: updated.status,
-            source: input.source
+            source: input.source,
+            ...(input.actorLogin ? { actorLogin: input.actorLogin, actorGitHubId: input.actorGitHubId ?? null } : {})
           }
         }
       })
@@ -984,6 +1051,14 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
       }
     })
   }
+
+  // Best-effort projection cache: a lost item id only costs one more idempotent add, never a missed Status write.
+  async setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void> {
+    await this.db.kanbanCard.updateMany({
+      where: { id: cardId },
+      data: { projectItemId, projectItemProjectId: projectNodeId }
+    })
+  }
 }
 
 function toCardRow(row: {
@@ -992,6 +1067,8 @@ function toCardRow(row: {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  projectItemId: string | null
+  projectItemProjectId: string | null
   idempotencyKey: string | null
   status: string
   assigneeAgentId: string | null
@@ -1077,9 +1154,9 @@ function sameValue(a: unknown, b: unknown): boolean {
 async function auditBoard(
   tx: Prisma.TransactionClient,
   orgId: string,
-  userId: string,
+  userId: string | null,
   boardId: string,
-  change: 'created' | 'updated' | 'deleted',
+  change: 'created' | 'updated' | 'deleted' | 'repo_renamed',
   fields: string[],
   repoId: bigint
 ): Promise<void> {

@@ -36,6 +36,13 @@ export function canTransition(from: KanbanStatus, to: KanbanStatus): boolean {
   return KANBAN_TRANSITIONS[from].includes(to)
 }
 
+/** Ending a work episode: the next work claim starts a new one, and the old PR can no longer complete the card. */
+export const EPISODE_RESET = { linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] as string[] }
+
+/** A closed card (`done` or `archived`) that reopens starts a new episode; every other move stays inside it. */
+export const endsEpisode = (from: string, to: string): boolean =>
+  (from === 'done' || from === 'archived') && to !== from
+
 /** The GitHub issue state a status implies. */
 export function issueStateFor(status: KanbanStatus): { state: 'open' } | { state: 'closed'; reason: IssueCloseReason } {
   if (status === 'done') return { state: 'closed', reason: 'completed' }
@@ -76,6 +83,8 @@ export interface LabelPlan {
   issueState?: { state: 'open' } | { state: 'closed'; reason: IssueCloseReason }
   /** Body-free CP comment explaining a repair or revert; absent on silent outcomes. */
   comment?: string
+  // Stable effect identity: retry only after checking this App's existing marked comments.
+  commentKey?: string
 }
 
 /** Split an issue's labels into recognized statuses and malformed `ac/status:*` labels. */
@@ -218,6 +227,14 @@ function issueStateDiffers(
 ): boolean {
   if (desired.state !== observed.state) return true
   return desired.state === 'closed' && (observed.stateReason ?? null) !== desired.reason
+}
+
+/** Fixed-template revert of an edit by a GitHub user without live write access; it names only the kept status. */
+export function permissionRefusalComment(status: KanbanStatus): string {
+  return (
+    `AgentConnect Kanban: only collaborators with write access can change a card's status or agent, ` +
+    `so this edit was reverted. Kept \`${statusLabel(status)}\`.`
+  )
 }
 
 /** Fixed-template comment text: it names only statuses and labels, never issue content. */
