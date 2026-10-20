@@ -936,6 +936,30 @@ describe('vera-415r2: a PR contract never settles through a human hold (real Pos
     await h.contracts!.onVerified(cardId)
   }
 
+  it('vera-415r3: B4 a leftover own flag never overrides a newer human hold', async () => {
+    const { h, card } = await held({ reason: 'label_attribution_timeout', flags: ['pr_unbound#12'] })
+    // Exercise the settlement CAS independently of the listing predicate.
+    expect(
+      await h.repo.settleContract({
+        cardId: card.id,
+        expectedStateRevision: card.stateRevision,
+        expectedConfigRevision: h.board.configRevision,
+        to: 'done',
+        reason: 'pr_merged',
+        prNumber: 12
+      })
+    ).toBe(false)
+    expect(await h.contracts!.onVerified(card.id)).toBeNull()
+    await judge(h, card.id)
+    expect(await h.card(card.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'label_attribution_timeout',
+      stateRevision: card.stateRevision
+    })
+    expect(h.store.writes).toEqual([])
+  })
+
   it.each([
     ['label_attribution_timeout', [], {}],
     ['label_attribution_timeout', [], { merged: false }],

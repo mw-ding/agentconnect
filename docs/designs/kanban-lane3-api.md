@@ -275,7 +275,13 @@ unclaimed or claimed longer ago than `COMMAND_EFFECT_TTL_MS` (5 minutes). A deli
 overlaps a live claim posts nothing and throws, so its GUID stays unlanded; the redelivery
 sweep (10-minute ticks) re-asks it, and by then the row is settled (`duplicate`). A failed effect
 releases its own claim so the next delivery retries at once; a holder that died is taken over
-after the TTL. An applied move queues the Projects projection when it commits.
+after the TTL. Refusal plans carry the stable command-row id in a hidden marker.
+Before every refusal POST, including recovery after a crash, a lost POST response, or a
+failed `settledAt` write, the writer scans the issue's comments for this App bot's marker.
+A match skips the POST and lets settlement finish. A failed read or a history beyond ten
+100-comment pages fails closed without posting. Human or other bots' copies do not count.
+The marker is GitHub-side recovery metadata; no comment body is persisted in the CP.
+An applied move queues the Projects projection when it commits.
 
 ### PR completion contracts
 

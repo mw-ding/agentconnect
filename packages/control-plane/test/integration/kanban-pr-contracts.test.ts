@@ -13,6 +13,9 @@ import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
 import { GithubPrReader } from '../../src/kanban/pr-reader.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/index.js'
+import { KanbanSync } from '../../src/kanban/sync.js'
+import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
 import { seedAgent } from '../fixtures/seed.js'
 
 const RELAY_TOKEN = 'relay-shared-secret-0123456789abcdef'
@@ -111,6 +114,15 @@ function fakeGithub(pr: PrState) {
       labels = labels.filter((l) => l !== decodeURIComponent(pathname.slice(`${base}/labels/`.length)))
       return json(200, [])
     }
+    if (pathname === `${base}/events` && method === 'GET')
+      return json(200, [
+        {
+          id: 1,
+          event: 'labeled',
+          label: { name: 'ac/status:review' },
+          actor: { login: 'agentconnect-test[bot]', type: 'Bot' }
+        }
+      ])
     if (pathname === `${base}/comments` && method === 'POST') return json(201, { id: 1 })
     return json(404, { message: 'Not Found' })
   }
@@ -535,4 +547,43 @@ describe('Kanban PR completion contracts through the real relay (real ports, rea
     // Leased and non-review cards are never listed.
     expect(await new PgKanbanDispatchRepo(prisma).listContractCards(board.id, {})).toEqual([])
   })
+})
+
+it.each([false, true])('vera-415r3: label repair after failed contract write (merged=%s)', async (merged) => {
+  const { github, board, card } = await boot(
+    { state: 'closed', merged, headSha: HEAD, runs: [] },
+    { completionContract: 'pr_merged' }
+  )
+  let fail = true
+  const fetchImpl = async (url: string, init?: RequestInit) => {
+    if (fail && init?.method === 'POST' && new URL(url).pathname.endsWith('/labels')) {
+      fail = false
+      return new Response('{}', { status: 500 })
+    }
+    return github.fetch(url, init)
+  }
+  await sweeper(fetchImpl).sweep(board.id)
+  const to = merged ? 'done' : 'triage'
+  expect(await cardOf(card.id)).toMatchObject({ status: to, labelWritePending: true, needsAttention: !merged })
+  expect(github.labels()).toEqual(['ac/status:review'])
+  const repo = { installationId: BigInt(INSTALLATION_ID), repoId: BigInt(REPO_ID), repoFullName: 'acme/board' }
+  const permissions = { permission: async () => 'write' as const }
+  const sync = new KanbanSync({
+    repo: new PgKanbanSyncRepo(prisma),
+    cards: new PgKanbanCardRepo(prisma),
+    store: new GithubCardStore({
+      tokens: { mintKanbanCard: async () => ({ token: 't' }) } as never,
+      fetchImpl,
+      permissions
+    }),
+    permissions,
+    repoRef: async () => repo,
+    revoke: async () => {},
+    promote: async () => {},
+    log: { warn: () => {} }
+  })
+  await sync.reconcileBoard(board.id)
+  expect(github.labels()).toEqual([`ac/status:${to}`])
+  expect(github.issueState().state).toBe(merged ? 'closed' : 'open')
+  expect(await cardOf(card.id)).toMatchObject({ status: to, labelWritePending: false, needsAttention: !merged })
 })

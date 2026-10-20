@@ -280,12 +280,12 @@ describe("vera-414-merge: 9 #415's contract and comment-command moves keep their
         prNumber: 7
       })
     ).toBe(true)
-    // The contract's own write: done with the approval spent and rounds reset; its label write stays its own (best effort).
+    // Settlement spends the approval and resets rounds; its label projection stays pending until repair.
     expect(await f.read(c.id)).toMatchObject({
       status: 'done',
       verifiedAt: null,
       reviewRounds: 0,
-      labelWritePending: false,
+      labelWritePending: true,
       stateRevision: before.stateRevision + 1n
     })
     expect(await f.audits(c.id)).toMatchObject([

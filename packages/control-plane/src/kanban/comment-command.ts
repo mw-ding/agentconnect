@@ -126,7 +126,7 @@ export class KanbanCommentCommands {
     try {
       await this.runEffect(board, repo, issueNumber, record)
     } catch (err) {
-      // A lost release only delays the retry until the TTL; the effect's own error is the one to surface.
+      // Recovery checks the refusal marker even after a lost POST response or settlement failure.
       await this.deps.cards.releaseCommandEffect(record.id, claimedAt).catch(() => undefined)
       throw err
     }
@@ -163,6 +163,7 @@ function refusalPlan(record: KanbanCommandRecord): LabelPlan {
     releaseLease: false,
     addLabels: [],
     removeLabels: [],
+    commentKey: `command:${record.id}`,
     comment: humanRefusalComment(record.command as KanbanCommand, status, record.outcome as HumanTransitionRefusal)
   }
 }

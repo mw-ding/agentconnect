@@ -611,6 +611,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         },
         data: {
           status: input.to,
+          labelWritePending: true,
           stateRevision: { increment: 1 },
           cooldownUntil: null,
           blockKind: null,

@@ -558,8 +558,9 @@ Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
   status write.
   - A comment command whose label write fails stays unsettled and is re-applied on
     the next delivery of that comment.
-  - A PR-contract move whose label write fails leaves label drift for the reconciler
-    (#194's projection).
+  - Both PR-contract moves (`done` and held `triage`) set `labelWritePending` in the
+    settlement transaction. A failed label write is repaired by the reconciler, including
+    held cards; a successful repair clears the flag without clearing the human hold.
   - A tick that claims a just-unblocked card before its labels land parks it as a
     `github_state_mismatch`.
 - `pr_checks_green` reads GitHub check runs only. Legacy commit statuses are not read,

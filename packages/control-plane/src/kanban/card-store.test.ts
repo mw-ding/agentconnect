@@ -646,3 +646,64 @@ describe('GithubCardStore link writes', () => {
     await expect(h.store.addSubIssue(REPO, 7, 3001n)).rejects.toThrow()
   })
 })
+
+describe('vera-415r3: refusal marker recovery', () => {
+  const marker = '<!-- agentconnect-kanban:command:uuid -->'
+  const plan = {
+    outcome: 'noop' as const,
+    status: 'triage' as const,
+    releaseLease: false,
+    addLabels: [],
+    removeLabels: [],
+    comment: 'fixed refusal',
+    commentKey: 'command:uuid'
+  }
+  const observed = { labels: [], state: 'open' as const }
+  const path = '/repositories/42/issues/7/comments?per_page=100'
+
+  it('vera-415r3: finds its own marker on a later page without a POST', async () => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () =>
+          new Response('[]', {
+            headers: { link: '<https://api.test/repositories/42/issues/7/comments?per_page=100&page=2>; rel="next"' }
+          }),
+        [`GET ${path}&page=2`]: () =>
+          json([{ body: `fixed refusal\n\n${marker}`, user: { login: 'agentconnect[bot]', type: 'Bot' } }])
+      },
+      'agentconnect'
+    )
+    await h.store.applyPlan(REPO, 7, observed, plan)
+    expect(h.calls.map((call) => call.method)).toEqual(['GET', 'GET'])
+  })
+
+  it.each(['alice', 'other[bot]'])('vera-415r3: a marker copied by %s cannot suppress the refusal', async (login) => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () => json([{ body: marker, user: { login, type: login === 'alice' ? 'User' : 'Bot' } }]),
+        'POST /repositories/42/issues/7/comments': () => json({ id: 1 }, 201)
+      },
+      'agentconnect'
+    )
+    await h.store.applyPlan(REPO, 7, observed, plan)
+    expect(h.calls.at(-1)).toMatchObject({ method: 'POST', body: { body: `fixed refusal\n\n${marker}` } })
+  })
+
+  it('vera-415r3: an unreadable comment history fails closed without posting', async () => {
+    const h = harness({ [`GET ${path}`]: () => json({ message: 'Forbidden' }, 403) }, 'agentconnect')
+    await expect(h.store.applyPlan(REPO, 7, observed, plan)).rejects.toThrow()
+    expect(h.calls.map((call) => call.method)).toEqual(['GET'])
+  })
+
+  it('vera-415r3: a truncated comment history fails closed without posting', async () => {
+    const h = harness(
+      {
+        [`GET ${path}`]: () => new Response('[]', { headers: { link: `<https://api.test${path}>; rel="next"` } })
+      },
+      'agentconnect'
+    )
+    await expect(h.store.applyPlan(REPO, 7, observed, plan)).rejects.toThrow('page bound')
+    expect(h.calls).toHaveLength(10)
+    expect(h.calls.every((call) => call.method === 'GET')).toBe(true)
+  })
+})

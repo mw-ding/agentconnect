@@ -1,14 +1,17 @@
 // `/kanban` comment commands end to end: signed issue_comment -> real relay -> rc/github-graph -> CP -> Postgres + GitHub writes.
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { generateKeyPairSync, randomUUID } from 'node:crypto'
 import { prisma } from '../setup.db.js'
 import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
+import { OrgId } from '../../src/domain/ids.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { MemorySecretsProvider } from '../../src/secrets/providers/memory.js'
 import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
 import { postGithubWebhook, startRelayCpLink, type RelayCpLink } from '../fixtures/relay-link.js'
-import { COMMAND_EFFECT_TTL_MS } from '../../src/kanban/comment-command.js'
+import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { PgKanbanCardRepo } from '../../src/persistence/repositories/kanban.repo.js'
+import { COMMAND_EFFECT_TTL_MS, KanbanCommentCommands } from '../../src/kanban/comment-command.js'
 
 const RELAY_TOKEN = 'relay-shared-secret-0123456789abcdef'
 const WEBHOOK_SECRET = 'kanban-webhook-secret-0123456789'
@@ -33,6 +36,7 @@ function fakeGithub(start: {
   onComment?: () => Promise<number>
 }) {
   const calls: GithubCall[] = []
+  const comments: Array<{ body: string; user: { login: string; type: string } }> = []
   let labels = [`ac/status:${start.status}`, 'bug']
   let state: 'open' | 'closed' = start.status === 'done' || start.status === 'archived' ? 'closed' : 'open'
   let stateReason: string | null = start.status === 'done' ? 'completed' : null
@@ -79,8 +83,11 @@ function fakeGithub(start: {
       labels = labels.filter((l) => l !== name)
       return json(200, [])
     }
+    if (pathname === `${base}/comments` && method === 'GET') return json(200, comments)
     if (pathname === `${base}/comments` && method === 'POST') {
       const status = (await start.onComment?.()) ?? 201
+      if (status === 201)
+        comments.push({ body: body!.body as string, user: { login: `${APP_SLUG}[bot]`, type: 'Bot' } })
       return status === 201 ? json(201, { id: 1 }) : json(status, { message: 'Server Error' })
     }
     return json(404, { message: 'Not Found' })
@@ -439,4 +446,56 @@ it('vera-415: an App-on-behalf-of-writer comment reaches the CP with viaApp and 
   expect(JSON.stringify(link.graphPokes)).not.toContain('private app name')
   expect(await prisma.kanbanCommand.count({ where: { boardId: board.id } })).toBe(0)
   expect(writes(github.calls)).toEqual([])
+})
+
+describe('vera-415r3: B7 durable refusal recovery', () => {
+  it.each(['immediate', 'expired claim', 'lost POST response'])(
+    'vera-415r3: B7 %s recovery finds the landed refusal and settles without reposting',
+    async (boundary) => {
+      const { github, board: row } = await boot('ready')
+      const board = { ...row, orgId: OrgId(row.orgId) }
+      const cards = new PgKanbanCardRepo(prisma)
+      let loseResponse = boundary === 'lost POST response'
+      const fetchImpl = async (url: string, init?: RequestInit) => {
+        const response = await github.fetch(url, init)
+        if (loseResponse && init?.method === 'POST' && new URL(url).pathname.endsWith('/comments')) {
+          loseResponse = false
+          throw new Error('POST response lost after GitHub accepted it')
+        }
+        return response
+      }
+      const create = () =>
+        new KanbanCommentCommands({
+          cards,
+          store: new GithubCardStore({
+            tokens: { mintKanbanCard: async () => ({ token: 't' }) } as never,
+            appSlug: APP_SLUG,
+            fetchImpl,
+            permissions: { permission: async () => 'write' }
+          }),
+          permissions: { permission: async () => 'write' },
+          appSlug: APP_SLUG,
+          log: { info: () => {}, warn: () => {} }
+        })
+      const command = { name: 'unblock' as const, commentId: '98765', sender: { login: 'alice', type: 'User' } }
+      const repo = { installationId: BigInt(INSTALLATION_ID), repoId: BigInt(REPO_ID), repoFullName: 'acme/board' }
+      if (boundary !== 'lost POST response')
+        vi.spyOn(cards, 'settleCommand').mockRejectedValueOnce(new Error('settle failed'))
+      await expect(create().handle(board, repo, ISSUE.number, command)).rejects.toThrow(
+        boundary === 'lost POST response' ? 'POST response lost' : 'settle failed'
+      )
+      expect(writes(github.calls).filter((c) => c.path.endsWith('/comments'))).toHaveLength(1)
+      expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeNull()
+      if (boundary === 'expired claim') {
+        // Simulate the dead process leaving its claim behind, then a fresh process recovering after the TTL.
+        await prisma.kanbanCommand.updateMany({
+          data: { effectClaimedAt: new Date(Date.now() - COMMAND_EFFECT_TTL_MS - 1000) }
+        })
+      }
+      await create().handle(board, repo, ISSUE.number, command)
+      await create().handle(board, repo, ISSUE.number, command)
+      expect(writes(github.calls).filter((c) => c.path.endsWith('/comments'))).toHaveLength(1)
+      expect((await prisma.kanbanCommand.findFirstOrThrow()).settledAt).toBeInstanceOf(Date)
+    }
+  )
 })

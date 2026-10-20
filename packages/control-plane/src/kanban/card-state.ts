@@ -83,6 +83,8 @@ export interface LabelPlan {
   issueState?: { state: 'open' } | { state: 'closed'; reason: IssueCloseReason }
   /** Body-free CP comment explaining a repair or revert; absent on silent outcomes. */
   comment?: string
+  // Stable effect identity: retry only after checking this App's existing marked comments.
+  commentKey?: string
 }
 
 /** Split an issue's labels into recognized statuses and malformed `ac/status:*` labels. */
