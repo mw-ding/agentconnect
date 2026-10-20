@@ -31,6 +31,12 @@ const A1 = 'a1111111-1111-4111-8111-111111111111'
 const REPO_ID = 987654321n
 const T0 = Date.parse('2026-10-15T12:00:00.000Z')
 
+function latch(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => (resolve = done))
+  return { promise, resolve }
+}
+
 class FakeStore {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
@@ -76,7 +82,9 @@ class FakeStore {
   }
 }
 
-async function harness(opts: { completionContract?: 'close' | 'pr_merged' } = {}) {
+async function harness(
+  opts: { completionContract?: 'close' | 'pr_merged'; pr?: Partial<LivePullRequest> | 'error' } = {}
+) {
   await seedDaemon(prisma, D1, { sessionEpoch: 4n })
   await seedDaemon(prisma, D2, { sessionEpoch: 1n })
   await seedAgent(prisma, A1, { daemonId: D1 })
@@ -142,6 +150,19 @@ async function harness(opts: { completionContract?: 'close' | 'pr_merged' } = {}
           : null
     },
     store,
+    prs: {
+      readPullRequest: async (_repo, number) => {
+        if (opts.pr === 'error') throw new Error('read failed')
+        return {
+          number,
+          state: 'open',
+          merged: false,
+          headRef: 'ac/card-1',
+          headRepoId: REPO_ID,
+          ...opts.pr
+        } as LivePullRequest
+      }
+    },
     resolveLogin: async () => 'maintainer',
     poke: (boardId) => dispatcher.poke(boardId),
     gate: dispatcher,
@@ -716,28 +737,28 @@ describe('416c: a paused board keeps its sync and graph loops (real Postgres)', 
 })
 
 describe('416r2: controls on an unpaused board race the dispatcher (real Postgres)', () => {
-  it('416r2: restart on an UNPAUSED board survives a claim/reconcile racing the GitHub write', async () => {
+  it('416r3: restart on an UNPAUSED board excludes a claim until its gated GitHub write lands', async () => {
     const h = await harness()
     const c = await h.addCard(['ac/status:done'], 'running')
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'done' } })
     Object.assign(h.store.issues.get(c.issueNumber)!, { state: 'closed', stateReason: 'completed' })
-    const restartCard = PgKanbanCardRepo.prototype.restartCard
-    let race: Promise<void> | undefined
-    vi.spyOn(PgKanbanCardRepo.prototype, 'restartCard').mockImplementation(async function (
-      this: PgKanbanCardRepo,
-      input
-    ) {
-      const result = await restartCard.call(this, input)
-      // The committed card is claimable now; the cap only keeps a gated claim from hanging the control.
-      race = h.dispatcher.reconcileBoard(h.board.id)
-      await Promise.race([race, new Promise((resolve) => setTimeout(resolve, 1_500))])
-      return result
+    const entered = latch()
+    const release = latch()
+    const read = h.store.readCard.bind(h.store)
+    vi.spyOn(h.store, 'readCard').mockImplementationOnce(async (...args) => {
+      entered.resolve()
+      await release.promise
+      return read(...args)
     })
-    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
-    await race
+    const restart = h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await entered.promise
+    await h.dispatcher.reconcileBoard(h.board.id)
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', labelWritePending: true })
+    release.resolve()
+    expect((await restart).ok).toBe(true)
     await h.dispatcher.settle()
     expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
-    expect((await h.card(c.id)).status).toBe('running')
     expect(h.store.issues.get(c.issueNumber)).toMatchObject({ state: 'open', labels: ['ac/status:running'] })
   })
 
@@ -754,7 +775,6 @@ describe('416r2: controls on an unpaused board race the dispatcher (real Postgre
     await h.dispatcher.reconcileBoard(h.board.id)
     expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
     const skipped = h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
-    await new Promise((resolve) => setTimeout(resolve, 300))
     land()
     expect((await skipped).ok).toBe(true)
     await h.dispatcher.settle()
@@ -800,7 +820,177 @@ describe('416r2: controls on an unpaused board race the dispatcher (real Postgre
     expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
     expect(h.store.writes.at(-1)!.comment).toBe(
       `restarted via AgentConnect; pull request #21 from the earlier work can no longer complete this card, ` +
-        `so close it if it is still open and open a new one from \`ac/card-${c.issueNumber}\``
+        `and the next run replaces it with a new one from \`ac/card-${c.issueNumber}\``
     )
+  })
+})
+
+describe('416r3: versioned controls and restart recovery', () => {
+  it.each(['skip', 'restart'] as const)(
+    '416r3: %s commits first while the GitHub slots run in reverse commit order',
+    async (first) => {
+      const h = await harness()
+      await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+      const c = await h.addCard(['ac/status:review'])
+      await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review' } })
+      const later = first === 'skip' ? 'restart' : 'skip'
+      const entered = latch()
+      const commit = latch()
+      const originalLater =
+        later === 'skip' ? PgKanbanCardRepo.prototype.skipCard : PgKanbanCardRepo.prototype.restartCard
+      vi.spyOn(PgKanbanCardRepo.prototype, later === 'skip' ? 'skipCard' : 'restartCard').mockImplementationOnce(
+        async function (this: PgKanbanCardRepo, input: Parameters<PgKanbanCardRepo['restartCard']>[0]) {
+          entered.resolve()
+          await commit.promise
+          return originalLater.call(this, input)
+        }
+      )
+      // Reserve slot one but hold its transaction; slot two commits first.
+      const last = h.controls[later](DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+      await entered.promise
+      const originalFirst =
+        first === 'skip' ? PgKanbanCardRepo.prototype.skipCard : PgKanbanCardRepo.prototype.restartCard
+      const committed = latch()
+      vi.spyOn(PgKanbanCardRepo.prototype, first === 'skip' ? 'skipCard' : 'restartCard').mockImplementationOnce(
+        async function (this: PgKanbanCardRepo, input: Parameters<PgKanbanCardRepo['restartCard']>[0]) {
+          const result = await originalFirst.call(this, input)
+          committed.resolve()
+          return result
+        }
+      )
+      const early = h.controls[first](DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+      await committed.promise
+      commit.resolve()
+      expect((await last).ok).toBe(true)
+      expect((await early).ok).toBe(true)
+      const status = later === 'skip' ? 'archived' : 'ready'
+      expect(await h.card(c.id)).toMatchObject({
+        status,
+        controlVersion: 2n,
+        controlWrittenVersion: 2n,
+        labelWritePending: false
+      })
+      expect(h.store.issues.get(c.issueNumber)).toMatchObject({
+        state: later === 'skip' ? 'closed' : 'open',
+        labels: [`ac/status:${status}`]
+      })
+      expect(h.store.writes).toHaveLength(1)
+    }
+  )
+
+  it('416r3: failed restart survives poke and claim until the existing sync repairs its intent', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:done'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'done' } })
+    Object.assign(h.store.issues.get(c.issueNumber)!, { state: 'closed', stateReason: 'completed' })
+    vi.spyOn(h.store, 'applyPlan').mockRejectedValueOnce(new Error('temporary GitHub failure'))
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    await h.dispatcher.reconcileBoard(h.board.id)
+    expect(h.sent).toEqual([])
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'ready',
+      labelWritePending: true,
+      controlWrittenVersion: 0n,
+      controlVersion: 1n
+    })
+    const sync = new KanbanSync({
+      repo: new PgKanbanSyncRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      store: h.store,
+      permissions: { permission: async () => 'write' as const },
+      appSlug: 'agentconnect-test',
+      repoRef: async () => ({ installationId: 77n, repoId: REPO_ID, repoFullName: 'acme/web' }),
+      revoke: async () => {},
+      promote: async () => {},
+      log: { warn: vi.fn() }
+    })
+    await sync.reconcileBoard(h.board.id)
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', labelWritePending: false, controlWrittenVersion: 1n })
+    expect(h.store.issues.get(c.issueNumber)).toMatchObject({ state: 'open', labels: ['ac/status:ready'] })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.cardId)).toEqual([c.id])
+  })
+
+  it('416r3: a sync retry in flight cannot acknowledge or overwrite a newer skip', async () => {
+    const h = await harness()
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    const c = await h.addCard(['ac/status:done'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'done' } })
+    Object.assign(h.store.issues.get(c.issueNumber)!, { state: 'closed', stateReason: 'completed' })
+    vi.spyOn(h.store, 'applyPlan').mockRejectedValueOnce(new Error('GitHub unavailable'))
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    const entered = latch()
+    const release = latch()
+    const apply = h.store.applyPlan.bind(h.store)
+    vi.spyOn(h.store, 'applyPlan').mockImplementationOnce(async (...args) => {
+      entered.resolve()
+      await release.promise
+      return apply(...args)
+    })
+    const sync = new KanbanSync({
+      repo: new PgKanbanSyncRepo(prisma),
+      cards: new PgKanbanCardRepo(prisma),
+      store: h.store,
+      gate: h.dispatcher,
+      permissions: { permission: async () => 'write' as const },
+      appSlug: 'agentconnect-test',
+      repoRef: async () => ({ installationId: 77n, repoId: REPO_ID, repoFullName: 'acme/web' }),
+      revoke: async () => {},
+      promote: async () => {},
+      log: { warn: vi.fn() }
+    })
+    const retry = sync.reconcileBoard(h.board.id)
+    await entered.promise
+    const committed = latch()
+    const skipCard = PgKanbanCardRepo.prototype.skipCard
+    vi.spyOn(PgKanbanCardRepo.prototype, 'skipCard').mockImplementationOnce(async function (
+      this: PgKanbanCardRepo,
+      input
+    ) {
+      const result = await skipCard.call(this, input)
+      committed.resolve()
+      return result
+    })
+    const skip = h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await committed.promise
+    release.resolve()
+    await retry
+    expect((await skip).ok).toBe(true)
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'archived',
+      controlVersion: 2n,
+      controlWrittenVersion: 2n,
+      labelWritePending: false
+    })
+    expect(h.store.issues.get(c.issueNumber)).toMatchObject({ state: 'closed', labels: ['ac/status:archived'] })
+  })
+
+  it.each([
+    ['unrelated', { number: 99 }],
+    ['foreign repo', { headRepoId: 99n }],
+    ['closed', { state: 'closed' }],
+    ['merged', { merged: true }],
+    ['wrong head', { headRef: 'human-work' }],
+    ['read failure', 'error']
+  ] as const)('416r3: restart drops a %s PR and emits no close target', async (_name, pr) => {
+    const h = await harness({ pr })
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    expect(h.store.writes.at(-1)!.comment).toBe('restarted via AgentConnect')
+    expect((await h.card(c.id)).supersededPrNumber).toBeNull()
+  })
+
+  it('416r3: validated open card PR reaches the worker through the trusted dispatch', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { defaultMode: 'write' } })
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    expect(h.sent[0]!.d).toMatchObject({ supersededPrNumber: 21, mode: 'write' })
   })
 })

@@ -15,6 +15,8 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
       status: 'ready',
       assigneeAgentId: A1,
       promotionPending: false,
+      controlWritePending: false,
+      labelWritePending: false,
       cooldownUntil: null,
       notBefore: null,
       verifiedAt: null,
@@ -55,6 +57,8 @@ describe('explainClaim — gates', () => {
           status: 'todo',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -70,6 +74,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: true,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -85,6 +91,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: new Date(NOW.getTime() + 1000),
           notBefore: null,
           verifiedAt: null,
@@ -100,6 +108,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: new Date(NOW.getTime() + 1000),
           verifiedAt: null,
@@ -115,6 +125,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: null,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -134,6 +146,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -164,6 +178,8 @@ describe('explainClaim — gates', () => {
           status: 'todo',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -184,6 +200,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: true,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -203,6 +221,8 @@ describe('explainClaim — gates', () => {
             status: 'ready',
             assigneeAgentId: A1,
             promotionPending: false,
+            controlWritePending: false,
+            labelWritePending: false,
             cooldownUntil: new Date(NOW.getTime() - 1),
             notBefore: new Date(NOW.getTime() - 1),
             verifiedAt: null,
@@ -372,5 +392,14 @@ describe('vera-414-main2: merged claim caps apply to work and verify', () => {
     expect(explainClaim(f)).toEqual({ eligible: false, gate: 'daemon_cap' })
     f.daemonCapacity.openRunCount = 0
     expect(explainClaim(f)).toEqual({ eligible: false, gate: 'verifier_is_worker' })
+  })
+})
+
+it.each(['controlWritePending', 'labelWritePending'] as const)('416r3: pure claims exclude %s', (field) => {
+  const facts = input()
+  facts.card[field] = true
+  expect(explainClaim(facts)).toEqual({
+    eligible: false,
+    gate: field === 'controlWritePending' ? 'control_write_pending' : 'label_write_pending'
   })
 })

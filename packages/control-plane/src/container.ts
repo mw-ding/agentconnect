@@ -1830,16 +1830,17 @@ export function buildContainer(
         })
       : undefined
 
+  // CP-only pull_requests:read PR reads: completion contracts and a restart's superseded-PR validation.
+  const kanbanPrReader = kanbanTokens
+    ? new GithubPrReader({ tokens: kanbanTokens, ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}) })
+    : undefined
   // PR completion contracts (TRD 4.7): CP-only pull_requests:read + checks:read reads; workflow lookup on its own actions:read token.
   const kanbanPrContracts: KanbanPrContracts | undefined =
-    kanbanCardStore && kanbanTokens
+    kanbanCardStore && kanbanPrReader
       ? new KanbanPrContracts({
           appSlug: githubAppCfg?.slug,
           repo: repos.kanbanDispatch,
-          prs: new GithubPrReader({
-            tokens: kanbanTokens,
-            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
-          }),
+          prs: kanbanPrReader,
           store: kanbanCardStore,
           repoRef: (boardId): Promise<KanbanRepoRef | null> =>
             kanbanDispatcher?.boardRepo(boardId) ?? Promise.resolve(null),
@@ -1881,6 +1882,7 @@ export function buildContainer(
   const kanbanSync =
     kanbanCardStore && kanbanTokens
       ? new KanbanSync({
+          gate: { holdStatusWrite: (cardId) => kanbanDispatcher!.holdStatusWrite(cardId) },
           repo: new PgKanbanSyncRepo(prisma),
           cards: repos.kanbanCard,
           store: kanbanCardStore,
@@ -1963,6 +1965,7 @@ export function buildContainer(
     cards: repos.kanbanCard,
     installations: repos.githubInstallation,
     ...(kanbanCardStore ? { store: kanbanCardStore } : {}),
+    ...(kanbanPrReader ? { prs: kanbanPrReader } : {}),
     ...(kanbanDispatcher ? { gate: kanbanDispatcher } : {}),
     resolveLogin: async (userId) =>
       (await prisma.githubRepoIdentity.findUnique({ where: { userId }, select: { login: true } }))?.login ?? null,

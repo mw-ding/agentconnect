@@ -562,31 +562,21 @@ to `ready` — resetting the failure counters, block recurrence, cooldown, block
 kind and the attention flag — revokes any open lease, reopens a closed issue,
 writes the status label and one comment, then re-arms the dispatcher.
 
-Skip and restart hold the dispatcher's per-card status-write queue from before
-their database write until their GitHub write has run, the same queue the
-dispatcher's own label writes use. A claim that lands in between waits for that
-write before it reads the issue, so it sees the restart's reopened `ready` issue
-rather than the old closed one, and it cannot release the card back to its old
-status. A skip's close is likewise ordered after any status label write that is
-still in flight for the card. The lease revocation is sent alongside the GitHub
-write, never ahead of it. The queue is in-process, like the dispatcher's own. If
-the GitHub write itself fails, `labelWritePending` stays set for the label sync
-to repair. On an unpaused board, though, a claim before that repair still reads
-the old issue and releases the card into the issue's status, so the restart has
-to be repeated. Skip also clears any open promotion intent, because recovery and
-the label sync never revisit an archived card. Without a GitHub card store
-(no GitHub App), pause and resume still work, while skip and restart answer
-`404 kanban controls unavailable`.
+Skip/restart CAS a per-card control version in their move transaction. Queued
+GitHub writes drop superseded versions. SQL, pure and explain claims exclude
+pending label/control writes. A failed acknowledged restart remains ready and
+unclaimable until the existing label sync reopens the issue and writes ready;
+skip repair closes and archives. Sync and dispatch projections share the
+in-process status queue. Multiple CP processes still lack a shared write queue.
+Skip clears promotion intent. Without a GitHub card store, pause/resume work
+and skip/restart answer `404 kanban controls unavailable`.
 
-A restart starts a new work episode, so a pull request from the earlier episode
-can no longer complete the card. GitHub allows only one open pull request per
-head and base, and `ac/card-<n>` is reused. When the restart cleared a linked
-pull request, its comment therefore names that pull request and asks for it to
-be closed and replaced from `ac/card-<n>`. The write-mode worker prompt tells
-the worker to do this when the App's restart comment names a pull request. The
-CP cannot close the pull request itself, because its Kanban pull-request token
-is read-only. If the old pull request is reported again anyway, the binding
-still refuses it with `pr_unbound`, and the card waits for a human.
+Restart starts a new work episode and validates a linked PR with the read-only
+reader (same repository, open, unmerged, exact card head). Any failure drops it.
+A validated number travels in trusted dispatch data; comment text never
+authorizes closing a PR. The CP's PR token stays read-only. Write-run token scope
+tightening is a separate follow-up. An older PR reported again is refused by
+the episode binding with `pr_unbound`.
 
 Known gaps (M4 controls): a half-landed synthesis promotion is not adopted by
 the attributed pending-promotion recovery (the graph reconciler's adoption rule
@@ -595,7 +585,7 @@ unattributed promotion. The skip comment names the actor's GitHub login only whe
 a linked `github_repo_identity` row exists; otherwise it omits the login. Board
 pause/resume and card skip/restart leave body-free audit rows (`board_paused`,
 `board_resumed`, `card_skipped`, `card_restarted`). The claim predicate now
-reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.4).
+reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.5).
 
 M4 controls continuation: synthesis re-evaluates the parent on an `issues.closed`
 or `issues.reopened` doorbell, assigns the configured organization agent, and
@@ -609,9 +599,11 @@ another session can acquire its branch. A session with no local `ac/card-<n>`
 (a fresh session clone, or a worktree on another daemon) first checks whether
 `origin` has the branch. If it does, the session fetches it and starts from it.
 This applies to the cold preparation of a session pod too. Otherwise the session
-creates the branch from the default branch. An existing local branch always
-wins, even if it is behind `origin`. Commits that were never pushed stay in the
-clone that made them.
+creates the branch from the default branch. A fresh card checkout preserves an existing local card branch. An existing
+read-mode checkout safely switches to the requested card branch: it fetches and
+tracks origin when present, otherwise starts from the default branch. Dirty,
+detached, locked and foreign-held state fails closed; local-only card commits
+are never reset. Commits never pushed stay in the clone that made them.
 
 Known validation limits (M4 controls): the live suite uses GitHub scratch issues,
 real PostgreSQL, a real daemon with a fake ACP runtime, and interactive OIDC

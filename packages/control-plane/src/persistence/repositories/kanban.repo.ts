@@ -26,11 +26,13 @@ import {
   type KanbanBoardView,
   type KanbanBoardWriteResult,
   type KanbanCardControlInput,
+  type KanbanCardControlPeek,
   type KanbanCardControlRepo,
   type KanbanCardControlResult,
   type KanbanCardRecord,
   type KanbanCardRepo,
   type KanbanCardRow,
+  type KanbanRestartInput,
   type KanbanCardUpsertInput,
   type KanbanCardUpsertResult,
   type KanbanCommandInput,
@@ -935,13 +937,40 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     return this.controlCard(input, 'archived', 'card_skipped', 'skipped', 'skip')
   }
 
-  restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult> {
+  restartCard(input: KanbanRestartInput): Promise<KanbanCardControlResult> {
     return this.controlCard(input, 'ready', 'card_restarted', 'restarted', 'restart')
+  }
+
+  async peekControl(orgId: string, boardId: string, cardId: string): Promise<KanbanCardControlPeek | null> {
+    const row = await this.db.kanbanCard.findFirst({
+      where: { id: cardId, boardId, board: { orgId } },
+      select: { issueNumber: true, linkedPrNumber: true, board: { select: { repoId: true, repoFullName: true } } }
+    })
+    if (!row) return null
+    return {
+      issueNumber: row.issueNumber,
+      linkedPrNumber: row.linkedPrNumber,
+      orgId: OrgId(orgId),
+      repoId: row.board.repoId,
+      repoFullName: row.board.repoFullName
+    }
+  }
+
+  async isLatestControl(cardId: string, version: bigint): Promise<boolean> {
+    return (await this.db.kanbanCard.count({ where: { id: cardId, controlVersion: version } })) === 1
+  }
+
+  async markControlWritten(cardId: string, version: bigint): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, controlVersion: version, controlWrittenVersion: { lt: version } },
+      data: { controlWrittenVersion: version, labelWritePending: false }
+    })
+    return count === 1
   }
 
   /** The shared B5 control write: revoke any open lease (bumping the fence), move the card, and audit — all in one transaction. */
   private controlCard(
-    input: KanbanCardControlInput,
+    input: KanbanRestartInput,
     to: KanbanStatus,
     auditKind: 'card_skipped' | 'card_restarted',
     reasonCode: string,
@@ -960,10 +989,11 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           repoFullName: string
           targetChannel: string | null
           linkedPrNumber: number | null
+          controlVersion: bigint
         }>
       >(
         Prisma.sql`
-          SELECT c."id", c."status", c."stateRevision", c."issueNumber", c."linkedPrNumber", b."orgId", b."repoId", b."repoFullName", b."targetChannel"
+          SELECT c."id", c."status", c."stateRevision", c."issueNumber", c."linkedPrNumber", c."controlVersion", b."orgId", b."repoId", b."repoFullName", b."targetChannel"
           FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
           WHERE c."id" = ${input.cardId}::uuid AND c."boardId" = ${input.boardId}::uuid AND b."orgId" = ${input.orgId}
           FOR UPDATE OF c
@@ -979,7 +1009,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         orgId: OrgId(row.orgId),
         repoId: row.repoId,
         repoFullName: row.repoFullName,
-        supersededPrNumber: null
+        supersededPrNumber: null,
+        controlVersion: row.controlVersion
       }
       // A repeated skip is idempotent: an archived card holds no lease, so there is nothing to revoke, move, audit or write.
       if (to === 'archived' && row.status === 'archived')
@@ -1025,10 +1056,19 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         }))
       )
         return { ok: true, value: { ...outcome, changed: false, revokedLease: null } }
-      await tx.kanbanCard.update({
-        where: { id: row.id },
+      // Only a PR validated as this card's open card-branch PR, and still the linked one, becomes the close target.
+      const superseded =
+        to === 'ready' && input.validatedPrNumber != null && input.validatedPrNumber === row.linkedPrNumber
+          ? row.linkedPrNumber
+          : null
+      const controlVersion = row.controlVersion + 1n
+      // CAS under the row lock: the version this move commits is the one its GitHub write must still match.
+      const { count } = await tx.kanbanCard.updateMany({
+        where: { id: row.id, controlVersion: row.controlVersion },
         data: {
           status: to,
+          controlVersion,
+          ...(to === 'ready' ? { supersededPrNumber: superseded } : {}),
           stateRevision: { increment: 1 },
           dispatchRevision: { increment: 1 },
           githubSyncedAt: new Date(),
@@ -1038,6 +1078,7 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           ...(to === 'ready' ? reset : PROMOTION_CLEARED)
         }
       })
+      if (count !== 1) throw new Error('kanban control version moved under the card lock')
       await auditCardTransition(tx, {
         cardId: row.id,
         from: row.status,
@@ -1083,7 +1124,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           ...outcome,
           changed: true,
           revokedLease: open ?? null,
-          supersededPrNumber: to === 'ready' ? row.linkedPrNumber : null
+          supersededPrNumber: superseded,
+          controlVersion
         }
       }
     })

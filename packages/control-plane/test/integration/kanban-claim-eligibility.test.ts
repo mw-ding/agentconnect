@@ -121,6 +121,8 @@ async function factsFor(boardId: string, cardId: string, maxPerDaemon?: number):
       status: c.status,
       assigneeAgentId: c.assigneeAgentId,
       promotionPending: c.promotionPending,
+      controlWritePending: c.controlWrittenVersion < c.controlVersion,
+      labelWritePending: c.labelWritePending,
       cooldownUntil: c.cooldownUntil,
       notBefore: c.notBefore,
       verifiedAt: c.verifiedAt,
@@ -356,7 +358,10 @@ describe('claim eligibility parity (real Postgres)', () => {
       daemon_offline: await card(b.id, 7, { assigneeAgentId: A4 }),
       cooldown: await card(b.id, 8, { cooldownUntil: new Date(NOW.getTime() + 60_000) }),
       not_before: await card(b.id, 9, { notBefore: new Date(NOW.getTime() + 60_000) }),
-      promotion_pending: await card(b.id, 10, { promotionPending: true })
+      promotion_pending: await card(b.id, 10, { promotionPending: true }),
+      label_write_pending: await card(b.id, 29, { labelWritePending: true }),
+      // 416r3: a skip/restart whose GitHub write has not landed is held by the SQL and the pure gate alike.
+      control_write_pending: await card(b.id, 11, { controlVersion: 2n, controlWrittenVersion: 1n })
     }
 
     const repo = new PgKanbanDispatchRepo(prisma)
@@ -376,6 +381,14 @@ describe('claim eligibility parity (real Postgres)', () => {
       if (verdict.eligible) expect(verdict).toEqual({ eligible: true, role: 'work', agentId: A1 })
     }
 
+    expect(explainClaim(snapshots.get(cards.label_write_pending.id)!)).toEqual({
+      eligible: false,
+      gate: 'label_write_pending'
+    })
+    expect(explainClaim(snapshots.get(cards.control_write_pending.id)!)).toEqual({
+      eligible: false,
+      gate: 'control_write_pending'
+    })
     // The board's total is one (the eligible card): nothing else was claimed.
     expect(claimed.leases).toHaveLength(1)
   })

@@ -72,7 +72,9 @@ export const KanbanDispatch = z
     sessionKeyPrefix: z.string().regex(/^[^#\s]{1,200}$/),
     mode: KanbanRunMode,
     // Trusted turn context (like leaseId): work (ready card) or verify (review card). Absent = work.
-    role: KanbanDispatchRole.optional()
+    role: KanbanDispatchRole.optional(),
+    // Trusted: the restart's superseded PR the CP validated as this card's open `ac/card-<n>` PR; write work runs only.
+    supersededPrNumber: z.number().int().positive().optional()
   })
   .strict()
 export type KanbanDispatch = z.infer<typeof KanbanDispatch>

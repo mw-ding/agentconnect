@@ -12,8 +12,9 @@ import type {
 import { planStatusWrite, type KanbanStatus } from './card-state.js'
 import type { CardStore, KanbanRepoRef } from './card-store.js'
 import type { KanbanProjectHook } from './project-writer.js'
+import type { PrReader } from './pr-reader.js'
 
-/** Fixed, body-free templates: names and reason codes only, never issue content. */
+// Fixed, body-free templates: names and reason codes only, never issue content.
 export function skipComment(login: string | null): string {
   return login ? `skipped by @${login} via AgentConnect` : 'skipped via AgentConnect'
 }
@@ -22,27 +23,44 @@ export function restartComment(issueNumber: number, supersededPrNumber: number |
   if (supersededPrNumber === null) return 'restarted via AgentConnect'
   return (
     `restarted via AgentConnect; pull request #${supersededPrNumber} from the earlier work can no longer complete ` +
-    `this card, so close it if it is still open and open a new one from \`ac/card-${issueNumber}\``
+    `this card, and the next run replaces it with a new one from \`ac/card-${issueNumber}\``
   )
 }
 
-/** Releases a held status-write slot, running `write` (if any) in it; resolves once the slot has drained. */
+// Only this repository's open, unmerged PR from the card's own `ac/card-<n>` may be named for closing.
+export function isSupersededCardPr(
+  pr: Awaited<ReturnType<PrReader['readPullRequest']>>,
+  expected: { prNumber: number; issueNumber: number; repoId: bigint }
+): boolean {
+  return (
+    pr !== null &&
+    pr.number === expected.prNumber &&
+    pr.state === 'open' &&
+    !pr.merged &&
+    pr.headRef === `ac/card-${expected.issueNumber}` &&
+    pr.headRepoId === expected.repoId
+  )
+}
+
+// Releases a held status-write slot, running `write` (if any) in it; resolves once the slot has drained.
 type StatusWriteRelease = (write?: () => Promise<void>) => Promise<void>
 
 export interface KanbanControlsDeps {
   boards: KanbanBoardAdminRepo
   cards: KanbanCardControlRepo
   installations: Pick<GithubInstallationRepo, 'liveByOrgAndAccount'>
-  /** The GitHub card store; without one (no GitHub App) only pause and resume are available. */
+  // The GitHub card store; without one (no GitHub App) only pause and resume are available.
   store?: Pick<CardStore, 'readCard' | 'applyPlan'>
-  /** The dispatcher's per-card status-write queue, held across the DB write so no claim reads GitHub before the control's write lands. */
+  // The read-only PR reader that validates a restart's superseded PR; without one no PR is ever named.
+  prs?: Pick<PrReader, 'readPullRequest'>
+  // The dispatcher's per-card status-write queue, held across the DB write so no claim reads GitHub before the control's write lands.
   gate?: { holdStatusWrite(cardId: string): StatusWriteRelease }
-  /** Resolve the acting user's GitHub login for the body-free skip comment; undefined or null ⇒ no login in the comment. */
+  // Resolve the acting user's GitHub login for the body-free skip comment; undefined or null ⇒ no login in the comment.
   resolveLogin?: (userId: string) => Promise<string | null>
   poke(boardId: string): void
-  /** Tells the revoked lease's daemon to stop now; the bumped dispatchRevision fences it either way. */
+  // Tells the revoked lease's daemon to stop now; the bumped dispatchRevision fences it either way.
   revoke?: (lease: KanbanLeaseRef, cardId: string) => Promise<void>
-  /** Post-commit Projects v2 seam for the committed status. */
+  // Post-commit Projects v2 seam for the committed status.
   project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
   log: { warn(obj: unknown, msg?: string): void }
 }
@@ -76,17 +94,26 @@ export class KanbanControls {
 
   async restart(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
     const store = this.cardStore()
+    const validatedPrNumber = await this.validatedSupersededPr(orgId, boardId, cardId)
     const result = await this.control(
       boardId,
       cardId,
-      () => this.deps.cards.restartCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' }),
+      () =>
+        this.deps.cards.restartCard({
+          orgId,
+          boardId,
+          cardId,
+          actorUserId: userId,
+          source: 'owner',
+          validatedPrNumber
+        }),
       (card) => this.writeIssue(store, card, 'ready', restartComment(card.issueNumber, card.supersededPrNumber))
     )
     if (result.ok && result.value.changed) this.deps.poke(boardId)
     return result
   }
 
-  /** Skip and restart write the GitHub issue, so they need the card store; without one their routes answer unavailable. */
+  // Skip and restart write the GitHub issue, so they need the card store; without one their routes answer unavailable.
   get cardControlsAvailable(): boolean {
     return this.deps.store !== undefined
   }
@@ -96,7 +123,23 @@ export class KanbanControls {
     return this.deps.store
   }
 
-  /** Hold the card's status-write slot across the DB move, write GitHub in it, and revoke the old lease alongside, never ahead of it. */
+  // The linked PR, kept only when a live read proves it this repo's open PR from `ac/card-<n>`; any failure drops it.
+  private async validatedSupersededPr(orgId: string, boardId: string, cardId: string): Promise<number | null> {
+    try {
+      const peek = await this.deps.cards.peekControl(orgId, boardId, cardId)
+      if (!peek || peek.linkedPrNumber === null || !this.deps.prs) return null
+      const repo = await this.repoRef(peek)
+      if (!repo) return null
+      const pr = await this.deps.prs.readPullRequest(repo, peek.linkedPrNumber)
+      const expected = { prNumber: peek.linkedPrNumber, issueNumber: peek.issueNumber, repoId: peek.repoId }
+      return isSupersededCardPr(pr, expected) ? peek.linkedPrNumber : null
+    } catch (err) {
+      this.deps.log.warn({ err, cardId }, 'kanban: superseded PR validation failed; the restart names no PR')
+      return null
+    }
+  }
+
+  // Hold the card's status-write slot across the DB move, write GitHub in it unless a newer control superseded it, and revoke alongside.
   private async control(
     boardId: string,
     cardId: string,
@@ -113,8 +156,31 @@ export class KanbanControls {
       const changed = card
       if (changed && changed.from !== changed.status) this.projectCommitted(boardId, changed)
       const revoking = changed ? this.revokeLease(changed) : undefined
-      await release(changed ? () => write(changed) : undefined)
+      await release(changed ? () => this.versionedWrite(changed, write) : undefined)
       await revoking
+    }
+  }
+
+  // A control's write lands only while its version is the card's latest; a failure stays pending, unclaimable, for the label sync.
+  private async versionedWrite(
+    card: KanbanCardControlOutcome,
+    write: (card: KanbanCardControlOutcome) => Promise<void>
+  ): Promise<void> {
+    try {
+      if (!(await this.deps.cards.isLatestControl(card.cardId, card.controlVersion))) {
+        this.deps.log.warn(
+          { cardId: card.cardId, controlVersion: card.controlVersion },
+          'kanban: dropped a control write a newer control superseded'
+        )
+        return
+      }
+      await write(card)
+      await this.deps.cards.markControlWritten(card.cardId, card.controlVersion)
+    } catch (err) {
+      this.deps.log.warn(
+        { err, cardId: card.cardId, status: card.status },
+        'kanban: control issue write failed; the card stays unclaimable until the label sync repairs it'
+      )
     }
   }
 
@@ -133,28 +199,27 @@ export class KanbanControls {
     })
   }
 
-  /** Best-effort label/close + comment after the DB write committed; a failure leaves drift for the reconciler. */
+  // The label/close + comment after the DB write committed; it throws when the write cannot land, leaving it pending.
   private async writeIssue(
     store: NonNullable<KanbanControlsDeps['store']>,
     card: KanbanCardControlOutcome,
     status: KanbanStatus,
     comment: string
   ): Promise<void> {
-    try {
-      const repo = await this.repoRef(card)
-      if (!repo) return
-      const observed = await store.readCard(repo, card.issueNumber)
-      if (!observed) return
-      await store.applyPlan(repo, card.issueNumber, observed, {
-        ...planStatusWrite(status, observed),
-        comment
-      })
-    } catch (err) {
-      this.deps.log.warn({ err, cardId: card.cardId, status }, 'kanban: control issue write failed')
-    }
+    const repo = await this.repoRef(card)
+    if (!repo) throw new Error('kanban control write has no live installation')
+    const observed = await store.readCard(repo, card.issueNumber)
+    if (!observed) throw new Error('kanban control write found no issue')
+    if (!(await this.deps.cards.isLatestControl(card.cardId, card.controlVersion))) return
+    await store.applyPlan(repo, card.issueNumber, observed, {
+      ...planStatusWrite(status, observed),
+      comment
+    })
   }
 
-  private async repoRef(card: KanbanCardControlOutcome): Promise<KanbanRepoRef | null> {
+  private async repoRef(
+    card: Pick<KanbanCardControlOutcome, 'orgId' | 'repoId' | 'repoFullName'>
+  ): Promise<KanbanRepoRef | null> {
     const owner = card.repoFullName.split('/', 1)[0]
     if (!owner) return null
     const installation = await this.deps.installations.liveByOrgAndAccount(card.orgId, owner)

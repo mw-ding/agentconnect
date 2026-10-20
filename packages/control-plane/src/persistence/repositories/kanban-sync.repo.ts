@@ -31,6 +31,8 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         assigneeAgentId: true,
         promotionPending: true,
         labelWritePending: true,
+        controlVersion: true,
+        controlWrittenVersion: true,
         syncEventCursor: true,
         syncAgentCursor: true,
         syncDeferredAt: true,
@@ -62,7 +64,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
       const rows = await tx.$queryRaw<Array<{ id: string; issueNumber: number }>>(Prisma.sql`
         SELECT "id", "issueNumber" FROM "kanban_card"
         WHERE "boardId" = ${boardId}::uuid AND NOT "promotionPending" AND (NOT "needsAttention" OR "labelWritePending")
-        ORDER BY "syncCheckedAt" ASC NULLS FIRST, "issueNumber" ASC
+        ORDER BY "controlWrittenVersion" < "controlVersion" DESC, "syncCheckedAt" ASC NULLS FIRST, "issueNumber" ASC
         LIMIT ${limit} FOR UPDATE SKIP LOCKED
       `)
       await tx.kanbanCard.updateMany({
@@ -162,11 +164,14 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         id: card.id,
         stateRevision: card.stateRevision,
         dispatchRevision: card.dispatchRevision,
+        controlVersion: card.controlVersion,
         syncEventCursor: card.syncEventCursor,
         syncAgentCursor: card.syncAgentCursor
       },
       data: {
         labelWritePending: false,
+        // The projection just written is this snapshot's status, so GitHub now reflects its latest control too.
+        controlWrittenVersion: card.controlVersion,
         githubSyncedAt: new Date(),
         syncEventCursor: cursor > card.syncEventCursor ? cursor : card.syncEventCursor,
         syncAgentCursor: agentCursor > card.syncAgentCursor ? agentCursor : card.syncAgentCursor,

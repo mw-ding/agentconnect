@@ -2398,25 +2398,7 @@ export class WorkspaceManager {
         .then(() => true)
         .catch(() => false)
       // Only a removed daemon session can release a card branch; an existing worktree may still be live.
-      if (exists) {
-        const listing = await git().raw(['worktree', 'list', '--porcelain', '-z'])
-        for (const record of listing.split('\0\0')) {
-          const fields = record.split('\0')
-          if (!fields.includes(`branch refs/heads/${branch}`)) continue
-          const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
-          if (!path) continue
-          const location = cardWorktreeLocation(path, cwd)
-          if (
-            location === 'foreign' ||
-            (await this.fsFor(agentId).stat(path)) !== 'missing' ||
-            fields.some((field) => field.startsWith('locked'))
-          ) {
-            throw new Error(`card branch ${branch} is already checked out in another worktree`)
-          }
-          // Remove only the proven stale card registration; pruning also drops unrelated foreign registrations.
-          await git().raw(['worktree', 'remove', path])
-        }
-      }
+      if (exists) await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
       // A card branch pushed from another clone or daemon resumes from origin; no upstream, so a push never targets the default branch.
       const start = exists
         ? undefined
@@ -2431,6 +2413,102 @@ export class WorkspaceManager {
     const name = await this.drawSessionBranch(git(), initiatedBy)
     // No upstream: the console's push authorization must never treat the base branch as the session's target.
     await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
+  }
+
+  /** Refuse a card branch a live, locked or foreign worktree holds; release only a proven removed managed registration. */
+  private async releaseCardBranchRegistrations(
+    agentId: string,
+    root: WorkspaceRoot,
+    cwd: string,
+    branch: string
+  ): Promise<void> {
+    const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
+    const listing = await git().raw(['worktree', 'list', '--porcelain', '-z'])
+    for (const record of listing.split('\0\0')) {
+      const fields = record.split('\0')
+      if (!fields.includes(`branch refs/heads/${branch}`)) continue
+      const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
+      if (!path) continue
+      const location = cardWorktreeLocation(path, cwd)
+      if (
+        location === 'foreign' ||
+        (await this.fsFor(agentId).stat(path)) !== 'missing' ||
+        fields.some((field) => field.startsWith('locked'))
+      ) {
+        throw new Error(`card branch ${branch} is already checked out in another worktree`)
+      }
+      // Remove only the proven stale card registration; pruning also drops unrelated foreign registrations.
+      await git().raw(['worktree', 'remove', path])
+    }
+  }
+
+  /** Move a resumed session checkout onto its card branch; a detached or dirty checkout is refused, never discarded. */
+  private async switchToCardBranch(
+    agentId: string,
+    root: WorkspaceRoot,
+    cwd: string,
+    target: string,
+    branch: string,
+    tier: 'worktree' | 'clone'
+  ): Promise<void> {
+    const git = () =>
+      this.runnerFor(agentId, cwd).withEnv(
+        tier === 'clone' ? this.sessionCloneGitEnv(agentId, root, cwd) : workspaceGitLocalEnv()
+      )
+    const head = (
+      await git()
+        .raw(['symbolic-ref', '--quiet', 'HEAD'])
+        .catch(() => '')
+    ).trim()
+    if (head === `refs/heads/${branch}`) return
+    if (head === '') throw new Error(`session checkout has a detached HEAD; refusing to switch it to ${branch}`)
+    const registrations = await git().raw(['worktree', 'list', '--porcelain', '-z'])
+    for (const record of registrations.split('\0\0')) {
+      const fields = record.split('\0')
+      const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
+      if (path && cardWorktreeLocation(path, cwd) === 'same' && fields.some((field) => field.startsWith('locked'))) {
+        throw new Error(`session checkout is locked; refusing to switch it to ${branch}`)
+      }
+    }
+    // Untracked files count too: a checkout may overwrite one the card branch tracks.
+    if ((await git().raw(['status', '--porcelain'])).trim() !== '') {
+      throw new Error(`session checkout has uncommitted or untracked changes; refusing to switch it to ${branch}`)
+    }
+    const repository = tier === 'clone' ? cwd : root.path
+    const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
+    const exists = await git()
+      .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+      .then(() => true)
+      .catch(() => false)
+    if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
+    const start = remote ?? target
+    if (exists) {
+      const localTip = (await git().raw(['rev-parse', `refs/heads/${branch}`])).trim()
+      // Reset only when every local commit is reachable from the intended starting point.
+      const retained = await git()
+        .raw(['merge-base', '--is-ancestor', localTip, start])
+        .then(() => true)
+        .catch(() => false)
+      if (!retained) throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
+    }
+    if (remote) {
+      // Exact-refspec fetches need a matching origin mapping before Git can configure branch tracking.
+      const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`
+      const mappings = await git()
+        .raw(['config', '--local', '--get-all', 'remote.origin.fetch'])
+        .catch(() => '')
+      if (!mappings.split('\n').includes(refspec)) {
+        await git().raw(['config', '--local', '--add', 'remote.origin.fetch', refspec])
+      }
+    }
+    await git().raw([
+      'checkout',
+      '--no-overwrite-ignore',
+      '-B',
+      branch,
+      ...(remote ? ['--track'] : ['--no-track']),
+      start
+    ])
   }
 
   /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
@@ -2698,6 +2776,8 @@ export class WorkspaceManager {
     } else if (review) {
       // Tracked files alone follow the revision; untracked and ignored files (node_modules, a cargo target, build output) are the session's own intermediates and stay, so a re-review does not rebuild them.
       await this.runnerFor(agent.id, cwd).withEnv(workspaceGitLocalEnv()).raw(['reset', '--hard', target])
+    } else if (request.branch !== undefined) {
+      await this.switchToCardBranch(agent.id, root, cwd, target, request.branch, 'worktree')
     }
     if (review && (await this.revParse(agent.id, cwd, 'HEAD')).toLowerCase() !== review.checkout) {
       throw new Error('github review worktree HEAD does not match the verified revision')
@@ -2863,6 +2943,8 @@ export class WorkspaceManager {
       await this.runnerFor(agentId, cwd)
         .withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
         .raw(['reset', '--hard', target])
+    } else if (request.branch !== undefined) {
+      await this.switchToCardBranch(agentId, root, cwd, target, request.branch, 'clone')
     }
     if (review && (await this.revParse(agentId, cwd, 'HEAD')).toLowerCase() !== review.checkout) {
       throw new Error('github review clone HEAD does not match the verified revision')

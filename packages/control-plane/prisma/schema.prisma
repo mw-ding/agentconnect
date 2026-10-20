@@ -2646,6 +2646,12 @@ model KanbanCard {
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
   labelWritePending Boolean @default(false)
+  // B5 controls: bumped by each skip/restart under the card lock; its GitHub write lands only while still the latest.
+  controlVersion        BigInt @default(0)
+  // The latest control version GitHub reflects; below controlVersion the card is never claimed.
+  controlWrittenVersion BigInt @default(0)
+  // A restart's superseded PR, validated open on this card's `ac/card-<n>` in this repo; the next write run is told to close it.
+  supersededPrNumber    Int?
   syncEventCursor BigInt @default(0)
   syncAgentCursor BigInt @default(0)
   syncCheckedAt DateTime? @db.Timestamptz(6)

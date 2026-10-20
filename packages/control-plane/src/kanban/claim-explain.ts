@@ -79,6 +79,9 @@ export function claimFactsOf(input: ClaimEligibilityInput): ClaimFacts {
 const HINTS: Record<ClaimGate, (facts: ClaimFacts) => string> = {
   board_disabled: () => 'the board is disabled; enable it to dispatch cards',
   board_paused: () => 'the board is paused; resume it to dispatch cards',
+  label_write_pending: () => 'the issue status is still being written on GitHub; dispatch waits for the label sync',
+  control_write_pending: () =>
+    'a skip or restart is still writing the issue on GitHub; the label sync retries a failed write, then the card is dispatched',
   status_not_claimable: (f) => `only ready (work) and review (verify) cards are dispatched; this card is ${f.status}`,
   verified: () => 'the verifier approved this card; it is waiting for the completion contract',
   needs_attention: () => 'this card needs human attention; a human status move clears the hold',

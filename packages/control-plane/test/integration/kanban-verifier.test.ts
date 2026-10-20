@@ -1,3 +1,5 @@
+import { acknowledgeKanbanProjection } from '../fixtures/kanban-projection.js'
+import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 // Verifier routing (M4) on real Postgres: review cards claim to the verifier, B8 refuses self-approval, changes_requested returns to the assignee.
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
@@ -45,6 +47,9 @@ class FakeStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
+    const row = await prisma.kanbanCard.findFirst({ where: { issueNumber: n, board: { repoId: _repo.repoId } } })
+    const sync = new PgKanbanSyncRepo(prisma)
+    const snapshot = row ? await sync.get(row.boardId, n) : null
     this.writes.push(plan)
     const i = this.issues.get(n)!
     i.labels = [...i.labels.filter((l) => !plan.removeLabels.includes(l)), ...plan.addLabels]
@@ -53,6 +58,9 @@ class FakeStore {
       i.stateReason = plan.issueState.state === 'closed' ? plan.issueState.reason : null
     }
     for (const label of plan.addLabels) await onLabelAdded?.(label)
+    if (snapshot && snapshot.status === plan.status) {
+      await sync.ack(snapshot, snapshot.syncEventCursor, snapshot.syncAgentCursor)
+    }
   }
   async readLabelEvents(_repo: KanbanRepoRef, n: number): Promise<LabelEvent[]> {
     return (this.issues.get(n)?.labels ?? []).map((name, i) => ({
@@ -103,6 +111,13 @@ async function harness(
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
+  const ingestStatus = repo.ingestStatus.bind(repo)
+  vi.spyOn(repo, 'ingestStatus').mockImplementation(async (...args) => {
+    const result = await ingestStatus(...args)
+    if (result.moved) await acknowledgeKanbanProjection(result.cardId)
+    return result
+  })
+
   const project = { onStatusCommitted: vi.fn() }
   const repoRef = { installationId: 77n, repoId: REPO_ID, repoFullName: 'acme/web' }
   const contracts = opts.prs
@@ -336,7 +351,7 @@ describe('Kanban verifier routing (real Postgres)', () => {
     expect(h.sent.map((s) => [s.d.cardId, s.d.agentId])).toEqual([[c.id, A1]])
   })
 
-  it('changes_requested returns the card to ready for the original assignee and re-dispatches as work', async () => {
+  it('416r3: a completed ready projection re-arms dispatch after pending-write claim exclusion', async () => {
     const h = await harness()
     const c = await h.reviewCard()
     await h.dispatcher.reconcileBoard(h.board.id)
@@ -1068,6 +1083,7 @@ describe('vera-415r2: B5 every path out of done ends the work episode (real Post
     // A human readies it; new work reports no PR; the verifier approves: the card waits, it never completes.
     expect(await cards.casStatus(c.id, (await h.card(c.id)).stateRevision, 'ready')).toBe(true)
     h.store.issues.set(c.issueNumber, { labels: ['ac/status:ready'], state: 'open', stateReason: null })
+    await acknowledgeKanbanProjection(c.id)
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
     const work = h.sent.at(-1)!.d

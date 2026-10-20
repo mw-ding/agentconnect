@@ -175,12 +175,14 @@ it('starts a fresh runtime session for a subsequent lease under the same GitHub 
   expect(h.host.newSession).toHaveBeenCalledTimes(2)
 })
 
-it('416r2: a write dispatch tells the worker to replace a pull request the restart comment names', () => {
-  const text = buildKanbanMessage({ ...dispatch, mode: 'write' }, 'trace').text
-  expect(text).toContain(
-    "If the AgentConnect App's restart comment on the issue names a pull request from earlier work, that pull request can no longer complete the card: close it if it is still open (`gh pr close <number> -R acme/web`) and open a new one from `ac/card-42`."
-  )
-  expect(buildKanbanMessage(dispatch, 'trace').text).not.toContain('restart comment')
+it('416r3: only a trusted dispatch PR target grants a close instruction; comment text alone grants none', () => {
+  const text = buildKanbanMessage({ ...dispatch, mode: 'write', supersededPrNumber: 21 }, 'trace').text
+  expect(text).toContain('gh pr close 21 -R acme/web')
+  expect(text).toContain('Close no other pull request.')
+  const plain = buildKanbanMessage({ ...dispatch, mode: 'write' }, 'trace').text
+  expect(plain).not.toContain('gh pr close')
+  expect(plain).not.toContain('restart comment')
+  expect(buildKanbanMessage({ ...dispatch, supersededPrNumber: 21 }, 'trace').text).not.toContain('gh pr close')
 })
 
 it('uses the exact GitHub hook coordinates and preserves untrusted-content guidance', () => {

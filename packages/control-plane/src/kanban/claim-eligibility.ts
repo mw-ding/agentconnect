@@ -11,6 +11,9 @@ export type ClaimGate =
   | 'board_paused'
   | 'status_not_claimable'
   | 'promotion_pending'
+  // A skip/restart's GitHub write has not landed yet; the claim waits so it never reads the pre-control issue.
+  | 'control_write_pending'
+  | 'label_write_pending'
   | 'cooldown'
   | 'not_before'
   | 'no_assignee'
@@ -59,6 +62,9 @@ export interface ClaimEligibilityInput {
     status: KanbanStatus
     assigneeAgentId: string | null
     promotionPending: boolean
+    /** A skip/restart committed a control version GitHub does not reflect yet. */
+    controlWritePending: boolean
+    labelWritePending: boolean
     cooldownUntil: Date | null
     notBefore: Date | null
     /** When the verifier approved a review card under a PR contract; set ⇒ the card is not re-verified. */
@@ -98,6 +104,8 @@ export function explainClaim(input: ClaimEligibilityInput): ClaimVerdict {
   if (role === 'verify' && card.verifiedAt !== null) return { eligible: false, gate: 'verified' }
   if (card.needsAttention) return { eligible: false, gate: 'needs_attention' }
   if (card.promotionPending) return { eligible: false, gate: 'promotion_pending' }
+  if (card.controlWritePending) return { eligible: false, gate: 'control_write_pending' }
+  if (card.labelWritePending) return { eligible: false, gate: 'label_write_pending' }
   if (card.cooldownUntil !== null && card.cooldownUntil.getTime() > now.getTime()) {
     return { eligible: false, gate: 'cooldown' }
   }

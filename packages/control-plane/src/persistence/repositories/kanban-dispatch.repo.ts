@@ -100,6 +100,7 @@ interface CandidateRow {
   verifierDidWork: boolean
   epicCardId: string | null
   workEpisodeStartedAt: Date | null
+  supersededPrNumber: number | null
 }
 
 interface RunEndRow {
@@ -225,7 +226,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
         SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
-               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt", c."supersededPrNumber",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
                EXISTS (SELECT 1 FROM "kanban_run" w
                  WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
@@ -247,6 +248,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
               : Prisma.empty
           }
           AND NOT c."promotionPending"
+          -- A skip/restart whose GitHub write has not landed is never claimed, so no claim reads the pre-control issue.
+          AND c."controlWrittenVersion" >= c."controlVersion"
+          AND NOT c."labelWritePending"
           AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= ${opts.now})
           AND (c."notBefore" IS NULL OR c."notBefore" <= ${opts.now})
           AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)
@@ -342,8 +346,9 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
             orderBy: { createdAt: 'asc' },
             select: { githubSessionKey: true }
           })
+          const mode = card.role === 'verify' ? 'read' : (card.mode ?? board.defaultMode)
           claimed.push({
-            mode: card.role === 'verify' ? 'read' : (card.mode ?? board.defaultMode),
+            mode,
             role: card.role,
             runId: run.id,
             leaseId: run.leaseId,
@@ -358,7 +363,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
             orgId: OrgId(board.orgId),
             repoId: board.repoId,
             repoFullName: board.repoFullName,
-            sessionKeyPrefix: hook?.githubSessionKey ?? `github:${board.repoId}`
+            sessionKeyPrefix: hook?.githubSessionKey ?? `github:${board.repoId}`,
+            // Trusted dispatch data: only a write-mode work run may be told to close the restart's validated PR.
+            ...(card.role === 'work' && mode === 'write' && card.supersededPrNumber !== null
+              ? { supersededPrNumber: card.supersededPrNumber }
+              : {})
           })
           perAgent.set(card.agentId, (perAgent.get(card.agentId) ?? 0) + 1)
           if (card.epicCardId !== null) perEpic.set(card.epicCardId, (perEpic.get(card.epicCardId) ?? 0) + 1)
@@ -1291,6 +1300,9 @@ async function loadExplainState(
       needsAttention: true,
       epicCardId: true,
       promotionPending: true,
+      labelWritePending: true,
+      controlVersion: true,
+      controlWrittenVersion: true,
       cooldownUntil: true,
       notBefore: true,
       priority: true,
@@ -1388,6 +1400,8 @@ async function loadExplainState(
         verifiedAt: c.verifiedAt,
         needsAttention: c.needsAttention,
         promotionPending: c.promotionPending,
+        controlWritePending: c.controlWrittenVersion < c.controlVersion,
+        labelWritePending: c.labelWritePending,
         cooldownUntil: c.cooldownUntil,
         notBefore: c.notBefore,
         hasOpenLease: leased.has(c.id)

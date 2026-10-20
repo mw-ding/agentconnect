@@ -1855,6 +1855,86 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     }
   )
 
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout switches to a remote card branch',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const tip = pushCardBranch(primary!.seed, 7)
+      const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(next).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/ac/card-7')
+    }
+  )
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout creates an absent card branch from default',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(next).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+    }
+  )
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing dirty %s checkout fails without discarding user work',
+    async (tier) => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      writeFileSync(join(cwd, 'user-work.txt'), 'keep me')
+      await expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+        /uncommitted|untracked/
+      )
+      expect(readFileSync(join(cwd, 'user-work.txt'), 'utf8')).toBe('keep me')
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
+
+  it('416r3: an existing locked worktree refuses a branch switch', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, unconfined())
+    const branch = git(cwd, ['symbolic-ref', 'HEAD'])
+    git(workspaces.primaryRoot(agent).path, ['worktree', 'lock', cwd])
+    await expect(
+      workspaces.prepareSessionWorkspace(agent, unconfined({ branch: kanbanCardBranch(7) }))
+    ).rejects.toThrow(/locked/)
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(branch)
+  })
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout preserves a local-only card commit',
+    async (tier) => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      git(cwd, ['checkout', '-b', 'ac/card-7'])
+      writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+      git(cwd, ['add', 'local-only.md'])
+      git(cwd, ['commit', '-m', 'local card work'])
+      const localTip = git(cwd, ['rev-parse', 'HEAD'])
+      git(cwd, ['checkout', '-b', 'read-mode'])
+      await expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+        /local-only commits/
+      )
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('read-mode')
+    }
+  )
+
   it('416r2: a fresh confined session with no pushed card branch starts it at the default branch', async () => {
     const agent = agentFixture()
     const { primary } = serveAll(agent)

@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.4 (2026-10-20)
+**Version:** 1.5 (2026-10-20)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -19,6 +19,8 @@ export type ClaimGate =
   | 'board_paused'
   | 'status_not_claimable'
   | 'promotion_pending'
+  | 'control_write_pending'
+  | 'label_write_pending'
   | 'cooldown'
   | 'not_before'
   | 'no_assignee'
@@ -51,6 +53,8 @@ export interface ClaimEligibilityInput {
     status
     assigneeAgentId
     promotionPending
+    controlWritePending
+    labelWritePending
     cooldownUntil
     notBefore
     verifiedAt
@@ -416,6 +420,14 @@ reads a binding override from configuration or environment.
 
 ## Changelog
 
+- **1.5 (2026-10-20):** exclude pending control and label projections from SQL,
+  pure and explain claims. Controls CAS a monotonic `controlVersion` in the move
+  transaction; queued writes drop obsolete versions. The existing sync retries
+  pending controls toward their committed status before attributing GitHub edits.
+  Restart close targets are validated by the read-only PR reader and delivered
+  only as trusted `supersededPrNumber` dispatch data. Existing session checkouts
+  safely switch to the card branch; a remote branch is fetched and tracked.
+
 - **1.4 (2026-10-20):** add the required `board.paused` fact and the `board_paused` gate
   immediately after `board_disabled` (#416), preserving 1.1 review routing, `verified`,
   `needs_attention`, the 1.2 epic/daemon caps and any-attempt B8 ordering. Write-card
@@ -515,4 +527,29 @@ For `ac/card-<n>`, an existing checked-out worktree is never detached or deleted
 by a competing session. Removed daemon session registrations can be pruned and
 the branch reused, preserving committed progress. Existing directories require
 explicit retirement before another session can acquire their branch. A local
-branch is preferred over `origin`'s. Separate clones share only what was pushed.
+branch is preserved for a fresh checkout. Separate clones share only what was pushed.
+
+Existing read-mode session checkouts switch to `ac/card-<n>` on write preparation:
+fetch the remote card branch and track it if present, otherwise start from the
+default branch. Dirty, detached, locked or foreign-held checkouts are refused;
+a local card ref with commits absent from the intended tip is refused rather
+than reset. A checkout already on its card branch preserves its work.
+
+Skip and restart CAS a monotonic `controlVersion` in the same locked transaction
+as their move. Their GitHub writes use the dispatcher's per-card queue and drop
+versions superseded by a later control. Claims exclude `labelWritePending` and
+`controlWrittenVersion < controlVersion`, so an acknowledged restart survives a
+GitHub failure without being reverted by a stale claim read. The existing label
+sync retries the committed intent (restart: open + ready; skip: closed +
+archived), acknowledges the version and clears the pending flag. Completed dispatcher
+projections re-arm dispatch so a poke blocked by a pending write is not lost. The sync and
+dispatcher projections share the queue. This queue remains in-process; multiple
+CP processes do not share its serialization.
+
+Before naming a superseded PR, the CP's read-only PR reader proves it is open,
+unmerged, in this repository and has head `ac/card-<n>`. A failed read or mismatch
+drops the target and yields a plain restart comment. The number is retained only
+if the transaction still sees that linked PR, then passed as trusted
+`supersededPrNumber` lease/dispatch data. Only that trusted field generates a
+worker close instruction; comment text grants no close authority. The CP's PR
+token remains read-only. Write-run token scope tightening is a separate follow-up.

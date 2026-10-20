@@ -7995,6 +7995,8 @@ export interface KanbanClaimedLease extends KanbanBoardRef {
   dispatchRevision: bigint
   /** `HookDef.githubSessionKey` of the agent's GitHub hook on this repo, else `github:<repoId>` (design D4). */
   sessionKeyPrefix: string
+  /** A write-mode work run's validated superseded PR from the card's last restart; the worker may close only this one. */
+  supersededPrNumber?: number
 }
 
 /** A review card the claim refused to dispatch because its verifier is the worker (B8); flagged once, never claimed. */
@@ -8558,8 +8560,10 @@ export interface KanbanCardControlOutcome {
   repoFullName: string
   /** The open lease this write ended as `reclaimed` (dispatchRevision already bumped); null when none. */
   revokedLease: KanbanLeaseRef | null
-  /** The PR a restart unlinked from the ended work episode, which can no longer complete the card; null when none. */
+  /** The validated PR a restart unlinked from the ended episode; the next write run is told to close it. Null when none. */
   supersededPrNumber: number | null
+  /** The control version this move committed; its GitHub write lands only while it is still the card's latest. */
+  controlVersion: bigint
 }
 
 export type KanbanCardControlRefusal = 'not_found' | 'illegal_transition'
@@ -8575,11 +8579,31 @@ export interface KanbanCardControlInput {
   source: string
 }
 
+export interface KanbanRestartInput extends KanbanCardControlInput {
+  /** A linked PR the caller validated as this card's open `ac/card-<n>` PR; kept only if it is still the linked one. */
+  validatedPrNumber?: number | null
+}
+
+/** The body-free facts a restart validates its superseded PR against before the move. */
+export interface KanbanCardControlPeek {
+  issueNumber: number
+  linkedPrNumber: number | null
+  orgId: OrgId
+  repoId: bigint
+  repoFullName: string
+}
+
 export interface KanbanCardControlRepo {
   /** Archive the card and revoke its lease (issue #2 B5). The caller writes the close + comment. */
   skipCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult>
   /** Reset the card to ready and revoke its lease (issue #2 B5). The caller writes the reopen + status label + comment. */
-  restartCard(input: KanbanCardControlInput): Promise<KanbanCardControlResult>
+  restartCard(input: KanbanRestartInput): Promise<KanbanCardControlResult>
+  /** The card's linked PR and repository, unlocked; null when the card is not on this org's board. */
+  peekControl(orgId: string, boardId: string, cardId: string): Promise<KanbanCardControlPeek | null>
+  /** Whether `version` is still the card's latest control, so its GitHub write may land. */
+  isLatestControl(cardId: string, version: bigint): Promise<boolean>
+  /** Record that GitHub reflects control `version`; false when a newer control superseded it. */
+  markControlWritten(cardId: string, version: bigint): Promise<boolean>
 }
 
 /** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */
