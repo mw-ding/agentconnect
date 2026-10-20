@@ -33,6 +33,7 @@ import {
   type LabelPlan
 } from './card-state.js'
 import { planReassign } from './reassign.js'
+import type { KanbanProjectHook } from './project-writer.js'
 
 export interface SyncCard {
   id: string
@@ -91,6 +92,8 @@ export interface KanbanSyncDeps {
   promote(boardId: string, repo: KanbanRepoRef, issueNumber: number): Promise<void>
   log: { warn(obj: unknown, message: string): void }
   now?: () => Date
+  /** Post-commit Projects v2 seam; every status this sync commits is queued there (never throws). */
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
 }
 
 const BATCH = 25
@@ -407,6 +410,9 @@ export class KanbanSync {
         })
         if (!result.ok) return done(false)
         changed = result.changed
+        // Queue the committed restart before revocation or its comment can fail.
+        if (result.changed && result.card.status !== card.status)
+          this.deps.project?.onStatusCommitted({ boardId, issueNumber })
         if (result.revokedLease) {
           const planned = planReassign(
             {
@@ -478,6 +484,8 @@ export class KanbanSync {
     const actor = status.verdict === 'ignore' ? undefined : status.actor
     const result = await this.deps.repo.apply(card, plan, statusCursorCommit, acceptStatus, agentCursorCommit, actor)
     if (!result) return done(changed)
+    // Later GitHub effects can fail permanently after this status has already committed.
+    if (result.changed) this.deps.project?.onStatusCommitted({ boardId, issueNumber })
     if (result.revoked) await this.deps.revoke(result.revoked, card.id)
     changed ||= result.changed
     const current = await this.deps.repo.get(boardId, issueNumber)
@@ -515,6 +523,7 @@ export class KanbanSync {
     if (refreshed.needsAttention && !refreshed.labelWritePending) return false
     const failed = await this.deps.repo.failClosed(refreshed)
     if (!failed) return false
+    if (failed.status !== refreshed.status) this.deps.project?.onStatusCommitted({ boardId, issueNumber })
     if (failed.revoked) await this.deps.revoke(failed.revoked, refreshed.id)
     const plan = planStatusWrite(failed.status, issue)
     if (!refreshed.needsAttention) {

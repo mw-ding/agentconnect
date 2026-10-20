@@ -24,6 +24,8 @@ export interface GithubRetryHint {
 export class GithubApiError extends Error {
   readonly retryAfterMs?: number
   readonly rateLimitResetAt?: number
+  /** GraphQL `errors[].type` codes (NOT_FOUND vs FORBIDDEN), so callers branch without parsing GitHub's text. */
+  graphqlErrorTypes?: readonly string[]
 
   constructor(
     message: string,
@@ -239,12 +241,14 @@ export async function githubGraphql<T>(
     }
     // Authorization and missing-node failures — the denial REST would have answered 404/403 with.
     const denied = errors.some((e) => e.type === 'FORBIDDEN' || e.type === 'NOT_FOUND')
-    throw new GithubApiError(
+    const err = new GithubApiError(
       `github graphql ${denied ? 'denied' : 'error'}: ${detail}`,
       200,
       denied ? 'LEASE_DENIED' : 'INTERNAL',
       false
     )
+    err.graphqlErrorTypes = errors.flatMap((e) => (e.type ? [e.type] : []))
+    throw err
   }
   // `data` absent with no `errors` is a contract violation, not a partial answer.
   throw new GithubApiError('github graphql returned no data', 200, 'INTERNAL', false)

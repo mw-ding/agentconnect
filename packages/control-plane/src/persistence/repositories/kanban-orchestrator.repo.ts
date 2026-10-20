@@ -24,6 +24,8 @@ const CARD_ROW_SELECT = {
   issueId: true,
   issueNumber: true,
   issueNodeId: true,
+  projectItemId: true,
+  projectItemProjectId: true,
   idempotencyKey: true,
   status: true,
   assigneeAgentId: true,
@@ -319,6 +321,8 @@ function toCardRow(row: {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  projectItemId: string | null
+  projectItemProjectId: string | null
   idempotencyKey: string | null
   status: string
   assigneeAgentId: string | null

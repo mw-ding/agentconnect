@@ -858,3 +858,90 @@ it('vera-349: prepare returns the trusted deployment App login on proceed and ex
   expect(await h.svc.orchestrate(ORG, AGENT, prepare)).toMatchObject({ verdict: 'existing', appLogin: 'acme-app[bot]' })
   expect(await harness().svc.orchestrate(ORG, AGENT, prepare)).toMatchObject({ appLogin: null })
 })
+
+describe('merged Lane 2b status projection', () => {
+  it.each(['create', 'unblock', 'assign', 'epic budget'] as const)(
+    'vera-474r2: orchestrator %s queues its committed status before a label failure',
+    async (path) => {
+      const project = { onStatusCommitted: vi.fn() }
+      const h = harness({ project })
+      h.store.applyPlan.mockRejectedValue(new GithubApiError('offline', 502, 'INTERNAL', true))
+      if (path === 'unblock') h.orchestrator.cardByIssueNumber.mockResolvedValue(card({ status: 'blocked' }))
+      if (path === 'assign') {
+        h.orchestrator.cardByIssueNumber.mockResolvedValue(card({ status: 'running', leased: true }))
+        h.cards.setAssignee.mockResolvedValue({
+          ok: true,
+          changed: true,
+          card: card({ status: 'ready' }),
+          revokedLease: null,
+          previousAgentId: 'worker'
+        })
+      }
+      if (path === 'epic budget')
+        h.orchestrator.createEpicChild.mockResolvedValue({ ok: false, reason: 'epic_budget_exhausted' })
+      const request =
+        path === 'unblock'
+          ? req('unblock', { issueNumber: 7 })
+          : path === 'assign'
+            ? req('assign', { issueNumber: 7, assignee: null })
+            : req('commit_create', {
+                issueNumber: 7,
+                step: 's',
+                specDigest: 'a'.repeat(64),
+                ...(path === 'epic budget' ? { epicIssueNumber: 8 } : {})
+              })
+      await h.svc.orchestrate(ORG, AGENT, request)
+      expect(project.onStatusCommitted).toHaveBeenCalledExactlyOnceWith({
+        boardId: BOARD,
+        issueNumber: path === 'epic budget' ? 8 : 7
+      })
+      expect(project.onStatusCommitted.mock.invocationCallOrder[0]).toBeLessThan(
+        h.store.applyPlan.mock.invocationCallOrder[0]
+      )
+    }
+  )
+
+  it.each(['replayed create', 'lost unblock CAS', 'assignment only', 'already triaged epic'] as const)(
+    'vera-474r2: orchestrator %s queues no projection',
+    async (path) => {
+      const project = { onStatusCommitted: vi.fn() }
+      const h = harness({ project })
+      if (path === 'replayed create')
+        h.orchestrator.createEpicChild.mockResolvedValue({
+          ok: true,
+          created: false,
+          matchedBy: 'issue_id',
+          card: { ...card(), id: 'card' }
+        })
+      if (path === 'lost unblock CAS') {
+        h.orchestrator.cardByIssueNumber.mockResolvedValue(card({ status: 'blocked' }))
+        h.cards.casStatus.mockResolvedValue(false)
+      }
+      if (path === 'assignment only')
+        h.cards.setAssignee.mockResolvedValue({
+          ok: true,
+          changed: true,
+          card: card(),
+          revokedLease: null,
+          previousAgentId: 'worker'
+        })
+      if (path === 'already triaged epic') {
+        h.orchestrator.createEpicChild.mockResolvedValue({ ok: false, reason: 'epic_budget_exhausted' })
+        h.orchestrator.cardByIssueNumber.mockResolvedValue(card({ status: 'triage' }))
+      }
+      const request =
+        path === 'lost unblock CAS'
+          ? req('unblock', { issueNumber: 7 })
+          : path === 'assignment only'
+            ? req('assign', { issueNumber: 7, assignee: null })
+            : req('commit_create', {
+                issueNumber: 7,
+                step: 's',
+                specDigest: 'a'.repeat(64),
+                ...(path === 'already triaged epic' ? { epicIssueNumber: 8 } : {})
+              })
+      await h.svc.orchestrate(ORG, AGENT, request)
+      expect(project.onStatusCommitted).not.toHaveBeenCalled()
+    }
+  )
+})

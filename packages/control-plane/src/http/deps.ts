@@ -129,6 +129,7 @@ import type { SessionAccessPlugin } from './session-access-plugin.js'
 import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
 import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
+import type { KanbanProjectVerifier } from '../kanban/project-guard.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
   SLACK_INSTALL_TTL_SEC?: number
@@ -471,6 +472,8 @@ export interface HttpDeps {
   github?: GithubService
   /** Board repository resolution for Kanban CRUD; absent ⇒ derived from `github` and the installation repo. */
   kanbanRepoResolver?: KanbanRepoResolver
+  /** Org-only guard for a board's Projects v2 projection; absent ⇒ derived from `github`. */
+  kanbanProjectVerifier?: KanbanProjectVerifier
   /** Resolves a typed login to the host's numeric user id for the "Trusted users" list; per-provider arms
    *  are present only where that host is configured, so an unconfigured host answers 409 rather than 404. */
   trustedActors: CodeHostTrustedActorService

@@ -35,6 +35,7 @@ import {
   type ObservedIssue
 } from './card-state.js'
 import type { CardIssue, CardStore, KanbanRepoRef } from './card-store.js'
+import type { KanbanProjectHook } from './project-writer.js'
 import type { KanbanSync } from './sync.js'
 import type { KanbanIssueDoorbell } from './graph-doorbell.js'
 import { planGraphPromotion } from './graph-reconciler.js'
@@ -60,7 +61,9 @@ export interface KanbanDispatcherDeps {
   isDaemonLive(daemonId: string): boolean
   clock: Clock
   log: KanbanDispatcherLog
-  /** Drains the transition outbox (rows are written in the repo's own transactions); undefined when notifications are off. */
+  // Post-commit Projects writes run on their own per-card queue.
+  project?: Pick<KanbanProjectHook, 'onStatusCommitted'>
+  // Drain the notification outbox written inside each transition transaction.
   notify?: { drain(): Promise<void> }
   /** Reconciler period when no doorbell rings (design §4: 60s). */
   sync?: Pick<KanbanSync, 'onCardChanged' | 'reconcileBoard' | 'projectStatus'>
@@ -313,9 +316,11 @@ export class KanbanDispatcher {
       )
       return { moved: false, observed }
     }
-    // The move's notification is written in the same transaction, so a crash here can no longer drop it.
     const result = await this.deps.repo.ingestStatus(boardId, issueNumber, from, plan.to)
-    if (result.moved) void this.deps.notify?.drain().catch(() => undefined)
+    if (result.moved) {
+      this.projectCommitted(boardId, issueNumber, issue)
+      void this.deps.notify?.drain().catch(() => undefined)
+    }
     return { moved: result.moved, observed }
   }
 
@@ -335,6 +340,7 @@ export class KanbanDispatcher {
     }
     if (outcome === 'adopt') {
       if (!(await this.deps.repo.settlePromotion(card.cardId, true))) return { moved: false, observed }
+      this.projectCommitted(boardId, card.issueNumber, issue)
       // Residue is dispatchable as is, and the running write clears both labels.
       this.deps.log.info({ boardId, issueNumber: card.issueNumber }, 'kanban: adopted a half-landed graph promotion')
       return { moved: true }
@@ -342,7 +348,8 @@ export class KanbanDispatcher {
     if (outcome === 'clear') {
       // An unacknowledged POST may still land, so no ready label only clears once its watch has passed.
       if (watching(card, now)) return { moved: false, observed }
-      await this.deps.repo.settlePromotion(card.cardId, false)
+      if (await this.deps.repo.settlePromotion(card.cardId, false))
+        this.projectCommitted(boardId, card.issueNumber, issue)
       return { moved: false, observed }
     }
     return { ...(await this.escalatePromotion(boardId, card, outcome, repo, issue)), observed }
@@ -384,6 +391,7 @@ export class KanbanDispatcher {
   ): Promise<RecoveryRead> {
     const { issueNumber } = card
     if (!(await this.deps.repo.escalatePromotion(card.cardId, reason))) return { moved: false }
+    this.projectCommitted(boardId, issueNumber, issue)
     this.deps.log.warn(
       { boardId, issueNumber, reason, checks: card.promotionChecks },
       'kanban: pending promotion needs human attention'
@@ -510,7 +518,7 @@ export class KanbanDispatcher {
     const dispatchable = (o: ObservedIssue): boolean =>
       lease.role === 'verify' ? isReviewDispatchableIssue(o) : isDispatchableIssue(o) || isPromotionResidue(o)
     if (!observed || !dispatchable(observed)) {
-      await this.deps.repo.endRun({
+      const released = await this.deps.repo.endRun({
         leaseId: lease.leaseId,
         outcome: 'transient',
         reasonCode: 'github_state_mismatch',
@@ -523,6 +531,9 @@ export class KanbanDispatcher {
           countsAsFailure: false
         })
       })
+      if (released.accepted && released.card.from !== released.card.to) {
+        this.projectCommitted(lease.boardId, lease.issueNumber, observed)
+      }
       return
     }
     const mode = lease.mode
@@ -617,6 +628,7 @@ export class KanbanDispatcher {
     status: KanbanStatus,
     observed?: ObservedIssue
   ): void {
+    this.projectCommitted(card.boardId, card.issueNumber, observed)
     const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
       .then(async () => {
         if (this.deps.sync) return this.deps.sync.projectStatus(card.boardId, card.issueNumber, status)
@@ -633,6 +645,16 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  /** Post-commit Projects v2 seam: queued apart from label writes, and a faulty hook can never fail the transition. */
+  private projectCommitted(boardId: string, issueNumber: number, observed?: ObservedIssue | null): void {
+    const issueNodeId = observed && 'nodeId' in observed && typeof observed.nodeId === 'string' ? observed.nodeId : null
+    try {
+      this.deps.project?.onStatusCommitted({ boardId, issueNumber, ...(issueNodeId ? { issueNodeId } : {}) })
+    } catch {
+      this.deps.log.warn({ boardId, issueNumber, reason: 'project_hook_failed' }, 'kanban: projection hook failed')
+    }
   }
 
   private async boardRepoRef(boardId: string): Promise<KanbanRepoRef | null> {

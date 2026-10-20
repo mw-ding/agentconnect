@@ -2553,6 +2553,9 @@ model KanbanBoard {
   blockRecurrenceLimit  Int                      @default(2)
   defaultMode           KanbanRunMode            @default(read)
   completionContract    KanbanCompletionContract @default(close)
+  // Optional one-way Projects v2 `Status` projection (org-owned projects only); both set or both null (CHECK).
+  projectNodeId         String?
+  statusFieldId         String?
   enabled               Boolean                  @default(true)
   configRevision        BigInt                   @default(1)
   visibility            ResourceVisibility       @default(org)
@@ -2582,6 +2585,8 @@ model KanbanCard {
   boardId             String           @db.Uuid
   issueId             BigInt // GitHub numeric issue id (what graph webhooks name)
   issueNodeId         String? // GraphQL node id, filled on first GitHub read
+  projectItemId       String? // cached ProjectV2Item id on the board's project, so later Status writes skip the add
+  projectItemProjectId String? // the project projectItemId belongs to; an item cached for another project is never reused
   issueNumber         Int
   // sha256(epic, step, spec) for orchestrator-filed cards so a retried create never files twice; null for human-filed cards.
   idempotencyKey      String?
