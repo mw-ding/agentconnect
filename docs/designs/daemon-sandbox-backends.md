@@ -929,17 +929,14 @@ The release images are currently Linux amd64; an arm64 daemon must configure
 a compatible image explicitly. The full image's Antigravity binary requires
 AVX in the guest CPU; amd64 emulation without AVX cannot run that runtime.
 
-To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile` and run
-the **Build runtime bases** workflow manually in GitHub Actions. Its default tag is
-`base-YYYYMMDD-HHMMSS` in UTC; an optional explicit tag must also include the date.
-The workflow refuses to overwrite an existing tag, publishes both bases and verifies
-each with the application layers, runtime table and real shim session. Successful jobs
-report digest-pinned references in the run summary and upload them as artifacts.
-Update the two base ARGs in the release Dockerfile to those verified references.
+To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile`. This repository
+does not build or publish runtime base images or releases; that happens upstream in
+`agentconnect-md/agentconnect`, and the two base ARGs in the release Dockerfile are updated
+to the digest-pinned references it publishes.
 
 For a local build, use a new tag and an amd64 host with AVX for full application
-verification. Push candidates before checking them: nothing references a new tag
-until the release Dockerfile pins it. Run these commands from the repository root:
+verification. Nothing references a new tag until the release Dockerfile pins it.
+Run these commands from the repository root:
 
 ```bash
 set -eu
@@ -948,7 +945,6 @@ for variant in runtime-sandbox runtime-sandbox-full; do
   docker buildx build --builder "$(docker context show)" --platform linux/amd64 \
     -f docker/runtime-sandbox-base.Dockerfile --target "$variant-base" \
     -t "ghcr.io/agentconnect-md/$variant:base-$BASE_VERSION" --load .
-  docker push "ghcr.io/agentconnect-md/$variant:base-$BASE_VERSION"
 done
 
 for variant in runtime-sandbox runtime-sandbox-full; do
@@ -977,13 +973,12 @@ the `$variant` target with `--load -t "$variant:local"` and, after `pnpm install
 `pnpm --filter @agentconnect.md/daemon exec tsx scripts/smoke-runtime-image.mts "$variant:local"`,
 which starts the container with `docker run` and drives the same steps.
 
-After both variants pass, inspect the pushed tags' registry digests with
-`docker buildx imagetools inspect`. Verify anonymous pulls, then update both `ARG`
-defaults in `docker/runtime-sandbox.Dockerfile` to `tag@sha256:digest` references in
+After both variants pass, upstream publishes the base tags; update both `ARG` defaults in
+`docker/runtime-sandbox.Dockerfile` to the published `tag@sha256:digest` references in
 the dependency update PR. Do not overwrite an existing base tag.
-Changing only the manual base Dockerfile does not publish a daemon or release image;
-changing a base digest in the release Dockerfile does. Normal release CI continues
-to verify the final images and exercise a real ACP session through the shim.
+Changing only the base Dockerfile does not publish a daemon or release image;
+changing a base digest in the release Dockerfile does, and upstream release CI verifies
+the final images and exercises a real ACP session through the shim.
 
 An explicit daemon image overrides this metadata. Development builds remove
 release metadata and require an explicit image; they do not derive a default
