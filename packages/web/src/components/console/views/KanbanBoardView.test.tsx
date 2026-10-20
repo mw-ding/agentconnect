@@ -344,6 +344,23 @@ describe('KanbanBoardView attention and run state', () => {
     await click(button("Why isn't this running?", tile(1)!))
     await settleUntil(() => tile(1)!.textContent?.includes('Eligible') === true)
   })
+
+  it.each(['agent_cap', 'board_cap', 'epic_cap', 'daemon_cap'] as const)(
+    'shows the %s deferral hint, not the dispatch promise, for a cap-bound eligible card',
+    async (capBound) => {
+      const hint = `held back by ${capBound}: once the cards ahead of it are dispatched`
+      serve({
+        cards: [card(1)],
+        explain: { verdict: { eligible: true, role: 'work', agentId: 'a' }, capBound, claimOrder: 3, hint }
+      })
+      await render(<KanbanBoardView />)
+      await settleUntil(() => tile(1) !== null)
+      await click(button("Why isn't this running?", tile(1)!))
+      await settleUntil(() => tile(1)!.textContent?.includes(hint) === true)
+      expect(tile(1)!.textContent).toContain(capBound)
+      expect(tile(1)!.textContent).not.toContain('Eligible')
+    }
+  )
 })
 
 describe('KanbanBoardView run-mode controls', () => {

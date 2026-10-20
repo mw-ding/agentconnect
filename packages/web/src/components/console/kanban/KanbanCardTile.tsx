@@ -51,11 +51,12 @@ function Explain({ boardId, cardId }: { boardId: string; cardId: string }) {
       {isLoading && <span>{t('explainLoading')}</span>}
       {error && <span role="alert">{t('explainFailed')}</span>}
       {data &&
-        (data.verdict.eligible ? (
+        (data.verdict.eligible && !data.capBound ? (
           <span>{t('explainEligible')}</span>
         ) : (
           <>
-            <span className="mono text-[11px] text-(--text-primary)">{data.verdict.gate}</span>
+            {/* An eligible card deferred by a cap shows the cap and the CP's deferral hint, not a dispatch promise. */}
+            <span className="mono text-[11px] text-(--text-primary)">{data.capBound ?? data.verdict.gate}</span>
             {/* The hint is the CP's static English sentence for the gate, never issue text. */}
             <span className="ml-2">{data.hint}</span>
           </>

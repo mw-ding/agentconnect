@@ -82,6 +82,10 @@ export interface KanbanCardExplainDto {
   issueNumber: number
   status: string
   verdict: { eligible: boolean; role?: 'work' | 'verify'; agentId?: string; gate?: string }
+  /** Position in the claim order, when the card is eligible. */
+  claimOrder?: number
+  /** Set when an eligible card is deferred because earlier cards fill this cap. */
+  capBound?: 'board_cap' | 'agent_cap' | 'epic_cap' | 'daemon_cap'
   /** A sentence from the CP's static table keyed by the gate; no issue text. */
   hint: string
   evaluatedAt: string
