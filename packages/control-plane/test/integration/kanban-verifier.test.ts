@@ -360,11 +360,36 @@ describe('Kanban verifier routing (real Postgres)', () => {
     const verify = h.sent[0]!.d
     expect(verify).toMatchObject({ cardId: c.id, agentId: A2, role: 'verify' })
 
+    let enteredProjection!: () => void
+    let releaseProjection!: () => void
+    let enteredClaim!: () => void
+    const projecting = new Promise<void>((resolve) => (enteredProjection = resolve))
+    const projectionRelease = new Promise<void>((resolve) => (releaseProjection = resolve))
+    const claimed = new Promise<void>((resolve) => (enteredClaim = resolve))
+    const apply = h.store.applyPlan.bind(h.store)
+    vi.spyOn(h.store, 'applyPlan').mockImplementationOnce(async (...args) => {
+      enteredProjection()
+      await projectionRelease
+      return apply(...args)
+    })
+    const claim = h.repo.claim.bind(h.repo)
+    vi.spyOn(h.repo, 'claim').mockImplementationOnce(async (...args) => {
+      const result = await claim(...args)
+      expect(result.leases).toEqual([])
+      enteredClaim()
+      return result
+    })
+
     expect(await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'changes_requested' }))).toEqual({
       leaseId: verify.leaseId,
       accepted: true
     })
-    // The report's poke re-claims the now-ready card for the original assignee as a work run.
+    await projecting
+    await claimed
+    expect(h.sent).toHaveLength(1)
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', labelWritePending: true })
+    releaseProjection()
+    // The first poke saw a pending projection; its completion must re-arm a second claim.
     await h.dispatcher.settle()
     const redispatch = h.sent.at(-1)!.d
     expect(redispatch).toMatchObject({ cardId: c.id, agentId: A1, attempt: 2 })
