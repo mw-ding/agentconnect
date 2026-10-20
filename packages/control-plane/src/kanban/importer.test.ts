@@ -505,3 +505,38 @@ describe('Kanban import sync cursor', () => {
     expect(upserted(triage)).not.toHaveProperty('syncEventCursor')
   })
 })
+
+describe('vera-474 B2: import reaches the projection seam', () => {
+  it('vera-474: B2 an imported card projects its initial status', async () => {
+    const h = harness(issue())
+    const project = { onStatusCommitted: vi.fn() }
+    const importer = new KanbanImporter({
+      cards: h.cards,
+      store: h.store,
+      permissions: h.permissions,
+      appSlug: APP,
+      now: () => h.clock.now,
+      project
+    } as ConstructorParameters<typeof KanbanImporter>[0])
+    expect(await importer.import(board, repo, 1)).toBe(true)
+    expect(h.cards.upsertCard).toHaveBeenCalledTimes(1)
+    expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'board', issueNumber: 1, issueNodeId: 'I_100' })
+    expect(h.cards.upsertCard.mock.invocationCallOrder[0]).toBeLessThan(
+      project.onStatusCommitted.mock.invocationCallOrder[0]!
+    )
+  })
+
+  it('vera-474: B2 an issue that is not imported projects nothing', async () => {
+    const h = harness(issue([]))
+    const project = { onStatusCommitted: vi.fn() }
+    const importer = new KanbanImporter({
+      cards: h.cards,
+      store: h.store,
+      permissions: h.permissions,
+      appSlug: APP,
+      project
+    } as ConstructorParameters<typeof KanbanImporter>[0])
+    expect(await importer.import(board, repo, 1)).toBe(false)
+    expect(project.onStatusCommitted).not.toHaveBeenCalled()
+  })
+})

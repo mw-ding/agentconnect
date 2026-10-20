@@ -7873,6 +7873,9 @@ export interface KanbanBoardView {
   blockRecurrenceLimit: number
   defaultMode: 'read' | 'write'
   completionContract: 'close' | 'pr_merged' | 'pr_checks_green'
+  /** Projects v2 Status projection target (org-owned project); both set or both null. */
+  projectNodeId: string | null
+  statusFieldId: string | null
   enabled: boolean
   configRevision: bigint
   visibility: 'org' | 'restricted'
@@ -7899,6 +7902,8 @@ export interface KanbanBoardConfigInput {
   protocolRetryLimit?: number
   blockRecurrenceLimit?: number
   completionContract?: 'close' | 'pr_merged' | 'pr_checks_green'
+  projectNodeId?: string | null
+  statusFieldId?: string | null
   enabled?: boolean
   visibility?: 'org' | 'restricted'
   sharedWith?: string[]
@@ -7907,7 +7912,7 @@ export interface KanbanBoardConfigInput {
 export type KanbanBoardCreateInput = KanbanBoardConfigInput & { name: string; repoId: bigint; repoFullName: string }
 
 export type KanbanBoardWriteRefusal =
-  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards'
+  'not_found' | 'repo_taken' | 'agent_not_in_org' | 'empty_audience' | 'active_runs' | 'repo_has_cards' | 'stale'
 
 export type KanbanBoardWriteResult<T> = { ok: true; value: T } | { ok: false; reason: KanbanBoardWriteRefusal }
 
@@ -7924,7 +7929,8 @@ export interface KanbanBoardAdminRepo {
     orgId: string,
     boardId: string,
     userId: string,
-    patch: KanbanBoardConfigInput
+    patch: KanbanBoardConfigInput,
+    expectedConfigRevision?: bigint
   ): Promise<KanbanBoardWriteResult<KanbanBoardView>>
   /** Refused while any card holds an open lease: disable the board and let its runs end first. */
   deleteBoard(orgId: string, boardId: string, userId: string): Promise<KanbanBoardWriteResult<null>>
@@ -8289,6 +8295,10 @@ export interface KanbanCardRow {
   issueId: bigint
   issueNumber: number
   issueNodeId: string | null
+  /** Cached ProjectV2Item id on the board's project, so later Status writes skip the add; null until first projected. */
+  projectItemId: string | null
+  /** The project `projectItemId` belongs to; an item cached for any other project is never reused. */
+  projectItemProjectId: string | null
   /** B1 key for orchestrator-filed cards (`cardIdempotencyKey`); null for human-filed or imported cards. */
   idempotencyKey: string | null
   status: KanbanStatus
@@ -8409,6 +8419,8 @@ export interface KanbanCardRepo {
   clearPromotionIntent(cardId: string): Promise<boolean>
   /** Undo a failed promotion write, keeping its intent and watching for a late landing so recovery judges it. */
   revertPromotion(cardId: string, expectedStateRevision: bigint, revertedAt: Date): Promise<boolean>
+  /** Remember the card's ProjectV2Item id and the project it belongs to, so later writes there skip the add. */
+  setProjectItemId(cardId: string, projectNodeId: string, projectItemId: string): Promise<void>
 }
 
 // ── Kanban orchestrator (issue #2 M3, Lane 2b) — B2 epic budgets and card writes under the epic row lock ──

@@ -131,6 +131,7 @@ import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
 import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
 import type { KanbanTitleSource } from '../kanban/card-titles.js'
+import type { KanbanProjectVerifier } from '../kanban/project-guard.js'
 
 export interface HttpServerConfig extends HumanAuthConfig {
   /** Match the dispatcher’s configured cross-board daemon cap. */
@@ -479,6 +480,8 @@ export interface HttpDeps {
   kanbanRepoResolver?: KanbanRepoResolver
   /** Live issue titles for the board view; absent ⇒ the titles route answers 409 `github_app_not_configured`. */
   kanbanTitles?: KanbanTitleSource
+  /** Org-only guard for a board's Projects v2 projection; absent ⇒ derived from `github`. */
+  kanbanProjectVerifier?: KanbanProjectVerifier
   /** Resolves a typed login to the host's numeric user id for the "Trusted users" list; per-provider arms
    *  are present only where that host is configured, so an unconfigured host answers 409 rather than 404. */
   trustedActors: CodeHostTrustedActorService
