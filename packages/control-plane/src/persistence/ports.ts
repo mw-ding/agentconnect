@@ -8426,7 +8426,7 @@ export interface KanbanCardRepo {
   resolveAgentSlug(orgId: string, slug: string): Promise<string | null>
   /** Change the assignee under the reassign rule: a live lease is refused, or killed (never transferred) on `revoke`. */
   setAssignee(input: KanbanSetAssigneeInput): Promise<KanbanSetAssigneeResult>
-  /** Move status only if stateRevision still matches; false means a racing writer won. */
+  /** Move status only if stateRevision still matches and no human hold is set; false means it lost or the card is held. */
   casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean>
   /** CAS todo to ready and open the intent in one write; refused while an intent is open or the card awaits a human. */
   beginPromotion(cardId: string, expectedStateRevision: bigint, eventCursor: bigint, startedAt: Date): Promise<boolean>

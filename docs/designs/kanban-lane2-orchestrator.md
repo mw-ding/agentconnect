@@ -27,6 +27,9 @@ Refusals are data, never errors, with stable codes: `not_orchestrator`, `board_n
 `unknown_agent`, `agent_not_assignable`, `key_conflict`, `issue_mismatch`, `invalid_link`, `cross_repo`,
 `repo_mismatch`, `status_not_allowed`, `card_conflict`, `github_unavailable`, `github_partial`. The schema tests prove `title`/`body`/`text` keys are rejected everywhere.
 
+`unblock` moves an unleased `blocked` card back to `todo`. A card held for a human (`needsAttention`) keeps its
+status and its hold, because `casStatus` refuses a flagged card; only a human status move lifts the hold.
+
 Deploy the CP before the daemon: older CP versions reject the new `kanban/orchestrate` frame and
 `kanban_orchestrator_write` gitcred purpose. No relay change is required.
 
@@ -89,8 +92,8 @@ the B1 idempotency and B2 budget checks.
 child never refunds).
 
 - **maxCards**: checked in `prepare_create`, and again under the epic row lock in `createEpicChild` / `adoptEpic`.
-  Exhausted → refuse before filing and move the epic to `triage` (CAS + label) when it is unleased and the
-  transition is allowed; a leased epic is just refused. The B1 replay (`existing`) answers before the budget, so a
+  Exhausted → refuse before filing and move the epic to `triage` (CAS + label) when it is unleased, not held for a
+  human (`needsAttention`), and the transition is allowed; a leased or held epic is just refused. The B1 replay (`existing`) answers before the budget, so a
   re-plan of an already-filed card is never refused by a full epic.
 - **maxActive**: in the claim, a ready child is skipped while its epic already has ≥ `epicMaxActive` open runs
   (counted within the claim loop like the per-agent cap).

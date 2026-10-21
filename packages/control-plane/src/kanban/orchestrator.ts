@@ -305,7 +305,7 @@ export class KanbanOrchestrator {
     }
     // An unread page may still hold blockers, so the card keeps its status and the reply says to call again.
     const truncated = named === null && graph.truncated
-    // A blocked card that nobody holds moves back to todo; promotion past todo stays with the reconciler/humans.
+    // An unleased, unheld blocked card moves back to todo; promotion past todo stays with the reconciler/humans.
     let status: KanbanStatus = card.status
     if (!truncated && card.status === 'blocked' && !card.leased) {
       if (await this.deps.cards.casStatus(card.cardId, card.stateRevision, 'todo')) {
@@ -508,7 +508,7 @@ export class KanbanOrchestrator {
     await this.deps.store.applyPlan(repo, issue.number, issue, plan)
   }
 
-  /** B2 exhausted: move the epic to triage if it is unleased and the move is allowed; a leased epic is only refused. */
+  /** B2 exhausted: move the epic to triage if it is unleased, unheld and the move is allowed; else it is only refused. */
   private async moveEpicToTriage(board: Board, epicIssueNumber: number): Promise<void> {
     const epic = await this.deps.orchestrator.cardByIssueNumber(board.id, epicIssueNumber)
     if (!epic || epic.leased || epic.status === 'triage' || !canTransition(epic.status, 'triage')) return
