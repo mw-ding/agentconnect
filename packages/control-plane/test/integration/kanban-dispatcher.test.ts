@@ -550,14 +550,22 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
     expect((await h.run(d.leaseId)).reasonCode).toBe('reclaimed:agent_moved')
   })
 
-  it('reclaims an unacked dispatch quickly', async () => {
-    const h = await harness({ reply: () => new Promise<KanbanDispatchOk>(() => {}) })
+  it('416r3: reclaims the exact unacked dispatch even when projection completion starts its replacement', async () => {
+    let enteredDispatch!: () => void
+    const entered = new Promise<void>((resolve) => (enteredDispatch = resolve))
+    const h = await harness({
+      reply: () => {
+        enteredDispatch()
+        return new Promise<KanbanDispatchOk>(() => {})
+      }
+    })
     await h.addCard()
     void h.dispatcher.reconcileBoard(h.board.id)
-    await new Promise((r) => setTimeout(r, 200))
+    await entered
+    const leaseId = h.sent[0]!.d.leaseId
     h.clock.advance(3 * 60_000)
     expect(await h.dispatcher.reap()).toBe(1)
-    expect((await prisma.kanbanRun.findFirstOrThrow()).reasonCode).toBe('reclaimed:dispatch_unacked')
+    expect((await h.run(leaseId)).reasonCode).toBe('reclaimed:dispatch_unacked')
   })
 
   it('a tick reaps first, so the reclaimed slot is claimed again in the same pass', async () => {
