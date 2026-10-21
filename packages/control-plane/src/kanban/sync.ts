@@ -47,6 +47,9 @@ export interface SyncCard {
   assigneeName?: string | null
   promotionPending: boolean
   labelWritePending: boolean
+  /** The card's latest skip/restart version; an ack of this snapshot's projection records GitHub reflects it. */
+  controlVersion: bigint
+  controlWrittenVersion: bigint
   syncEventCursor: bigint
   syncAgentCursor: bigint
   syncDeferredAt: Date | null
@@ -80,6 +83,7 @@ export interface KanbanSyncRepo {
 }
 
 export interface KanbanSyncDeps {
+  gate?: { holdStatusWrite(cardId: string): (write?: () => Promise<void>) => Promise<void> }
   repo: KanbanSyncRepo
   cards: Pick<KanbanCardRepo, 'resolveAgentSlug' | 'setAssignee'>
   store: Pick<CardStore, 'readCard' | 'applyPlan' | 'readLabelEvents'>
@@ -142,7 +146,24 @@ export class KanbanSync {
   private enqueue(boardId: string, issueNumber: number, run: () => Promise<boolean>): Promise<boolean> {
     const key = `${boardId}:${issueNumber}`
     const previous = this.running.get(key) ?? Promise.resolve(false)
-    const queued = previous.catch(() => false).then(run)
+    const queued = previous
+      .catch(() => false)
+      .then(async () => {
+        if (!this.deps.gate) return run()
+        const card = await this.deps.repo.get(boardId, issueNumber)
+        if (!card) return false
+        let result = false
+        let error: unknown
+        await this.deps.gate.holdStatusWrite(card.id)(async () => {
+          try {
+            result = await run()
+          } catch (err) {
+            error = err
+          }
+        })
+        if (error) throw error
+        return result
+      })
     this.running.set(key, queued)
     void queued
       .finally(() => {
@@ -339,6 +360,15 @@ export class KanbanSync {
     if (!repo) return done(false)
     const issue = await this.deps.store.readCard(repo, issueNumber)
     if (!issue) return done(false)
+    // An acknowledged control is authoritative until GitHub reflects it, even if history is missing or stale.
+    if (card.controlWrittenVersion < card.controlVersion) {
+      const current = await this.deps.repo.get(boardId, issueNumber)
+      if (!current || current.controlVersion !== card.controlVersion || current.stateRevision !== card.stateRevision)
+        return done(false)
+      await this.deps.store.applyPlan(repo, issueNumber, issue, planStatusWrite(card.status, issue))
+      await this.deps.repo.ack(card, card.syncEventCursor, card.syncAgentCursor)
+      return done(false)
+    }
     let events: LabelEvent[]
     try {
       // Visible history oldest-first; one past the page bound can attribute nothing, so it defers toward fail-closed.

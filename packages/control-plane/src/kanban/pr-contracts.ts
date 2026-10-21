@@ -27,6 +27,8 @@ export interface KanbanPrContractsDeps {
   // The live E2E uses PAT-authored PRs targeting a disposable base instead of touching the default branch.
   bindingOverrideForTests?: { authorLogin: string; authorType: string; defaultBranch: string }
   store: Pick<CardStore, 'readCard' | 'applyPlan'>
+  /** The dispatcher's per-card status-write queue, held across the settle so its GitHub write is ordered with the controls'. */
+  gate?: { holdStatusWrite(cardId: string): (write?: () => Promise<void>) => Promise<void> }
   /** The board's live installation (never a webhook's word); null when it is gone or suspended. */
   repoRef(boardId: string): Promise<KanbanRepoRef | null>
   /** A contract moved the card: wake the board and its notifier. */
@@ -138,21 +140,28 @@ export class KanbanPrContracts {
       return 'wait'
     }
     const to = decision.kind
-    const moved = await this.deps.repo.settleContract({
-      cardId: card.cardId,
-      expectedStateRevision: card.stateRevision,
-      expectedConfigRevision: card.configRevision,
-      to,
-      reason: to === 'done' ? card.completionContract : decision.reason,
-      prNumber: card.linkedPrNumber
-    })
+    const release = this.deps.gate?.holdStatusWrite(card.cardId) ?? ((write) => write?.() ?? Promise.resolve())
+    let moved = false
+    try {
+      moved = await this.deps.repo.settleContract({
+        cardId: card.cardId,
+        expectedStateRevision: card.stateRevision,
+        expectedConfigRevision: card.configRevision,
+        to,
+        reason: to === 'done' ? card.completionContract : decision.reason,
+        prNumber: card.linkedPrNumber
+      })
+      if (moved) {
+        this.deps.project?.onStatusCommitted({ boardId: card.boardId, issueNumber: card.issueNumber })
+        this.deps.log.info(
+          { boardId: card.boardId, issueNumber: card.issueNumber, to, prNumber: card.linkedPrNumber },
+          'kanban: PR contract moved a card'
+        )
+      }
+    } finally {
+      await release(moved ? () => this.writeIssue(card, repo, to) : undefined)
+    }
     if (!moved) return 'lost_race'
-    this.deps.project?.onStatusCommitted({ boardId: card.boardId, issueNumber: card.issueNumber })
-    this.deps.log.info(
-      { boardId: card.boardId, issueNumber: card.issueNumber, to, prNumber: card.linkedPrNumber },
-      'kanban: PR contract moved a card'
-    )
-    await this.writeIssue(card, repo, to)
     await this.deps.onSettled?.(card, to)
     return to
   }
@@ -188,11 +197,15 @@ export class KanbanPrContracts {
     }
   }
 
-  // Best-effort after the commit, like every CP status write: a failure leaves label drift, never a second move.
+  // Best-effort after the commit, like every CP status write; a skip or restart since the settle drops it.
   private async writeIssue(card: KanbanContractCard, repo: KanbanRepoRef, to: 'done' | 'triage'): Promise<void> {
     try {
       const issue = await this.deps.store.readCard(repo, card.issueNumber)
       if (!issue) return
+      if (!(await this.deps.repo.isLatestControl(card.cardId, card.controlVersion))) {
+        this.deps.log.warn({ cardId: card.cardId, to }, 'kanban: dropped a contract write a newer control superseded')
+        return
+      }
       const plan: LabelPlan = planStatusWrite(to, issue)
       if (to === 'triage') plan.comment = prClosedUnmergedComment(card.linkedPrNumber!)
       await this.deps.store.applyPlan(repo, card.issueNumber, issue, plan)

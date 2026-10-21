@@ -4403,6 +4403,24 @@ export const KanbanCardModeDto = z.object({
   mode: KanbanRunModeDto.nullable()
 })
 
+// ── kanban human controls (B5) — pause/resume and skip/restart; body-free responses ──
+export const KanbanCardStatusDto = z.enum([
+  'triage',
+  'todo',
+  'ready',
+  'running',
+  'blocked',
+  'review',
+  'done',
+  'archived'
+])
+export const KanbanCardControlDto = z.object({
+  boardId: z.string(),
+  cardId: z.string(),
+  status: KanbanCardStatusDto
+})
+export type KanbanCardControlDtoT = z.infer<typeof KanbanCardControlDto>
+
 // ── kanban boards (body-free CP metadata; the repo id is resolved live through the org's installation, never sent) ──
 export const KANBAN_EPIC_MAX_CARDS_CEILING = 1000
 export const KANBAN_EPIC_MAX_ACTIVE_CEILING = 100
@@ -4417,6 +4435,7 @@ const KanbanBoardConfigFields = {
   name: z.string().trim().min(1).max(100),
   orchestratorAgentId: z.string().uuid().nullable(),
   verifierAgentId: z.string().uuid().nullable(),
+  synthesizerAgentId: z.string().uuid().nullable(),
   maxInProgress: z.number().int().min(1).max(100),
   maxInProgressPerAgent: z.number().int().min(1).max(100),
   // B2 per-epic budgets (the DB CHECKs > 0): lifetime children an epic may file, and how many may run at once.
@@ -4443,6 +4462,7 @@ export const CreateKanbanBoardBody = z
     ...KanbanBoardConfigFields,
     orchestratorAgentId: KanbanBoardConfigFields.orchestratorAgentId.optional(),
     verifierAgentId: KanbanBoardConfigFields.verifierAgentId.optional(),
+    synthesizerAgentId: KanbanBoardConfigFields.synthesizerAgentId.optional(),
     maxInProgress: KanbanBoardConfigFields.maxInProgress.optional(),
     maxInProgressPerAgent: KanbanBoardConfigFields.maxInProgressPerAgent.optional(),
     epicMaxCards: KanbanBoardConfigFields.epicMaxCards.optional(),
@@ -4486,6 +4506,7 @@ export const KanbanBoardDto = z.object({
   repoFullName: z.string(),
   orchestratorAgentId: z.string().nullable(),
   verifierAgentId: z.string().nullable(),
+  synthesizerAgentId: z.string().nullable(),
   maxInProgress: z.number().int(),
   maxInProgressPerAgent: z.number().int(),
   epicMaxCards: z.number().int(),
@@ -4501,6 +4522,9 @@ export const KanbanBoardDto = z.object({
   /** Node id of that project's single-select Status field; set exactly when `projectNodeId` is. */
   statusFieldId: z.string().nullable(),
   enabled: z.boolean(),
+  paused: z.boolean(),
+  pausedAt: z.string().nullable(),
+  pausedByUserId: z.string().nullable(),
   configRevision: z.string(),
   visibility: ResourceVisibilityEnum,
   sharedWith: z.array(z.string()),
@@ -4526,6 +4550,7 @@ export const KanbanExplainVerdictDto = z.object({
 })
 export const KanbanExplainFactsDto = z.object({
   boardEnabled: z.boolean(),
+  boardPaused: z.boolean(),
   status: z.string(),
   assigneeAgentId: z.string().nullable(),
   role: z.enum(['work', 'verify']),

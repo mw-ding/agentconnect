@@ -1,6 +1,7 @@
 // Kanban dispatch → turn (issue #2 D3/D4): keys the GitHub hook's `<prefix>#<n>` thread session; the worker reads the issue itself.
 import type { KanbanDispatch, KanbanNotify } from '@agentconnect.md/protocol'
 import type { NormalizedMessage } from './normalized.js'
+import { kanbanCardBranch } from '../kanban/card-branch.js'
 
 /** The same coordinates a headless GitHub hook delivery on this issue uses, so both land in one session. */
 export function kanbanSessionCoords(d: KanbanDispatch): {
@@ -33,9 +34,15 @@ export function buildKanbanText(d: KanbanDispatch): string {
       'When you are done, call exactly one Kanban terminal tool, once: `kanbanComplete` (approve the work), `kanbanRequestChanges` (send it back to the worker with a `reason`), or `kanbanBlock` (cannot proceed; give the kind and reason). Pass a self-contained `summary` to `kanbanComplete`/`kanbanBlock`, or a `reason` to `kanbanRequestChanges`. AgentConnect moves the card and posts that text as the final issue comment after your turn ends, so do not comment on the issue yourself. Ending the turn without a terminal call counts as a protocol violation.'
     ].join('\n')
   }
+  const branch = d.mode === 'write' ? kanbanCardBranch(d.issueNumber) : undefined
+  // The close target comes only from the CP's trusted dispatch frame, never from issue or comment text.
+  const superseded =
+    branch !== undefined && d.supersededPrNumber !== undefined
+      ? ` AgentConnect verified that pull request #${d.supersededPrNumber}, opened from \`${branch}\` by earlier work, can no longer complete the card: close it (\`gh pr close ${d.supersededPrNumber} -R ${d.repoFullName}\`) before you open a new one from \`${branch}\`. Close no other pull request.`
+      : ''
   const mode =
-    d.mode === 'write'
-      ? 'Mode: write. You may change code in this session worktree and open a pull request that references the issue.'
+    branch !== undefined
+      ? `Mode: write. You may change code in this session worktree and open a pull request that references the issue. Your worktree is on branch \`${branch}\`, created on first use and reused on later attempts.${superseded}`
       : 'Mode: read-only. Do not commit, push, or open pull requests; investigate and report findings only.'
   return [
     `AgentConnect Kanban dispatched card ${ref} to you (attempt ${d.attempt}).`,

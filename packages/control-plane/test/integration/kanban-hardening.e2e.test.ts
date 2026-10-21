@@ -116,7 +116,13 @@ describe.skipIf(!(process.env.KANBAN_E2E === '1' && process.env.GITHUB_TOKEN) ||
         clock: systemClock,
         log
       })
-      const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(db), store, log })
+      const reconciler = new KanbanGraphReconciler({
+        agentSlug: async (orgId, id) =>
+          (await db.agent.findFirst({ where: { orgId, id }, select: { name: true } }))?.name ?? null,
+        cards: new PgKanbanCardRepo(db),
+        store,
+        log
+      })
       return new KanbanGraphDoorbell({
         boards: new PgKanbanBoardRepo(db),
         installations: { getByInstallationId: async () => installation },

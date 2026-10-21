@@ -1943,7 +1943,12 @@ describe("a host start in a session's own pod leaves the agent's checkout alone 
   /** Run a turn's real openSession on a key-server pool whose cold host starts as the pool starts it, and return the options `sessions.handle` was given. */
   async function openKeyServerTurn(
     pool: Awaited<ReturnType<typeof poolMember>>,
-    opts: { started?: boolean; row?: Record<string, unknown>; reviewCwd?: string } = {}
+    opts: {
+      started?: boolean
+      row?: Record<string, unknown>
+      reviewCwd?: string
+      kanban?: { issueNumber: number; mode: 'read' | 'write' }
+    } = {}
   ): Promise<{ preparedWorkspaceCwd?: string }> {
     const inner = pool.inner
     let handed: { preparedWorkspaceCwd?: string } = {}
@@ -1975,7 +1980,8 @@ describe("a host start in a session's own pod leaves the agent's checkout alone 
       entry: {
         agentId: 'bot-a',
         initAbort: new AbortController(),
-        msg: { platform: 'webchat', channel: 'C1', msgId: 'm1', sender: { id: 'U1', name: 'Alice' }, text: 'hi' }
+        msg: { platform: 'webchat', channel: 'C1', msgId: 'm1', sender: { id: 'U1', name: 'Alice' }, text: 'hi' },
+        ...(opts.kanban ? { kanban: opts.kanban } : {})
       },
       key: KEY,
       plan: { deliveryBinding: {} },
@@ -2019,6 +2025,18 @@ describe("a host start in a session's own pod leaves the agent's checkout alone 
       await openKeyServerTurn(pool, { row: { key: KEY, workspaceIsolation: 'session', triggeredBy: 'U0' } })
       expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([
         { sessionKey: KEY, isolation: 'session', initiatedBy: 'Opener' }
+      ])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it("416r2: a cold host's preparation for a write card names its ac/card-<n> branch", async () => {
+    const pool = await poolMember()
+    try {
+      await openKeyServerTurn(pool, { kanban: { issueNumber: 42, mode: 'write' } })
+      expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([
+        { sessionKey: KEY, isolation: 'session', initiatedBy: 'Alice', branch: 'ac/card-42' }
       ])
     } finally {
       await pool.instance.stop()

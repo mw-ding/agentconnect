@@ -4,9 +4,16 @@ import { OrgId } from '../domain/ids.js'
 import type { KanbanBoardRecord, KanbanCardRecord } from '../persistence/ports.js'
 import type { KanbanStatus, LabelPlan } from './card-state.js'
 import type { CardGraph, CardIssue, CardLink } from './card-store.js'
-import { KanbanGraphReconciler, planGraphPromotion } from './graph-reconciler.js'
+import { KanbanGraphReconciler, planGraphPromotion, planSynthesis } from './graph-reconciler.js'
 
-const BOARD: KanbanBoardRecord = { id: 'b1', orgId: OrgId('o'), name: 'eng', repoId: 42n, repoFullName: 'acme/web' }
+const BOARD: KanbanBoardRecord = {
+  id: 'b1',
+  orgId: OrgId('o'),
+  name: 'eng',
+  repoId: 42n,
+  repoFullName: 'acme/web',
+  synthesizerAgentId: null
+}
 const REPO = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
 
 const link = (number: number, state: 'open' | 'closed', stateReason: string | null = null): CardLink => ({
@@ -25,6 +32,39 @@ const graph = (over: Partial<CardGraph> = {}): CardGraph => ({
   ...over
 })
 const done = link(1, 'closed', 'completed')
+
+describe('planSynthesis', () => {
+  const completedSub = link(2, 'closed', 'completed')
+  it('promotes a todo epic whose sub-issues all completed', () => {
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'closed', 'completed')] }), 'a1')
+    ).toBe('promote')
+  })
+  it('holds when any sub-issue is open or closed not_planned', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'open')] }), 'a1')).toBe('none')
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub, link(3, 'closed', 'not_planned')] }), 'a1')
+    ).toBe('none')
+  })
+  it('holds on a truncated graph read', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub], truncated: true }), 'a1')).toBe('none')
+  })
+  it('holds when no synthesizer is configured', () => {
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues: [completedSub] }), null)).toBe('none')
+  })
+  it('416c: an open or not_planned blocker holds synthesis even when every sub-issue completed', () => {
+    const subIssues = [completedSub]
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [link(5, 'open')] }), 'a1')).toBe('none')
+    expect(
+      planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [link(5, 'closed', 'not_planned')] }), 'a1')
+    ).toBe('none')
+    expect(planSynthesis({ status: 'todo' }, graph({ subIssues, blockedBy: [done] }), 'a1')).toBe('promote')
+  })
+  it('holds when the issue is not an epic or not todo', () => {
+    expect(planSynthesis({ status: 'todo' }, graph(), 'a1')).toBe('none')
+    expect(planSynthesis({ status: 'ready' }, graph({ subIssues: [completedSub] }), 'a1')).toBe('none')
+  })
+})
 
 describe('planGraphPromotion', () => {
   it('holds while a blocker is open', () => {
@@ -81,6 +121,13 @@ function make(
       card.promotionPending = true
       return true
     }),
+    beginSynthesis: vi.fn(async (id: string, _rev: bigint, ..._intent: unknown[]) => {
+      if (!casResult) return false
+      const card = [...db.values()].find((c) => c.id === id)!
+      card.status = 'ready'
+      card.promotionPending = true
+      return true
+    }),
     revertPromotion: vi.fn(async (id: string) => {
       const card = [...db.values()].find((c) => c.id === id)!
       card.status = 'todo'
@@ -123,7 +170,12 @@ function make(
       }
     )
   }
-  const reconciler = new KanbanGraphReconciler({ cards, store, log: { debug: vi.fn() } })
+  const reconciler = new KanbanGraphReconciler({
+    agentSlug: async () => 'synthesizer',
+    cards,
+    store,
+    log: { debug: vi.fn() }
+  })
   return { reconciler, cards, store, labels, db }
 }
 
@@ -342,13 +394,71 @@ describe('KanbanGraphReconciler', () => {
     await h.reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
     expect(h.store.applyPlan).not.toHaveBeenCalled()
   })
+
+  it('synthesizes a todo epic by assigning the synthesizer and opening the same intent', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make({ 7: { status: 'todo', labels: todoLabels } })
+    await h.reconciler.apply(board, REPO, 7, graph({ subIssues: [link(2, 'closed', 'completed')] }))
+    expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
+    expect(h.labels.get(7)).toContain('ac/agent:synthesizer')
+    expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.labels.get(7)).toEqual(['ac/agent:synthesizer', 'ac/status:ready'])
+  })
+
+  it.each([null, 'a1'])(
+    'does not bypass synthesis through completed blockers (agent %s)',
+    async (synthesizerAgentId) => {
+      const h = make({ 7: { status: 'todo', labels: todoLabels } })
+      await h.reconciler.apply(
+        { ...BOARD, synthesizerAgentId },
+        REPO,
+        7,
+        graph({ blockedBy: [done], subIssues: [link(2, 'open')] })
+      )
+      expect(h.cards.beginPromotion).not.toHaveBeenCalled()
+      expect(h.cards.beginSynthesis).not.toHaveBeenCalled()
+      expect(h.store.applyPlan).not.toHaveBeenCalled()
+    }
+  )
+
+  it('416c: a blocked epic is not synthesized when its last sub-issue closes', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make(
+      { 9: { status: 'running', labels: ['ac/status:running'] }, 7: { status: 'todo', labels: todoLabels } },
+      { 7: graph({ subIssues: [link(9, 'closed', 'completed')], blockedBy: [link(5, 'open')] }) }
+    )
+    await h.reconciler.apply(board, REPO, 9, graph({ parent: link(7, 'open') }))
+    expect(h.store.readGraph).toHaveBeenCalledWith(REPO, 7)
+    expect(h.cards.beginSynthesis).not.toHaveBeenCalled()
+    expect(h.db.get(7)!.status).toBe('todo')
+  })
+
+  it('re-evaluates the parent epic when a sub-issue closes', async () => {
+    const board = { ...BOARD, synthesizerAgentId: 'a1' }
+    const h = make(
+      { 9: { status: 'running', labels: ['ac/status:running'] }, 7: { status: 'todo', labels: todoLabels } },
+      { 7: graph({ subIssues: [link(9, 'closed', 'completed'), link(10, 'closed', 'completed')] }) }
+    )
+    await h.reconciler.apply(board, REPO, 9, graph({ parent: link(7, 'open') }))
+    expect(h.store.readGraph).toHaveBeenCalledWith(REPO, 7)
+    expect(h.db.get(7)!.status).toBe('ready')
+    expect(h.cards.beginSynthesis).toHaveBeenCalledWith('c7', 1n, 41n, expect.any(Date), 'a1')
+    expect(h.labels.get(7)).toContain('ac/agent:synthesizer')
+  })
 })
 
 describe('vera-474 B2: graph promotion reaches the projection seam', () => {
   it('vera-474: B2 a graph promotion todo→ready projects once its intent clears', async () => {
     const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
     const project = { onStatusCommitted: vi.fn() }
-    const reconciler = new KanbanGraphReconciler({ cards: h.cards, store: h.store, log: { debug: vi.fn() }, project })
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
     await reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))
     expect(h.db.get(7)!.status).toBe('ready')
     expect(project.onStatusCommitted).toHaveBeenCalledTimes(1)
@@ -362,7 +472,13 @@ describe('vera-474 B2: graph promotion reaches the projection seam', () => {
     const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
     h.store.applyPlan.mockRejectedValueOnce(new Error('label POST failed'))
     const project = { onStatusCommitted: vi.fn() }
-    const reconciler = new KanbanGraphReconciler({ cards: h.cards, store: h.store, log: { debug: vi.fn() }, project })
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
     await expect(reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('label POST failed')
     expect(h.db.get(7)!.status).toBe('todo')
     expect(project.onStatusCommitted).toHaveBeenCalledWith({ boardId: 'b1', issueNumber: 7, issueNodeId: 'n' })
@@ -371,7 +487,13 @@ describe('vera-474 B2: graph promotion reaches the projection seam', () => {
   it('vera-474: B2 no promotion means no projection', async () => {
     const h = make({ 7: { status: 'todo', labels: ['ac/status:todo'] } })
     const project = { onStatusCommitted: vi.fn() }
-    const reconciler = new KanbanGraphReconciler({ cards: h.cards, store: h.store, log: { debug: vi.fn() }, project })
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
     await reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [link(2, 'open')] }))
     expect(project.onStatusCommitted).not.toHaveBeenCalled()
   })
@@ -385,7 +507,13 @@ it.each(['lost CAS', 'DB error'] as const)(
     if (failure === 'lost CAS') h.cards.revertPromotion.mockResolvedValueOnce(false)
     else h.cards.revertPromotion.mockRejectedValueOnce(new Error('DB offline'))
     const project = { onStatusCommitted: vi.fn() }
-    const reconciler = new KanbanGraphReconciler({ cards: h.cards, store: h.store, log: { debug: vi.fn() }, project })
+    const reconciler = new KanbanGraphReconciler({
+      cards: h.cards,
+      store: h.store,
+      agentSlug: async () => null,
+      log: { debug: vi.fn() },
+      project
+    })
     await expect(reconciler.apply(BOARD, REPO, 7, graph({ blockedBy: [done] }))).rejects.toThrow('label POST failed')
     expect(h.db.get(7)!.status).toBe('ready')
     expect(project.onStatusCommitted).not.toHaveBeenCalled()

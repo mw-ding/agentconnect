@@ -1,6 +1,6 @@
 # Lane 3 Kanban claim-eligibility predicate (frozen contract)
 
-**Version:** 1.2 (2026-10-19)
+**Version:** 1.5 (2026-10-20)
 
 The pure claim predicate is `explainClaim` in `cp/src/kanban/claim-eligibility.ts`
 (`cp/` = `packages/control-plane/`). Lane 4's `dispatch --dry-run` calls it to explain
@@ -16,8 +16,11 @@ export type ClaimRole = 'work' | 'verify'
 
 export type ClaimGate =
   | 'board_disabled'
+  | 'board_paused'
   | 'status_not_claimable'
   | 'promotion_pending'
+  | 'control_write_pending'
+  | 'label_write_pending'
   | 'cooldown'
   | 'not_before'
   | 'no_assignee'
@@ -45,11 +48,13 @@ export interface ClaimAgentFacts {
 }
 
 export interface ClaimEligibilityInput {
-  board: { enabled; verifierAgentId; maxInProgress; maxInProgressPerAgent }
+  board: { enabled; paused; verifierAgentId; maxInProgress; maxInProgressPerAgent }
   card: {
     status
     assigneeAgentId
     promotionPending
+    controlWritePending
+    labelWritePending
     cooldownUntil
     notBefore
     verifiedAt
@@ -86,24 +91,25 @@ A `ready` card is a **work** claim to `assigneeAgentId`. A `review` card on a bo
 | #   | Gate                   | Condition                                                                                  |
 | --- | ---------------------- | ------------------------------------------------------------------------------------------ |
 | 1   | `board_disabled`       | the board is not enabled                                                                   |
-| 2   | `status_not_claimable` | status is neither `ready` nor `review`                                                     |
-| 3   | `verifier_unset`       | status is `review` and the board has no `verifierAgentId`                                  |
-| 4   | `verified`             | status is `review` and `verifiedAt` is set: the verifier approved under a PR contract      |
-| 5   | `needs_attention`      | the card is flagged for a human (B8 or an escalation)                                      |
-| 6   | `promotion_pending`    | the card holds a pending graph promotion                                                   |
-| 7   | `cooldown`             | `cooldownUntil` is in the future                                                           |
-| 8   | `not_before`           | `notBefore` is in the future                                                               |
-| 9   | `open_lease`           | an open (un-ended) run already holds the card                                              |
-| 10  | `no_assignee`          | no target agent id (assignee for work, verifier for verify)                                |
-| 11  | `agent_missing`        | the target agent row is gone                                                               |
-| 12  | `agent_paused`         | the target agent is paused                                                                 |
-| 13  | `agent_unplaced`       | the target agent has no daemon placement                                                   |
-| 14  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
-| 15  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
-| 16  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
-| 17  | `epic_cap`             | the epic child has no active slot left (work and verify both count)                        |
-| 18  | `daemon_cap`           | the target daemon is at its cross-board active cap                                         |
-| 19  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
+| 2   | `board_paused`         | the board is paused; open runs can still report and expire                                 |
+| 3   | `status_not_claimable` | status is neither `ready` nor `review`                                                     |
+| 4   | `verifier_unset`       | status is `review` and the board has no `verifierAgentId`                                  |
+| 5   | `verified`             | status is `review` and `verifiedAt` is set: the verifier approved under a PR contract      |
+| 6   | `needs_attention`      | the card is flagged for a human (B8 or an escalation)                                      |
+| 7   | `promotion_pending`    | the card holds a pending graph promotion                                                   |
+| 8   | `cooldown`             | `cooldownUntil` is in the future                                                           |
+| 9   | `not_before`           | `notBefore` is in the future                                                               |
+| 10  | `open_lease`           | an open (un-ended) run already holds the card                                              |
+| 11  | `no_assignee`          | no target agent id (assignee for work, verifier for verify)                                |
+| 12  | `agent_missing`        | the target agent row is gone                                                               |
+| 13  | `agent_paused`         | the target agent is paused                                                                 |
+| 14  | `agent_unplaced`       | the target agent has no daemon placement                                                   |
+| 15  | `board_cap`            | the board's open runs have reached `maxInProgress`                                         |
+| 16  | `agent_cap`            | the target agent's open runs have reached `maxInProgressPerAgent`                          |
+| 17  | `daemon_offline`       | the target agent's daemon has no live connection                                           |
+| 18  | `epic_cap`             | the epic child has no active slot left (work and verify both count)                        |
+| 19  | `daemon_cap`           | the target daemon is at its cross-board active cap                                         |
+| 20  | `verifier_is_worker`   | status is `review` and the verifier is the assignee or wrote any work run on the card (B8) |
 
 Main's orchestrator caps apply to work and verify alike. Supply `epicCapacity` for an epic
 child and `daemonCapacity` when a daemon cap is configured; both counts include every open
@@ -114,8 +120,7 @@ The SQL serializes capped work and verify claims using the target daemon's advis
 `verifier_is_worker` is last because the claim evaluates B8 on the locked candidate, after
 its cap and liveness checks; that is also where it flags the card for a human.
 `needs_attention` holds a flagged card in any status: B8 leaves its card in `review`, and
-only the documented human status move (a human-attributed status label the dispatcher
-ingests) clears the flag. Editing the board, such as fixing `verifierAgentId`, never
+a human-attributed status label the dispatcher ingests or an authorized owner restart clears the flag. Skip archives the card. Editing the board, such as fixing `verifierAgentId`, never
 releases it on its own.
 
 ## The approval stamp and review rounds
@@ -144,7 +149,9 @@ timeout reads the committed revocation before testing its lease fence.
 
 `reviewRounds` counts the verifier's `changes_requested` replies, and the card trips to
 `triage` (`review_round_limit`) when it reaches `KANBAN_REVIEW_ROUND_LIMIT` (3). Only an
-approval resets it; a worker's pass and every human move keep it. So after a trip, a human
+approval resets it; a worker's pass and every human status move keep it. The one exception
+is the owner-only restart control, which resets it to 0 together with the rest of the
+card's failure state and starts a new work episode. So after a trip, a human
 who moves the card back to `ready` buys exactly **one more verify round**: the worker runs,
 the verifier reviews once, and a further `changes_requested` (round 4) sends the card straight
 back to `triage`, while an approval ends the loop and resets the count. This is deliberate:
@@ -285,11 +292,10 @@ An applied move queues the Projects projection when it commits.
 
 ### PR completion contracts
 
-> **Inert until #416.** The binding below requires a head branch `ac/card-<issueNumber>`,
-> and no worker creates one before #416 (the write-card branch convention, on hold) lands.
-> Until then every `pr_merged` / `pr_checks_green` card that reaches `review` with a linked PR
-> waits on `pr_unbound`, flagged once (see below). Boards that need completion now should use
-> `close` with a verifier.
+Write-card sessions now create and reuse `ac/card-<issueNumber>` (#416), satisfying
+the branch binding below. PR contracts can complete cards when the live PR also meets
+the App-author, repository, default-base and work-episode checks. Upgrade the daemon
+before enabling these contracts; sessions using older session branches wait on `pr_unbound`.
 
 The pure planner is in `cp/src/kanban/contracts.ts`:
 `planContract(input) → done | triage(pr_closed_unmerged) | wait(reason)` and
@@ -378,7 +384,7 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   stamp, else their latest work claim); other cards stamp at their next work claim.
   A card in `ready` or `blocked` between rework rounds at deploy time therefore starts a new
   episode at its next claim, and attempt 1's PR is flagged `pr_unbound` once. That is
-  acceptable while contracts are inert.
+  a conservative deployment boundary; a human must start new work or report a new bound PR.
 - Known gap: a base branch renamed after merge leaves the merged PR's old `base.ref`,
   so the card waits as `pr_unbound` (flagged once). It fails closed; a human moves it.
 - `done` resets `reviewRounds` and `verifiedAt`.
@@ -414,11 +420,26 @@ reads a binding override from configuration or environment.
 
 ## Changelog
 
+- **1.5 (2026-10-20):** exclude pending control and label projections from SQL,
+  pure and explain claims. Controls CAS a monotonic `controlVersion` in the move
+  transaction; queued writes drop obsolete versions. The existing sync retries
+  pending controls toward their committed status before attributing GitHub edits.
+  Restart close targets are validated by the read-only PR reader and delivered
+  only as trusted `supersededPrNumber` dispatch data. Existing session checkouts
+  safely switch to the card branch; a remote branch is fetched and tracked.
+
+- **1.4 (2026-10-20):** add the required `board.paused` fact and the `board_paused` gate
+  immediately after `board_disabled` (#416), preserving 1.1 review routing, `verified`,
+  `needs_attention`, the 1.2 epic/daemon caps and any-attempt B8 ordering. Write-card
+  branches now satisfy the 3b PR binding. Controls revoke the daemon lease, reset the
+  work episode on restart, project status changes and leave failed label writes pending
+  for repair. Repeating a skip or a restart of an already-reset ready card is a no-op.
+
 - **1.3 (2026-10-20):** PR contracts bind against the card's work episode
   (`workEpisodeStartedAt`), not the reporting run; `pr_unbound`, `actions_read_missing`
   and `merged_by_app` are flagged once per `(card, reason, PR)`; the workflow lookup moves
   to its own `actions:read` token; check identity adds the triggering event. Contracts stay
-  inert until #416's branch convention lands.
+  inert at 1.3 until #416's branch convention (now supplied in 1.4) lands.
 
 - **1.2 (2026-10-19):** add optional epic and daemon capacity facts and matching gates for
   main's orchestrator caps. Work and verify claims share those caps and daemon locks.
@@ -442,3 +463,93 @@ reads a binding override from configuration or environment.
   `verifiedAt`, but only the parked ingest did; after the merge with the label sync (#194), its
   `apply` clears it too, so the statement now holds. The predicate and its inputs are unchanged.
 - **1.0 (2026-10-17):** initial frozen contract.
+
+## 3c
+
+Human controls (issue #2 B5) and the per-card write branch + synthesizer (B3).
+
+### Routes (all owner + interactive OIDC, like the run-mode setters)
+
+- `POST /api/v1/orgs/:orgId/kanban/boards/:boardId/pause` — pause a board.
+  Idempotent; a paused board claims nothing but its reaper, reports, heartbeats,
+  label sync, graph promotion and doorbells keep running. Returns the board DTO.
+- `POST /api/v1/orgs/:orgId/kanban/boards/:boardId/resume` — resume and re-arm
+  the dispatcher. Idempotent. Returns the board DTO.
+- `POST /api/v1/orgs/:orgId/kanban/boards/:boardId/cards/:cardId/skip` — archive
+  the card (issue closed `not_planned`), revoke any open lease with a
+  dispatch-revision bump, and post one body-free comment. `404` for a card not on
+  the board, `409` when the transition is not allowed.
+- `POST /api/v1/orgs/:orgId/kanban/boards/:boardId/cards/:cardId/restart` — reset
+  the card to `ready` (clearing failure counters, block recurrence, cooldown,
+  block kind, and the attention flag), revoke any open lease, reopen a closed
+  issue, write the status label and one body-free comment, then re-arm the
+  dispatcher. `404`/`409` as above.
+
+All four leave body-free audit rows: `board_paused`, `board_resumed`,
+`card_skipped`, `card_restarted`.
+
+### Board fields
+
+`KanbanBoard` gains `paused` (default false), `pausedAt`, `pausedByUserId`
+(`User` FK, `SetNull`), and `synthesizerAgentId` (`Agent` FK, `SetNull`).
+`synthesizerAgentId` is accepted on the board CRUD bodies and validated like
+`verifierAgentId` (an agent of the board's organization).
+
+### Synthesizer card (B3)
+
+A card whose issue has sub-issues (an epic) and is `todo` is promoted to `ready`
+and assigned to `synthesizerAgentId` when every sub-issue is closed `completed`
+and the graph read is not truncated; any `not_planned`/open sub-issue, a truncated
+read, or no synthesizer configured leaves it alone. This is `planSynthesis` in
+`cp/src/kanban/graph-reconciler.ts`, evaluated beside the existing blocker
+promotion, with a sub-issue close re-evaluating its parent epic (the mirror of a
+blocker re-evaluating its dependents). The write uses the same CAS + promotion
+intent + idempotent label-write pattern as graph promotion, replacing prior
+`ac/agent:*` labels with `ac/agent:<synthesizer-slug>`. An `issues.closed` or
+`issues.reopened` doorbell re-reads the changed child and its parent graph.
+
+### Write-card branch (B3)
+
+A WRITE-mode Kanban run for issue #n checks out its session worktree on branch
+`ac/card-<n>`, reused on later attempts and after a restart, and never used for
+another card. On first use in a clone or worktree, it starts from `origin`'s
+`ac/card-<n>` when an earlier attempt pushed one, and from the repository's
+default branch otherwise. The branch name comes from `kanbanCardBranch` in
+`packages/daemon/src/kanban/card-branch.ts` and is told to the worker in the
+kanban prompt. Read-mode runs are unchanged.
+
+Skip, restart and synthesis enqueue body-free `kanban_notification` rows in the
+same transaction as the status move (unique on card id and state revision).
+Restart and synthesis use reason codes `restarted` and `synthesis` for ready
+notifications. Headless boards and status self-moves stay silent.
+
+For `ac/card-<n>`, an existing checked-out worktree is never detached or deleted
+by a competing session. Removed daemon session registrations can be pruned and
+the branch reused, preserving committed progress. Existing directories require
+explicit retirement before another session can acquire their branch. A local
+branch is preserved for a fresh checkout. Separate clones share only what was pushed.
+
+Existing read-mode session checkouts switch to `ac/card-<n>` on write preparation:
+fetch the remote card branch and track it if present, otherwise start from the
+default branch. Dirty, detached, locked or foreign-held checkouts are refused;
+a local card ref with commits absent from the intended tip is refused rather
+than reset. A checkout already on its card branch preserves its work.
+
+Skip and restart CAS a monotonic `controlVersion` in the same locked transaction
+as their move. Their GitHub writes use the dispatcher's per-card queue and drop
+versions superseded by a later control. Claims exclude `labelWritePending` and
+`controlWrittenVersion < controlVersion`, so an acknowledged restart survives a
+GitHub failure without being reverted by a stale claim read. The existing label
+sync retries the committed intent (restart: open + ready; skip: closed +
+archived), acknowledges the version and clears the pending flag. Completed dispatcher
+projections re-arm dispatch so a poke blocked by a pending write is not lost. The sync and
+dispatcher projections share the queue. This queue remains in-process; multiple
+CP processes do not share its serialization.
+
+Before naming a superseded PR, the CP's read-only PR reader proves it is open,
+unmerged, in this repository and has head `ac/card-<n>`. A failed read or mismatch
+drops the target and yields a plain restart comment. The number is retained only
+if the transaction still sees that linked PR, then passed as trusted
+`supersededPrNumber` lease/dispatch data. Only that trusted field generates a
+worker close instruction; comment text grants no close authority. The CP's PR
+token remains read-only. Write-run token scope tightening is a separate follow-up.

@@ -1,3 +1,5 @@
+import { acknowledgeKanbanProjection } from '../fixtures/kanban-projection.js'
+import { PgKanbanSyncRepo } from '../../src/persistence/repositories/kanban-sync.repo.js'
 // KanbanDispatcher (issue #2 M2) on real Postgres with a fake GitHub store and daemon link: dispatch, fencing, reaper, accounting.
 import { describe, expect, it, vi } from 'vitest'
 import type { KanbanDispatch, KanbanDispatchOk, KanbanReport } from '@agentconnect.md/protocol'
@@ -114,6 +116,9 @@ class FakeStore {
     plan: LabelPlan,
     onLabelAdded?: LabelWriteObserver
   ): Promise<void> {
+    const row = await prisma.kanbanCard.findFirst({ where: { issueNumber: n, board: { repoId: _repo.repoId } } })
+    const sync = new PgKanbanSyncRepo(prisma)
+    const snapshot = row ? await sync.get(row.boardId, n) : null
     this.writes.push(plan)
     const i = this.issues.get(n)!
     this.record(n, plan.addLabels, plan.removeLabels, 'app')
@@ -122,6 +127,9 @@ class FakeStore {
     if (plan.issueState) {
       i.state = plan.issueState.state
       i.stateReason = plan.issueState.state === 'closed' ? plan.issueState.reason : null
+    }
+    if (snapshot && snapshot.status === plan.status) {
+      await sync.ack(snapshot, snapshot.syncEventCursor, snapshot.syncAgentCursor)
     }
   }
 }
@@ -152,6 +160,20 @@ async function harness(
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
+  // This fallback-path fixture has no live sync; human ingest and proven promotion reads already reflect GitHub.
+  const ingestStatus = repo.ingestStatus.bind(repo)
+  vi.spyOn(repo, 'ingestStatus').mockImplementation(async (...args) => {
+    const result = await ingestStatus(...args)
+    if (result.moved) await acknowledgeKanbanProjection(result.cardId)
+    return result
+  })
+  const settlePromotion = repo.settlePromotion.bind(repo)
+  vi.spyOn(repo, 'settlePromotion').mockImplementation(async (cardId, repaired) => {
+    const result = await settlePromotion(cardId, repaired)
+    if (result && repaired) await acknowledgeKanbanProjection(cardId)
+    return result
+  })
+
   const dispatcher = new KanbanDispatcher({
     repo,
     installations: {
@@ -481,7 +503,7 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
     { leaseId: d.leaseId, cardId: d.cardId, dispatchRevision: d.dispatchRevision, liveness: 'turn' as const }
   ]
 
-  it('keeps a beating lease and reclaims it once the heartbeat goes stale, counting no failure', async () => {
+  it('416r3: stale lease reaping counts no failure and its completed projection re-arms a new run', async () => {
     const h = await harness()
     const { c, d } = await leased(h)
     h.clock.advance(3 * 60 * 60_000)
@@ -492,14 +514,15 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
     h.clock.advance(4 * 60 * 60_000 + 1_000)
     expect(await h.dispatcher.reap()).toBe(1)
     await h.dispatcher.settle()
-    expect(await h.card(c.id)).toMatchObject({ status: 'ready', consecutiveFailures: 0, cooldownUntil: null })
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', consecutiveFailures: 0, cooldownUntil: null })
     expect(await h.run(d.leaseId)).toMatchObject({ outcome: 'reclaimed', reasonCode: 'reclaimed:stale_heartbeat' })
-    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:ready'])
+    expect(h.store.issues.get(c.issueNumber)?.labels).toEqual(['ac/status:running'])
 
     // The superseded run is fenced out: its heartbeat is refused and its late report cannot land.
     expect(await h.dispatcher.onHeartbeat(D1, 4, beat(d))).toEqual([d.leaseId])
     expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d))).accepted).toBe(false)
-    expect((await h.card(c.id)).status).toBe('ready')
+    expect((await h.card(c.id)).status).toBe('running')
+    expect(h.sent.at(-1)!.d).toMatchObject({ cardId: c.id, attempt: 2 })
   })
 
   it('reclaims after a daemon epoch change unless the daemon re-asserts the lease', async () => {
@@ -527,14 +550,22 @@ describe('KanbanDispatcher — stale lease reaper (real Postgres)', () => {
     expect((await h.run(d.leaseId)).reasonCode).toBe('reclaimed:agent_moved')
   })
 
-  it('reclaims an unacked dispatch quickly', async () => {
-    const h = await harness({ reply: () => new Promise<KanbanDispatchOk>(() => {}) })
+  it('416r3: reclaims the exact unacked dispatch even when projection completion starts its replacement', async () => {
+    let enteredDispatch!: () => void
+    const entered = new Promise<void>((resolve) => (enteredDispatch = resolve))
+    const h = await harness({
+      reply: () => {
+        enteredDispatch()
+        return new Promise<KanbanDispatchOk>(() => {})
+      }
+    })
     await h.addCard()
     void h.dispatcher.reconcileBoard(h.board.id)
-    await new Promise((r) => setTimeout(r, 200))
+    await entered
+    const leaseId = h.sent[0]!.d.leaseId
     h.clock.advance(3 * 60_000)
     expect(await h.dispatcher.reap()).toBe(1)
-    expect((await prisma.kanbanRun.findFirstOrThrow()).reasonCode).toBe('reclaimed:dispatch_unacked')
+    expect((await h.run(leaseId)).reasonCode).toBe('reclaimed:dispatch_unacked')
   })
 
   it('a tick reaps first, so the reclaimed slot is claimed again in the same pass', async () => {
@@ -848,7 +879,14 @@ async function graphHarness() {
   const h = await harness()
   const { graphs, store } = h
   const log = { debug: vi.fn(), warn: vi.fn() }
-  const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log, clock: h.clock })
+  const reconciler = new KanbanGraphReconciler({
+    agentSlug: async (orgId, id) =>
+      (await prisma.agent.findFirst({ where: { orgId, id }, select: { name: true } }))?.name ?? null,
+    cards: new PgKanbanCardRepo(prisma),
+    store,
+    log,
+    clock: h.clock
+  })
   const ingest = vi.spyOn(h.dispatcher, 'ingestCard')
   const poke = vi.spyOn(h.dispatcher, 'poke')
   const bell = new KanbanGraphDoorbell({
@@ -1477,6 +1515,39 @@ describe('Kanban graph reconciliation composed with dispatch (real Postgres)', (
     expect((await h.card(c.id)).status).toBe('blocked')
     expect(h.sent).toEqual([])
     expect(h.store.writes).toEqual([])
+  })
+
+  it('synthesizes a completed epic to its synthesizer agent (real Postgres)', async () => {
+    const h = await graphHarness()
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { synthesizerAgentId: A1 } })
+    const epic = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: epic.id }, data: { status: 'todo', assigneeAgentId: null } })
+    h.graphs.set(epic.issueNumber, {
+      ...emptyGraph(),
+      subIssues: [{ issueId: 900n, number: 900, repoId: REPO_ID, state: 'closed', stateReason: 'completed' }]
+    })
+    h.graphs.set(900, {
+      ...emptyGraph(),
+      parent: { issueId: epic.issueId, number: epic.issueNumber, repoId: REPO_ID, state: 'open', stateReason: null }
+    })
+    await h.ring(900)
+    // Synthesis assigned the synthesizer and promoted to ready; the dispatcher then claimed it.
+    expect(await h.card(epic.id)).toMatchObject({ status: 'running', assigneeAgentId: A1 })
+    expect(h.store.writes.map((p) => p.status)).toContain('ready')
+    expect(h.sent.some(({ d }) => d.cardId === epic.id)).toBe(true)
+    // A not_planned sub-issue never synthesizes.
+    const epic2 = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: epic2.id }, data: { status: 'todo', assigneeAgentId: null } })
+    h.graphs.set(epic2.issueNumber, {
+      ...emptyGraph(),
+      subIssues: [{ issueId: 901n, number: 901, repoId: REPO_ID, state: 'closed', stateReason: 'not_planned' }]
+    })
+    h.graphs.set(901, {
+      ...emptyGraph(),
+      parent: { issueId: epic2.issueId, number: epic2.issueNumber, repoId: REPO_ID, state: 'open', stateReason: null }
+    })
+    await h.ring(901)
+    expect((await h.card(epic2.id)).status).toBe('todo')
   })
 })
 

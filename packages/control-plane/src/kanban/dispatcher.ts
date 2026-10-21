@@ -589,7 +589,8 @@ export class KanbanDispatcher {
         sessionKeyPrefix: lease.sessionKeyPrefix,
         mode,
         // Absent = work, so a verify role is the only addition and older daemons still read the frame.
-        ...(lease.role === 'verify' ? { role: 'verify' as const } : {})
+        ...(lease.role === 'verify' ? { role: 'verify' as const } : {}),
+        ...(lease.supersededPrNumber !== undefined ? { supersededPrNumber: lease.supersededPrNumber } : {})
       })
     } catch (err) {
       // Nack or timeout → ready with a cooldown; if the daemon did start, the fence rejects that run's writes.
@@ -675,12 +676,21 @@ export class KanbanDispatcher {
     observed?: ObservedIssue
   ): void {
     this.projectCommitted(card.boardId, card.issueNumber, observed)
+    if (this.deps.sync) {
+      const task = this.deps.sync
+        .projectStatus(card.boardId, card.issueNumber, status)
+        .then(() => this.poke(card.boardId))
+        .catch((err: unknown) => this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: status projection failed'))
+        .finally(() => this.background.delete(task))
+      this.background.add(task)
+      return
+    }
     const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
       .then(async () => {
-        if (this.deps.sync) return this.deps.sync.projectStatus(card.boardId, card.issueNumber, status)
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
         if (!current) return
         await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
+        this.poke(card.boardId)
       })
       .catch((err: unknown) =>
         this.deps.log.warn({ err, cardId: card.cardId, status }, 'kanban: status label write failed')
@@ -691,6 +701,26 @@ export class KanbanDispatcher {
       })
     this.statusWrites.set(card.cardId, task)
     this.background.add(task)
+  }
+
+  /** Hold the card's status-write queue for an outside post-commit GitHub write; a claim reads GitHub only once `release` has run it. */
+  holdStatusWrite(cardId: string): (write?: () => Promise<void>) => Promise<void> {
+    let open!: (write: (() => Promise<void>) | undefined) => void
+    const held = new Promise<(() => Promise<void>) | undefined>((resolve) => (open = resolve))
+    const task = (this.statusWrites.get(cardId) ?? Promise.resolve())
+      .then(() => held)
+      .then((write) => write?.())
+      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: held status write failed'))
+      .finally(() => {
+        this.background.delete(task)
+        if (this.statusWrites.get(cardId) === task) this.statusWrites.delete(cardId)
+      })
+    this.statusWrites.set(cardId, task)
+    this.background.add(task)
+    return (write) => {
+      open(write)
+      return task
+    }
   }
 
   /** The board's repository with its installation resolved live; null when the board or installation is gone. */

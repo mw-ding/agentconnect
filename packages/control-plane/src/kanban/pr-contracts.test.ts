@@ -11,7 +11,14 @@ import { statusLabel, type LabelPlan } from './card-state.js'
 import type { CheckRunFacts, LivePullRequest } from './contracts.js'
 import { KanbanPrContracts } from './pr-contracts.js'
 
-const BOARD: KanbanBoardRecord = { id: 'b1', orgId: OrgId('org'), name: 'eng', repoId: 42n, repoFullName: 'acme/web' }
+const BOARD: KanbanBoardRecord = {
+  id: 'b1',
+  orgId: OrgId('org'),
+  name: 'eng',
+  repoId: 42n,
+  repoFullName: 'acme/web',
+  synthesizerAgentId: null
+}
 const REPO = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
 const HEAD = 'a'.repeat(40)
 const OLD = 'b'.repeat(40)
@@ -40,6 +47,7 @@ const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   completionContract: 'pr_merged',
   verifierAgentId: null,
   configRevision: 1n,
+  controlVersion: 0n,
   ...over
 })
 
@@ -84,7 +92,8 @@ function make(
         stateRevision: c.stateRevision + 1n
       })
       return true
-    })
+    }),
+    isLatestControl: vi.fn(async () => true)
   }
   const prs = {
     readPullRequest: vi.fn(async (_repo: unknown, n: number) =>

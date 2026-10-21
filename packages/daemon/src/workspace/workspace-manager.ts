@@ -63,6 +63,7 @@ import {
 } from './git-injection.js'
 import { GitTransportError, LocalGitRunner, type GitCloneOutput, type GitRunner } from './git-runner.js'
 import { cloneFromBundle, type BundleFallbackReason, type BundledCloneReport } from './bundled-clone.js'
+import { policyRefusalOf } from './git-command-policy.js'
 import type { SourceCacheShape } from '../source-cache/keys.js'
 import type { SourceCacheWorkspaceReader, WorkspaceCachePlan } from '../source-cache/read-plan.js'
 import type { SourceCacheWriteRequest, SourceCacheWriter } from '../source-cache/write-back.js'
@@ -83,6 +84,7 @@ import {
 } from './secondary-layout.js'
 import { authorizeWorkspaceGitUrl } from './git-origin-policy.js'
 import { blockingBranchRefs, isSessionBranch, sessionBranchName } from './session-branch.js'
+import { cardWorktreeLocation } from './card-worktree-path.js'
 import {
   confinedSessionDirIn,
   hasSessionsDirIn,
@@ -266,6 +268,8 @@ export interface PrepareSessionWorkspaceRequest {
   /** Display label of the user who OPENED this logical session — it names the
    * worktree's branch. Presentation only; never an identity or auth input. */
   initiatedBy?: string
+  /** An exact branch name (e.g. a Kanban write card's `ac/card-<n>`); overrides the generated session branch. */
+  branch?: string
   review?: GithubReviewWorkspaceRevision
   /** `owner/repo` the review is about, only with `review`: a secondary root's exact worktree becomes the cwd, the others ride along at their default branches (decisions 5, 6); absent or the primary is the ordinary review. */
   reviewRepoFullName?: string
@@ -2384,15 +2388,177 @@ export class WorkspaceManager {
     root: WorkspaceRoot,
     cwd: string,
     target: string,
-    initiatedBy?: string
+    initiatedBy?: string,
+    branch?: string
   ): Promise<void> {
     const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
-    const branch = await this.drawSessionBranch(git(), initiatedBy)
-    // --no-track: the start point is a remote-tracking ref, so git's own `branch.autoSetupMerge`
-    // would otherwise make `origin/<base>` this branch's upstream. That upstream is what the console's
-    // push authorizes against — it would turn the push button into a remote-branch creator — and it
-    // leaves a plain `git push` failing under push.default=simple on the name mismatch.
-    await git().raw(['worktree', 'add', '-b', branch, '--no-track', cwd, target])
+    // A fixed card branch is created from the root's default branch on first use and reused on later attempts.
+    if (branch !== undefined) {
+      const exists = await git()
+        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+        .then(() => true)
+        .catch(() => false)
+      // Only a removed daemon session can release a card branch; an existing worktree may still be live.
+      if (exists) await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
+      // A card branch pushed from another clone or daemon resumes from origin; no upstream, so a push never targets the default branch.
+      const start = exists
+        ? undefined
+        : ((await this.fetchRemoteCardBranch(agentId, root, root.path, branch)) ?? target)
+      await git().raw(
+        start === undefined
+          ? ['worktree', 'add', cwd, branch]
+          : ['worktree', 'add', '-b', branch, '--no-track', cwd, start]
+      )
+      return
+    }
+    const name = await this.drawSessionBranch(git(), initiatedBy)
+    // No upstream: the console's push authorization must never treat the base branch as the session's target.
+    await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
+  }
+
+  /** Refuse a card branch a live, locked or foreign worktree holds; release only a proven removed managed registration. */
+  private async releaseCardBranchRegistrations(
+    agentId: string,
+    root: WorkspaceRoot,
+    cwd: string,
+    branch: string
+  ): Promise<void> {
+    const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
+    const listing = await git().raw(['worktree', 'list', '--porcelain', '-z'])
+    for (const record of listing.split('\0\0')) {
+      const fields = record.split('\0')
+      if (!fields.includes(`branch refs/heads/${branch}`)) continue
+      const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
+      if (!path) continue
+      const location = cardWorktreeLocation(path, cwd)
+      if (
+        location === 'foreign' ||
+        (await this.fsFor(agentId).stat(path)) !== 'missing' ||
+        fields.some((field) => field.startsWith('locked'))
+      ) {
+        throw new Error(`card branch ${branch} is already checked out in another worktree`)
+      }
+      // Remove only the proven stale card registration; pruning also drops unrelated foreign registrations.
+      await git().raw(['worktree', 'remove', path])
+    }
+  }
+
+  /** Move a resumed session checkout onto its card branch; a detached or dirty checkout is refused, never discarded. */
+  private async switchToCardBranch(
+    agentId: string,
+    root: WorkspaceRoot,
+    cwd: string,
+    target: string,
+    branch: string,
+    tier: 'worktree' | 'clone'
+  ): Promise<void> {
+    const git = () =>
+      this.runnerFor(agentId, cwd).withEnv(
+        tier === 'clone' ? this.sessionCloneGitEnv(agentId, root, cwd) : workspaceGitLocalEnv()
+      )
+    const head = (
+      await git()
+        .raw(['symbolic-ref', '--quiet', 'HEAD'])
+        .catch(() => '')
+    ).trim()
+    if (head === `refs/heads/${branch}`) return
+    if (head === '') throw new Error(`session checkout has a detached HEAD; refusing to switch it to ${branch}`)
+    const registrations = await git().raw(['worktree', 'list', '--porcelain', '-z'])
+    for (const record of registrations.split('\0\0')) {
+      const fields = record.split('\0')
+      const path = fields.find((field) => field.startsWith('worktree '))?.slice(9)
+      if (path && cardWorktreeLocation(path, cwd) === 'same' && fields.some((field) => field.startsWith('locked'))) {
+        throw new Error(`session checkout is locked; refusing to switch it to ${branch}`)
+      }
+    }
+    // Untracked files count too: a checkout may overwrite one the card branch tracks.
+    if ((await git().raw(['status', '--porcelain'])).trim() !== '') {
+      throw new Error(`session checkout has uncommitted or untracked changes; refusing to switch it to ${branch}`)
+    }
+    // Full sandboxed switch support is #590; until then a policy refusal is reported as such, before the checkout moves.
+    const refuseIfPolicy = (args: string[], err: unknown): void => {
+      const refusal = policyRefusalOf(args, err)
+      if (refusal === undefined) return
+      throw new Error(
+        `switching an existing session checkout to ${branch} is not supported on the sandboxed tier: ` +
+          `the sandbox git policy refuses git ${args[0]} (${refusal})`
+      )
+    }
+    const repository = tier === 'clone' ? cwd : root.path
+    const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
+    const exists = await git()
+      .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+      .then(() => true)
+      .catch(() => false)
+    if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
+    const start = remote ?? target
+    if (exists) {
+      const localTip = (await git().raw(['rev-parse', `refs/heads/${branch}`])).trim()
+      // Reset only when every local commit is reachable from the intended starting point.
+      const ancestry = ['merge-base', '--is-ancestor', localTip, start]
+      const retained = await git()
+        .raw(ancestry)
+        .then(
+          () => true,
+          (err: unknown) => {
+            refuseIfPolicy(ancestry, err)
+            return false
+          }
+        )
+      if (!retained) throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
+    }
+    if (remote) {
+      // Exact-refspec fetches need a matching origin mapping before Git can configure branch tracking.
+      const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`
+      const mappings = await git()
+        .raw(['config', '--local', '--get-all', 'remote.origin.fetch'])
+        .catch(() => '')
+      if (!mappings.split('\n').includes(refspec)) {
+        const mapping = ['config', '--local', '--add', 'remote.origin.fetch', refspec]
+        await git()
+          .raw(mapping)
+          .catch((err: unknown) => {
+            refuseIfPolicy(mapping, err)
+            throw err
+          })
+      }
+    }
+    await git().raw([
+      'checkout',
+      '--no-overwrite-ignore',
+      '-B',
+      branch,
+      ...(remote ? ['--track'] : ['--no-track']),
+      start
+    ])
+  }
+
+  /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
+  private async fetchRemoteCardBranch(
+    agentId: string,
+    root: WorkspaceRoot,
+    path: string,
+    branch: string,
+    blobless = false
+  ): Promise<string | undefined> {
+    if (root.githubApp) await preWarmGitCred(agentId, 'pull', additionalRepositoryOf(root))
+    const remote = workspaceGitRemoteTarget(root.cloneUrl, root.githubApp ? agentId : undefined, root.managed, {
+      blobless
+    })
+    const git = this.runnerFor(agentId, path).withEnv(blobless ? { ...remote.env, GIT_NO_LAZY_FETCH: '0' } : remote.env)
+    const listed = await git.raw(['ls-remote', '--heads', remote.remote, `refs/heads/${branch}`])
+    if (listed.trim() === '') return undefined
+    const tracking = `refs/remotes/origin/${branch}`
+    await git.raw([
+      'fetch',
+      '--force',
+      '--no-tags',
+      '--no-recurse-submodules',
+      ...(blobless ? [`--filter=${SESSION_CLONE_FILTER}`] : []),
+      remote.remote,
+      `+refs/heads/${branch}:${tracking}`
+    ])
+    return tracking
   }
 
   /** A session branch name no ref in the repository `git` runs in blocks — word pairs first, random bytes once the draws are spent; only a printed ref counts, since a miss exits 1 silently, which one runner resolves and the other throws. */
@@ -2625,11 +2791,15 @@ export class WorkspaceManager {
     }
     if (!attached) {
       await fs.rmTree(cwd)
-      await this.runnerFor(agent.id, root.path).withEnv(workspaceGitLocalEnv()).raw(['worktree', 'prune'])
-      await this.addRootSessionWorktree(agent.id, root, cwd, target, request.initiatedBy)
+      // Fixed card branches release only the registration their safety checks identify.
+      if (request.branch === undefined)
+        await this.runnerFor(agent.id, root.path).withEnv(workspaceGitLocalEnv()).raw(['worktree', 'prune'])
+      await this.addRootSessionWorktree(agent.id, root, cwd, target, request.initiatedBy, request.branch)
     } else if (review) {
       // Tracked files alone follow the revision; untracked and ignored files (node_modules, a cargo target, build output) are the session's own intermediates and stay, so a re-review does not rebuild them.
       await this.runnerFor(agent.id, cwd).withEnv(workspaceGitLocalEnv()).raw(['reset', '--hard', target])
+    } else if (request.branch !== undefined) {
+      await this.switchToCardBranch(agent.id, root, cwd, target, request.branch, 'worktree')
     }
     if (review && (await this.revParse(agent.id, cwd, 'HEAD')).toLowerCase() !== review.checkout) {
       throw new Error('github review worktree HEAD does not match the verified revision')
@@ -2789,12 +2959,14 @@ export class WorkspaceManager {
         : this.submoduleReposAtRevision(agentId, root, cwd, target)
     )
     if (!attached) {
-      await this.checkoutSessionBranch(agentId, root, cwd, target, request.initiatedBy)
+      await this.checkoutSessionBranch(agentId, root, cwd, target, request.initiatedBy, request.branch)
     } else if (review) {
       // Tracked files alone follow the revision, as on the worktree tier: the session keeps its untracked and ignored intermediates across deliveries.
       await this.runnerFor(agentId, cwd)
         .withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
         .raw(['reset', '--hard', target])
+    } else if (request.branch !== undefined) {
+      await this.switchToCardBranch(agentId, root, cwd, target, request.branch, 'clone')
     }
     if (review && (await this.revParse(agentId, cwd, 'HEAD')).toLowerCase() !== review.checkout) {
       throw new Error('github review clone HEAD does not match the verified revision')
@@ -2871,16 +3043,27 @@ export class WorkspaceManager {
     root: WorkspaceRoot,
     cwd: string,
     target: string,
-    initiatedBy?: string
+    initiatedBy?: string,
+    branch?: string
   ): Promise<void> {
-    const branch = await this.drawSessionBranch(
-      this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()),
-      initiatedBy
-    )
+    const name =
+      branch ??
+      (await this.drawSessionBranch(this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()), initiatedBy))
     // Three admitted subcommands rather than `checkout -b`, which the sandbox refuses by design: create the branch, point HEAD at it, then materialize the tree HEAD now names.
     const git = this.runnerFor(agentId, cwd).withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
-    await git.raw(['branch', '--no-track', branch, target])
-    await git.raw(['symbolic-ref', 'HEAD', `refs/heads/${branch}`])
+    if (branch !== undefined) {
+      const exists = await git
+        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
+        .then(() => true)
+        .catch(() => false)
+      if (!exists) {
+        const start = (await this.fetchRemoteCardBranch(agentId, root, cwd, branch, true)) ?? target
+        await git.raw(['branch', '--no-track', branch, start])
+      }
+    } else {
+      await git.raw(['branch', '--no-track', name, target])
+    }
+    await git.raw(['symbolic-ref', 'HEAD', `refs/heads/${name}`])
     // The materialization is what may lazily fetch, so it runs under the clone env like the review reset below.
     await git.raw(['reset', '--hard'])
   }

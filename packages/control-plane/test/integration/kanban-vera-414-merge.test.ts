@@ -1,3 +1,4 @@
+import { acknowledgeKanbanProjection } from '../fixtures/kanban-projection.js'
 // Vera's #414 merge points on real Postgres: #194's sync apply, claim audit and ingest must keep #414's verify semantics.
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
@@ -185,7 +186,7 @@ describe('vera-414-merge: verify semantics survive the #194 merge (Postgres)', (
     expect(await f.read(verify.id)).toMatchObject({ status: 'review', labelWritePending: false })
   })
 
-  it('vera-414-merge: 3 a verify claim keeps a label write still owed from before, and a review→review run end owes none', async () => {
+  it('416r3: verify claims wait for an owed label write; a review→review run end owes none', async () => {
     const f = await fixture()
     const owed = await f.card('review', { labelWritePending: true })
     const clean = await f.card('review')
@@ -198,8 +199,9 @@ describe('vera-414-merge: verify semantics survive the #194 merge (Postgres)', (
     expect(await f.read(clean.id)).toMatchObject({ status: 'review', labelWritePending: false })
     expect((await f.read(clean.id)).verifiedAt).not.toBeNull()
     // A verifier's changes_requested does move the card (review→ready), so that end owes GitHub the new label.
-    const sendBack = leases.find((l) => l.cardId === owed.id)!
-    await prisma.kanbanCard.update({ where: { id: owed.id }, data: { labelWritePending: false } })
+    expect(leases.some((l) => l.cardId === owed.id)).toBe(false)
+    await acknowledgeKanbanProjection(owed.id)
+    const sendBack = (await f.claim()).find((l) => l.cardId === owed.id)!
     expect(await f.endRun(sendBack.leaseId, { outcome: 'changes_requested' })).toMatchObject({ accepted: true })
     expect(await f.read(owed.id)).toMatchObject({ status: 'ready', labelWritePending: true })
   })

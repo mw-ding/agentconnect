@@ -76,7 +76,13 @@ describe.skipIf(!enabled)('kanban graph e2e (live GitHub)', () => {
     })
 
   function doorbell(store: Pick<CardStore, 'readCard' | 'readGraph' | 'applyPlan' | 'lastEventId'>) {
-    const reconciler = new KanbanGraphReconciler({ cards: new PgKanbanCardRepo(prisma), store, log })
+    const reconciler = new KanbanGraphReconciler({
+      agentSlug: async (orgId, id) =>
+        (await prisma.agent.findFirst({ where: { orgId, id }, select: { name: true } }))?.name ?? null,
+      cards: new PgKanbanCardRepo(prisma),
+      store,
+      log
+    })
     return new KanbanGraphDoorbell({
       boards: new PgKanbanBoardRepo(prisma),
       installations: { getByInstallationId: async () => installation },

@@ -112,6 +112,7 @@ async function factsFor(boardId: string, cardId: string, maxPerDaemon?: number):
   return {
     board: {
       enabled: b.enabled,
+      paused: b.paused,
       verifierAgentId: b.verifierAgentId,
       maxInProgress: b.maxInProgress,
       maxInProgressPerAgent: b.maxInProgressPerAgent
@@ -120,6 +121,8 @@ async function factsFor(boardId: string, cardId: string, maxPerDaemon?: number):
       status: c.status,
       assigneeAgentId: c.assigneeAgentId,
       promotionPending: c.promotionPending,
+      controlWritePending: c.controlWrittenVersion < c.controlVersion,
+      labelWritePending: c.labelWritePending,
       cooldownUntil: c.cooldownUntil,
       notBefore: c.notBefore,
       verifiedAt: c.verifiedAt,
@@ -205,6 +208,20 @@ async function expectParity(
 }
 
 describe('claim eligibility parity (real Postgres)', () => {
+  it('416c: a paused board gates review cards before verifier, approval and attention checks', async () => {
+    await seedDaemon(prisma, D1, { sessionEpoch: 1n })
+    await seedAgent(prisma, A1, { daemonId: D1 })
+    await seedAgent(prisma, A2, { daemonId: D1 })
+    const b = await board(100, 100, true, A2)
+    await prisma.kanbanBoard.update({ where: { id: b.id }, data: { paused: true } })
+    const review = await card(b.id, 1, { status: 'review' })
+    const approved = await card(b.id, 2, { status: 'review', verifiedAt: NOW, needsAttention: true })
+    const claimed = await expectParity(b.id, { review, approved }, { review: 'board_paused', approved: 'board_paused' })
+    expect(claimed.flaggedSelfVerify).toEqual([])
+    await prisma.kanbanBoard.update({ where: { id: b.id }, data: { paused: false } })
+    await expectParity(b.id, { review, approved }, { review: 'eligible', approved: 'verified' })
+  })
+
   it.each(['ready', 'review'] as const)(
     'vera-414-cutover: %s parity includes epic and cross-board daemon caps',
     async (status) => {
@@ -341,7 +358,10 @@ describe('claim eligibility parity (real Postgres)', () => {
       daemon_offline: await card(b.id, 7, { assigneeAgentId: A4 }),
       cooldown: await card(b.id, 8, { cooldownUntil: new Date(NOW.getTime() + 60_000) }),
       not_before: await card(b.id, 9, { notBefore: new Date(NOW.getTime() + 60_000) }),
-      promotion_pending: await card(b.id, 10, { promotionPending: true })
+      promotion_pending: await card(b.id, 10, { promotionPending: true }),
+      label_write_pending: await card(b.id, 29, { labelWritePending: true }),
+      // 416r3: a skip/restart whose GitHub write has not landed is held by the SQL and the pure gate alike.
+      control_write_pending: await card(b.id, 11, { controlVersion: 2n, controlWrittenVersion: 1n })
     }
 
     const repo = new PgKanbanDispatchRepo(prisma)
@@ -361,6 +381,14 @@ describe('claim eligibility parity (real Postgres)', () => {
       if (verdict.eligible) expect(verdict).toEqual({ eligible: true, role: 'work', agentId: A1 })
     }
 
+    expect(explainClaim(snapshots.get(cards.label_write_pending.id)!)).toEqual({
+      eligible: false,
+      gate: 'label_write_pending'
+    })
+    expect(explainClaim(snapshots.get(cards.control_write_pending.id)!)).toEqual({
+      eligible: false,
+      gate: 'control_write_pending'
+    })
     // The board's total is one (the eligible card): nothing else was claimed.
     expect(claimed.leases).toHaveLength(1)
   })
@@ -373,6 +401,17 @@ describe('claim eligibility parity (real Postgres)', () => {
     const repo = new PgKanbanDispatchRepo(prisma)
     expect((await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
     expect(explainClaim(await factsFor(b.id, c.id))).toEqual({ eligible: false, gate: 'board_disabled' })
+  })
+
+  it('explains a paused board and never claims from it', async () => {
+    await seedDaemon(prisma, D1, { sessionEpoch: 1n })
+    await seedAgent(prisma, A1, { daemonId: D1 })
+    const b = await board(100, 100, true)
+    await prisma.kanbanBoard.update({ where: { id: b.id }, data: { paused: true } })
+    const c = await card(b.id, 1)
+    const repo = new PgKanbanDispatchRepo(prisma)
+    expect((await repo.claim(b.id, { now: NOW, isDaemonLive: () => true })).leases).toEqual([])
+    expect(explainClaim(await factsFor(b.id, c.id))).toEqual({ eligible: false, gate: 'board_paused' })
   })
 
   it('reports board_cap when the board is full of open runs', async () => {

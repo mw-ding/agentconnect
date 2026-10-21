@@ -42,7 +42,7 @@ export async function liveSync() {
       console.warn(message, obj)
     }
   }
-  const graph = new KanbanGraphReconciler({ cards, store, log })
+  const graph = new KanbanGraphReconciler({ cards, store, agentSlug: async () => null, log })
   const permission = { override: null as RepoPermissionLevel | null, logins: [] as string[] }
   const record = { ...board, orgId: OrgId(board.orgId) }
   const sync = new KanbanSync({

@@ -544,6 +544,73 @@ issue numbers cannot silently refer to another repository. Human status and
 assignment synchronization beyond mismatch-parked cards and periodic drift repair
 remain for the stacked M1 follow-up.
 
+## M4 — Human controls (B5 pause/resume, skip, restart) and the synthesizer (B3)
+
+Interactive organization owners pause and resume a board with
+`POST /api/v1/orgs/:orgId/kanban/boards/:boardId/pause` and `.../resume`, and
+skip or restart a card with
+`POST /api/v1/orgs/:orgId/kanban/boards/:boardId/cards/:cardId/skip` and
+`.../restart`, all owner + interactive-OIDC gated like the run-mode setters.
+A paused board claims nothing (`AND NOT "paused"` beside `"enabled"` in the
+claim), but its reaper, reports, heartbeats, label sync, graph promotion and
+doorbells keep running, and open leases finish normally; resume re-arms the
+dispatcher. Skip archives the card (closing the issue `not_planned`), revokes any
+open lease with a dispatch-revision bump so a late report fails the fence, and
+posts one body-free comment; dependents of a skipped card do not auto-promote.
+Restart moves a card from triage/blocked/review/done/archived/ready/running back
+to `ready` — resetting the failure counters, block recurrence, cooldown, block
+kind and the attention flag — revokes any open lease, reopens a closed issue,
+writes the status label and one comment, then re-arms the dispatcher.
+
+Skip/restart CAS a per-card control version in their move transaction. Queued
+GitHub writes drop superseded versions. SQL, pure and explain claims exclude
+pending label/control writes. A failed acknowledged restart remains ready and
+unclaimable until the existing label sync reopens the issue and writes ready;
+skip repair closes and archives. Sync and dispatch projections share the
+in-process status queue. Multiple CP processes still lack a shared write queue.
+Skip clears promotion intent. Without a GitHub card store, pause/resume work
+and skip/restart answer `404 kanban controls unavailable`.
+
+Restart starts a new work episode and validates a linked PR with the read-only
+reader (same repository, open, unmerged, exact card head). Any failure drops it.
+A validated number travels in trusted dispatch data; comment text never
+authorizes closing a PR. The CP's PR token stays read-only. Write-run token scope
+tightening is a separate follow-up. An older PR reported again is refused by
+the episode binding with `pr_unbound`.
+
+Known gaps (M4 controls): a half-landed synthesis promotion is not adopted by
+the attributed pending-promotion recovery (the graph reconciler's adoption rule
+still only reads `blockedBy`), so it escalates to a human like any other
+unattributed promotion. The skip comment names the actor's GitHub login only when
+a linked `github_repo_identity` row exists; otherwise it omits the login. Board
+pause/resume and card skip/restart leave body-free audit rows (`board_paused`,
+`board_resumed`, `card_skipped`, `card_restarted`). The claim predicate now
+reports `board_paused` immediately after `board_disabled` (Lane 3 API v1.5).
+
+M4 controls continuation: synthesis re-evaluates the parent on an `issues.closed`
+or `issues.reopened` doorbell, assigns the configured organization agent, and
+writes `ac/agent:<slug>` beside `ac/status:ready`. Skip, restart and synthesis
+status moves enqueue body-free notifications in the same PostgreSQL transaction;
+headless boards stay silent. An existing worktree holding `ac/card-<n>` is
+preserved and a competing session is refused. A removed worktree registration can
+be pruned and its committed card branch resumed. The daemon cannot prove that an
+existing session directory is inactive, so the operator must retire it before
+another session can acquire its branch. A session with no local `ac/card-<n>`
+(a fresh session clone, or a worktree on another daemon) first checks whether
+`origin` has the branch. If it does, the session fetches it and starts from it.
+This applies to the cold preparation of a session pod too. Otherwise the session
+creates the branch from the default branch. A fresh card checkout preserves an existing local card branch. An existing
+read-mode checkout safely switches to the requested card branch: it fetches and
+tracks origin when present, otherwise starts from the default branch. Dirty,
+detached, locked and foreign-held state fails closed; local-only card commits
+are never reset. Commits never pushed stay in the clone that made them.
+
+Known validation limits (M4 controls): the live suite uses GitHub scratch issues,
+real PostgreSQL, a real daemon with a fake ACP runtime, and interactive OIDC
+fixtures. Branch creation, preserved commits, removed registrations and live
+worktree exclusion are covered by real-git daemon tests; no live remote write
+agent is provisioned. Slack delivery is tested with fakes only.
+
 Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
 
 - Label-driven unblock and reopen for non-parked cards belong to #194's label sync
@@ -568,11 +635,10 @@ Known gaps (M4 Lane 3b: comment commands and PR completion contracts):
   than 300, is never green.
 - The card-to-PR link is `linkedPrNumber` from the worker's report, and it only counts
   when the PR is bound to the card: App-authored, head `ac/card-<n>` in the board's
-  repository, base the default branch, created inside the card's work episode. No worker
-  creates `ac/card-<n>` branches until #416 (on hold) lands, so until then PR contracts are
-  inert: every `pr_merged` / `pr_checks_green` card waits in `review` on `pr_unbound`,
-  flagged once with `needsAttention` and one body-free comment. Use `close` with a verifier
-  for boards that need completion before #416.
+  repository, base the default branch, created inside the card's work episode. The write
+  worker now creates and reuses that branch (#416), so those contracts can complete cards.
+  Upgrade the daemon before enabling them; older session branches still wait in `review`
+  on `pr_unbound`, flagged once with `needsAttention` and one body-free comment.
 - A missed `pull_request`/`check_suite` doorbell is recovered by the redelivery sweep
   (24 h look-back) and the 60 s sweep: 25 review cards per board per tick, with a
   rotating cursor. A board with hundreds of cards in review can take several minutes

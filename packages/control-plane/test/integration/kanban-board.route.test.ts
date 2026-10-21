@@ -158,6 +158,52 @@ describe('Kanban board routes — an interactive owner', () => {
     }
   )
 
+  it('416c: validates synthesizer agents on create and update and accepts an org agent or null', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedAgent(prisma, AGENT, { daemonId: DAEMON })
+    await seedOtherOrg()
+    await seedAgent(prisma, FOREIGN_AGENT, { daemonId: DAEMON, orgId: OTHER_ORG })
+    const { app, close } = buildApp()
+    const headers = await ownerBearer(prisma, oidc)
+    try {
+      for (const synthesizerAgentId of [FOREIGN_AGENT, '00000000-0000-4000-8000-000000000000']) {
+        const res = await app.inject({
+          method: 'POST',
+          url: BOARDS,
+          headers,
+          payload: { name: 'web', repoFullName: 'acme/web', synthesizerAgentId }
+        })
+        expect(res.statusCode).toBe(400)
+        expect(res.json()).toMatchObject({ code: 'agent_not_in_org' })
+      }
+      const created = await app.inject({
+        method: 'POST',
+        url: BOARDS,
+        headers,
+        payload: { name: 'web', repoFullName: 'acme/web', synthesizerAgentId: AGENT }
+      })
+      expect(created.statusCode).toBe(201)
+      expect(created.json()).toMatchObject({ synthesizerAgentId: AGENT })
+      const url = `${BOARDS}/${created.json().id}`
+      const refused = await app.inject({
+        method: 'PATCH',
+        url,
+        headers,
+        payload: { synthesizerAgentId: FOREIGN_AGENT }
+      })
+      expect(refused.statusCode).toBe(400)
+      expect(refused.json()).toMatchObject({ code: 'agent_not_in_org' })
+      expect(
+        (await prisma.kanbanBoard.findUniqueOrThrow({ where: { id: created.json().id } })).synthesizerAgentId
+      ).toBe(AGENT)
+      const cleared = await app.inject({ method: 'PATCH', url, headers, payload: { synthesizerAgentId: null } })
+      expect(cleared.statusCode).toBe(200)
+      expect(cleared.json()).toMatchObject({ synthesizerAgentId: null })
+    } finally {
+      await close()
+    }
+  })
+
   it('refuses a second board for the same repository, a foreign agent, and an empty restricted audience', async () => {
     await seedDaemon(prisma, DAEMON)
     await seedOtherOrg()

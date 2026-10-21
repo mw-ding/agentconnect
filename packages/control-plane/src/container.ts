@@ -93,6 +93,7 @@ import { GithubPrReader } from './kanban/pr-reader.js'
 import { KanbanDispatcher } from './kanban/dispatcher.js'
 import { KanbanOrchestrator } from './kanban/orchestrator.js'
 import { KanbanGraphReconciler } from './kanban/graph-reconciler.js'
+import { KanbanControls } from './kanban/controls.js'
 import { KanbanNotifier } from './kanban/notifier-sender.js'
 import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
 import { GithubRepoIdentityService } from './github/repo-identity.js'
@@ -1829,17 +1830,19 @@ export function buildContainer(
         })
       : undefined
 
+  // CP-only pull_requests:read PR reads: completion contracts and a restart's superseded-PR validation.
+  const kanbanPrReader = kanbanTokens
+    ? new GithubPrReader({ tokens: kanbanTokens, ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}) })
+    : undefined
   // PR completion contracts (TRD 4.7): CP-only pull_requests:read + checks:read reads; workflow lookup on its own actions:read token.
   const kanbanPrContracts: KanbanPrContracts | undefined =
-    kanbanCardStore && kanbanTokens
+    kanbanCardStore && kanbanPrReader
       ? new KanbanPrContracts({
           appSlug: githubAppCfg?.slug,
           repo: repos.kanbanDispatch,
-          prs: new GithubPrReader({
-            tokens: kanbanTokens,
-            ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
-          }),
+          prs: kanbanPrReader,
           store: kanbanCardStore,
+          gate: { holdStatusWrite: (cardId) => kanbanDispatcher!.holdStatusWrite(cardId) },
           repoRef: (boardId): Promise<KanbanRepoRef | null> =>
             kanbanDispatcher?.boardRepo(boardId) ?? Promise.resolve(null),
           onSettled: (card) => kanbanDispatcher?.poke(card.boardId),
@@ -1871,6 +1874,7 @@ export function buildContainer(
     ? new KanbanGraphReconciler({
         cards: repos.kanbanCard,
         store: kanbanCardStore,
+        agentSlug: async (orgId, id) => (await repos.agent.get(OrgId(orgId), AgentId(id)))?.name ?? null,
         log: kanbanGraphLog,
         ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {})
       })
@@ -1879,6 +1883,7 @@ export function buildContainer(
   const kanbanSync =
     kanbanCardStore && kanbanTokens
       ? new KanbanSync({
+          gate: { holdStatusWrite: (cardId) => kanbanDispatcher!.holdStatusWrite(cardId) },
           repo: new PgKanbanSyncRepo(prisma),
           cards: repos.kanbanCard,
           store: kanbanCardStore,
@@ -1955,6 +1960,24 @@ export function buildContainer(
       })
     : undefined
 
+  // Human controls (issue #2 B5): pause/resume need no GitHub; skip/restart also need the card store for the issue write.
+  const kanbanControls = new KanbanControls({
+    boards: repos.kanbanBoard,
+    cards: repos.kanbanCard,
+    installations: repos.githubInstallation,
+    ...(kanbanCardStore ? { store: kanbanCardStore } : {}),
+    ...(kanbanPrReader ? { prs: kanbanPrReader } : {}),
+    ...(kanbanDispatcher ? { gate: kanbanDispatcher } : {}),
+    resolveLogin: async (userId) =>
+      (await prisma.githubRepoIdentity.findUnique({ where: { userId }, select: { login: true } }))?.login ?? null,
+    poke: (boardId) => kanbanDispatcher?.poke(boardId),
+    revoke: async (lease, cardId) => {
+      await sender.kanbanRevoke(lease.daemonId, { leaseId: lease.leaseId, cardId })
+    },
+    ...(kanbanProjectStatus ? { project: kanbanProjectStatus } : {}),
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+
   // `/kanban` comment commands: a live, uncached write check per command, so a revoked grant stops the next one.
   const kanbanCommentCommands =
     kanbanCardStore && kanbanTokens
@@ -1990,7 +2013,8 @@ export function buildContainer(
             ['opened', 'transferred', 'labeled'].includes(doorbell.action ?? '') &&
             (await kanbanImporter?.import(board, repo, issueNumber, doorbell))
           if (!imported) await kanbanDispatcher?.onCardChanged(board.id, issueNumber, 'human', doorbell)
-          if (doorbell.action === 'closed')
+          // A close or reopen changes the dependency graph, so re-evaluate the card's parent epic and dependents.
+          if (doorbell.action === 'closed' || doorbell.action === 'reopened')
             await kanbanGraphReconciler?.apply(
               board,
               repo,
@@ -2278,6 +2302,7 @@ export function buildContainer(
       kanbanBoards: repos.kanbanBoard,
       kanbanDispatch: repos.kanbanDispatch
     },
+    kanbanControls,
     registry,
     agentSpecs,
     ...(daemonRelease ? { daemonRelease } : {}),

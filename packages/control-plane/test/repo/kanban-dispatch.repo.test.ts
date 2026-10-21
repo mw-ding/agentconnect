@@ -1,3 +1,4 @@
+import { acknowledgeKanbanProjection } from '../fixtures/kanban-projection.js'
 // PgKanbanDispatchRepo (issue #2 M2) against real Postgres: claim order, caps, SKIP LOCKED, the lease fence, and heartbeats.
 import { describe, expect, it } from 'vitest'
 import { prisma } from '../setup.db.js'
@@ -341,6 +342,8 @@ describe('PgKanbanDispatchRepo.endRun — the lease fence (real Postgres)', () =
     const lease = await leased()
     const reaped = await repo().endRun(end(lease.leaseId, 'reclaimed', { reasonCode: 'stale_heartbeat' }))
     expect(reaped).toMatchObject({ accepted: true, card: { to: 'ready' }, plan: { countsAsFailure: false } })
+    expect(await claimLeases(lease.boardId, live)).toEqual([])
+    await acknowledgeKanbanProjection(lease.cardId)
     const [next] = await claimLeases(lease.boardId, live)
     expect(next?.attempt).toBe(2)
 
@@ -783,6 +786,8 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
       attentionReason: null
     })
     expect(await repo().getParkedStatus(boardId, c.issueNumber)).toBeNull()
+    expect(await claimLeases(boardId, live)).toEqual([])
+    await acknowledgeKanbanProjection(c.id)
     expect(await claimLeases(boardId, live)).toHaveLength(1)
   })
 
@@ -824,6 +829,8 @@ describe('PgKanbanDispatchRepo mismatch recovery bounds (real Postgres)', () => 
     const c = await park(boardId, 'blocked')
     await repo().deferRecovery(c.id, NOW)
     await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'ready' } })
+    expect(await claimLeases(boardId, live)).toEqual([])
+    await acknowledgeKanbanProjection(c.id)
     expect(await claimLeases(boardId, live)).toHaveLength(1)
     expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
       recoveryCheckAt: null,

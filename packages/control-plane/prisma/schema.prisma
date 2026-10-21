@@ -210,6 +210,7 @@ model User {
   addedTrustedActors               CodeHostTrustedActor[]     @relation("CodeHostTrustedActorAddedBy")
   createdKanbanBoards              KanbanBoard[]              @relation("KanbanBoardCreatedBy")
   modifiedKanbanBoards             KanbanBoard[]              @relation("KanbanBoardModifiedBy")
+  pausedKanbanBoards               KanbanBoard[]              @relation("KanbanBoardPausedBy")
   createdRepoAuths                 AgentRepoAuthorization[]   @relation("AgentRepoAuthCreatedBy")
   attestedRepoAuths                AgentRepoAuthorization[]   @relation("AgentRepoAuthAttestedBy")
   createdInstallationAuths         AgentInstallationAuthorization[] @relation("AgentInstallationAuthCreatedBy")
@@ -984,6 +985,7 @@ model Agent {
   kanbanCards           KanbanCard[]
   kanbanOrchestrated    KanbanBoard[]              @relation("KanbanBoardOrchestrator")
   kanbanVerified        KanbanBoard[]              @relation("KanbanBoardVerifier")
+  kanbanSynthesized     KanbanBoard[]              @relation("KanbanBoardSynthesizer")
 
   organizationEnvironmentAssignments OrganizationEnvironmentAssignment[]
   memoryFiles           AgentMemoryFile[]
@@ -2538,6 +2540,8 @@ model KanbanBoard {
   repoFullName          String // "owner/repo" — display only; never matched on
   orchestratorAgentId   String?                  @db.Uuid
   verifierAgentId       String?                  @db.Uuid
+  // B3: the agent a todo epic is promoted to once every sub-issue closed as completed; null ⇒ no synthesis.
+  synthesizerAgentId    String?                  @db.Uuid
   // Notification anchor (same trio as HookDef.target*; null channel ⇒ headless).
   targetPlatform        String                   @default("slack")
   targetChannel         String?
@@ -2557,6 +2561,10 @@ model KanbanBoard {
   projectNodeId         String?
   statusFieldId         String?
   enabled               Boolean                  @default(true)
+  // A paused board claims nothing, but its reaper, reports, heartbeats, label sync, graph promotion and doorbells keep running.
+  paused                Boolean                  @default(false)
+  pausedAt              DateTime?                @db.Timestamptz(6)
+  pausedByUserId        String?
   configRevision        BigInt                   @default(1)
   visibility            ResourceVisibility       @default(org)
   sharedWith            String[]                 @default([])
@@ -2569,9 +2577,11 @@ model KanbanBoard {
   org               Org          @relation(fields: [orgId], references: [id], onDelete: Cascade)
   orchestratorAgent Agent?       @relation("KanbanBoardOrchestrator", fields: [orchestratorAgentId], references: [id], onDelete: SetNull)
   verifierAgent     Agent?       @relation("KanbanBoardVerifier", fields: [verifierAgentId], references: [id], onDelete: SetNull)
+  synthesizerAgent  Agent?       @relation("KanbanBoardSynthesizer", fields: [synthesizerAgentId], references: [id], onDelete: SetNull)
   targetIntegration Integration? @relation(fields: [targetIntegrationId], references: [id], onDelete: SetNull)
   createdBy         User?        @relation("KanbanBoardCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   lastModifiedBy    User?        @relation("KanbanBoardModifiedBy", fields: [lastModifiedByUserId], references: [id], onDelete: SetNull)
+  pausedBy          User?        @relation("KanbanBoardPausedBy", fields: [pausedByUserId], references: [id], onDelete: SetNull)
   cards             KanbanCard[]
   commands          KanbanCommand[]
   notifications     KanbanNotification[]
@@ -2636,6 +2646,12 @@ model KanbanCard {
   dispatchRevision    BigInt           @default(1)
   stateRevision       BigInt           @default(1) // optimistic concurrency + drift detection
   labelWritePending Boolean @default(false)
+  // B5 controls: bumped by each skip/restart under the card lock; its GitHub write lands only while still the latest.
+  controlVersion        BigInt @default(0)
+  // The latest control version GitHub reflects; below controlVersion the card is never claimed.
+  controlWrittenVersion BigInt @default(0)
+  // A restart's superseded PR, validated open on this card's `ac/card-<n>` in this repo; the next write run is told to close it.
+  supersededPrNumber    Int?
   syncEventCursor BigInt @default(0)
   syncAgentCursor BigInt @default(0)
   syncCheckedAt DateTime? @db.Timestamptz(6)
@@ -3386,6 +3402,10 @@ enum AuditKind {
   kanban_mode_change
   kanban_board_change
   kanban_card_change
+  board_paused
+  board_resumed
+  card_skipped
+  card_restarted
   protocol_error
   api_key_create
   api_key_rotate

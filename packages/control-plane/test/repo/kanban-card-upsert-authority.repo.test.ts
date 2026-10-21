@@ -1,3 +1,4 @@
+import { acknowledgeKanbanProjection } from '../fixtures/kanban-projection.js'
 // PgKanbanCardRepo.upsertCard authority (PR #136 review): no mode input, ready only from a live human writer, repo fence.
 import { describe, expect, it } from 'vitest'
 import { prisma } from '../setup.db.js'
@@ -65,6 +66,7 @@ describe('upsertCard: mode and ready are never an agent’s to set', () => {
     })
     // A human promotion (1b's casStatus) makes it claimable; the claim takes the board's read default.
     expect(await cards.casStatus(card.id, card.stateRevision, 'ready')).toBe(true)
+    await acknowledgeKanbanProjection(card.id)
     const [lease] = (await dispatch.claim(boardId, { now: NOW, isDaemonLive: () => true })).leases
     expect(lease).toMatchObject({ cardId: card.id, mode: 'read' })
     expect(await prisma.auditEvent.count({ where: { kind: 'kanban_mode_change' } })).toBe(0)

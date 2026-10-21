@@ -40,6 +40,8 @@ import type { ShimRequester } from '../src/shim/channels.js'
 import { buildWorkspaceRootsAppend } from '../src/session/turn/standing-context.js'
 import { sessionHomeIn } from '../src/workspace/session-layout.js'
 import { WorkspaceManager, type PrepareSessionWorkspaceRequest } from '../src/workspace/workspace-manager.js'
+import { kanbanCardBranch } from '../src/kanban/card-branch.js'
+import { planContract } from '../../control-plane/src/kanban/contracts.js'
 import { MicrosandboxWorkspaceFs } from '../src/microsandbox/workspace-fs.js'
 import { LocalWorkspaceFs } from '../src/workspace/workspace-fs.js'
 import { wireTestPlane } from './workspace-plane-support.js'
@@ -1616,5 +1618,370 @@ describe('the confined tier issues only Git the sandbox admits (k8s-daemon-pool.
       expect.arrayContaining(['branch', 'clone', 'fetch', 'ls-remote', 'reset', 'show-ref', 'symbolic-ref'])
     )
     expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+  })
+})
+
+// A Kanban write session (issue #2 B3) checks out its own `ac/card-<n>` branch on the worktree tier.
+describe('a Kanban write session checks out its ac/card-<n> branch', () => {
+  it('416c: releasing one removed card registration preserves an unrelated foreign registration', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const old = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+    )
+    const root = workspaces.primaryRoot(agent)
+    const foreign = join(tempRoot('ac-foreign-registration-'), 'checkout')
+    git(root.path, ['worktree', 'add', '-b', 'foreign-work', foreign, 'HEAD'])
+    rmSync(foreign, { recursive: true })
+    rmSync(old, { recursive: true })
+    await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+    )
+    expect(git(root.path, ['worktree', 'list', '--porcelain'])).toContain('branch refs/heads/foreign-work')
+  })
+
+  it('416c: the branch actually worked in Git satisfies the Lane 3b PR binding', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const started = new Date('2026-10-20T12:00:00Z')
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:binding-7', branch: kanbanCardBranch(7) })
+    )
+    writeFileSync(join(cwd, 'card.md'), 'card work\n')
+    git(cwd, ['add', 'card.md'])
+    git(cwd, ['commit', '-m', 'card work'])
+    const pr = {
+      number: 21,
+      state: 'closed' as const,
+      merged: true,
+      headSha: git(cwd, ['rev-parse', 'HEAD']),
+      headRef: git(cwd, ['symbolic-ref', '--short', 'HEAD']),
+      headRepoId: 42n,
+      baseRef: 'main',
+      defaultBranch: 'main',
+      authorLogin: 'agentconnect-test[bot]',
+      authorType: 'Bot',
+      mergedByLogin: 'alice',
+      createdAt: new Date(started.getTime() + 1_000)
+    }
+    const input = {
+      status: 'review' as const,
+      contract: 'pr_merged' as const,
+      verifierAgentId: null,
+      verifiedAt: null,
+      linkedPrNumber: pr.number,
+      binding: { appSlug: 'agentconnect-test', repoId: 42n, issueNumber: 7, workEpisodeStartedAt: started },
+      pr
+    }
+    expect(planContract(input)).toEqual({ kind: 'done' })
+    for (const over of [
+      { authorLogin: 'alice', authorType: 'User' },
+      { headRef: 'ac/card-8' },
+      { headRepoId: 43n },
+      { baseRef: 'other' },
+      { createdAt: new Date(started.getTime() - 1) }
+    ]) {
+      expect(planContract({ ...input, pr: { ...pr, ...over } })).toEqual({ kind: 'wait', reason: 'pr_unbound' })
+    }
+  })
+
+  it('416c: releases a removed session registration and resumes the existing card branch', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const old = unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+    const cwd = await workspaces.prepareSessionWorkspace(agent, old)
+    writeFileSync(join(cwd, 'saved.md'), 'saved work\n')
+    git(cwd, ['add', 'saved.md'])
+    git(cwd, ['commit', '-m', 'card progress'])
+    const tip = git(cwd, ['rev-parse', 'HEAD'])
+    rmSync(cwd, { recursive: true })
+    const nextPath = join(dirname(cwd), workspaces.sessionWorktreeId('kanban:new-7'))
+    const root = workspaces.primaryRoot(agent)
+    await workspaces.addRootSessionWorktree(
+      agent.id,
+      root,
+      nextPath,
+      `refs/remotes/origin/${root.branch}`,
+      undefined,
+      kanbanCardBranch(7)
+    )
+    const next = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+    )
+    expect(git(next, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(next, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(readFileSync(join(next, 'saved.md'), 'utf8')).toBe('saved work\n')
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    '416c: resumes the card branch from a removed registration when the agent home is reached through a symlink',
+    async () => {
+      const real = agentFixture()
+      // Git records a worktree under its real path, while the daemon composes session paths from the configured home.
+      const link = join(tempRoot('ac-card-link-'), 'home')
+      symlinkSync(workspaces.agentRootFor(real), link)
+      const agent = { ...real, dir: link }
+      serveAll(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+      )
+      writeFileSync(join(cwd, 'saved.md'), 'saved work\n')
+      git(cwd, ['add', 'saved.md'])
+      git(cwd, ['commit', '-m', 'card progress'])
+      const tip = git(cwd, ['rev-parse', 'HEAD'])
+      rmSync(cwd, { recursive: true })
+      const next = await workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+      )
+      expect(next).not.toBe(cwd)
+      expect(git(next, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(next, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(readFileSync(join(next, 'saved.md'), 'utf8')).toBe('saved work\n')
+    }
+  )
+
+  it.each(['locked', 'foreign'] as const)('416c: refuses a removed %s worktree registration', async (kind) => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+    )
+    const root = workspaces.primaryRoot(agent)
+    let stale = cwd
+    if (kind === 'locked') {
+      git(root.path, ['worktree', 'lock', cwd])
+    } else {
+      stale = join(tempRoot('ac-foreign-card-'), basename(cwd))
+      git(root.path, ['worktree', 'move', cwd, stale])
+    }
+    rmSync(stale, { recursive: true })
+    const nextPath = join(dirname(cwd), workspaces.sessionWorktreeId('kanban:new-7'))
+    const before = git(root.path, ['worktree', 'list', '--porcelain'])
+    await expect(
+      workspaces.addRootSessionWorktree(
+        agent.id,
+        root,
+        nextPath,
+        `refs/remotes/origin/${root.branch}`,
+        undefined,
+        kanbanCardBranch(7)
+      )
+    ).rejects.toThrow('already checked out in another worktree')
+    await expect(
+      workspaces.prepareSessionWorkspace(agent, unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) }))
+    ).rejects.toThrow('already checked out in another worktree')
+    expect(git(root.path, ['worktree', 'list', '--porcelain'])).toBe(before)
+    expect(existsSync(nextPath)).toBe(false)
+  })
+
+  it('416c: refuses an existing worktree without stealing its branch or touching another card', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd7 = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:live-7', branch: kanbanCardBranch(7) })
+    )
+    const cwd8 = await workspaces.prepareSessionWorkspace(
+      agent,
+      unconfined({ sessionKey: 'kanban:live-8', branch: kanbanCardBranch(8) })
+    )
+    writeFileSync(join(cwd7, 'wip.md'), 'live work\n')
+    await expect(
+      workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:other-7', branch: kanbanCardBranch(7) })
+      )
+    ).rejects.toThrow('already checked out in another worktree')
+    expect(readFileSync(join(cwd7, 'wip.md'), 'utf8')).toBe('live work\n')
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd8, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-8')
+  })
+
+  it('creates the branch on first use, reuses it on a later attempt, and gives two cards two branches', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+
+    const card7 = unconfined({ sessionKey: 'slack:C7:1700000000.000007', branch: kanbanCardBranch(7) })
+    const cwd7 = await workspaces.prepareSessionWorkspace(agent, card7)
+    expect(statSync(join(cwd7, '.git')).isFile()).toBe(true)
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd7, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+
+    // A later attempt on the same card (same session key) reuses the worktree and its branch.
+    expect(await workspaces.prepareSessionWorkspace(agent, card7)).toBe(cwd7)
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+
+    // A second card gets its own worktree and branch, never the first card's.
+    const card8 = unconfined({ sessionKey: 'slack:C8:1700000000.000008', branch: kanbanCardBranch(8) })
+    const cwd8 = await workspaces.prepareSessionWorkspace(agent, card8)
+    expect(cwd8).not.toBe(cwd7)
+    expect(git(cwd8, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-8')
+    expect(git(cwd7, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+  })
+})
+
+// A card branch an earlier attempt pushed from another clone or daemon is resumed from origin, never recreated from the default branch.
+describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin', () => {
+  function pushCardBranch(seed: string, n: number): string {
+    git(seed, ['checkout', '-q', '-b', `ac/card-${n}`, 'origin/main'])
+    writeFileSync(join(seed, 'card.md'), 'pushed card work\n')
+    git(seed, ['add', 'card.md'])
+    git(seed, ['commit', '-q', '-m', 'card work'])
+    git(seed, ['push', '-q', 'origin', `ac/card-${n}`])
+    const tip = git(seed, ['rev-parse', 'HEAD'])
+    git(seed, ['checkout', '-q', 'main'])
+    return tip
+  }
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r2: a fresh %s session checks out the pushed card branch tip with no upstream',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const tip = pushCardBranch(primary!.seed, 7)
+      const request = (tier === 'confined' ? confined : unconfined)({ branch: kanbanCardBranch(7) })
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(readFileSync(join(cwd, 'card.md'), 'utf8')).toBe('pushed card work\n')
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+    }
+  )
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout switches to a remote card branch',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const tip = pushCardBranch(primary!.seed, 7)
+      const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(next).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/ac/card-7')
+    }
+  )
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout creates an absent card branch from default',
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(next).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+    }
+  )
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing dirty %s checkout fails without discarding user work',
+    async (tier) => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      writeFileSync(join(cwd, 'user-work.txt'), 'keep me')
+      await expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+        /uncommitted|untracked/
+      )
+      expect(readFileSync(join(cwd, 'user-work.txt'), 'utf8')).toBe('keep me')
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
+
+  it('416r3: an existing locked worktree refuses a branch switch', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, unconfined())
+    const branch = git(cwd, ['symbolic-ref', 'HEAD'])
+    git(workspaces.primaryRoot(agent).path, ['worktree', 'lock', cwd])
+    await expect(
+      workspaces.prepareSessionWorkspace(agent, unconfined({ branch: kanbanCardBranch(7) }))
+    ).rejects.toThrow(/locked/)
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(branch)
+  })
+
+  it.each(['confined', 'unconfined'] as const)(
+    '416r3: existing %s checkout preserves a local-only card commit',
+    async (tier) => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      git(cwd, ['checkout', '-b', 'ac/card-7'])
+      writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+      git(cwd, ['add', 'local-only.md'])
+      git(cwd, ['commit', '-m', 'local card work'])
+      const localTip = git(cwd, ['rev-parse', 'HEAD'])
+      git(cwd, ['checkout', '-b', 'read-mode'])
+      await expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+        /local-only commits/
+      )
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('read-mode')
+    }
+  )
+
+  it('416r2: a fresh confined session with no pushed card branch starts it at the default branch', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+  })
+
+  it('416r2: resumes the pushed card branch across the sandbox exec channel with only admitted Git', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAllThroughShim(agent)
+    const tip = pushCardBranch(primary!.seed, 7)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(readFileSync(join(cwd, 'card.md'), 'utf8')).toBe('pushed card work\n')
+    const issued = [...new Set(gitRuns.map((run) => run.args[0]!))]
+    expect(issued).toEqual(expect.arrayContaining(['ls-remote', 'fetch']))
+    expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+  })
+
+  it('416r4: an existing sandboxed checkout reports the policy refusing a pushed card branch switch, untouched', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAllThroughShim(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const head = git(cwd, ['symbolic-ref', 'HEAD'])
+    const tip = git(cwd, ['rev-parse', 'HEAD'])
+    pushCardBranch(primary!.seed, 7)
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /not supported on the sandboxed tier: the sandbox git policy refuses git config/
+    )
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(() => git(cwd, ['rev-parse', '--verify', 'refs/heads/ac/card-7'])).toThrow()
+  })
+
+  it('416r4: an existing sandboxed checkout reports the policy refusing merge-base, never local-only commits', async () => {
+    const agent = agentFixture()
+    serveAllThroughShim(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const head = git(cwd, ['symbolic-ref', 'HEAD'])
+    // A card branch at the default tip has no local-only commits, so only the refused ancestry check can stop the switch.
+    git(cwd, ['branch', 'ac/card-7', 'origin/main'])
+    const cardTip = git(cwd, ['rev-parse', 'ac/card-7'])
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /not supported on the sandboxed tier: the sandbox git policy refuses git merge-base/
+    )
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(cardTip)
   })
 })

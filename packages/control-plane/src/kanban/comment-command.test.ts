@@ -15,7 +15,14 @@ import type { CardIssue } from './card-store.js'
 import { COMMAND_EFFECT_TTL_MS, KanbanCommentCommands } from './comment-command.js'
 import { isAttestedHumanAuthority } from './human-authority.js'
 
-const BOARD: KanbanBoardRecord = { id: 'b1', orgId: OrgId('org'), name: 'eng', repoId: 42n, repoFullName: 'acme/web' }
+const BOARD: KanbanBoardRecord = {
+  id: 'b1',
+  orgId: OrgId('org'),
+  name: 'eng',
+  repoId: 42n,
+  repoFullName: 'acme/web',
+  synthesizerAgentId: null
+}
 const REPO = { installationId: 1n, repoId: 42n, repoFullName: 'acme/web' }
 
 const cmd = (name: KanbanDoorbellCommand['name'], over: Partial<KanbanDoorbellCommand['sender']> = {}) => ({

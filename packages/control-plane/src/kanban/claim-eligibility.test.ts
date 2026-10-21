@@ -10,11 +10,13 @@ function liveAgent(): ClaimAgentFacts {
 
 function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibilityInput {
   return {
-    board: { enabled: true, verifierAgentId: null, maxInProgress: 1, maxInProgressPerAgent: 1 },
+    board: { enabled: true, paused: false, verifierAgentId: null, maxInProgress: 1, maxInProgressPerAgent: 1 },
     card: {
       status: 'ready',
       assigneeAgentId: A1,
       promotionPending: false,
+      controlWritePending: false,
+      labelWritePending: false,
       cooldownUntil: null,
       notBefore: null,
       verifiedAt: null,
@@ -42,7 +44,11 @@ describe('explainClaim — gates', () => {
   it.each<[ClaimGate, Partial<ClaimEligibilityInput>]>([
     [
       'board_disabled',
-      { board: { enabled: false, verifierAgentId: null, maxInProgress: 1, maxInProgressPerAgent: 1 } }
+      { board: { enabled: false, paused: false, verifierAgentId: null, maxInProgress: 1, maxInProgressPerAgent: 1 } }
+    ],
+    [
+      'board_paused',
+      { board: { enabled: true, paused: true, verifierAgentId: null, maxInProgress: 1, maxInProgressPerAgent: 1 } }
     ],
     [
       'status_not_claimable',
@@ -51,6 +57,8 @@ describe('explainClaim — gates', () => {
           status: 'todo',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -66,6 +74,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: true,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -81,6 +91,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: new Date(NOW.getTime() + 1000),
           notBefore: null,
           verifiedAt: null,
@@ -96,6 +108,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: new Date(NOW.getTime() + 1000),
           verifiedAt: null,
@@ -111,6 +125,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: null,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -130,6 +146,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -144,6 +162,15 @@ describe('explainClaim — gates', () => {
     expect(explainClaim(input(overrides))).toEqual({ eligible: false, gate })
   })
 
+  it('checks disabled before paused and paused before card gates', () => {
+    const b = { ...input().board, paused: true }
+    expect(explainClaim(input({ board: b }))).toEqual({ eligible: false, gate: 'board_paused' })
+    expect(explainClaim(input({ board: { ...b, enabled: false } }))).toEqual({
+      eligible: false,
+      gate: 'board_disabled'
+    })
+  })
+
   it('honours the documented precedence: board cap loses to a status gate', () => {
     const verdict = explainClaim(
       input({
@@ -151,6 +178,8 @@ describe('explainClaim — gates', () => {
           status: 'todo',
           assigneeAgentId: A1,
           promotionPending: false,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -171,6 +200,8 @@ describe('explainClaim — gates', () => {
           status: 'ready',
           assigneeAgentId: A1,
           promotionPending: true,
+          controlWritePending: false,
+          labelWritePending: false,
           cooldownUntil: null,
           notBefore: null,
           verifiedAt: null,
@@ -190,6 +221,8 @@ describe('explainClaim — gates', () => {
             status: 'ready',
             assigneeAgentId: A1,
             promotionPending: false,
+            controlWritePending: false,
+            labelWritePending: false,
             cooldownUntil: new Date(NOW.getTime() - 1),
             notBefore: new Date(NOW.getTime() - 1),
             verifiedAt: null,
@@ -217,6 +250,19 @@ function review(overrides: Partial<ClaimEligibilityInput> = {}, card: Partial<Cl
 }
 
 describe('explainClaim — review routing', () => {
+  it('416c: checks board pause before review routing, approval and attention gates', () => {
+    const facts = review({ board: { ...review().board, paused: true } })
+    expect(explainClaim(facts)).toEqual({ eligible: false, gate: 'board_paused' })
+    expect(explainClaim({ ...facts, card: { ...facts.card, verifiedAt: NOW, needsAttention: true } })).toEqual({
+      eligible: false,
+      gate: 'board_paused'
+    })
+    expect(explainClaim({ ...facts, board: { ...facts.board, verifierAgentId: null } })).toEqual({
+      eligible: false,
+      gate: 'board_paused'
+    })
+  })
+
   it('vera-414: routes a review card to the verifier as a verify claim', () => {
     expect(explainClaim(review())).toEqual({ eligible: true, role: 'verify', agentId: A2 })
   })
@@ -346,5 +392,14 @@ describe('vera-414-main2: merged claim caps apply to work and verify', () => {
     expect(explainClaim(f)).toEqual({ eligible: false, gate: 'daemon_cap' })
     f.daemonCapacity.openRunCount = 0
     expect(explainClaim(f)).toEqual({ eligible: false, gate: 'verifier_is_worker' })
+  })
+})
+
+it.each(['controlWritePending', 'labelWritePending'] as const)('416r3: pure claims exclude %s', (field) => {
+  const facts = input()
+  facts.card[field] = true
+  expect(explainClaim(facts)).toEqual({
+    eligible: false,
+    gate: field === 'controlWritePending' ? 'control_write_pending' : 'label_write_pending'
   })
 })

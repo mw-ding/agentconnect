@@ -36,6 +36,8 @@ function fixture(overrides: Partial<SyncCard> = {}) {
     assigneeAgentId: null,
     promotionPending: false,
     labelWritePending: false,
+    controlVersion: 0n,
+    controlWrittenVersion: 0n,
     syncEventCursor: 0n,
     syncAgentCursor: 0n,
     syncDeferredAt: null,

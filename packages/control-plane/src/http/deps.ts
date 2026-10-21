@@ -130,6 +130,7 @@ import type { SessionAccessPlugin } from './session-access-plugin.js'
 import type { RuntimeConfigRouteDeps } from './routes/runtime-config.js'
 import type { ProviderKeyProvider } from '@agentconnect.md/protocol'
 import type { KanbanRepoResolver } from '../kanban/repo-resolver.js'
+import type { KanbanControls } from '../kanban/controls.js'
 import type { KanbanTitleSource } from '../kanban/card-titles.js'
 import type { KanbanProjectVerifier } from '../kanban/project-guard.js'
 
@@ -481,6 +482,8 @@ export interface HttpDeps {
   github?: GithubService
   /** Board repository resolution for Kanban CRUD; absent ⇒ derived from `github` and the installation repo. */
   kanbanRepoResolver?: KanbanRepoResolver
+  /** Kanban human controls (issue #2 B5): pause/resume, skip/restart; absent ⇒ the control routes 404. */
+  kanbanControls?: KanbanControls
   /** Live issue titles for the board view; absent ⇒ the titles route answers 409 `github_app_not_configured`. */
   kanbanTitles?: KanbanTitleSource
   /** Org-only guard for a board's Projects v2 projection; absent ⇒ derived from `github`. */

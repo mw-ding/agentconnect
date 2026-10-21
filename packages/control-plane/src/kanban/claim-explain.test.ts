@@ -14,11 +14,13 @@ const NOW = new Date('2026-10-15T12:00:00.000Z')
 
 function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibilityInput {
   return {
-    board: { enabled: true, verifierAgentId: null, maxInProgress: 3, maxInProgressPerAgent: 2 },
+    board: { enabled: true, paused: false, verifierAgentId: null, maxInProgress: 3, maxInProgressPerAgent: 2 },
     card: {
       status: 'ready',
       assigneeAgentId: 'a1',
       promotionPending: false,
+      controlWritePending: false,
+      labelWritePending: false,
       cooldownUntil: null,
       notBefore: null,
       verifiedAt: null,
@@ -38,6 +40,7 @@ function input(overrides: Partial<ClaimEligibilityInput> = {}): ClaimEligibility
 
 const GATES: ClaimGate[] = [
   'board_disabled',
+  'board_paused',
   'status_not_claimable',
   'promotion_pending',
   'cooldown',
@@ -100,6 +103,7 @@ describe('claimFactsOf', () => {
     )
     expect(facts).toMatchObject({
       boardEnabled: true,
+      boardPaused: false,
       status: 'ready',
       assigneeAgentId: 'a1',
       promotionPending: false,

@@ -54,6 +54,13 @@ describe('planNotification', () => {
     expect(planNotification(tr('todo', 'ready'), board).notify).toBe(false)
   })
 
+  it('notifies explicit restarts and synthesis without mentioning the owner', () => {
+    for (const reasonCode of ['restarted', 'synthesis']) {
+      expect(planNotification(tr('todo', 'ready', { reasonCode }), board)).toEqual({ notify: true, mention: false })
+      expect(planNotification(tr('todo', 'ready', { reasonCode }), { targetChannel: null }).notify).toBe(false)
+    }
+  })
+
   it('never notifies self-moves, running churn, or a headless board', () => {
     expect(planNotification(tr('review', 'review'), board).notify).toBe(false)
     expect(planNotification(tr('ready', 'running'), board).notify).toBe(false)

@@ -26,7 +26,7 @@ export interface NotificationDecision {
   mention: boolean
 }
 
-/** Pure from×to table: notify entering blocked/review/done/archived, triage with a trip or reason, and a verifier's review→ready; never churn, self-moves, or headless boards. */
+// Explicit restarts and synthesis notify alongside terminal moves; churn and headless boards stay silent.
 export function planNotification(transition: KanbanTransition, board: NotificationBoard): NotificationDecision {
   if (board.targetChannel == null) return { notify: false, mention: false }
   if (transition.from === transition.to) return { notify: false, mention: false }
@@ -35,6 +35,8 @@ export function planNotification(transition: KanbanTransition, board: Notificati
   if (to === 'review' || to === 'done' || to === 'archived') return { notify: true, mention: false }
   if (to === 'triage')
     return { notify: transition.tripped !== undefined || transition.reasonCode != null, mention: false }
+  if (to === 'ready' && (transition.reasonCode === 'restarted' || transition.reasonCode === 'synthesis'))
+    return { notify: true, mention: false }
   if (to === 'ready' && transition.from === 'review' && transition.role === 'verify')
     return { notify: true, mention: false }
   return { notify: false, mention: false }

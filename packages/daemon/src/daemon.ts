@@ -1,6 +1,7 @@
 import { KanbanWorker, type KanbanStartResult } from './kanban/kanban-worker.js'
 import { KanbanCommentPublisher } from './kanban/kanban-comments.js'
 import { KanbanCardTools } from './kanban/card-tools.js'
+import { kanbanCardBranch } from './kanban/card-branch.js'
 import { buildKanbanMessage, kanbanNotifyText } from './messages/kanban-message.js'
 import { KanbanOrchestratorTools } from './kanban/orchestrator-tools.js'
 import { memorySourceTurnId } from './memory/source-turn.js'
@@ -17579,7 +17580,13 @@ export class Daemon {
           launchWorkspaceCwd = await this.prepareAgentWorkspace(currentAgent, undefined, {
             sessionKey: key,
             isolation: 'session',
-            initiatedBy: await sessionInitiatedBy((ids) => this.store.getDisplayNames(ids), persisted?.triggeredBy, msg)
+            initiatedBy: await sessionInitiatedBy(
+              (ids) => this.store.getDisplayNames(ids),
+              persisted?.triggeredBy,
+              msg
+            ),
+            // A write card's first preparation fixes the clone's branch, so it must name the card branch too.
+            ...(entry.kanban?.mode === 'write' ? { branch: kanbanCardBranch(entry.kanban.issueNumber) } : {})
           })
         }
         entry.selectedHost = await this.modelSessions.ensure(currentAgent, key, firstTurnModel)
@@ -17631,7 +17638,11 @@ export class Daemon {
           ...(entry.selectedHost ? { host: entry.selectedHost.host } : {}),
           ...(webchatIsolation ? { workspaceIsolation: webchatIsolation } : {}),
           ...(entry.kanban?.mode === 'write'
-            ? { workspaceIsolation: 'session' as const, forceWorkspaceIsolation: true }
+            ? {
+                workspaceIsolation: 'session' as const,
+                forceWorkspaceIsolation: true,
+                branch: kanbanCardBranch(entry.kanban.issueNumber)
+              }
             : {}),
           ...reviewWorkspace,
           ...(launchWorkspaceCwd !== undefined ? { preparedWorkspaceCwd: launchWorkspaceCwd } : {})
