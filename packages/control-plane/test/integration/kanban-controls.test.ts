@@ -588,36 +588,36 @@ describe('416c: skip/restart lease revocation, episode reset and repair (real Po
   )
 })
 
+const pull = (issueNumber: number, createdAt: Date, over: Partial<LivePullRequest> = {}): LivePullRequest => ({
+  number: 21,
+  state: 'closed',
+  merged: true,
+  headSha: 'c'.repeat(40),
+  authorLogin: 'agentconnect-test[bot]',
+  authorType: 'Bot',
+  headRef: kanbanCardBranch(issueNumber),
+  headRepoId: REPO_ID,
+  baseRef: 'main',
+  defaultBranch: 'main',
+  createdAt,
+  mergedByLogin: 'alice',
+  ...over
+})
+
+async function workedCard(h: Awaited<ReturnType<typeof harness>>) {
+  const c = await h.addCard()
+  await h.dispatcher.reconcileBoard(h.board.id)
+  await h.dispatcher.settle()
+  const d = h.sent.at(-1)!.d
+  expect(d.cardId).toBe(c.id)
+  expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d, { prNumber: 21 }))).accepted).toBe(true)
+  await h.dispatcher.settle()
+  const card = await h.card(c.id)
+  expect(card).toMatchObject({ status: 'review', linkedPrNumber: 21 })
+  return { c, d, episode: card.workEpisodeStartedAt! }
+}
+
 describe('416c: cross-lane, a PR from the daemon ac/card-<n> branch under the #415 binding (real Postgres)', () => {
-  const pull = (issueNumber: number, createdAt: Date, over: Partial<LivePullRequest> = {}): LivePullRequest => ({
-    number: 21,
-    state: 'closed',
-    merged: true,
-    headSha: 'c'.repeat(40),
-    authorLogin: 'agentconnect-test[bot]',
-    authorType: 'Bot',
-    headRef: kanbanCardBranch(issueNumber),
-    headRepoId: REPO_ID,
-    baseRef: 'main',
-    defaultBranch: 'main',
-    createdAt,
-    mergedByLogin: 'alice',
-    ...over
-  })
-
-  async function workedCard(h: Awaited<ReturnType<typeof harness>>) {
-    const c = await h.addCard()
-    await h.dispatcher.reconcileBoard(h.board.id)
-    await h.dispatcher.settle()
-    const d = h.sent.at(-1)!.d
-    expect(d.cardId).toBe(c.id)
-    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(d, { prNumber: 21 }))).accepted).toBe(true)
-    await h.dispatcher.settle()
-    const card = await h.card(c.id)
-    expect(card).toMatchObject({ status: 'review', linkedPrNumber: 21 })
-    return { c, d, episode: card.workEpisodeStartedAt! }
-  }
-
   const contracts = (h: Awaited<ReturnType<typeof harness>>, pr: () => LivePullRequest) =>
     new KanbanPrContracts({
       repo: h.repo,
@@ -993,4 +993,91 @@ describe('416r3: versioned controls and restart recovery', () => {
     await h.dispatcher.settle()
     expect(h.sent[0]!.d).toMatchObject({ supersededPrNumber: 21, mode: 'write' })
   })
+})
+
+describe('416r4: completion-contract writes share the control queue and version (real Postgres)', () => {
+  // The production contract wiring: the dispatcher's status-write queue and the live card's control version.
+  const gatedContracts = (h: Awaited<ReturnType<typeof harness>>, pr: () => LivePullRequest) =>
+    new KanbanPrContracts({
+      repo: h.repo,
+      appSlug: 'agentconnect-test',
+      prs: { readPullRequest: async () => pr(), readCheckRuns: async () => ({ runs: [], complete: true }) },
+      store: h.store,
+      gate: h.dispatcher,
+      repoRef: async () => ({ installationId: 77n, repoId: REPO_ID, repoFullName: 'acme/web' }),
+      log: { info: vi.fn(), warn: vi.fn() }
+    })
+
+  // Stalled before its check the write is dropped; already writing, it lands first and the queued restart follows.
+  it.each([
+    ['before its version check', 'readCard', 0],
+    ['inside its GitHub write', 'applyPlan', 1]
+  ] as const)(
+    '416r4: a contract done write stalled %s cannot undo a restart on GitHub or through the next claim',
+    async (_name, stallAt, doneWrites) => {
+      const h = await harness({ completionContract: 'pr_merged' })
+      const { c, episode } = await workedCard(h)
+      // Paused, the restart's poke claims nothing, so the next claim reads GitHub only after the stalled write lands.
+      await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+      const entered = latch()
+      const release = latch()
+      if (stallAt === 'readCard') {
+        const read = h.store.readCard.bind(h.store)
+        vi.spyOn(h.store, 'readCard').mockImplementationOnce(async (...args) => {
+          entered.resolve()
+          await release.promise
+          return read(...args)
+        })
+      } else {
+        const apply = h.store.applyPlan.bind(h.store)
+        vi.spyOn(h.store, 'applyPlan').mockImplementationOnce(async (...args) => {
+          entered.resolve()
+          await release.promise
+          return apply(...args)
+        })
+      }
+      const settled = gatedContracts(h, () => pull(c.issueNumber, new Date(episode.getTime() + 1_000))).sweep(
+        h.board.id
+      )
+      await entered.promise
+      expect(await h.card(c.id)).toMatchObject({ status: 'done', controlVersion: 0n })
+
+      const committed = latch()
+      const restartCard = PgKanbanCardRepo.prototype.restartCard
+      vi.spyOn(PgKanbanCardRepo.prototype, 'restartCard').mockImplementationOnce(async function (
+        this: PgKanbanCardRepo,
+        input
+      ) {
+        const result = await restartCard.call(this, input)
+        committed.resolve()
+        return result
+      })
+      const restarted = h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+      await committed.promise
+      expect(await h.card(c.id)).toMatchObject({ status: 'ready', controlVersion: 1n })
+
+      release.resolve()
+      await settled
+      expect((await restarted).ok).toBe(true)
+      await h.dispatcher.settle()
+      const afterWrites = { db: await h.card(c.id), github: { ...h.store.issues.get(c.issueNumber)! } }
+
+      await h.controls.resume(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+      await h.dispatcher.reconcileBoard(h.board.id)
+      await h.dispatcher.settle()
+      expect({
+        db: { status: afterWrites.db.status, controlWrittenVersion: afterWrites.db.controlWrittenVersion },
+        github: afterWrites.github,
+        doneWrites: h.store.writes.filter((plan) => plan.status === 'done').length,
+        claimed: h.sent.slice(1).map(({ d }) => ({ cardId: d.cardId, attempt: d.attempt })),
+        afterClaim: (await h.card(c.id)).status
+      }).toEqual({
+        db: { status: 'ready', controlWrittenVersion: 1n },
+        github: { state: 'open', stateReason: null, labels: ['ac/status:ready'] },
+        doneWrites,
+        claimed: [{ cardId: c.id, attempt: 2 }],
+        afterClaim: 'running'
+      })
+    }
+  )
 })

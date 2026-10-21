@@ -71,7 +71,7 @@ const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."lin
   AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
 const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
   c."linkedPrNumber", c."workEpisodeStartedAt", c."contractFlags", c."needsAttention", c."verifiedAt",
-  b."completionContract", b."verifierAgentId", b."configRevision"`
+  b."completionContract", b."verifierAgentId", b."configRevision", c."controlVersion"`
 
 interface BoardRow {
   id: string
@@ -567,6 +567,10 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
       WHERE c."id" = ${cardId}::uuid AND ${CONTRACT_DUE}
     `)
     return card ?? null
+  }
+
+  async isLatestControl(cardId: string, version: bigint): Promise<boolean> {
+    return (await this.db.kanbanCard.count({ where: { id: cardId, controlVersion: version } })) === 1
   }
 
   async flagContract(input: KanbanContractFlagInput): Promise<boolean> {

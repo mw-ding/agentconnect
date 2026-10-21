@@ -8624,6 +8624,8 @@ export interface KanbanContractCard {
   verifierAgentId: string | null
   /** The board configuration the contract and verifier were read under; a board edit bumps it. */
   configRevision: bigint
+  /** The card's control version at the read; a settle at this stateRevision commits under it. */
+  controlVersion: bigint
 }
 
 export interface KanbanContractSettleInput {
@@ -8656,6 +8658,8 @@ export interface KanbanContractRepo {
   settleContract(input: KanbanContractSettleInput): Promise<boolean>
   /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */
   flagContract(input: KanbanContractFlagInput): Promise<boolean>
+  /** True while no skip or restart has committed since `version`; a contract's GitHub write lands only then. */
+  isLatestControl(cardId: string, version: bigint): Promise<boolean>
 }
 
 /** One `/kanban` comment command as recorded: body-free (command, login, statuses, and a reason code). */

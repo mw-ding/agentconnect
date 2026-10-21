@@ -1842,6 +1842,7 @@ export function buildContainer(
           repo: repos.kanbanDispatch,
           prs: kanbanPrReader,
           store: kanbanCardStore,
+          gate: { holdStatusWrite: (cardId) => kanbanDispatcher!.holdStatusWrite(cardId) },
           repoRef: (boardId): Promise<KanbanRepoRef | null> =>
             kanbanDispatcher?.boardRepo(boardId) ?? Promise.resolve(null),
           onSettled: (card) => kanbanDispatcher?.poke(card.boardId),

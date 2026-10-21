@@ -47,6 +47,7 @@ const card = (over: Partial<KanbanContractCard> = {}): KanbanContractCard => ({
   completionContract: 'pr_merged',
   verifierAgentId: null,
   configRevision: 1n,
+  controlVersion: 0n,
   ...over
 })
 
@@ -91,7 +92,8 @@ function make(
         stateRevision: c.stateRevision + 1n
       })
       return true
-    })
+    }),
+    isLatestControl: vi.fn(async () => true)
   }
   const prs = {
     readPullRequest: vi.fn(async (_repo: unknown, n: number) =>
