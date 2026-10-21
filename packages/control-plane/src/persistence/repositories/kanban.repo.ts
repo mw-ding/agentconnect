@@ -456,9 +456,10 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
   }
 
   async casStatus(cardId: string, expectedStateRevision: bigint, to: KanbanStatus): Promise<boolean> {
+    // A flagged card is a human's: only a human status move (label sync, /kanban restart or skip) lifts the hold.
     return applyCardTransition(
       this.db,
-      { id: cardId, stateRevision: expectedStateRevision },
+      { id: cardId, stateRevision: expectedStateRevision, needsAttention: false },
       { status: to, stateRevision: { increment: 1 }, githubSyncedAt: new Date(), ...PROMOTION_CLEARED },
       'cas_status'
     )
