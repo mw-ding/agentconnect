@@ -1954,4 +1954,34 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     expect(issued).toEqual(expect.arrayContaining(['ls-remote', 'fetch']))
     expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
   })
+
+  it('416r4: an existing sandboxed checkout reports the policy refusing a pushed card branch switch, untouched', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAllThroughShim(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const head = git(cwd, ['symbolic-ref', 'HEAD'])
+    const tip = git(cwd, ['rev-parse', 'HEAD'])
+    pushCardBranch(primary!.seed, 7)
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /not supported on the sandboxed tier: the sandbox git policy refuses git config/
+    )
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+    expect(() => git(cwd, ['rev-parse', '--verify', 'refs/heads/ac/card-7'])).toThrow()
+  })
+
+  it('416r4: an existing sandboxed checkout reports the policy refusing merge-base, never local-only commits', async () => {
+    const agent = agentFixture()
+    serveAllThroughShim(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const head = git(cwd, ['symbolic-ref', 'HEAD'])
+    // A card branch at the default tip has no local-only commits, so only the refused ancestry check can stop the switch.
+    git(cwd, ['branch', 'ac/card-7', 'origin/main'])
+    const cardTip = git(cwd, ['rev-parse', 'ac/card-7'])
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /not supported on the sandboxed tier: the sandbox git policy refuses git merge-base/
+    )
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(cardTip)
+  })
 })
