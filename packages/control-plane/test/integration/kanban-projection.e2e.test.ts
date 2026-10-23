@@ -225,7 +225,36 @@ describe.skipIf(!blockA)('kanban projection 4a e2e (live GitHub)', () => {
       expect(verdict.ok).toBe(true)
       const writer = new KanbanProjectWriter({ tokens: { mintKanbanProject: mint } as never, fetchImpl: spyFetch })
       const issueNodeId = process.env.KANBAN_PROJECT_ISSUE_NODE_ID!
-      for (const status of ['todo', 'ready', 'done'] as const) {
+      const gql = async <T>(query: string, variables: Record<string, unknown>): Promise<T> => {
+        const res = await gh<{ data?: T; errors?: unknown[] }>('POST', '/graphql', { query, variables })
+        if (res.errors?.length || !res.data) throw new Error(`GitHub GraphQL: ${JSON.stringify(res.errors)}`)
+        return res.data
+      }
+      const { node: fieldNode } = await gql<{ node: { options: Array<{ id: string; name: string }> } | null }>(
+        'query($id: ID!) { node(id: $id) { ... on ProjectV2SingleSelectField { options { id name } } } }',
+        { id: statusFieldId }
+      )
+      const readStatus = async (itemId: string) => {
+        const { node } = await gql<{
+          node: {
+            fieldValues: {
+              nodes: Array<{ optionId?: string; name?: string; field?: { id: string } } | null>
+            }
+          } | null
+        }>(
+          'query($id: ID!) { node(id: $id) { ... on ProjectV2Item { fieldValues(first: 50) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { optionId name field { ... on ProjectV2FieldCommon { id } } } } } } } }',
+          { id: itemId }
+        )
+        const values = (node?.fieldValues.nodes ?? []).filter((v) => v?.field?.id === statusFieldId)
+        expect(values).toHaveLength(1)
+        return values[0]!
+      }
+      let firstItemId: string | undefined
+      for (const [status, optionName] of [
+        ['todo', 'Todo'],
+        ['ready', 'Ready'],
+        ['done', 'Done']
+      ] as const) {
         const result = await writer.project({
           repo: { installationId: INSTALLATION_ID, repoId: BigInt(repoMeta.id), repoFullName: orgRepo },
           board: { projectNodeId, statusFieldId },
@@ -233,6 +262,15 @@ describe.skipIf(!blockA)('kanban projection 4a e2e (live GitHub)', () => {
           status
         })
         expect(result).not.toBeNull()
+        const itemId = result!.itemId
+        firstItemId ??= itemId
+        expect(itemId).toBe(firstItemId)
+        const expected = fieldNode?.options.find((o) => o.name.toLowerCase() === optionName.toLowerCase())
+        expect(expected).toBeDefined()
+        const observed = await readStatus(itemId)
+        phase(`B read back ${status}`, { itemId, optionId: observed.optionId, name: observed.name })
+        expect(observed.optionId).toBe(expected!.id)
+        expect(observed.name).toBe(optionName)
       }
       phase('B projection wrote three statuses', { orgRepo })
     })
