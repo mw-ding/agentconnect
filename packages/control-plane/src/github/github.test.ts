@@ -41,6 +41,16 @@ describe('resolveGithubAppConfig', () => {
     expect(() => resolveGithubAppConfig({ GITHUB_APP_ID: 1 })).toThrow(/missing GITHUB_APP_PRIVATE_KEY_B64/)
   })
 
+  it('fails fast when the App is configured without GITHUB_APP_SLUG', () => {
+    const base = { GITHUB_APP_ID: 1, GITHUB_APP_PRIVATE_KEY_B64: PEM_B64 }
+    expect(() => resolveGithubAppConfig(base)).toThrow(/missing GITHUB_APP_SLUG/)
+    expect(() => resolveGithubAppConfig({ ...base, GITHUB_APP_SLUG: '  ' })).toThrow(/missing GITHUB_APP_SLUG/)
+  })
+
+  it('keeps a blank slug with no other App vars as feature off', () => {
+    expect(resolveGithubAppConfig({ GITHUB_APP_SLUG: '' })).toBeUndefined()
+  })
+
   it('decodes both PKCS#8 and PKCS#1 (GitHub download format) keys', () => {
     for (const b64 of [PEM_B64, PKCS1_B64]) {
       const c = resolveGithubAppConfig({

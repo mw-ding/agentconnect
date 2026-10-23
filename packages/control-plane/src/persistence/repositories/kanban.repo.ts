@@ -115,7 +115,8 @@ const COMMAND_SELECT = {
   outcome: true,
   fromStatus: true,
   toStatus: true,
-  settledAt: true
+  settledAt: true,
+  createdAt: true
 } as const
 
 /** Thrown inside the command transaction so a lost CAS also rolls back its ledger row. */
@@ -132,6 +133,7 @@ function toCommandRecord(row: {
   fromStatus: string
   toStatus: string | null
   settledAt: Date | null
+  createdAt: Date
 }): KanbanCommandRecord {
   return { ...row, fromStatus: row.fromStatus as KanbanStatus, toStatus: row.toStatus as KanbanStatus | null }
 }

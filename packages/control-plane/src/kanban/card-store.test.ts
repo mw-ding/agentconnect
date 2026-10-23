@@ -706,4 +706,20 @@ describe('vera-415r3: refusal marker recovery', () => {
     expect(h.calls).toHaveLength(10)
     expect(h.calls.every((call) => call.method === 'GET')).toBe(true)
   })
+
+  it('scans with since= so a marker past 1,000 comments is still found without a POST', async () => {
+    const createdAt = new Date('2026-05-01T12:00:00Z')
+    const sincePath = `${path}&since=2026-05-01T11:59:00.000Z`
+    const h = harness(
+      {
+        // Without since= this issue has 1,200 comments (12 pages); with it only the recent tail is returned.
+        [`GET ${path}`]: () => new Response('[]', { headers: { link: `<https://api.test${path}>; rel="next"` } }),
+        [`GET ${sincePath}`]: () =>
+          json([{ body: `fixed refusal\n\n${marker}`, user: { login: 'agentconnect[bot]', type: 'Bot' } }])
+      },
+      'agentconnect'
+    )
+    await h.store.applyPlan(REPO, 7, observed, { ...plan, commentSince: createdAt })
+    expect(h.calls.map((call) => `${call.method} ${call.url}`)).toEqual([`GET https://api.test${sincePath}`])
+  })
 })

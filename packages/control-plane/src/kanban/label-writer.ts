@@ -16,6 +16,8 @@ interface MarkedComment {
   user?: { login?: string; type?: string }
 }
 
+const SINCE_SKEW_MS = 60_000
+
 export class KanbanLabelWriter {
   constructor(private readonly deps: KanbanLabelWriterDeps) {}
 
@@ -58,15 +60,24 @@ export class KanbanLabelWriter {
     }
     if (plan.comment) {
       const marker = plan.commentKey ? `<!-- agentconnect-kanban:${plan.commentKey} -->` : undefined
-      if (marker && (await this.hasComment(repo, issueNumber, marker, grant.token))) return
+      if (marker && (await this.hasComment(repo, issueNumber, marker, grant.token, plan.commentSince))) return
       await call('/comments', 'POST', { body: marker ? `${plan.comment}\n\n${marker}` : plan.comment })
     }
   }
 
   // A failed or incomplete read never authorizes a POST; writes are never retried blind by githubRequest.
-  private async hasComment(repo: KanbanRepoRef, issueNumber: number, marker: string, token: string): Promise<boolean> {
+  private async hasComment(
+    repo: KanbanRepoRef,
+    issueNumber: number,
+    marker: string,
+    token: string,
+    since?: Date
+  ): Promise<boolean> {
     if (!this.deps.appSlug) throw new Error('kanban: App identity required for comment recovery')
-    let path: string | undefined = `/repositories/${repo.repoId}/issues/${issueNumber}/comments?per_page=100`
+    // The marker is posted after the plan's row exists, so a minute of skew margin keeps it in range.
+    const sinceQuery = since ? `&since=${new Date(since.getTime() - SINCE_SKEW_MS).toISOString()}` : ''
+    let path: string | undefined =
+      `/repositories/${repo.repoId}/issues/${issueNumber}/comments?per_page=100${sinceQuery}`
     for (let page = 0; path && page < 10; page++) {
       const result: GithubPage<MarkedComment[]> = await githubRequestPage<MarkedComment[]>(path, {
         auth: token,

@@ -164,6 +164,7 @@ function refusalPlan(record: KanbanCommandRecord): LabelPlan {
     addLabels: [],
     removeLabels: [],
     commentKey: `command:${record.id}`,
+    commentSince: record.createdAt,
     comment: humanRefusalComment(record.command as KanbanCommand, status, record.outcome as HumanTransitionRefusal)
   }
 }

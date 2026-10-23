@@ -39,7 +39,8 @@ export function resolveGithubAppConfig(config: GithubEnvSlice): GithubAppConfig 
   const present = {
     GITHUB_APP_ID: config.GITHUB_APP_ID !== undefined,
     GITHUB_APP_PRIVATE_KEY_B64: config.GITHUB_APP_PRIVATE_KEY_B64 !== undefined,
-    GITHUB_APP_SLUG: config.GITHUB_APP_SLUG !== undefined
+    // A blank slug is missing: the bot would fail closed and never post refusal comments.
+    GITHUB_APP_SLUG: config.GITHUB_APP_SLUG !== undefined && config.GITHUB_APP_SLUG.trim() !== ''
   }
   const set = Object.values(present).filter(Boolean).length
   if (set === 0) return undefined
@@ -47,7 +48,9 @@ export function resolveGithubAppConfig(config: GithubEnvSlice): GithubAppConfig 
     const missing = Object.entries(present)
       .filter(([, ok]) => !ok)
       .map(([k]) => k)
-    throw new Error(`github app config is partial — missing ${missing.join(', ')} (set all three or none)`)
+    throw new Error(
+      `github app config is partial — missing ${missing.join(', ')} (set all three or none; GITHUB_APP_SLUG is the App's URL slug, required for refusal comments)`
+    )
   }
 
   let pem: string
@@ -70,7 +73,7 @@ export function resolveGithubAppConfig(config: GithubEnvSlice): GithubAppConfig 
 
   return {
     appId: config.GITHUB_APP_ID!,
-    slug: config.GITHUB_APP_SLUG!,
+    slug: config.GITHUB_APP_SLUG!.trim(),
     jwtIssuer: config.GITHUB_APP_CLIENT_ID ?? String(config.GITHUB_APP_ID!),
     privateKey
   }
