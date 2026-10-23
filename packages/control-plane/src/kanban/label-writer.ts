@@ -74,7 +74,7 @@ export class KanbanLabelWriter {
     since?: Date
   ): Promise<boolean> {
     if (!this.deps.appSlug) throw new Error('kanban: App identity required for comment recovery')
-    // The marker is posted after the plan's row exists, so a minute of skew margin keeps it in range.
+    // since= filters on updated_at, so >1,000 comments touched after the cutoff still exhaust the 10 pages and throw (fail closed); skew margin keeps the marker in range.
     const sinceQuery = since ? `&since=${new Date(since.getTime() - SINCE_SKEW_MS).toISOString()}` : ''
     let path: string | undefined =
       `/repositories/${repo.repoId}/issues/${issueNumber}/comments?per_page=100${sinceQuery}`
