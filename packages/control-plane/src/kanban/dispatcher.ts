@@ -66,8 +66,12 @@ export interface KanbanDispatcherDeps {
   >
   /** Live write check for the human whose status label un-parks a card (the comment-command gate); the container always wires it. */
   humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
-  /** PR completion contracts: the tick's bounded backstop sweep, and a re-check when a run leaves its card in review. */
-  contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
+  /** PR completion contracts: the tick's sweep, and a run end's re-check in review or after a move out of it to ready/triage. */
+  contracts?: {
+    sweep(boardId: string): Promise<void>
+    onReview(cardId: string): Promise<unknown>
+    onLeftReview?(cardId: string): Promise<unknown>
+  }
   /** The read-only PR reader: a write run's claim re-validates the card branch's open PR, which a restart may have dropped. */
   prs?: Pick<PrReader, 'listOpenPullRequestsByHead'>
   /** The daemon's live control connection; throws when it is gone. */
@@ -97,6 +101,16 @@ const RECOVERY_BATCH = 25
 /** A pending promotion still unresolved after this many reads, or this long, escalates to a human. */
 export const MAX_PROMOTION_CHECKS = 12
 export const MAX_PROMOTION_AGE_MS = 6 * 60 * 60_000
+/** A pending run-end contract re-check holds its card's claim at most this long; its GitHub reads time out far sooner. */
+export const RECHECK_HOLD_MS = 5 * 60_000
+
+type RunEndCard = Pick<Extract<KanbanRunEndResult, { accepted: true }>['card'], 'cardId' | 'boardId' | 'from' | 'to'>
+/** A run end's contract re-check, holding its card's claim in this process from before the end's commit until it settles. */
+interface RecheckHold {
+  card: RunEndCard
+  leftReview: boolean
+  since: number
+}
 
 /** Why recovery gave a pending promotion up to a human. */
 export type PromotionAttention = 'unattributed' | 'unexpected_labels' | 'blockers_reopened' | 'unresolved'
@@ -154,6 +168,8 @@ export class KanbanDispatcher {
   private readonly recoveryDue = new Set<string>()
   private readonly background = new Set<Promise<unknown>>()
   private readonly statusWrites = new Map<string, Promise<void>>()
+  private readonly rechecks = new Map<string, RecheckHold>()
+  private readonly recheckSkipped = new Set<string>()
 
   constructor(private readonly deps: KanbanDispatcherDeps) {}
 
@@ -246,6 +262,7 @@ export class KanbanDispatcher {
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id),
+      skipCard: (cardId) => this.recheckHolds(cardId),
       ...(this.deps.maxPerDaemon !== undefined ? { maxPerDaemon: this.deps.maxPerDaemon } : {})
     })
     await Promise.allSettled([
@@ -671,49 +688,117 @@ export class KanbanDispatcher {
   ): Promise<KanbanRunEndResult> {
     const now = await this.deps.repo.now()
     const outcome: KanbanRunOutcomeValue = end.outcome
-    const result = await this.deps.repo.endRun({
-      leaseId,
-      outcome,
-      reasonCode,
-      now,
-      ...extra,
-      ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
-      plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx)
-    })
-    if (result.accepted && result.card.from !== result.card.to) {
-      const repo = await this.repoRef(result.card)
-      if (repo) this.writeStatus(result.card, repo, result.card.to)
+    let held: RecheckHold | undefined
+    let result: KanbanRunEndResult
+    try {
+      result = await this.deps.repo.endRun({
+        leaseId,
+        outcome,
+        reasonCode,
+        now,
+        ...extra,
+        ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
+        plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx),
+        // Held under the card's row lock, before the commit makes it claimable, so no claim here can take it first (#602).
+        beforeCommit: (card) => {
+          if (held) this.releaseHold(held)
+          held = this.holdForRecheck(card)
+        }
+      })
+    } catch (err) {
+      if (held) this.releaseHold(held)
+      throw err
     }
+    if (!result.accepted) {
+      if (held) this.releaseHold(held)
+      return result
+    }
+    const { card } = result
     // A verifier's approval, or a worker whose PR already finished, completes the contract now rather than on the next event.
-    if (result.accepted && result.card.to === 'review' && this.deps.contracts) this.recheckContract(result.card.cardId)
+    // A repo that never called beforeCommit (a test double) still gets its hold here, after the commit.
+    const recheck = this.recheckContract(card, held ?? this.holdForRecheck(card))
+    if (card.from !== card.to) {
+      const repo = await this.repoRef(card)
+      // The status write also waits for the re-check, so its own ack never frees the card ahead of the flag (#602).
+      if (repo) this.writeStatus(card, repo, card.to, undefined, recheck)
+    }
     return result
   }
 
-  private recheckContract(cardId: string): void {
-    const task = this.deps
-      .contracts!.onReview(cardId)
-      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
-      .finally(() => this.background.delete(task))
-    this.background.add(task)
+  // In review, or moved from review to ready/triage, where a verdict must not carry an unbound PR back to work unflagged.
+  private holdForRecheck(card: RunEndCard): RecheckHold | undefined {
+    const contracts = this.deps.contracts
+    if (!contracts) return undefined
+    const leftReview = card.from === 'review' && (card.to === 'ready' || card.to === 'triage')
+    if (card.to !== 'review' && !(leftReview && contracts.onLeftReview)) return undefined
+    const hold: RecheckHold = { card, leftReview, since: this.deps.clock.now() }
+    this.rechecks.set(card.cardId, hold)
+    return hold
   }
 
-  /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
+  private recheckContract(card: RunEndCard, hold: RecheckHold | undefined): Promise<unknown> | undefined {
+    if (!hold) return undefined
+    const contracts = this.deps.contracts!
+    const { cardId } = card
+    const task: Promise<unknown> = (hold.leftReview ? contracts.onLeftReview!(cardId) : contracts.onReview(cardId))
+      .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
+      .finally(() => {
+        this.background.delete(task)
+        this.releaseHold(hold)
+      })
+    this.background.add(task)
+    return task
+  }
+
+  private releaseHold(hold: RecheckHold): void {
+    const { cardId, boardId } = hold.card
+    if (this.rechecks.get(cardId) === hold) this.rechecks.delete(cardId)
+    // A claim skipped the card while it was held: retry it now rather than on the next event.
+    if (this.recheckSkipped.delete(cardId)) this.poke(boardId)
+  }
+
+  private recheckHolds(cardId: string): boolean {
+    const hold = this.rechecks.get(cardId)
+    if (!hold || this.deps.clock.now() - hold.since >= RECHECK_HOLD_MS) return false
+    this.recheckSkipped.add(cardId)
+    return true
+  }
+
+  /** Best-effort label write after the CP state committed, once `after` settles; a failure leaves drift for the reconciler. */
   private writeStatus(
     card: { issueNumber: number; cardId: string; boardId: string },
     repo: KanbanRepoRef,
     status: KanbanStatus,
-    observed?: ObservedIssue
+    observed?: ObservedIssue,
+    after?: Promise<unknown>
   ): void {
     this.projectCommitted(card.boardId, card.issueNumber, observed)
     if (this.deps.sync) {
-      const task = this.deps.sync
-        .projectStatus(card.boardId, card.issueNumber, status)
+      // The sync projects the card's live status, so a contract settle during `after` is written, not overwritten.
+      const task = Promise.resolve(after)
+        .then(() => this.deps.sync!.projectStatus(card.boardId, card.issueNumber, status))
         .then(() => this.poke(card.boardId))
         .catch((err: unknown) => this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: status projection failed'))
         .finally(() => this.background.delete(task))
       this.background.add(task)
       return
     }
+    if (!after) return this.queueStatusWrite(card, repo, status, observed)
+    // Queued once `after` settles, as a contract settle inside it holds this queue; a settle writes its own status.
+    const deferred = after
+      .then((outcome) => {
+        if (outcome !== 'done' && outcome !== 'triage') this.queueStatusWrite(card, repo, status, observed)
+      })
+      .finally(() => this.background.delete(deferred))
+    this.background.add(deferred)
+  }
+
+  private queueStatusWrite(
+    card: { issueNumber: number; cardId: string; boardId: string },
+    repo: KanbanRepoRef,
+    status: KanbanStatus,
+    observed?: ObservedIssue
+  ): void {
     const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
       .then(async () => {
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))

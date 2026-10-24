@@ -137,7 +137,11 @@ async function harness(
     project,
     ...(contracts
       ? {
-          contracts: { sweep: (id: string) => contracts.sweep(id), onReview: (id: string) => contracts.onVerified(id) }
+          contracts: {
+            sweep: (id: string) => contracts.sweep(id),
+            onReview: (id: string) => contracts.onVerified(id),
+            onLeftReview: (id: string) => contracts.onLeftReview(id)
+          }
         }
       : {}),
     repo,
@@ -909,8 +913,6 @@ describe("vera-415b3: the PR binding follows the card's work episode (real Postg
     issue = c.issueNumber
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
-    // A label-write poke racing the run end's re-check could claim a verify first (#600), so only explicit ticks claim.
-    h.dispatcher.stop()
     h.clock.advance(30_000)
     await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
     await h.dispatcher.settle()
@@ -944,6 +946,127 @@ function cardPr(n: () => number, over: Partial<LivePullRequest> = {}, onRead?: (
     readCheckRuns: async () => ({ runs: [], complete: true })
   }
 }
+
+// Holds every PR read while armed, forcing the interleaving #600 hit by chance: a claim runs during the re-check's read.
+function heldReads(reader: PrReader) {
+  let held: Promise<void> | undefined
+  let open = (): void => {}
+  const prs: PrReader = {
+    readPullRequest: async (repo, n) => {
+      await held
+      return reader.readPullRequest(repo, n)
+    },
+    readCheckRuns: (repo, sha) => reader.readCheckRuns(repo, sha)
+  }
+  return {
+    prs,
+    hold: () => void (held = new Promise<void>((resolve) => (open = resolve))),
+    release: () => {
+      held = undefined
+      open()
+    }
+  }
+}
+
+describe('#602: a run end flags pr_unbound before its status write makes the card claimable (real Postgres)', () => {
+  const roles = (h: { sent: Array<{ d: KanbanDispatch }> }) => h.sent.map((s) => s.d.role ?? 'work')
+  // Any label write already queued for the card lands first, then a claim runs while the re-check's PR read is held.
+  async function claimDuringRecheck(h: Awaited<ReturnType<typeof harness>>, cardId: string): Promise<void> {
+    await h.dispatcher.holdStatusWrite(cardId)()
+    await h.dispatcher.reconcileBoard(h.board.id)
+  }
+
+  it('#602 AC2: the review run end flags an unbound PR before any verify run starts', async () => {
+    let issue = 0
+    const reads = heldReads({
+      readPullRequest: (repo, n) => mergedCardPr(issue, 12, new Date(T0 - 1_000)).readPullRequest(repo, n),
+      readCheckRuns: async () => ({ runs: [], complete: true })
+    })
+    const h = await harness({ completionContract: 'pr_merged', prs: reads.prs })
+    const c = await h.addCard()
+    issue = c.issueNumber
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    h.clock.advance(30_000)
+    reads.hold()
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+    await claimDuringRecheck(h, c.id)
+    // The review label still waits on the re-check, so the claim cannot take the card.
+    expect(roles(h)).toEqual(['work'])
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', labelWritePending: true, needsAttention: false })
+    reads.release()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'review',
+      labelWritePending: false,
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#12']
+    })
+    // The flag's comment went out before the review label that cleared the claim's last gate.
+    const comment = h.store.writes.findIndex((w) => w.comment?.includes('(pr_unbound)'))
+    const label = h.store.writes.findIndex((w) => w.addLabels.includes('ac/status:review'))
+    expect(comment).toBeGreaterThanOrEqual(0)
+    expect(comment).toBeLessThan(label)
+    for (let i = 0; i < 3; i++) {
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+    }
+    expect(roles(h)).toEqual(['work'])
+    expect(h.store.writes.filter((w) => w.comment?.includes('(pr_unbound)'))).toHaveLength(1)
+  })
+
+  it.each([
+    ['ready', 0],
+    ['triage', 2]
+  ] as const)(
+    '#602 AC1: a changes_requested verdict to %s re-checks the PR and flags it before the card is claimable',
+    async (to, rounds) => {
+      let issue = 0
+      const over: Partial<LivePullRequest> = {}
+      const reads = heldReads(cardPr(() => issue, over))
+      const h = await harness({ completionContract: 'pr_merged', prs: reads.prs })
+      const c = await h.addCard()
+      issue = c.issueNumber
+      await prisma.kanbanCard.update({ where: { id: c.id }, data: { reviewRounds: rounds } })
+      await h.dispatcher.reconcileBoard(h.board.id)
+      await h.dispatcher.settle()
+      h.clock.advance(60_000)
+      await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+      await h.dispatcher.settle()
+      // Bound at the work run's end, so the card waits for its verifier unflagged.
+      const verify = h.sent.at(-1)!.d
+      expect(verify.role).toBe('verify')
+      expect((await h.card(c.id)).needsAttention).toBe(false)
+      // Retargeted while the verifier runs, the PR no longer binds; a verify started before this fix ends the same way.
+      over.baseRef = 'release'
+      reads.hold()
+      await h.dispatcher.onReport(D2, 2, h.reportFor(verify, { outcome: 'changes_requested' }))
+      await claimDuringRecheck(h, c.id)
+      expect(roles(h)).toEqual(['work', 'verify'])
+      expect(await h.card(c.id)).toMatchObject({ status: to, labelWritePending: true, needsAttention: false })
+      reads.release()
+      await h.dispatcher.settle()
+      expect(await h.card(c.id)).toMatchObject({
+        status: to,
+        reviewRounds: rounds + 1,
+        labelWritePending: false,
+        needsAttention: true,
+        attentionReason: 'pr_unbound',
+        contractFlags: ['pr_unbound#12']
+      })
+      for (let i = 0; i < 3; i++) {
+        await h.dispatcher.tick()
+        await h.dispatcher.settle()
+      }
+      // No rework run starts on the flagged card, and the one comment names the status it is held in.
+      expect(roles(h)).toEqual(['work', 'verify'])
+      const comments = h.store.writes.filter((w) => w.comment?.includes('(pr_unbound)'))
+      expect(comments).toHaveLength(1)
+      expect(comments[0]!.comment).toContain(`stays in \`ac/status:${to}\``)
+    }
+  )
+})
 
 describe('vera-415r2: a PR contract never settles through a human hold (real Postgres)', () => {
   // An approved review card bound to PR 12 at episode T0, optionally held; the board has a verifier (A2).

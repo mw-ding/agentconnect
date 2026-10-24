@@ -82,9 +82,38 @@ export function planContract(input: ContractInput): ContractDecision {
   const wait = (reason: ContractWait): ContractDecision => ({ kind: 'wait', reason })
   if (input.status !== 'review') return wait('not_review')
   if (input.contract === 'close') return wait('no_pr_contract')
-  if (input.linkedPrNumber === null) return wait('no_linked_pr')
+  const unbound = bindingWait(input)
+  if (unbound) return wait(unbound)
+  const pr = input.pr!
+  const binding = input.binding!
+  if (pr.state === 'closed' && !pr.merged) return { kind: 'triage', reason: 'pr_closed_unmerged' }
+  const verified = input.verifierAgentId === null || input.verifiedAt !== null
+  if (input.contract === 'pr_merged') {
+    if (!pr.merged) return wait('pr_open')
+    // The worker's own token can merge on an unprotected base, so with no verifier an App-bot merge proves nothing.
+    const appBot = binding.appSlug ? `${binding.appSlug}[bot]`.toLowerCase() : null
+    if (input.verifierAgentId === null && appBot !== null && pr.mergedByLogin?.toLowerCase() === appBot)
+      return wait('merged_by_app')
+    return verified ? { kind: 'done' } : wait('awaiting_verifier')
+  }
+  const checks = input.checks
+  if (!checks) return wait('checks_unread')
+  if (checks.headSha !== pr.headSha) return wait('stale_sha')
+  // Without actions:read, same-named jobs of different workflows cannot be told apart, so the head is never green.
+  if (checks.actionsUnreadable && checks.verdict !== 'failed') return wait('actions_read_missing')
+  if (checks.verdict === 'pending') return wait('checks_pending')
+  if (checks.verdict === 'failed') return wait('checks_failed')
+  if (checks.verdict === 'none') return wait('no_checks')
+  return verified ? { kind: 'done' } : wait('awaiting_verifier')
+}
+
+/** Whether the linked PR is this card's episode PR, whatever the card's status: the wait that says why not, else null. */
+export function bindingWait(
+  input: Pick<ContractInput, 'binding' | 'linkedPrNumber' | 'pr'>
+): 'no_linked_pr' | 'pr_missing' | 'pr_unbound' | null {
+  if (input.linkedPrNumber === null) return 'no_linked_pr'
   const pr = input.pr
-  if (!pr || pr.number !== input.linkedPrNumber) return wait('pr_missing')
+  if (!pr || pr.number !== input.linkedPrNumber) return 'pr_missing'
   const binding = input.binding
   const expected = binding?.overrideForTests ?? {
     authorLogin: binding?.appSlug ? `${binding.appSlug}[bot]` : null,
@@ -106,26 +135,8 @@ export function planContract(input: ContractInput): ContractDecision {
     !Number.isFinite(binding.workEpisodeStartedAt.getTime()) ||
     pr.createdAt.getTime() < binding.workEpisodeStartedAt.getTime()
   )
-    return wait('pr_unbound')
-  if (pr.state === 'closed' && !pr.merged) return { kind: 'triage', reason: 'pr_closed_unmerged' }
-  const verified = input.verifierAgentId === null || input.verifiedAt !== null
-  if (input.contract === 'pr_merged') {
-    if (!pr.merged) return wait('pr_open')
-    // The worker's own token can merge on an unprotected base, so with no verifier an App-bot merge proves nothing.
-    const appBot = binding.appSlug ? `${binding.appSlug}[bot]`.toLowerCase() : null
-    if (input.verifierAgentId === null && appBot !== null && pr.mergedByLogin?.toLowerCase() === appBot)
-      return wait('merged_by_app')
-    return verified ? { kind: 'done' } : wait('awaiting_verifier')
-  }
-  const checks = input.checks
-  if (!checks) return wait('checks_unread')
-  if (checks.headSha !== pr.headSha) return wait('stale_sha')
-  // Without actions:read, same-named jobs of different workflows cannot be told apart, so the head is never green.
-  if (checks.actionsUnreadable && checks.verdict !== 'failed') return wait('actions_read_missing')
-  if (checks.verdict === 'pending') return wait('checks_pending')
-  if (checks.verdict === 'failed') return wait('checks_failed')
-  if (checks.verdict === 'none') return wait('no_checks')
-  return verified ? { kind: 'done' } : wait('awaiting_verifier')
+    return 'pr_unbound'
+  return null
 }
 
 /** Body-free note for a card whose linked PR closed unmerged: it names only the PR number, labels, and the reason code. */
@@ -149,9 +160,13 @@ const FLAG_HINTS: Partial<Record<ContractWait, string>> = {
 }
 
 /** Body-free note for a contract that needs a human: the PR number, a fixed reason, and the reason code only. */
-export function contractAttentionComment(reason: ContractWait, prNumber: number): string {
+export function contractAttentionComment(
+  reason: ContractWait,
+  prNumber: number,
+  status: KanbanStatus = 'review'
+): string {
   return (
     `AgentConnect Kanban: linked pull request #${prNumber} ${FLAG_HINTS[reason] ?? 'cannot complete this card'}, ` +
-    `so this card stays in \`ac/status:review\` and needs attention (${reason}). Move the card to continue.`
+    `so this card stays in \`ac/status:${status}\` and needs attention (${reason}). Move the card to continue.`
   )
 }

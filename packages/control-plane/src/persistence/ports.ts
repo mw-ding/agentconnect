@@ -8021,6 +8021,8 @@ export interface KanbanClaimOpts {
   isDaemonLive(daemonId: string): boolean
   /** Per-daemon cap across all boards (audit 2.2); absent means uncapped. */
   maxPerDaemon?: number
+  /** In-process hold checked before every other per-card gate: true skips the card (a pending contract re-check, #602). */
+  skipCard?(cardId: string): boolean
 }
 
 /** What a daemon-originated write must echo to pass the lease fence. */
@@ -8049,6 +8051,8 @@ export interface KanbanRunEndInput {
   now: Date
   /** Pure accounting, evaluated under the row locks. */
   plan(card: AccountingCard, board: AccountingBoard, ctx: RunEndContext): RunEndPlan
+  /** Called synchronously under the row locks once the end is accepted, before its commit; a rollback throws from `endRun`. */
+  beforeCommit?(card: { cardId: string; boardId: string; from: KanbanStatus; to: KanbanStatus }): void
 }
 
 export type KanbanRunEndResult =
@@ -8655,6 +8659,8 @@ export interface KanbanContractFlagInput {
   expectedStateRevision: bigint
   reason: string
   prNumber: number
+  /** The status the card was judged in (default `review`); a run end also flags a card it moved to ready or triage. */
+  status?: KanbanStatus
 }
 
 export interface KanbanContractRepo {
@@ -8664,6 +8670,8 @@ export interface KanbanContractRepo {
     opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
   ): Promise<KanbanContractCard[]>
   getContractCard(cardId: string): Promise<KanbanContractCard | null>
+  /** An unleased, unflagged `ready`/`triage` card that still holds its episode's linked PR under a PR contract. */
+  getLeftReviewCard(cardId: string): Promise<KanbanContractCard | null>
   /** CAS review → done/triage with an audit row; false when the card moved, was leased or held, or the board changed. */
   settleContract(input: KanbanContractSettleInput): Promise<boolean>
   /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */
