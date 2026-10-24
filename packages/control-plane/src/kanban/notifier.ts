@@ -26,7 +26,9 @@ export interface NotificationDecision {
   mention: boolean
 }
 
-// Explicit restarts and synthesis notify alongside terminal moves; churn and headless boards stay silent.
+const READY_NOTIFY_REASONS: ReadonlySet<string> = new Set(['restarted', 'synthesis', 'comment_command'])
+
+// Explicit restarts, synthesis and comment commands notify alongside terminal moves; churn and headless boards stay silent.
 export function planNotification(transition: KanbanTransition, board: NotificationBoard): NotificationDecision {
   if (board.targetChannel == null) return { notify: false, mention: false }
   if (transition.from === transition.to) return { notify: false, mention: false }
@@ -35,8 +37,7 @@ export function planNotification(transition: KanbanTransition, board: Notificati
   if (to === 'review' || to === 'done' || to === 'archived') return { notify: true, mention: false }
   if (to === 'triage')
     return { notify: transition.tripped !== undefined || transition.reasonCode != null, mention: false }
-  if (to === 'ready' && (transition.reasonCode === 'restarted' || transition.reasonCode === 'synthesis'))
-    return { notify: true, mention: false }
+  if (to === 'ready' && READY_NOTIFY_REASONS.has(transition.reasonCode ?? '')) return { notify: true, mention: false }
   if (to === 'ready' && transition.from === 'review' && transition.role === 'verify')
     return { notify: true, mention: false }
   return { notify: false, mention: false }
