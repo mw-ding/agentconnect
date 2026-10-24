@@ -22,7 +22,7 @@ export type ContractOutcome = ContractDecision['kind'] | 'stale_doorbell' | 'los
 
 export interface KanbanPrContractsDeps {
   repo: KanbanContractRepo
-  prs: PrReader
+  prs: Pick<PrReader, 'readPullRequest' | 'readCheckRuns'>
   appSlug?: string
   // The live E2E uses PAT-authored PRs targeting a disposable base instead of touching the default branch.
   bindingOverrideForTests?: { authorLogin: string; authorType: string; defaultBranch: string }

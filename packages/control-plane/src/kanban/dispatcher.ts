@@ -43,6 +43,8 @@ import type { RepoPermissionLookup } from '../github/repo-permission.js'
 import { authorizeHumanKanbanAction } from './human-action.js'
 import { labelAdder } from './label-attribution.js'
 import { planRunEnd, staleLeaseReason, type KanbanRunEnd } from './run-accounting.js'
+import { isSupersededCardPr } from './controls.js'
+import type { PrReader } from './pr-reader.js'
 
 export { WRITE_MODE_LABEL } from './card-store.js'
 
@@ -66,6 +68,8 @@ export interface KanbanDispatcherDeps {
   humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
   /** PR completion contracts: the tick's bounded backstop sweep, and a re-check when a run leaves its card in review. */
   contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
+  /** The read-only PR reader: a write run's claim re-validates the card branch's open PR, which a restart may have dropped. */
+  prs?: Pick<PrReader, 'listOpenPullRequestsByHead'>
   /** The daemon's live control connection; throws when it is gone. */
   send(daemonId: string, d: KanbanDispatch): Promise<KanbanDispatchOk>
   isDaemonLive(daemonId: string): boolean
@@ -572,6 +576,17 @@ export class KanbanDispatcher {
       }
       return
     }
+    let supersededPrNumber = lease.supersededPrNumber
+    if (lease.staleCardPrBefore && this.deps.prs) {
+      try {
+        supersededPrNumber = await this.staleCardPr(repo, lease.issueNumber, lease.staleCardPrBefore)
+      } catch (err) {
+        // Dispatching without the close target would strand the card at pr_unbound, so a failed read retries like the card read.
+        this.deps.log.warn({ err, leaseId: lease.leaseId }, 'kanban: card-branch PR lookup failed before dispatch')
+        await this.endRun(lease.leaseId, { outcome: 'transient' }, 'github_read_failed')
+        return
+      }
+    }
     const mode = lease.mode
     if (!(await this.deps.repo.isCurrentLease(lease.leaseId, mode, lease.daemonEpoch))) return
     let reply: KanbanDispatchOk
@@ -590,7 +605,7 @@ export class KanbanDispatcher {
         mode,
         // Absent = work, so a verify role is the only addition and older daemons still read the frame.
         ...(lease.role === 'verify' ? { role: 'verify' as const } : {}),
-        ...(lease.supersededPrNumber !== undefined ? { supersededPrNumber: lease.supersededPrNumber } : {})
+        ...(supersededPrNumber !== undefined ? { supersededPrNumber } : {})
       })
     } catch (err) {
       // Nack or timeout → ready with a cooldown; if the daemon did start, the fence rejects that run's writes.
@@ -609,6 +624,20 @@ export class KanbanDispatcher {
     if (!(await this.deps.repo.markAcked(lease.leaseId, mode, await this.deps.repo.now(), lease.daemonEpoch))) return
     // A verify run keeps the card in `review`; only a work run writes the `running` label.
     if (lease.role !== 'verify') this.writeStatus(lease, repo, 'running', observed)
+  }
+
+  // The one open card-branch PR of this repo created before the episode: it can never bind and blocks a new PR from the branch.
+  private async staleCardPr(repo: KanbanRepoRef, issueNumber: number, before: Date): Promise<number | undefined> {
+    const open = await this.deps.prs!.listOpenPullRequestsByHead(repo, `ac/card-${issueNumber}`)
+    const stale = open.filter(
+      (pr) =>
+        isSupersededCardPr(pr, { prNumber: pr.number, issueNumber, repoId: repo.repoId }) &&
+        pr.createdAt !== null &&
+        pr.createdAt.getTime() < before.getTime()
+    )
+    if (stale.length > 1)
+      this.deps.log.info({ issueNumber, count: stale.length }, 'kanban: several stale card-branch PRs; none named')
+    return stale.length === 1 ? stale[0]!.number : undefined
   }
 
   /** B8 self-approval: post the one body-free comment for a newly flagged card; best-effort like the escalation comment. */

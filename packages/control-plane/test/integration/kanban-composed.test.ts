@@ -19,6 +19,7 @@ import type {
   LabelWriteObserver
 } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
+import type { LivePullRequest } from '../../src/kanban/contracts.js'
 import { OrgId } from '../../src/domain/ids.js'
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
@@ -38,8 +39,12 @@ class FakeGithub {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   readonly events = new Map<number, LabelEvent[]>()
+  /** Posted comments; a keyed one is skipped when its key is already on the issue, as the label writer's marker scan does. */
+  readonly comments: Array<{ n: number; body: string; key: string | null }> = []
   /** The next this-many label writes fail, as a GitHub outage would. */
   failWrites = 0
+  /** The next this-many writes land in full and then throw, as a lost response would. */
+  lostAcks = 0
   private eventId = 0
 
   open(n: number, labels: string[]): void {
@@ -99,7 +104,48 @@ class FakeGithub {
       i.state = plan.issueState.state
       i.stateReason = plan.issueState.state === 'closed' ? plan.issueState.reason : null
     }
+    const key = plan.commentKey ?? null
+    if (plan.comment && !(key && this.comments.some((c) => c.n === n && c.key === key)))
+      this.comments.push({ n, body: plan.comment, key })
+    if (this.lostAcks > 0) {
+      this.lostAcks -= 1
+      throw new Error('GitHub response lost')
+    }
   }
+}
+
+// The read-only PR reader's head-branch list over a fixed set of PRs.
+class FakePrs {
+  readonly pulls: LivePullRequest[] = []
+  lookups = 0
+  /** The next this-many lookups fail, as a GitHub outage would. */
+  failReads = 0
+  async listOpenPullRequestsByHead(_repo: KanbanRepoRef, headRef: string): Promise<LivePullRequest[]> {
+    this.lookups += 1
+    if (this.failReads > 0) {
+      this.failReads -= 1
+      throw new Error('GitHub unavailable')
+    }
+    return this.pulls.filter((pr) => pr.state === 'open' && pr.headRef === headRef)
+  }
+}
+
+function cardPr(number: number, issueNumber: number, createdAt: number, patch: Partial<LivePullRequest> = {}) {
+  return {
+    number,
+    state: 'open',
+    merged: false,
+    headSha: 'a'.repeat(40),
+    authorLogin: `${APP_SLUG}[bot]`,
+    authorType: 'Bot',
+    headRef: `ac/card-${issueNumber}`,
+    headRepoId: REPO_ID,
+    baseRef: 'main',
+    defaultBranch: null,
+    createdAt: new Date(createdAt),
+    mergedByLogin: null,
+    ...patch
+  } satisfies LivePullRequest
 }
 
 async function harness(opts: { verifier?: boolean; sync?: boolean } = {}) {
@@ -120,6 +166,7 @@ async function harness(opts: { verifier?: boolean; sync?: boolean } = {}) {
   })
   const clock = new FakeClock(T0)
   const github = new FakeGithub()
+  const prs = new FakePrs()
   const warn = vi.fn()
   const log = { debug: vi.fn(), info: vi.fn(), warn }
   const sent: Array<{ daemonId: string; d: KanbanDispatch }> = []
@@ -162,6 +209,7 @@ async function harness(opts: { verifier?: boolean; sync?: boolean } = {}) {
     ...(sync ? { sync } : {}),
     installations,
     store: github,
+    prs,
     humanAuthz: { appSlug: APP_SLUG, permissions: { permission: async () => 'write' as const } },
     send: async (daemonId, d) => {
       sent.push({ daemonId, d })
@@ -204,7 +252,7 @@ async function harness(opts: { verifier?: boolean; sync?: boolean } = {}) {
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const labels = (n: number) => github.issues.get(n)!.labels.filter((l) => l.startsWith('ac/status:'))
-  return { board, clock, github, warn, sent, dispatcher, controls, addCard, reportFor, card, labels }
+  return { board, clock, github, prs, warn, sent, dispatcher, controls, addCard, reportFor, card, labels }
 }
 
 describe('590: Kanban composed like the container (real Postgres)', () => {
@@ -277,5 +325,157 @@ describe('590: Kanban composed like the container (real Postgres)', () => {
     await h.dispatcher.settle()
     expect(h.sent.map(({ d }) => d.role ?? 'work')).toEqual(['work', 'verify', 'work'])
     expect(await h.card(c.id)).toMatchObject({ status: 'running', labelWritePending: false })
+  })
+})
+
+describe('598: a label-sync repair re-posts the control comment once (real Postgres)', () => {
+  it('a restart whose write failed is repaired with its comment, and a repeated repair posts it once', async () => {
+    const h = await harness()
+    const c = await h.addCard('triage')
+    h.github.failWrites = 1
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.github.comments).toEqual([])
+
+    // The first repair lands, comment included, but its response is lost, so the next tick repairs again.
+    h.github.lostAcks = 1
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', controlWrittenVersion: 0n })
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', controlWrittenVersion: 1n })
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'restarted via AgentConnect', key: `control:${c.id}:1` }
+    ])
+  })
+
+  it("a skip whose write failed is repaired with the actor's comment", async () => {
+    const h = await harness()
+    const c = await h.addCard('ready')
+    h.github.failWrites = 1
+    expect((await h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.github.comments).toEqual([])
+
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'archived', controlWrittenVersion: 1n })
+    expect(h.github.issues.get(c.issueNumber)).toMatchObject({ state: 'closed', stateReason: 'not_planned' })
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'skipped by @maintainer via AgentConnect', key: `control:${c.id}:1` }
+    ])
+  })
+
+  it('a control write that landed but lost its response is repaired without a second comment', async () => {
+    const h = await harness()
+    const c = await h.addCard('triage')
+    h.github.lostAcks = 1
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ controlWrittenVersion: 0n })
+
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', controlWrittenVersion: 1n })
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'restarted via AgentConnect', key: `control:${c.id}:1` }
+    ])
+  })
+})
+
+describe('598: a write claim re-validates the open card-branch PR a restart dropped (real Postgres)', () => {
+  async function restartedWithOpenPr() {
+    const h = await harness()
+    const c = await h.addCard('ready')
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { mode: 'write' } })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => d.attempt)).toEqual([1])
+    // The revoked run opened #12 but never reported it, so the restart (no linked PR) names nothing; a fork's PR is not ours.
+    h.prs.pulls.push(cardPr(11, c.issueNumber, T0 + 20_000, { headRepoId: REPO_ID + 1n }))
+    h.prs.pulls.push(cardPr(12, c.issueNumber, T0 + 30_000))
+    h.clock.advance(60_000)
+    return { h, c }
+  }
+
+  it('a restart that could not name the open card-branch PR has the next write claim name it for closing', async () => {
+    const { h, c } = await restartedWithOpenPr()
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => [d.attempt, d.supersededPrNumber])).toEqual([
+      [1, undefined],
+      [2, 12]
+    ])
+  })
+
+  it('a restart during the head-branch lookup fences the old claim before sending its close target', async () => {
+    const { h, c } = await restartedWithOpenPr()
+    let enter!: () => void
+    let resume!: () => void
+    const entered = new Promise<void>((resolve) => (enter = resolve))
+    const held = new Promise<void>((resolve) => (resume = resolve))
+    const list = h.prs.listOpenPullRequestsByHead.bind(h.prs)
+    vi.spyOn(h.prs, 'listOpenPullRequestsByHead').mockImplementationOnce(async (...args) => {
+      enter()
+      await held
+      return list(...args)
+    })
+    try {
+      expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+      await entered
+      h.clock.advance(1_000)
+      expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    } finally {
+      resume()
+    }
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => [d.attempt, d.supersededPrNumber])).toEqual([
+      [1, undefined],
+      [3, 12]
+    ])
+    expect(await prisma.kanbanRun.findFirstOrThrow({ where: { cardId: c.id, attempt: 2 } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'restarted'
+    })
+  })
+
+  it('a failed card-branch PR lookup ends the claim as transient, and the retry names the PR', async () => {
+    const { h, c } = await restartedWithOpenPr()
+    h.prs.failReads = 1
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.sent).toHaveLength(1)
+    const failed = await prisma.kanbanRun.findFirstOrThrow({ where: { cardId: c.id, attempt: 2 } })
+    expect(failed).toMatchObject({ outcome: 'transient', reasonCode: 'github_read_failed' })
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', consecutiveFailures: 0 })
+
+    h.clock.advance(61_000)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => [d.attempt, d.supersededPrNumber])).toEqual([
+      [1, undefined],
+      [3, 12]
+    ])
+  })
+
+  it('an open card-branch PR the current episode opened is never named, since it can still bind', async () => {
+    const h = await harness()
+    const c = await h.addCard('ready')
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { mode: 'write' } })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    h.prs.pulls.push(cardPr(12, c.issueNumber, T0 + 30_000))
+    const first = h.sent[0]!.d
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(first, { outcome: 'transient' }))).accepted).toBe(true)
+    await h.dispatcher.settle()
+    h.clock.advance(61_000)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.prs.lookups).toBe(1)
+    expect(h.sent.map(({ d }) => [d.attempt, d.supersededPrNumber])).toEqual([
+      [1, undefined],
+      [2, undefined]
+    ])
   })
 })

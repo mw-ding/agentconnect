@@ -1938,6 +1938,7 @@ export function buildContainer(
               }
             }
           : {}),
+        ...(kanbanPrReader ? { prs: kanbanPrReader } : {}),
         contracts: {
           sweep: async (boardId): Promise<void> => kanbanPrContracts?.sweep(boardId),
           onReview: async (cardId): Promise<unknown> => kanbanPrContracts?.onVerified(cardId)

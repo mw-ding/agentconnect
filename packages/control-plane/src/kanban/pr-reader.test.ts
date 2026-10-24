@@ -89,6 +89,38 @@ describe('GithubPrReader', () => {
     expect(await h.reader.readPullRequest(REPO, 13)).toBeNull()
   })
 
+  it('598: lists the open PRs from one head branch of this repository, without a default-branch read', async () => {
+    const h = harness({
+      '/repositories/42/pulls': () => ({
+        status: 200,
+        body: [
+          { number: 12, state: 'open', title: 'secret', ...PR_FIELDS },
+          { number: 13, state: 'open', ...PR_FIELDS, head: { ...PR_FIELDS.head, ref: 'ac/card-70' } }
+        ]
+      })
+    })
+    expect(await h.reader.listOpenPullRequestsByHead(REPO, 'ac/card-7')).toEqual([
+      {
+        number: 12,
+        state: 'open',
+        merged: false,
+        headSha: SHA,
+        authorLogin: 'agentconnect[bot]',
+        authorType: 'Bot',
+        headRef: 'ac/card-7',
+        headRepoId: 42n,
+        baseRef: 'main',
+        defaultBranch: null,
+        createdAt: new Date(PR_FIELDS.created_at),
+        mergedByLogin: null
+      }
+    ])
+    expect(h.urls.map((u) => [u.pathname, u.searchParams.get('state'), u.searchParams.get('head')])).toEqual([
+      ['/repositories/42/pulls', 'open', 'acme:ac/card-7']
+    ])
+    expect(h.mintKanbanPr).toHaveBeenCalledWith(9n, 'acme/web', 42n)
+  })
+
   it('rethrows a non-404 failure so the doorbell stays unlanded', async () => {
     const h = harness({ '/repositories/42/pulls/12': () => ({ status: 502, body: {} }) })
     await expect(h.reader.readPullRequest(REPO, 12)).rejects.toThrow()

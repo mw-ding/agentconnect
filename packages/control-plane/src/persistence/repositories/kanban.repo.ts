@@ -1035,7 +1035,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         repoFullName: row.repoFullName,
         supersededPrNumber: null,
         controlVersion: row.controlVersion,
-        stateRevision: row.stateRevision
+        stateRevision: row.stateRevision,
+        controlAt: new Date()
       }
       // A repeated skip is idempotent: an archived card holds no lease, so there is nothing to revoke, move, audit or write.
       if (to === 'archived' && row.status === 'archived')
@@ -1089,12 +1090,17 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           ? row.linkedPrNumber
           : null
       const controlVersion = row.controlVersion + 1n
+      const controlAt = new Date()
       // CAS under the row lock: the version this move commits is the one its GitHub write must still match.
       const { count } = await tx.kanbanCard.updateMany({
         where: { id: row.id, controlVersion: row.controlVersion },
         data: {
           status: to,
           controlVersion,
+          // The comment's facts ride with the version, so a label-sync repair re-posts the same keyed comment.
+          controlKind: source,
+          controlActorLogin: source === 'skip' ? (input.actorLogin ?? null) : null,
+          controlAt,
           stateRevision: { increment: 1 },
           dispatchRevision: { increment: 1 },
           githubSyncedAt: new Date(),
@@ -1152,7 +1158,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           revokedLease: open ?? null,
           supersededPrNumber: superseded,
           controlVersion,
-          stateRevision: row.stateRevision + 1n
+          stateRevision: row.stateRevision + 1n,
+          controlAt
         }
       }
     })

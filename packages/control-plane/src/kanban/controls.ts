@@ -9,7 +9,7 @@ import type {
   KanbanCardControlResult,
   KanbanBoardView
 } from '../persistence/ports.js'
-import { planStatusWrite, type KanbanStatus } from './card-state.js'
+import { planStatusWrite, type KanbanStatus, type LabelPlan } from './card-state.js'
 import type { CardStore, KanbanRepoRef } from './card-store.js'
 import type { KanbanProjectHook } from './project-writer.js'
 import type { PrReader } from './pr-reader.js'
@@ -25,6 +25,29 @@ export function restartComment(issueNumber: number, supersededPrNumber: number |
     `restarted via AgentConnect; pull request #${supersededPrNumber} from the earlier work can no longer complete ` +
     `this card, and the next run replaces it with a new one from \`ac/card-${issueNumber}\``
   )
+}
+
+/** The facts a control's comment is rendered from, stored on the card so the label sync's repair can re-post it. */
+export interface ControlCommentFacts {
+  cardId: string
+  issueNumber: number
+  controlVersion: bigint
+  kind: 'skip' | 'restart'
+  actorLogin: string | null
+  supersededPrNumber: number | null
+  at: Date
+}
+
+// One key per control version: the control's own write and any repair post the comment at most once between them.
+export function controlComment(facts: ControlCommentFacts): Pick<LabelPlan, 'comment' | 'commentKey' | 'commentSince'> {
+  return {
+    comment:
+      facts.kind === 'skip'
+        ? skipComment(facts.actorLogin)
+        : restartComment(facts.issueNumber, facts.supersededPrNumber),
+    commentKey: `control:${facts.cardId}:${facts.controlVersion}`,
+    commentSince: facts.at
+  }
 }
 
 // Only this repository's open, unmerged PR from the card's own `ac/card-<n>` may be named for closing.
@@ -81,14 +104,14 @@ export class KanbanControls {
 
   async skip(orgId: string, boardId: string, cardId: string, userId: string): Promise<KanbanCardControlResult> {
     const store = this.cardStore()
+    // Resolved before the move, so the login is stored with the control for a repair to re-post.
+    const login = this.deps.resolveLogin ? await this.deps.resolveLogin(userId).catch(() => null) : null
     return this.control(
       boardId,
       cardId,
-      () => this.deps.cards.skipCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner' }),
-      async (card) => {
-        const login = this.deps.resolveLogin ? await this.deps.resolveLogin(userId).catch(() => null) : null
-        await this.writeIssue(store, card, 'archived', skipComment(login))
-      }
+      () =>
+        this.deps.cards.skipCard({ orgId, boardId, cardId, actorUserId: userId, source: 'owner', actorLogin: login }),
+      (card) => this.writeIssue(store, card, 'archived', controlComment(commentFacts(card, 'skip', login)))
     )
   }
 
@@ -107,7 +130,7 @@ export class KanbanControls {
           source: 'owner',
           validatedPrNumber
         }),
-      (card) => this.writeIssue(store, card, 'ready', restartComment(card.issueNumber, card.supersededPrNumber))
+      (card) => this.writeIssue(store, card, 'ready', controlComment(commentFacts(card, 'restart', null)))
     )
     if (result.ok && result.value.changed) this.deps.poke(boardId)
     return result
@@ -204,7 +227,7 @@ export class KanbanControls {
     store: NonNullable<KanbanControlsDeps['store']>,
     card: KanbanCardControlOutcome,
     status: KanbanStatus,
-    comment: string
+    comment: Pick<LabelPlan, 'comment' | 'commentKey' | 'commentSince'>
   ): Promise<void> {
     const repo = await this.repoRef(card)
     if (!repo) throw new Error('kanban control write has no live installation')
@@ -213,7 +236,7 @@ export class KanbanControls {
     if (!(await this.deps.cards.isLatestControl(card.cardId, card.controlVersion))) return
     await store.applyPlan(repo, card.issueNumber, observed, {
       ...planStatusWrite(status, observed),
-      comment
+      ...comment
     })
   }
 
@@ -225,5 +248,21 @@ export class KanbanControls {
     const installation = await this.deps.installations.liveByOrgAndAccount(card.orgId, owner)
     if (!installation || installation.revokedAt || installation.suspendedAt) return null
     return { installationId: installation.installationId, repoId: card.repoId, repoFullName: card.repoFullName }
+  }
+}
+
+function commentFacts(
+  card: KanbanCardControlOutcome,
+  kind: ControlCommentFacts['kind'],
+  actorLogin: string | null
+): ControlCommentFacts {
+  return {
+    cardId: card.cardId,
+    issueNumber: card.issueNumber,
+    controlVersion: card.controlVersion,
+    kind,
+    actorLogin,
+    supersededPrNumber: card.supersededPrNumber,
+    at: card.controlAt
   }
 }

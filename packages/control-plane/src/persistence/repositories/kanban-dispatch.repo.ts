@@ -101,6 +101,7 @@ interface CandidateRow {
   epicCardId: string | null
   workEpisodeStartedAt: Date | null
   supersededPrNumber: number | null
+  linkedPrNumber: number | null
 }
 
 interface RunEndRow {
@@ -226,7 +227,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         const candidates: CandidateRow[] = await tx.$queryRaw<CandidateRow[]>(Prisma.sql`
         SELECT c."id", c."issueNumber", c."mode", c."priority", c."createdAt",
                CASE WHEN c."status" = 'review' THEN ${board.verifierAgentId}::uuid ELSE c."assigneeAgentId" END AS "agentId",
-               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt", c."supersededPrNumber",
+               a."daemonId", d."sessionEpoch", c."assigneeAgentId", c."epicCardId", c."workEpisodeStartedAt", c."supersededPrNumber", c."linkedPrNumber",
                CASE WHEN c."status" = 'review' THEN 'verify'::"KanbanRunRole" ELSE 'work'::"KanbanRunRole" END AS "role",
                EXISTS (SELECT 1 FROM "kanban_run" w
                  WHERE w."cardId" = c."id" AND w."role" = 'work' AND w."agentId" = ${board.verifierAgentId}::uuid
@@ -367,6 +368,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
             // Trusted dispatch data: only a write-mode work run may be told to close the restart's validated PR.
             ...(card.role === 'work' && mode === 'write' && card.supersededPrNumber !== null
               ? { supersededPrNumber: card.supersededPrNumber }
+              : {}),
+            // No close target and no linked PR after an earlier run: the dispatcher re-validates the card branch's open PR.
+            ...(card.role === 'work' &&
+            mode === 'write' &&
+            card.supersededPrNumber === null &&
+            card.linkedPrNumber === null &&
+            attempt > 1
+              ? { staleCardPrBefore: card.workEpisodeStartedAt ?? opts.now }
               : {})
           })
           perAgent.set(card.agentId, (perAgent.get(card.agentId) ?? 0) + 1)

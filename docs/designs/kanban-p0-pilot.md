@@ -567,9 +567,13 @@ Skip/restart CAS a per-card control version in their move transaction. Queued
 GitHub writes drop superseded versions. SQL, pure and explain claims exclude
 pending label/control writes. A failed acknowledged restart remains ready and
 unclaimable until the existing label sync reopens the issue and writes ready;
-skip repair closes and archives. The repair posts no control comment (#590). A
-deleted or transferred issue never takes the write, so its card stays unclaimable
-until a human resolves it; the claim explanation says so. Sync and dispatch projections share the
+skip repair closes and archives. Every control write and repair uses the same
+`control:<cardId>:<controlVersion>` comment key, with the control's commit time as
+the marker search cutoff. Stored kind, actor login and commit time let repair
+reconstruct the body-free comment; repeated repair and lost write responses do
+not duplicate it (#598). Controls committed before that additive migration lack
+these facts, so their repair still writes status alone. A deleted or transferred
+issue never takes the write, so its card stays unclaimable until a human resolves it; the claim explanation says so. Sync and dispatch projections share the
 in-process status queue. Multiple CP processes still lack a shared write queue.
 Skip clears promotion intent. Without a GitHub card store, pause/resume work
 and skip/restart answer `404 kanban controls unavailable`.
@@ -583,13 +587,18 @@ the episode binding with `pr_unbound`. The close target is spent once a work run
 reports `completed` or `review_requested`, or binds a PR; a failed run's retry
 keeps it, and a reopen from `done`/`archived` clears it with the episode.
 
-Known gap (#590): restart keeps `ac/card-<n>`, so a still-open PR from that branch
-which restart could not validate (the PR read failed, no PR reader is configured,
-or the revoked run opened it without reporting) blocks a second PR from the branch
-and can never bind, because it predates the new episode. The card then waits in
-`review` flagged `pr_unbound` until a human closes or merges that PR and moves the
-card. Re-validating at claim time needs a PR lookup by head branch that the
-read-only PR reader does not have, so it is not done.
+Recovered gap (#590, completed by #598): restart keeps `ac/card-<n>`. Before
+sending a later write-mode work claim with no linked PR or stored close target,
+the dispatcher looks up open PRs by that head branch with the read-only PR token.
+It names a single same-repository, open, unmerged PR created before this work
+episode for closing, even if restart's read failed or the revoked run never
+reported it. A PR from the current episode stays eligible to bind and is never
+named. Lookup failure ends the claim as a non-counting transient for retry; the
+lease is checked again before dispatch. This adds one bounded list request on
+such claims and no PR-number migration. An absent reader or ambiguous matches
+still require human recovery. This does not change the asynchronous run-end
+contract recheck or its race with verifier claiming (#600/#601); episode binding
+and completion fences remain in force.
 
 Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.
 A daemon older than #416 reads CP frames tolerantly (`decodeCpEnvelope` strips
@@ -625,8 +634,17 @@ read-mode checkout safely switches to the requested card branch: it fetches
 origin's branch when present, otherwise starts from the default branch. The switch
 sets no upstream and writes no per-card fetch refspec (the worktree tier's config
 is the root's, shared by every worktree), and checks local-only commits with
-`rev-list --count`, so it runs on host Git and the sandboxed tier alike. Dirty,
-detached, locked and foreign-held state fails closed; local-only card commits
+`rev-list --count`, so it runs on host Git and the sandboxed tier alike. On
+reachable disk, card preparation also removes only older daemons' exact
+`+refs/heads/ac/card-<n>:refs/remotes/origin/ac/card-<n>` fetch entries and single
+`origin` / `refs/heads/ac/card-<n>` upstream pairs for those branches or the
+requested card. Wildcard, differently mapped and unforced refspecs, other
+remotes and custom upstreams stay intact. Cleanup runs before an already-on-card
+return and on fresh worktrees; shared root config is cleaned for all its
+worktrees. It is best effort, never resets commits, and skips off-disk shim
+repositories, where the old config writes were refused. Exact legacy-shaped
+user entries cannot be distinguished without historical ownership metadata.
+Dirty, detached, locked and foreign-held state fails closed; local-only card commits
 are never reset. Commits never pushed stay in the clone that made them.
 
 Known validation limits (M4 controls): the live suite uses GitHub scratch issues,

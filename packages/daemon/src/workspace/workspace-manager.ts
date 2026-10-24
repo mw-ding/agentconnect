@@ -306,6 +306,8 @@ const SESSION_BRANCH_DRAWS = 5
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/i
 /** The ref every review fetch writes and verifies, so probing this ONE answers "is this a daemon-owned review snapshot" without listing the ref root. */
 const reviewHeadRefFor = (id: string): string => `refs/agentconnect/reviews/${id}/head`
+// The exact per-card refspec an older daemon's checkout switch added to `remote.origin.fetch`; nothing else is ever removed.
+const LEGACY_CARD_REFSPEC = /^\+refs\/heads\/(ac\/card-[1-9][0-9]*):refs\/remotes\/origin\/\1$/
 
 /** Git this daemon runs on its own disk, with no plane between. */
 function hostGitRunner(cwd?: string, abort?: AbortSignal): GitRunner {
@@ -2404,6 +2406,7 @@ export class WorkspaceManager {
     const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
     // A fixed card branch is created from the root's default branch on first use and reused on later attempts.
     if (branch !== undefined) {
+      await this.dropLegacyCardConfig(agentId, root.path, branch)
       const exists = await localBranchExists(git(), branch)
       // Only a removed daemon session can release a card branch; an existing worktree may still be live.
       if (exists) await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
@@ -2421,6 +2424,52 @@ export class WorkspaceManager {
     const name = await this.drawSessionBranch(git(), initiatedBy)
     // No upstream: the console's push authorization must never treat the base branch as the session's target.
     await git().raw(['worktree', 'add', '-b', name, '--no-track', cwd, target])
+  }
+
+  /** Undo exactly what an older daemon's switch wrote: per-card fetch refspecs and this card branch's `--track` upstream to its origin twin. */
+  private async dropLegacyCardConfig(agentId: string, repository: string, branch: string): Promise<void> {
+    if (!/^ac\/card-[1-9][0-9]*$/.test(branch)) return
+    // Old shim runners could not write this config; clean reachable disk directly, including a host checkout now used by a sandbox.
+    if (this.offDisk({ agentId, path: repository })) return
+    const git = () => hostGitRunner(repository).withEnv(workspaceGitLocalEnv())
+    const values = async (key: string): Promise<string[]> => {
+      const listed = await git()
+        .raw(['config', '--local', '--get-all', key])
+        .catch((err: unknown) => {
+          if (err instanceof GitExecError && err.code === 1) return ''
+          throw err
+        })
+      return listed.split('\n').filter((line) => line !== '')
+    }
+    try {
+      const branches = new Set([branch])
+      for (const refspec of new Set(await values('remote.origin.fetch'))) {
+        const match = LEGACY_CARD_REFSPEC.exec(refspec)
+        if (!match) continue
+        branches.add(match[1]!)
+        await git().raw(['config', '--local', '--fixed-value', '--unset-all', 'remote.origin.fetch', refspec])
+      }
+      for (const name of branches) {
+        const remote = await values(`branch.${name}.remote`)
+        const merge = await values(`branch.${name}.merge`)
+        if (remote.length === 1 && remote[0] === 'origin' && merge.length === 1 && merge[0] === `refs/heads/${name}`) {
+          await git().raw(['config', '--local', '--fixed-value', '--unset-all', `branch.${name}.remote`, 'origin'])
+          await git().raw([
+            'config',
+            '--local',
+            '--fixed-value',
+            '--unset-all',
+            `branch.${name}.merge`,
+            `refs/heads/${name}`
+          ])
+        }
+      }
+    } catch (err) {
+      // Best-effort: leftover config is what an older daemon already left, never a reason to fail the card's workspace.
+      workspaceLog.warn(
+        `workspace: could not drop an older daemon's ${branch} config in ${repository} (${formatErr(err)})`
+      )
+    }
   }
 
   /** Refuse a card branch a live, locked or foreign worktree holds; release only a proven removed managed registration. */
@@ -2459,10 +2508,11 @@ export class WorkspaceManager {
     branch: string,
     tier: 'worktree' | 'clone'
   ): Promise<void> {
-    const git = () =>
-      this.runnerFor(agentId, cwd).withEnv(
-        tier === 'clone' ? this.sessionCloneGitEnv(agentId, root, cwd) : workspaceGitLocalEnv()
-      )
+    const env = () => (tier === 'clone' ? this.sessionCloneGitEnv(agentId, root, cwd) : workspaceGitLocalEnv())
+    const git = () => this.runnerFor(agentId, cwd).withEnv(env())
+    const repository = tier === 'clone' ? cwd : root.path
+    // Before the early return, so a checkout an older daemon left on its card branch is cleaned too.
+    await this.dropLegacyCardConfig(agentId, repository, branch)
     const head = (
       await git()
         .raw(['symbolic-ref', '--quiet', 'HEAD'])
@@ -2482,7 +2532,6 @@ export class WorkspaceManager {
     if ((await git().raw(['status', '--porcelain'])).trim() !== '') {
       throw new Error(`session checkout has uncommitted or untracked changes; refusing to switch it to ${branch}`)
     }
-    const repository = tier === 'clone' ? cwd : root.path
     const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
     const exists = await localBranchExists(git(), branch)
     if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)

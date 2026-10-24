@@ -15,7 +15,7 @@ import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanNotifier } from '../../src/kanban/notifier-sender.js'
 import { KanbanPrContracts } from '../../src/kanban/pr-contracts.js'
 import type { LivePullRequest } from '../../src/kanban/contracts.js'
-import type { PrReader } from '../../src/kanban/pr-reader.js'
+import type { PrReader as GithubPrReads } from '../../src/kanban/pr-reader.js'
 import type {
   CardGraph,
   CardIssue,
@@ -25,6 +25,9 @@ import type {
 } from '../../src/kanban/card-store.js'
 import type { LabelPlan, ObservedIssue } from '../../src/kanban/card-state.js'
 import { OrgId } from '../../src/domain/ids.js'
+
+// The completion contracts read a PR and its checks; nothing here looks one up by head branch.
+type PrReader = Pick<GithubPrReads, 'readPullRequest' | 'readCheckRuns'>
 
 const D1 = 'd1111111-1111-4111-8111-111111111111'
 const D2 = 'd2222222-2222-4222-8222-222222222222'

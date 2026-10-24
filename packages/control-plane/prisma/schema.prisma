@@ -2652,6 +2652,10 @@ model KanbanCard {
   controlWrittenVersion BigInt @default(0)
   // A restart's superseded PR, validated open on this card's `ac/card-<n>` in this repo; the next write run is told to close it.
   supersededPrNumber    Int?
+  // The latest control's comment facts (skip | restart, the skip's actor login, commit time), so a label-sync repair re-posts its keyed comment.
+  controlKind           String?
+  controlActorLogin     String?
+  controlAt             DateTime? @db.Timestamptz(6)
   syncEventCursor BigInt @default(0)
   syncAgentCursor BigInt @default(0)
   syncCheckedAt DateTime? @db.Timestamptz(6)
