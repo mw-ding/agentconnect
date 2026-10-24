@@ -597,9 +597,11 @@ named. Lookup failure ends the claim as a non-counting transient for retry; the
 lease is checked again before dispatch. This adds one bounded list request on
 such claims and no PR-number migration. An absent reader or ambiguous matches
 still require human recovery. Episode binding and completion fences remain in
-force. The run-end contract re-check now runs before the status label write that
-makes the card claimable, so it no longer races verifier claiming (#600/#601,
-fixed by #602).
+force. Within the CP process that ended a run, its contract re-check now holds the
+card's claim until the re-check settles, so a verify or rework claim there cannot
+start before a `pr_unbound` flag lands (#600/#601, fixed by #602). Another replica, or
+a restart before the re-check settles, can still race it and fail closed; see
+[kanban-lane3-api.md](kanban-lane3-api.md) for the bounds.
 
 Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.
 A daemon older than #416 reads CP frames tolerantly (`decodeCpEnvelope` strips

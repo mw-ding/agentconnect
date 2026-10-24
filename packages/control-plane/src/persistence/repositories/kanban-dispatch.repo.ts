@@ -268,6 +268,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
         cursor = candidates.at(-1)
         for (const card of candidates) {
           if (claimed.length >= room || inProgress >= board.maxInProgress) break
+          if (opts.skipCard?.(card.id)) continue
           if ((perAgent.get(card.agentId) ?? 0) >= board.maxInProgressPerAgent) continue
           if (!opts.isDaemonLive(card.daemonId)) continue
           // B2 maxActive: a child waits while its epic already has enough open runs.

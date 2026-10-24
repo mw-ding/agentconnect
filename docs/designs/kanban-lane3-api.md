@@ -397,11 +397,17 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
     judged there: an unbound linked PR is flagged `pr_unbound` once, in that status,
     with the same CAS and one comment naming it; nothing settles outside `review`.
   - the dispatcher tick's bounded sweep: 25 cards per board, with a cursor.
-- A run end's status label write, which clears `labelWritePending` (the claim's last
-  gate), waits until its own re-check has finished (#602). So no verify or rework claim
-  in this CP process can take the card before its flag lands. A CP restart in between, or
-  a sync repair of the label during the re-check, falls back to the tick, whose sweep
-  runs before its claim. Both paths still fail closed.
+- A run end's re-check holds its card's claim in the CP process that ended the run
+  (#602). From the run end's commit until the re-check settles, every claim in that
+  process skips the card, even when another sync's label ack has already cleared
+  `labelWritePending`. A claim skipped this way is retried as soon as the hold lifts. The
+  run end's own status label write also waits for the re-check. The hold is in memory and
+  lapses after 5 minutes; the re-check's GitHub reads time out long before that. A re-check
+  that fails lifts the hold without a flag.
+- Nothing holds the card in another CP replica, or after a CP restart before the re-check
+  settles. A claim there can still start a run before the flag lands. That fails closed:
+  nothing completes on an unbound PR, and the run's own end re-checks it. The 60s tick's
+  sweep flags `review` cards before its claim; `ready` and `triage` cards are not swept.
 
 ### Deploy order
 

@@ -101,6 +101,8 @@ const RECOVERY_BATCH = 25
 /** A pending promotion still unresolved after this many reads, or this long, escalates to a human. */
 export const MAX_PROMOTION_CHECKS = 12
 export const MAX_PROMOTION_AGE_MS = 6 * 60 * 60_000
+/** A pending run-end contract re-check holds its card's claim at most this long; its GitHub reads time out far sooner. */
+export const RECHECK_HOLD_MS = 5 * 60_000
 
 /** Why recovery gave a pending promotion up to a human. */
 export type PromotionAttention = 'unattributed' | 'unexpected_labels' | 'blockers_reopened' | 'unresolved'
@@ -158,6 +160,8 @@ export class KanbanDispatcher {
   private readonly recoveryDue = new Set<string>()
   private readonly background = new Set<Promise<unknown>>()
   private readonly statusWrites = new Map<string, Promise<void>>()
+  private readonly rechecks = new Map<string, { since: number }>()
+  private readonly recheckSkipped = new Set<string>()
 
   constructor(private readonly deps: KanbanDispatcherDeps) {}
 
@@ -250,6 +254,7 @@ export class KanbanDispatcher {
     const result = await this.deps.repo.claim(boardId, {
       now: await this.deps.repo.now(),
       isDaemonLive: (id) => this.deps.isDaemonLive(id),
+      skipCard: (cardId) => this.recheckHolds(cardId),
       ...(this.deps.maxPerDaemon !== undefined ? { maxPerDaemon: this.deps.maxPerDaemon } : {})
     })
     await Promise.allSettled([
@@ -690,7 +695,7 @@ export class KanbanDispatcher {
     const recheck = this.recheckContract(card)
     if (card.from !== card.to) {
       const repo = await this.repoRef(card)
-      // The status write clears the claim's last gate, so it waits for the re-check: no claim beats its flag (#602).
+      // The status write also waits for the re-check, so its own ack never frees the card ahead of the flag (#602).
       if (repo) this.writeStatus(card, repo, card.to, undefined, recheck)
     }
     return result
@@ -699,6 +704,7 @@ export class KanbanDispatcher {
   // In review, or moved from review to ready/triage, where a verdict must not carry an unbound PR back to work unflagged.
   private recheckContract(card: {
     cardId: string
+    boardId: string
     from: KanbanStatus
     to: KanbanStatus
   }): Promise<unknown> | undefined {
@@ -707,11 +713,26 @@ export class KanbanDispatcher {
     const { cardId } = card
     const leftReview = card.from === 'review' && (card.to === 'ready' || card.to === 'triage')
     if (card.to !== 'review' && !(leftReview && contracts.onLeftReview)) return undefined
+    const hold = { since: this.deps.clock.now() }
     const task: Promise<unknown> = (leftReview ? contracts.onLeftReview!(cardId) : contracts.onReview(cardId))
       .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
-      .finally(() => this.background.delete(task))
+      .finally(() => {
+        this.background.delete(task)
+        if (this.rechecks.get(cardId) === hold) this.rechecks.delete(cardId)
+        // A claim skipped the card while it was held: retry it now rather than on the next event.
+        if (this.recheckSkipped.delete(cardId)) this.poke(card.boardId)
+      })
+    // Held from the commit, so no claim here takes the card before its flag, whichever sync acks its label first (#602).
+    this.rechecks.set(cardId, hold)
     this.background.add(task)
     return task
+  }
+
+  private recheckHolds(cardId: string): boolean {
+    const hold = this.rechecks.get(cardId)
+    if (!hold || this.deps.clock.now() - hold.since >= RECHECK_HOLD_MS) return false
+    this.recheckSkipped.add(cardId)
+    return true
   }
 
   /** Best-effort label write after the CP state committed, once `after` settles; a failure leaves drift for the reconciler. */

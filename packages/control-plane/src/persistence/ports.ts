@@ -8021,6 +8021,8 @@ export interface KanbanClaimOpts {
   isDaemonLive(daemonId: string): boolean
   /** Per-daemon cap across all boards (audit 2.2); absent means uncapped. */
   maxPerDaemon?: number
+  /** In-process hold checked before every other per-card gate: true skips the card (a pending contract re-check, #602). */
+  skipCard?(cardId: string): boolean
 }
 
 /** What a daemon-originated write must echo to pass the lease fence. */
