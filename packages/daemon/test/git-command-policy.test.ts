@@ -66,6 +66,7 @@ describe('admitted near-misses the daemon sends', () => {
     [['push', '--no-verify', 'origin', 'refs/heads/a:refs/heads/a']],
     [['commit', '--no-gpg-sign', '--cleanup=verbatim', '-m', 'x']],
     [['checkout', '--no-track', '-B', 'b', 'refs/remotes/origin/b']],
+    [['checkout', '--no-overwrite-ignore', '-b', 'ac/card-7', '--no-track', 'refs/remotes/origin/main']],
     [['config', '--replace-all', 'credential.https://github.com.helper', '']],
     [['config', '--add', 'credential.https://github.com.helper', "!'/opt/agentconnect/helper' agent-abc"]],
     [['diff', '--no-ext-diff', '--no-textconv', '--no-color']],

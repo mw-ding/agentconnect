@@ -10,6 +10,7 @@ import { PgKanbanBoardRepo, PgKanbanCardRepo } from '../../src/persistence/repos
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { KanbanGraphReconciler } from '../../src/kanban/graph-reconciler.js'
 import { KanbanControls } from '../../src/kanban/controls.js'
+import { applyCardTransition } from '../../src/kanban/audit.js'
 import type {
   CardGraph,
   CardIssue,
@@ -333,6 +334,19 @@ describe('Kanban M4 controls — skip (real Postgres)', () => {
     )
     expect((await h.card(dependent.id)).status).toBe('todo')
     expect(h.store.writes.filter((w) => w.status === 'ready')).toEqual([])
+  })
+
+  it('590: restart refuses a todo card, so it never jumps its blockers', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:todo'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'todo' } })
+    expect(await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).toEqual({
+      ok: false,
+      reason: 'illegal_transition'
+    })
+    expect(await h.card(c.id)).toMatchObject({ status: 'todo', controlVersion: 0n, labelWritePending: false })
+    expect(h.store.writes).toEqual([])
+    expect(await prisma.auditEvent.count({ where: { kind: 'card_restarted' } })).toBe(0)
   })
 
   it('416c: refuses a card not on the board and a transition that is not allowed', async () => {
@@ -992,6 +1006,111 @@ describe('416r3: versioned controls and restart recovery', () => {
     await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
     await h.dispatcher.settle()
     expect(h.sent[0]!.d).toMatchObject({ supersededPrNumber: 21, mode: 'write' })
+  })
+
+  it.each([
+    ['clears its own owed write', false],
+    ['keeps the write a later move still owes', true]
+  ] as const)('590: recording a control write %s', async (_name, movedOn) => {
+    await harness()
+    const c = await prisma.kanbanCard.create({
+      data: {
+        boardId: (await prisma.kanbanBoard.findFirstOrThrow()).id,
+        issueId: 9n,
+        issueNumber: 9,
+        status: 'triage',
+        assigneeAgentId: A1
+      }
+    })
+    const cards = new PgKanbanCardRepo(prisma)
+    const input = {
+      orgId: DEFAULT_ORG_ID,
+      boardId: c.boardId,
+      cardId: c.id,
+      actorUserId: DEFAULT_OWNER_ID,
+      source: 'owner'
+    }
+    const result = await cards.restartCard(input)
+    if (!result.ok) throw new Error('restart refused')
+    // Another committed move in the commit→write window owes its own label write.
+    if (movedOn) await prisma.kanbanCard.update({ where: { id: c.id }, data: { stateRevision: { increment: 1 } } })
+    expect(await cards.markControlWritten(c.id, result.value.controlVersion, result.value.stateRevision)).toBe(true)
+    expect(await prisma.kanbanCard.findUniqueOrThrow({ where: { id: c.id } })).toMatchObject({
+      controlWrittenVersion: result.value.controlVersion,
+      labelWritePending: movedOn
+    })
+  })
+
+  it('590: the first accepted report clears the close target, so a rework claim never repeats it', async () => {
+    const h = await harness({ completionContract: 'pr_merged' })
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { defaultMode: 'write' } })
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    const first = h.sent[0]!.d
+    expect(first).toMatchObject({ supersededPrNumber: 21 })
+    // Run 1 closed #21 and opened #22 from the same card branch.
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(first, { prNumber: 22 }))).accepted).toBe(true)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', linkedPrNumber: 22, supersededPrNumber: null })
+    // A rework move (review→ready) dispatches write work again, with no stale close instruction.
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'ready', labelWritePending: false } })
+    h.store.issues.set(c.issueNumber, { labels: ['ac/status:ready'], state: 'open', stateReason: null })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent).toHaveLength(2)
+    expect(h.sent[1]!.d).toMatchObject({ cardId: c.id, mode: 'write' })
+    expect(h.sent[1]!.d).not.toHaveProperty('supersededPrNumber')
+  })
+
+  it('590: a failed run keeps the close target for the retry', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { defaultMode: 'write' } })
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    const first = h.sent[0]!.d
+    expect((await h.dispatcher.onReport(D1, 4, h.reportFor(first, { outcome: 'failed' }))).accepted).toBe(true)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', supersededPrNumber: 21 })
+  })
+
+  it('590: a done→ready reopen starts a new episode without the old close target', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanBoard.update({ where: { id: h.board.id }, data: { defaultMode: 'write' } })
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    expect((await h.card(c.id)).supersededPrNumber).toBe(21)
+    // A human closes the card before any run reports, then reopens it.
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'done' } })
+    expect(await applyCardTransition(prisma, { id: c.id }, { status: 'ready' }, 'human')).toBe(true)
+    expect((await h.card(c.id)).supersededPrNumber).toBeNull()
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { labelWritePending: false } })
+    h.store.issues.set(c.issueNumber, { labels: ['ac/status:ready'], state: 'open', stateReason: null })
+    await h.controls.resume(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]!.d).toMatchObject({ cardId: c.id, mode: 'write' })
+    expect(h.sent[0]!.d).not.toHaveProperty('supersededPrNumber')
+  })
+
+  it('590: a repeated restart of the reset card keeps its close target', async () => {
+    const h = await harness()
+    const c = await h.addCard(['ac/status:review'])
+    await prisma.kanbanCard.update({ where: { id: c.id }, data: { status: 'review', linkedPrNumber: 21 } })
+    await h.controls.pause(DEFAULT_ORG_ID, h.board.id, DEFAULT_OWNER_ID)
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    const once = await h.card(c.id)
+    await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ supersededPrNumber: 21, controlVersion: once.controlVersion })
   })
 })
 

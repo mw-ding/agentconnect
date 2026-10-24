@@ -61,9 +61,9 @@ import {
   type GitCredRepository,
   type ManagedCredentialScope
 } from './git-injection.js'
+import { GitExecError } from './command-git-runner.js'
 import { GitTransportError, LocalGitRunner, type GitCloneOutput, type GitRunner } from './git-runner.js'
 import { cloneFromBundle, type BundleFallbackReason, type BundledCloneReport } from './bundled-clone.js'
-import { policyRefusalOf } from './git-command-policy.js'
 import type { SourceCacheShape } from '../source-cache/keys.js'
 import type { SourceCacheWorkspaceReader, WorkspaceCachePlan } from '../source-cache/read-plan.js'
 import type { SourceCacheWriteRequest, SourceCacheWriter } from '../source-cache/write-back.js'
@@ -310,6 +310,16 @@ const reviewHeadRefFor = (id: string): string => `refs/agentconnect/reviews/${id
 /** Git this daemon runs on its own disk, with no plane between. */
 function hostGitRunner(cwd?: string, abort?: AbortSignal): GitRunner {
   return new LocalGitRunner(gitFor(cwd, abort), cwd, (env) => gitFor(cwd, abort, env))
+}
+
+/** Whether `refs/heads/<branch>` is listed; a failed probe throws, but a silent miss can hide an unreadable ref, so callers create without force. */
+async function localBranchExists(git: GitRunner, branch: string): Promise<boolean> {
+  const ref = `refs/heads/${branch}`
+  const listed = await git.raw(['show-ref', ref]).catch((err: unknown) => {
+    if (err instanceof GitExecError && err.code === 1 && `${err.stdout}${err.stderr}`.trim() === '') return ''
+    throw err
+  })
+  return listed.split('\n').some((line) => line.trimEnd().endsWith(` ${ref}`))
 }
 
 // Instance state, not module state: a process can hold more than one daemon (the test suite routinely does), and a k8s daemon and a local one place every scope differently.
@@ -2394,10 +2404,7 @@ export class WorkspaceManager {
     const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
     // A fixed card branch is created from the root's default branch on first use and reused on later attempts.
     if (branch !== undefined) {
-      const exists = await git()
-        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-        .then(() => true)
-        .catch(() => false)
+      const exists = await localBranchExists(git(), branch)
       // Only a removed daemon session can release a card branch; an existing worktree may still be live.
       if (exists) await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
       // A card branch pushed from another clone or daemon resumes from origin; no upstream, so a push never targets the default branch.
@@ -2475,62 +2482,17 @@ export class WorkspaceManager {
     if ((await git().raw(['status', '--porcelain'])).trim() !== '') {
       throw new Error(`session checkout has uncommitted or untracked changes; refusing to switch it to ${branch}`)
     }
-    // Full sandboxed switch support is #590; until then a policy refusal is reported as such, before the checkout moves.
-    const refuseIfPolicy = (args: string[], err: unknown): void => {
-      const refusal = policyRefusalOf(args, err)
-      if (refusal === undefined) return
-      throw new Error(
-        `switching an existing session checkout to ${branch} is not supported on the sandboxed tier: ` +
-          `the sandbox git policy refuses git ${args[0]} (${refusal})`
-      )
-    }
     const repository = tier === 'clone' ? cwd : root.path
     const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
-    const exists = await git()
-      .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-      .then(() => true)
-      .catch(() => false)
+    const exists = await localBranchExists(git(), branch)
     if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
     const start = remote ?? target
-    if (exists) {
-      const localTip = (await git().raw(['rev-parse', `refs/heads/${branch}`])).trim()
-      // Reset only when every local commit is reachable from the intended starting point.
-      const ancestry = ['merge-base', '--is-ancestor', localTip, start]
-      const retained = await git()
-        .raw(ancestry)
-        .then(
-          () => true,
-          (err: unknown) => {
-            refuseIfPolicy(ancestry, err)
-            return false
-          }
-        )
-      if (!retained) throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
+    // Reset only when every local commit is reachable from the start; rev-list, not merge-base, is what the sandbox admits.
+    if (exists && (await git().raw(['rev-list', '--count', `refs/heads/${branch}`, `^${start}`])).trim() !== '0') {
+      throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
     }
-    if (remote) {
-      // Exact-refspec fetches need a matching origin mapping before Git can configure branch tracking.
-      const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`
-      const mappings = await git()
-        .raw(['config', '--local', '--get-all', 'remote.origin.fetch'])
-        .catch(() => '')
-      if (!mappings.split('\n').includes(refspec)) {
-        const mapping = ['config', '--local', '--add', 'remote.origin.fetch', refspec]
-        await git()
-          .raw(mapping)
-          .catch((err: unknown) => {
-            refuseIfPolicy(mapping, err)
-            throw err
-          })
-      }
-    }
-    await git().raw([
-      'checkout',
-      '--no-overwrite-ignore',
-      '-B',
-      branch,
-      ...(remote ? ['--track'] : ['--no-track']),
-      start
-    ])
+    // No upstream or per-card refspec (the worktree tier's config is the shared root's); `-B` only past the guard, else `-b` refuses a branch the probe missed.
+    await git().raw(['checkout', '--no-overwrite-ignore', exists ? '-B' : '-b', branch, '--no-track', start])
   }
 
   /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
@@ -3049,13 +3011,10 @@ export class WorkspaceManager {
     const name =
       branch ??
       (await this.drawSessionBranch(this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()), initiatedBy))
-    // Three admitted subcommands rather than `checkout -b`, which the sandbox refuses by design: create the branch, point HEAD at it, then materialize the tree HEAD now names.
+    // Three admitted subcommands: create the branch (refused if it exists), point HEAD at it, then materialize the tree HEAD now names.
     const git = this.runnerFor(agentId, cwd).withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
     if (branch !== undefined) {
-      const exists = await git
-        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-        .then(() => true)
-        .catch(() => false)
+      const exists = await localBranchExists(git, branch)
       if (!exists) {
         const start = (await this.fetchRemoteCardBranch(agentId, root, cwd, branch, true)) ?? target
         await git.raw(['branch', '--no-track', branch, start])

@@ -175,7 +175,7 @@ export class KanbanControls {
         return
       }
       await write(card)
-      await this.deps.cards.markControlWritten(card.cardId, card.controlVersion)
+      await this.deps.cards.markControlWritten(card.cardId, card.controlVersion, card.stateRevision)
     } catch (err) {
       this.deps.log.warn(
         { err, cardId: card.cardId, status: card.status },

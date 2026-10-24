@@ -37,7 +37,12 @@ export function canTransition(from: KanbanStatus, to: KanbanStatus): boolean {
 }
 
 /** Ending a work episode: the next work claim starts a new one, and the old PR can no longer complete the card. */
-export const EPISODE_RESET = { linkedPrNumber: null, workEpisodeStartedAt: null, contractFlags: [] as string[] }
+export const EPISODE_RESET = {
+  linkedPrNumber: null,
+  workEpisodeStartedAt: null,
+  contractFlags: [] as string[],
+  supersededPrNumber: null
+}
 
 /** A closed card (`done` or `archived`) that reopens starts a new episode; every other move stays inside it. */
 export const endsEpisode = (from: string, to: string): boolean =>

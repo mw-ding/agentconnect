@@ -558,7 +558,8 @@ dispatcher. Skip archives the card (closing the issue `not_planned`), revokes an
 open lease with a dispatch-revision bump so a late report fails the fence, and
 posts one body-free comment; dependents of a skipped card do not auto-promote.
 Restart moves a card from triage/blocked/review/done/archived/ready/running back
-to `ready` — resetting the failure counters, block recurrence, cooldown, block
+to `ready`; a `todo` card is refused, so a restart never lifts a card past its
+open blockers or a pending synthesis — resetting the failure counters, block recurrence, cooldown, block
 kind and the attention flag — revokes any open lease, reopens a closed issue,
 writes the status label and one comment, then re-arms the dispatcher.
 
@@ -566,7 +567,9 @@ Skip/restart CAS a per-card control version in their move transaction. Queued
 GitHub writes drop superseded versions. SQL, pure and explain claims exclude
 pending label/control writes. A failed acknowledged restart remains ready and
 unclaimable until the existing label sync reopens the issue and writes ready;
-skip repair closes and archives. Sync and dispatch projections share the
+skip repair closes and archives. The repair posts no control comment (#590). A
+deleted or transferred issue never takes the write, so its card stays unclaimable
+until a human resolves it; the claim explanation says so. Sync and dispatch projections share the
 in-process status queue. Multiple CP processes still lack a shared write queue.
 Skip clears promotion intent. Without a GitHub card store, pause/resume work
 and skip/restart answer `404 kanban controls unavailable`.
@@ -576,7 +579,25 @@ reader (same repository, open, unmerged, exact card head). Any failure drops it.
 A validated number travels in trusted dispatch data; comment text never
 authorizes closing a PR. The CP's PR token stays read-only. Write-run token scope
 tightening is a separate follow-up. An older PR reported again is refused by
-the episode binding with `pr_unbound`.
+the episode binding with `pr_unbound`. The close target is spent once a work run
+reports `completed` or `review_requested`, or binds a PR; a failed run's retry
+keeps it, and a reopen from `done`/`archived` clears it with the episode.
+
+Known gap (#590): restart keeps `ac/card-<n>`, so a still-open PR from that branch
+which restart could not validate (the PR read failed, no PR reader is configured,
+or the revoked run opened it without reporting) blocks a second PR from the branch
+and can never bind, because it predates the new episode. The card then waits in
+`review` flagged `pr_unbound` until a human closes or merges that PR and moves the
+card. Re-validating at claim time needs a PR lookup by head branch that the
+read-only PR reader does not have, so it is not done.
+
+Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.
+A daemon older than #416 reads CP frames tolerantly (`decodeCpEnvelope` strips
+unknown keys), so it accepts such a dispatch, silently drops the field, and runs
+without the close instruction. Nothing fails: the superseded PR stays open, and
+once that run reports `completed` or `review_requested`, or binds a PR, the CP
+spends the close target, so no later dispatch closes it either. Upgrade every
+daemon before restarting a card whose linked PR is still open.
 
 Known gaps (M4 controls): a half-landed synthesis promotion is not adopted by
 the attributed pending-promotion recovery (the graph reconciler's adoption rule
@@ -600,8 +621,11 @@ another session can acquire its branch. A session with no local `ac/card-<n>`
 `origin` has the branch. If it does, the session fetches it and starts from it.
 This applies to the cold preparation of a session pod too. Otherwise the session
 creates the branch from the default branch. A fresh card checkout preserves an existing local card branch. An existing
-read-mode checkout safely switches to the requested card branch: it fetches and
-tracks origin when present, otherwise starts from the default branch. Dirty,
+read-mode checkout safely switches to the requested card branch: it fetches
+origin's branch when present, otherwise starts from the default branch. The switch
+sets no upstream and writes no per-card fetch refspec (the worktree tier's config
+is the root's, shared by every worktree), and checks local-only commits with
+`rev-list --count`, so it runs on host Git and the sandboxed tier alike. Dirty,
 detached, locked and foreign-held state fails closed; local-only card commits
 are never reset. Commits never pushed stay in the clone that made them.
 

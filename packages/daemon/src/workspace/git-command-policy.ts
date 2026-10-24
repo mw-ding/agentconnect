@@ -41,7 +41,7 @@ const REFUSED_LONG_OPTIONS = [
 // Ad-hoc config in any short spelling: -c k=v, -ck=v.
 const REFUSED_SHORT_CONFIG = /^-c/
 
-// Exec-channel policy, not execution: admitted only for the workspace sync's `checkout --no-track -B <branch> <ref>`.
+// Exec-channel policy, not execution: admitted only for the daemon's own `checkout --no-track -B|-b <branch> <ref>`.
 const REFUSED_CHECKOUT_ARGUMENT = [
   /^-f$/,
   /^--force$/,
@@ -164,17 +164,6 @@ export function validateGitArgs(args: string[]): void {
       throw new ExecRefusedError(`argument ${argument} is refused for git ${subcommand}`)
     }
   }
-}
-
-/** The policy's refusal of `args` when `err` is that refusal, thrown in-process or relayed over the exec channel; else undefined. */
-export function policyRefusalOf(args: string[], err: unknown): string | undefined {
-  if (!(err instanceof Error)) return undefined
-  try {
-    validateGitArgs(args)
-  } catch (refusal) {
-    if (refusal instanceof ExecRefusedError && err.message.includes(refusal.message)) return refusal.message
-  }
-  return undefined
 }
 
 // config is admitted only for the daemon's managed-credential writes and its read-only .gitmodules listing.

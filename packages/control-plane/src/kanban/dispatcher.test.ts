@@ -36,6 +36,7 @@ function dispatcher(
     ingestStatus: vi.fn(async () => ({ moved: true })),
     settlePromotion: vi.fn(async () => true),
     escalatePromotion: vi.fn(async () => true),
+    markStatusWritten: vi.fn(async () => true),
     endRun: vi.fn(async () => ({
       accepted: true as const,
       card: { ...BOARD_REF, cardId: 'card-1', issueNumber: 11, from: 'running' as const, to: 'done' as const },
@@ -62,6 +63,7 @@ function dispatcher(
     ...(project ? { project } : {}),
     ...(over.sync ? { sync: over.sync } : {})
   } as unknown as KanbanDispatcherDeps)
+  const poke = vi.spyOn(d, 'poke').mockImplementation(() => {})
   const writeStatus = (
     d as unknown as {
       writeStatus(
@@ -77,7 +79,7 @@ function dispatcher(
     escalatePromotion(boardId: string, card: KanbanRecoveryDue, reason: 'unresolved'): Promise<{ moved: boolean }>
     dispatchLease(lease: KanbanClaimedLease): Promise<void>
   }
-  return { d, store, repo, onStatusCommitted, log, writeStatus, internals }
+  return { d, store, repo, onStatusCommitted, log, poke, writeStatus, internals }
 }
 
 const CARD = { issueNumber: 11, cardId: 'card-1', boardId: 'board-1' }
@@ -99,6 +101,10 @@ describe('dispatcher Projects v2 projection seam', () => {
     h.writeStatus(CARD, REPO, 'done', { labels: [], state: 'open', nodeId: 'I_kwDOAbc123' })
     await h.d.settle()
     expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
+    // Without a sync the label write acks the owed status itself, then re-arms the board.
+    expect(h.repo.markStatusWritten).toHaveBeenCalledWith('card-1', 'done')
+    expect(h.poke).toHaveBeenCalledWith('board-1')
+    expect(h.log.warn).not.toHaveBeenCalled()
     expect(h.onStatusCommitted).toHaveBeenCalledWith({
       boardId: 'board-1',
       issueNumber: 11,
@@ -114,6 +120,8 @@ describe('dispatcher Projects v2 projection seam', () => {
     expect(() => h.writeStatus(CARD, REPO, 'done')).not.toThrow()
     await h.d.settle()
     expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
+    expect(h.repo.markStatusWritten).toHaveBeenCalledWith('card-1', 'done')
+    expect(h.poke).toHaveBeenCalledWith('board-1')
     expect(throwing).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(h.log.warn.mock.calls)).not.toContain('[SECRET]')
   })
@@ -123,6 +131,9 @@ describe('dispatcher Projects v2 projection seam', () => {
     h.writeStatus(CARD, REPO, 'done')
     await h.d.settle()
     expect(h.store.applyPlan).toHaveBeenCalledTimes(1)
+    expect(h.repo.markStatusWritten).toHaveBeenCalledWith('card-1', 'done')
+    expect(h.poke).toHaveBeenCalledWith('board-1')
+    expect(h.log.warn).not.toHaveBeenCalled()
     expect(h.onStatusCommitted).not.toHaveBeenCalled()
   })
 

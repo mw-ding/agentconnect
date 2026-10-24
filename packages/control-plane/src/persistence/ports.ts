@@ -8116,6 +8116,8 @@ export interface KanbanDispatchRepo {
   getParkedStatus(boardId: string, issueNumber: number): Promise<KanbanStatus | null>
   // Move a card still parked in `from` to `to` and reset its recovery backoff; false when the card moved meanwhile.
   ingestStatus(boardId: string, issueNumber: number, from: KanbanStatus, to: KanbanStatus): Promise<KanbanIngestResult>
+  // A sync-less dispatcher's label write for `status` landed: clear the card's owed write unless it has moved on.
+  markStatusWritten(cardId: string, status: KanbanStatus): Promise<boolean>
   // Push the next re-read out exponentially (a changed `observed` restarts it); counts a pending promotion's check.
   deferRecovery(cardId: string, now: Date, observed?: string): Promise<void>
   // GitHub changed this card, so its next recovery re-read is due on the next tick.
@@ -8564,6 +8566,8 @@ export interface KanbanCardControlOutcome {
   supersededPrNumber: number | null
   /** The control version this move committed; its GitHub write lands only while it is still the card's latest. */
   controlVersion: bigint
+  /** The card's state revision right after this move; a later move still owes its own label write. */
+  stateRevision: bigint
 }
 
 export type KanbanCardControlRefusal = 'not_found' | 'illegal_transition'
@@ -8603,7 +8607,7 @@ export interface KanbanCardControlRepo {
   /** Whether `version` is still the card's latest control, so its GitHub write may land. */
   isLatestControl(cardId: string, version: bigint): Promise<boolean>
   /** Record that GitHub reflects control `version`; false when a newer control superseded it. */
-  markControlWritten(cardId: string, version: bigint): Promise<boolean>
+  markControlWritten(cardId: string, version: bigint, stateRevision: bigint): Promise<boolean>
 }
 
 /** A `review` card with a linked PR under a PR completion contract (TRD 4.7), body-free. */

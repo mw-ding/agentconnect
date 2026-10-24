@@ -690,6 +690,8 @@ export class KanbanDispatcher {
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))
         if (!current) return
         await this.deps.store.applyPlan(repo, card.issueNumber, current, planStatusWrite(status, current))
+        // Without a sync no ack ever clears the owed write, and the claim skips a card that still owes one.
+        await this.deps.repo.markStatusWritten(card.cardId, status)
         this.poke(card.boardId)
       })
       .catch((err: unknown) =>

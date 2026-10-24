@@ -1,5 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -36,7 +37,7 @@ import {
 } from '../src/workspace/git-runner.js'
 import { ALLOWED_GIT_SUBCOMMANDS, createExecHandler } from '../src/shim/exec-handler.js'
 import { ShimGitRunner, type GitExecPayload } from '../src/shim/git-exec.js'
-import type { ShimRequester } from '../src/shim/channels.js'
+import { ShimChannelLostError, type ShimRequester } from '../src/shim/channels.js'
 import { buildWorkspaceRootsAppend } from '../src/session/turn/standing-context.js'
 import { sessionHomeIn } from '../src/workspace/session-layout.js'
 import { WorkspaceManager, type PrepareSessionWorkspaceRequest } from '../src/workspace/workspace-manager.js'
@@ -254,12 +255,18 @@ function wireEnv(env: Record<string, string>): Record<string, string> {
 }
 
 /** The pool's own runner against the pod's own handler, so the daemon's argv crosses the real exec channel and meets the real inventory — the enforcement a permissive stand-in hides, which is how `checkout` reached the field. */
-function shimRunner(workspaceRoot: string, cwd: string | undefined, abort: AbortSignal | undefined): GitRunner {
+function shimRunner(
+  workspaceRoot: string,
+  cwd: string | undefined,
+  abort: AbortSignal | undefined,
+  lose?: (args: string[]) => boolean
+): GitRunner {
   const handle = createExecHandler({ workspaceRoot, log: { info: () => {}, warn: () => {} } })
   const requester: ShimRequester = {
     request: async (capability, payload, options) => {
       const sent = payload as GitExecPayload
       gitRuns.push({ args: sent.args, env: sent.env ?? {} })
+      if (lose?.(sent.args)) throw new ShimChannelLostError('test channel lost')
       const wire: GitExecPayload = {
         ...sent,
         args: sent.args.map(substitute),
@@ -287,11 +294,58 @@ function serveAll(agent: Agent, branches: Record<string, string> = {}): Record<s
 }
 
 /** The same fixtures on the pool's shape: every daemon-run Git for this agent goes through the sandbox handler rooted at its directory. */
-function serveAllThroughShim(agent: Agent): Record<string, ReturnType<typeof bareRepo>> {
+function serveAllThroughShim(
+  agent: Agent,
+  lose?: (args: string[]) => boolean
+): Record<string, ReturnType<typeof bareRepo>> {
   const served = serveAll(agent)
   const root = workspaces.agentRootFor(agent)
-  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort) })
+  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort, lose) })
   return served
+}
+
+/** Whether a ref directory's read bit can be dropped here: Windows has no mode bits and root ignores them. */
+const refDirsCanBeUnreadable = process.platform !== 'win32' && process.getuid?.() !== 0
+
+/** Commit local-only work on ac/card-7 (from `start`, else the checkout's current card branch) and return to the original HEAD. */
+function commitLocalCardWork(cwd: string, start?: string): string {
+  const head = git(cwd, ['symbolic-ref', '--short', 'HEAD'])
+  if (start !== undefined) git(cwd, ['checkout', '-q', '--no-track', '-b', 'ac/card-7', start])
+  writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+  git(cwd, ['add', 'local-only.md'])
+  git(cwd, ['commit', '-q', '-m', 'local card work'])
+  const tip = git(cwd, ['rev-parse', 'HEAD'])
+  if (start !== undefined) git(cwd, ['checkout', '-q', head])
+  return tip
+}
+
+/** Run `body` with the repository's loose `refs/heads/ac` directory unlistable (0300), which pattern-form show-ref silently skips. */
+async function withUnreadableCardRefs(cwd: string, body: () => Promise<void>): Promise<void> {
+  const dir = join(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']), 'refs', 'heads', 'ac')
+  chmodSync(dir, 0o300)
+  try {
+    await body()
+  } finally {
+    chmodSync(dir, 0o700)
+  }
+}
+
+/** A runner whose card-branch show-ref lists nothing after `before` runs: a silent miss over a branch that exists. */
+function blindCardProbe(runner: GitRunner, before: () => void): GitRunner {
+  return new Proxy(runner, {
+    get(target, key) {
+      if (key === 'withEnv') return (env: Record<string, string>) => blindCardProbe(target.withEnv(env), before)
+      if (key === 'raw') {
+        return async (args: string[]) => {
+          if (args[0] !== 'show-ref' || args[1] !== 'refs/heads/ac/card-7') return await target.raw(args)
+          before()
+          return ''
+        }
+      }
+      const value: unknown = Reflect.get(target, key)
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
 }
 
 const confined = (extra: Partial<PrepareSessionWorkspaceRequest> = {}): PrepareSessionWorkspaceRequest => ({
@@ -1862,12 +1916,19 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
       const { primary } = serveAll(agent)
       const request = tier === 'confined' ? confined : unconfined
       const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      // The worktree tier's `config --local` is the root's, shared by every worktree of it.
+      const repository = tier === 'confined' ? cwd : workspaces.primaryRoot(agent).path
+      const mappings = () => git(repository, ['config', '--local', '--get-all', 'remote.origin.fetch'])
+      const before = mappings()
       const tip = pushCardBranch(primary!.seed, 7)
       const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
       expect(next).toBe(cwd)
       expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
       expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
-      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/ac/card-7')
+      // 590: no upstream and no per-card refspec, so a plain fetch survives the branch's deletion after merge.
+      expect(mappings()).toBe(before)
+      expect(git(repository, ['config', '--local', '--list'])).not.toContain('ac/card-7')
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
     }
   )
 
@@ -1955,33 +2016,145 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
   })
 
-  it('416r4: an existing sandboxed checkout reports the policy refusing a pushed card branch switch, untouched', async () => {
+  it.each(['remote', 'local'] as const)(
+    '590: an existing sandboxed checkout switches to a %s card branch with only admitted Git',
+    async (kind) => {
+      const agent = agentFixture()
+      const { primary } = serveAllThroughShim(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+      const config = readFileSync(join(cwd, '.git', 'config'), 'utf8')
+      // A local card branch at the default tip has nothing local-only, so the switch must accept it.
+      const tip = kind === 'remote' ? pushCardBranch(primary!.seed, 7) : git(cwd, ['rev-parse', 'origin/main'])
+      if (kind === 'local') git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+      gitRuns.length = 0
+      expect(await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+      expect(readFileSync(join(cwd, '.git', 'config'), 'utf8')).toBe(config)
+      const issued = [...new Set(gitRuns.map((run) => run.args[0]!))]
+      expect(issued).toEqual(expect.arrayContaining(['ls-remote', 'checkout']))
+      expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+    }
+  )
+
+  it('590: an existing sandboxed checkout over a pushed card branch accepts a local branch the remote contains', async () => {
     const agent = agentFixture()
     const { primary } = serveAllThroughShim(agent)
     const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
-    const head = git(cwd, ['symbolic-ref', 'HEAD'])
-    const tip = git(cwd, ['rev-parse', 'HEAD'])
-    pushCardBranch(primary!.seed, 7)
-    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
-      /not supported on the sandboxed tier: the sandbox git policy refuses git config/
-    )
-    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+    const tip = pushCardBranch(primary!.seed, 7)
+    await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
     expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
-    expect(() => git(cwd, ['rev-parse', '--verify', 'refs/heads/ac/card-7'])).toThrow()
   })
 
-  it('416r4: an existing sandboxed checkout reports the policy refusing merge-base, never local-only commits', async () => {
+  it.each(['without', 'with'] as const)(
+    '590: an existing sandboxed checkout still refuses a local-only card commit %s a pushed card branch',
+    async (remote) => {
+      const agent = agentFixture()
+      const { primary } = serveAllThroughShim(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      if (remote === 'with') pushCardBranch(primary!.seed, 7)
+      git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+      git(cwd, ['checkout', '-q', 'ac/card-7'])
+      writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+      git(cwd, ['add', 'local-only.md'])
+      git(cwd, ['commit', '-q', '-m', 'local card work'])
+      const localTip = git(cwd, ['rev-parse', 'HEAD'])
+      git(cwd, ['checkout', '-q', head.replace('refs/heads/', '')])
+      await expect(
+        workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+      ).rejects.toThrow(/card branch ac\/card-7 has local-only commits; refusing to reset it/)
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
+
+  it('590: a sandboxed card-branch probe that loses its channel refuses the switch instead of resetting local-only commits', async () => {
     const agent = agentFixture()
-    serveAllThroughShim(agent)
+    let losing = false
+    serveAllThroughShim(agent, (args) => losing && args[0] === 'show-ref')
     const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
     const head = git(cwd, ['symbolic-ref', 'HEAD'])
-    // A card branch at the default tip has no local-only commits, so only the refused ancestry check can stop the switch.
-    git(cwd, ['branch', 'ac/card-7', 'origin/main'])
-    const cardTip = git(cwd, ['rev-parse', 'ac/card-7'])
+    git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+    git(cwd, ['checkout', '-q', 'ac/card-7'])
+    writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+    git(cwd, ['add', 'local-only.md'])
+    git(cwd, ['commit', '-q', '-m', 'local card work'])
+    const localTip = git(cwd, ['rev-parse', 'HEAD'])
+    git(cwd, ['checkout', '-q', head.replace('refs/heads/', '')])
+    losing = true
     await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
-      /not supported on the sandboxed tier: the sandbox git policy refuses git merge-base/
+      /git show-ref lost its sandbox channel/
     )
+    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
     expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
-    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(cardTip)
+  })
+
+  it.skipIf(!refDirsCanBeUnreadable).each(['confined', 'sandboxed', 'unconfined'] as const)(
+    '590r2: an existing %s checkout whose probe cannot list the card branch refuses instead of resetting local-only commits',
+    async (tier) => {
+      const agent = agentFixture()
+      if (tier === 'sandboxed') serveAllThroughShim(agent)
+      else serveAll(agent)
+      const request = tier === 'unconfined' ? unconfined : confined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      const localTip = commitLocalCardWork(cwd, git(cwd, ['rev-parse', 'origin/main']))
+      // The probe misses the branch, while Git's own lookup when creating one still resolves it.
+      await withUnreadableCardRefs(cwd, () =>
+        expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+          /a branch named 'ac\/card-7' already exists/
+        )
+      )
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
+
+  it.skipIf(!refDirsCanBeUnreadable)(
+    '590r2: a new unconfined session whose probe cannot list the card branch refuses instead of replacing it',
+    async () => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const old = await workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+      )
+      const localTip = commitLocalCardWork(old)
+      rmSync(old, { recursive: true })
+      const root = workspaces.primaryRoot(agent).path
+      await withUnreadableCardRefs(root, () =>
+        expect(
+          workspaces.prepareSessionWorkspace(
+            agent,
+            unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+          )
+        ).rejects.toThrow(/a branch named 'ac\/card-7' already exists/)
+      )
+      expect(git(root, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+    }
+  )
+
+  it('590r2: a new confined clone whose probe misses an existing card branch refuses instead of replacing it', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    let localTip = ''
+    // A probe that lists nothing while the branch exists: the clone tier's creation must refuse rather than overwrite it.
+    wireTestPlane(workspaces, {
+      gitRunnerFor: (_agentId, cwd, abort) =>
+        blindCardProbe(new SeamRunner(cwd, abort), () => {
+          localTip = git(cwd!, ['commit-tree', '-m', 'local card work', 'HEAD^{tree}'])
+          git(cwd!, ['update-ref', 'refs/heads/ac/card-7', localTip])
+        })
+    })
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /a branch named 'ac\/card-7' already exists/
+    )
+    // The probe ran over the planted branch, and the refused clone is never published as the session's cwd.
+    expect(localTip).not.toBe('')
+    expect(existsSync(join(leafOf(agent), 'workspace', '.git'))).toBe(false)
   })
 })
