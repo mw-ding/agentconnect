@@ -637,7 +637,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
       if (count !== 1) return false
       const card = await tx.kanbanCard.findUniqueOrThrow({
         where: { id: input.cardId },
-        select: { boardId: true, issueNumber: true, board: { select: { orgId: true } } }
+        select: { boardId: true, issueNumber: true, board: { select: { orgId: true, targetChannel: true } } }
       })
       await tx.auditEvent.create({
         data: {
@@ -657,6 +657,22 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
           }
         }
       })
+      // The note commits or rolls back with the move; the CAS pinned stateRevision, so the new one is +1.
+      const transition = {
+        cardId: input.cardId,
+        boardId: card.boardId,
+        issueNumber: card.issueNumber,
+        from: 'review',
+        to: input.to,
+        reasonCode: input.reason
+      } as const
+      const decision = planNotification(transition, card.board)
+      if (decision.notify)
+        await insertKanbanNotification(tx, {
+          ...transition,
+          stateRevision: input.expectedStateRevision + 1n,
+          mention: decision.mention
+        })
       return true
     })
   }

@@ -657,7 +657,10 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           }
         })
         if (count !== 1) throw STALE_COMMAND
-        const board = await tx.kanbanBoard.findUniqueOrThrow({ where: { id: input.boardId }, select: { orgId: true } })
+        const board = await tx.kanbanBoard.findUniqueOrThrow({
+          where: { id: input.boardId },
+          select: { orgId: true, targetChannel: true }
+        })
         const card = await tx.kanbanCard.findUniqueOrThrow({
           where: { id: input.cardId },
           select: { issueNumber: true }
@@ -681,6 +684,22 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
             }
           }
         })
+        // The note commits or rolls back with the move; the CAS pinned stateRevision, so the new one is +1.
+        const transition = {
+          cardId: input.cardId,
+          boardId: input.boardId,
+          issueNumber: card.issueNumber,
+          from: input.from,
+          to: input.to!,
+          reasonCode: 'comment_command'
+        }
+        const decision = planNotification(transition, board)
+        if (decision.notify)
+          await insertKanbanNotification(tx, {
+            ...transition,
+            stateRevision: input.expectedStateRevision + 1n,
+            mention: decision.mention
+          })
         return { kind: 'recorded', record: toCommandRecord(row) } as const
       })
     } catch (err) {

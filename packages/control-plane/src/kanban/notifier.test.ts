@@ -52,6 +52,7 @@ describe('planNotification', () => {
     expect(planNotification(tr('review', 'ready'), board).notify).toBe(false)
     expect(planNotification(tr('running', 'ready', { role: 'work' }), board).notify).toBe(false)
     expect(planNotification(tr('todo', 'ready'), board).notify).toBe(false)
+    expect(planNotification(tr('blocked', 'ready', { reasonCode: 'comment_command' }), board).notify).toBe(true)
   })
 
   it('notifies explicit restarts and synthesis without mentioning the owner', () => {
