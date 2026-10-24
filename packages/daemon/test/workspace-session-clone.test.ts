@@ -1,5 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -301,6 +302,50 @@ function serveAllThroughShim(
   const root = workspaces.agentRootFor(agent)
   wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort, lose) })
   return served
+}
+
+/** Whether a ref directory's read bit can be dropped here: Windows has no mode bits and root ignores them. */
+const refDirsCanBeUnreadable = process.platform !== 'win32' && process.getuid?.() !== 0
+
+/** Commit local-only work on ac/card-7 (from `start`, else the checkout's current card branch) and return to the original HEAD. */
+function commitLocalCardWork(cwd: string, start?: string): string {
+  const head = git(cwd, ['symbolic-ref', '--short', 'HEAD'])
+  if (start !== undefined) git(cwd, ['checkout', '-q', '--no-track', '-b', 'ac/card-7', start])
+  writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+  git(cwd, ['add', 'local-only.md'])
+  git(cwd, ['commit', '-q', '-m', 'local card work'])
+  const tip = git(cwd, ['rev-parse', 'HEAD'])
+  if (start !== undefined) git(cwd, ['checkout', '-q', head])
+  return tip
+}
+
+/** Run `body` with the repository's loose `refs/heads/ac` directory unlistable (0300), which pattern-form show-ref silently skips. */
+async function withUnreadableCardRefs(cwd: string, body: () => Promise<void>): Promise<void> {
+  const dir = join(git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']), 'refs', 'heads', 'ac')
+  chmodSync(dir, 0o300)
+  try {
+    await body()
+  } finally {
+    chmodSync(dir, 0o700)
+  }
+}
+
+/** A runner whose card-branch show-ref lists nothing after `before` runs: a silent miss over a branch that exists. */
+function blindCardProbe(runner: GitRunner, before: () => void): GitRunner {
+  return new Proxy(runner, {
+    get(target, key) {
+      if (key === 'withEnv') return (env: Record<string, string>) => blindCardProbe(target.withEnv(env), before)
+      if (key === 'raw') {
+        return async (args: string[]) => {
+          if (args[0] !== 'show-ref' || args[1] !== 'refs/heads/ac/card-7') return await target.raw(args)
+          before()
+          return ''
+        }
+      }
+      const value: unknown = Reflect.get(target, key)
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
 }
 
 const confined = (extra: Partial<PrepareSessionWorkspaceRequest> = {}): PrepareSessionWorkspaceRequest => ({
@@ -2046,5 +2091,70 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     )
     expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
     expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+  })
+
+  it.skipIf(!refDirsCanBeUnreadable).each(['confined', 'sandboxed', 'unconfined'] as const)(
+    '590r2: an existing %s checkout whose probe cannot list the card branch refuses instead of resetting local-only commits',
+    async (tier) => {
+      const agent = agentFixture()
+      if (tier === 'sandboxed') serveAllThroughShim(agent)
+      else serveAll(agent)
+      const request = tier === 'unconfined' ? unconfined : confined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      const localTip = commitLocalCardWork(cwd, git(cwd, ['rev-parse', 'origin/main']))
+      // The probe misses the branch, while Git's own lookup when creating one still resolves it.
+      await withUnreadableCardRefs(cwd, () =>
+        expect(workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+          /a branch named 'ac\/card-7' already exists/
+        )
+      )
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
+
+  it.skipIf(!refDirsCanBeUnreadable)(
+    '590r2: a new unconfined session whose probe cannot list the card branch refuses instead of replacing it',
+    async () => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const old = await workspaces.prepareSessionWorkspace(
+        agent,
+        unconfined({ sessionKey: 'kanban:old-7', branch: kanbanCardBranch(7) })
+      )
+      const localTip = commitLocalCardWork(old)
+      rmSync(old, { recursive: true })
+      const root = workspaces.primaryRoot(agent).path
+      await withUnreadableCardRefs(root, () =>
+        expect(
+          workspaces.prepareSessionWorkspace(
+            agent,
+            unconfined({ sessionKey: 'kanban:new-7', branch: kanbanCardBranch(7) })
+          )
+        ).rejects.toThrow(/a branch named 'ac\/card-7' already exists/)
+      )
+      expect(git(root, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+    }
+  )
+
+  it('590r2: a new confined clone whose probe misses an existing card branch refuses instead of replacing it', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    let localTip = ''
+    // A probe that lists nothing while the branch exists: the clone tier's creation must refuse rather than overwrite it.
+    wireTestPlane(workspaces, {
+      gitRunnerFor: (_agentId, cwd, abort) =>
+        blindCardProbe(new SeamRunner(cwd, abort), () => {
+          localTip = git(cwd!, ['commit-tree', '-m', 'local card work', 'HEAD^{tree}'])
+          git(cwd!, ['update-ref', 'refs/heads/ac/card-7', localTip])
+        })
+    })
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /a branch named 'ac\/card-7' already exists/
+    )
+    // The probe ran over the planted branch, and the refused clone is never published as the session's cwd.
+    expect(localTip).not.toBe('')
+    expect(existsSync(join(leafOf(agent), 'workspace', '.git'))).toBe(false)
   })
 })

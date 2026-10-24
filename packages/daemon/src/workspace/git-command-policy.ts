@@ -41,7 +41,7 @@ const REFUSED_LONG_OPTIONS = [
 // Ad-hoc config in any short spelling: -c k=v, -ck=v.
 const REFUSED_SHORT_CONFIG = /^-c/
 
-// Exec-channel policy, not execution: admitted only for the workspace sync's `checkout --no-track -B <branch> <ref>`.
+// Exec-channel policy, not execution: admitted only for the daemon's own `checkout --no-track -B|-b <branch> <ref>`.
 const REFUSED_CHECKOUT_ARGUMENT = [
   /^-f$/,
   /^--force$/,

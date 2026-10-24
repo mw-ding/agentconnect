@@ -312,7 +312,7 @@ function hostGitRunner(cwd?: string, abort?: AbortSignal): GitRunner {
   return new LocalGitRunner(gitFor(cwd, abort), cwd, (env) => gitFor(cwd, abort, env))
 }
 
-/** Whether `refs/heads/<branch>` exists; only show-ref's silent exit 1 is a miss, so a failed probe throws instead of reading as absent. */
+/** Whether `refs/heads/<branch>` is listed; a failed probe throws, but a silent miss can hide an unreadable ref, so callers create without force. */
 async function localBranchExists(git: GitRunner, branch: string): Promise<boolean> {
   const ref = `refs/heads/${branch}`
   const listed = await git.raw(['show-ref', ref]).catch((err: unknown) => {
@@ -2491,8 +2491,8 @@ export class WorkspaceManager {
     if (exists && (await git().raw(['rev-list', '--count', `refs/heads/${branch}`, `^${start}`])).trim() !== '0') {
       throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
     }
-    // No upstream and no per-card refspec: the worktree tier's config is the shared root's, and the branch is deleted after merge.
-    await git().raw(['checkout', '--no-overwrite-ignore', '-B', branch, '--no-track', start])
+    // No upstream or per-card refspec (the worktree tier's config is the shared root's); `-B` only past the guard, else `-b` refuses a branch the probe missed.
+    await git().raw(['checkout', '--no-overwrite-ignore', exists ? '-B' : '-b', branch, '--no-track', start])
   }
 
   /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
@@ -3011,7 +3011,7 @@ export class WorkspaceManager {
     const name =
       branch ??
       (await this.drawSessionBranch(this.runnerFor(agentId, cwd).withEnv(workspaceGitLocalEnv()), initiatedBy))
-    // Three admitted subcommands rather than `checkout -b`, which the sandbox refuses by design: create the branch, point HEAD at it, then materialize the tree HEAD now names.
+    // Three admitted subcommands: create the branch (refused if it exists), point HEAD at it, then materialize the tree HEAD now names.
     const git = this.runnerFor(agentId, cwd).withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
     if (branch !== undefined) {
       const exists = await localBranchExists(git, branch)
