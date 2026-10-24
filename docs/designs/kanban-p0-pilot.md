@@ -596,9 +596,10 @@ reported it. A PR from the current episode stays eligible to bind and is never
 named. Lookup failure ends the claim as a non-counting transient for retry; the
 lease is checked again before dispatch. This adds one bounded list request on
 such claims and no PR-number migration. An absent reader or ambiguous matches
-still require human recovery. This does not change the asynchronous run-end
-contract recheck or its race with verifier claiming (#600/#601); episode binding
-and completion fences remain in force.
+still require human recovery. Episode binding and completion fences remain in
+force. The run-end contract re-check now runs before the status label write that
+makes the card claimable, so it no longer races verifier claiming (#600/#601,
+fixed by #602).
 
 Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.
 A daemon older than #416 reads CP frames tolerantly (`decodeCpEnvelope` strips

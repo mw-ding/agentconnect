@@ -69,6 +69,10 @@ const CONTRACT_HOLD_OWN = Prisma.sql`(NOT c."needsAttention" OR (c."attentionRea
 const CONTRACT_DUE = Prisma.sql`b."enabled" AND c."status" = 'review' AND c."linkedPrNumber" IS NOT NULL
   AND b."completionContract" <> 'close' AND ${CONTRACT_HOLD_OWN}
   AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
+/** A card a run just moved from review to ready or triage, still holding its episode's linked PR under a PR contract. */
+const LEFT_REVIEW_DUE = Prisma.sql`b."enabled" AND c."status" IN ('ready', 'triage') AND c."linkedPrNumber" IS NOT NULL
+  AND b."completionContract" <> 'close' AND NOT c."needsAttention"
+  AND NOT EXISTS (SELECT 1 FROM "kanban_run" r WHERE r."cardId" = c."id" AND r."endedAt" IS NULL)`
 const CONTRACT_COLUMNS = Prisma.sql`c."id" AS "cardId", c."boardId", c."issueNumber", c."status", c."stateRevision",
   c."linkedPrNumber", c."workEpisodeStartedAt", c."contractFlags", c."needsAttention", c."verifiedAt",
   b."completionContract", b."verifierAgentId", b."configRevision", c."controlVersion"`
@@ -586,6 +590,15 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
     return card ?? null
   }
 
+  async getLeftReviewCard(cardId: string): Promise<KanbanContractCard | null> {
+    const [card] = await this.db.$queryRaw<KanbanContractCard[]>(Prisma.sql`
+      SELECT ${CONTRACT_COLUMNS}
+      FROM "kanban_card" c JOIN "kanban_board" b ON b."id" = c."boardId"
+      WHERE c."id" = ${cardId}::uuid AND ${LEFT_REVIEW_DUE}
+    `)
+    return card ?? null
+  }
+
   async isLatestControl(cardId: string, version: bigint): Promise<boolean> {
     return (await this.db.kanbanCard.count({ where: { id: cardId, controlVersion: version } })) === 1
   }
@@ -597,7 +610,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
       where: {
         id: input.cardId,
         stateRevision: input.expectedStateRevision,
-        status: 'review',
+        status: input.status ?? 'review',
         linkedPrNumber: input.prNumber,
         needsAttention: false,
         NOT: { contractFlags: { has: key } },

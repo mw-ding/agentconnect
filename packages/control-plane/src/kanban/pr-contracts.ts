@@ -4,12 +4,14 @@ import type { KanbanBoardRecord, KanbanContractCard, KanbanContractRepo } from '
 import { planStatusWrite, type LabelPlan } from './card-state.js'
 import type { CardStore, KanbanRepoRef } from './card-store.js'
 import {
+  bindingWait,
   checksVerdict,
   contractAttentionComment,
   FLAGGED_WAITS,
   planContract,
   prClosedUnmergedComment,
   type ContractDecision,
+  type ContractInput,
   type ContractWait
 } from './contracts.js'
 import type { PrReader } from './pr-reader.js'
@@ -67,6 +69,18 @@ export class KanbanPrContracts {
     return repo ? this.evaluate(card, repo) : null
   }
 
+  /** A run moved the card from review to ready or triage: an unbound linked PR is flagged there, before it is claimable. */
+  async onLeftReview(cardId: string): Promise<ContractOutcome | null> {
+    const card = await this.deps.repo.getLeftReviewCard(cardId)
+    if (!card) return null
+    const repo = await this.deps.repoRef(card.boardId)
+    if (!repo) return null
+    const pr = await this.deps.prs.readPullRequest(repo, card.linkedPrNumber!)
+    if (bindingWait({ binding: this.binding(card, repo), linkedPrNumber: card.linkedPrNumber, pr }) === 'pr_unbound')
+      await this.flag(card, repo, 'pr_unbound')
+    return 'wait'
+  }
+
   /** The 60s tick's backstop for missed doorbells: a bounded batch per board, resuming after the last card it judged. */
   async sweep(boardId: string): Promise<void> {
     const after = this.cursors.get(boardId) ?? 0
@@ -94,13 +108,7 @@ export class KanbanPrContracts {
     const pr = await this.deps.prs.readPullRequest(repo, card.linkedPrNumber)
     const input: Parameters<typeof planContract>[0] = {
       status: card.status,
-      binding: {
-        appSlug: this.deps.appSlug,
-        repoId: repo.repoId,
-        issueNumber: card.issueNumber,
-        workEpisodeStartedAt: card.workEpisodeStartedAt,
-        ...(this.deps.bindingOverrideForTests ? { overrideForTests: this.deps.bindingOverrideForTests } : {})
-      },
+      binding: this.binding(card, repo),
       contract: card.completionContract,
       verifierAgentId: card.verifierAgentId,
       verifiedAt: card.verifiedAt,
@@ -166,6 +174,16 @@ export class KanbanPrContracts {
     return to
   }
 
+  private binding(card: KanbanContractCard, repo: KanbanRepoRef): NonNullable<ContractInput['binding']> {
+    return {
+      appSlug: this.deps.appSlug,
+      repoId: repo.repoId,
+      issueNumber: card.issueNumber,
+      workEpisodeStartedAt: card.workEpisodeStartedAt,
+      ...(this.deps.bindingOverrideForTests ? { overrideForTests: this.deps.bindingOverrideForTests } : {})
+    }
+  }
+
   // A stuck contract is raised once per (card, reason, PR): the CAS winner alone posts the one body-free comment.
   private async flag(card: KanbanContractCard, repo: KanbanRepoRef, reason: ContractWait): Promise<void> {
     const prNumber = card.linkedPrNumber!
@@ -174,7 +192,8 @@ export class KanbanPrContracts {
       cardId: card.cardId,
       expectedStateRevision: card.stateRevision,
       reason,
-      prNumber
+      prNumber,
+      status: card.status
     })
     if (!flagged) return
     this.deps.log.info(
@@ -185,11 +204,11 @@ export class KanbanPrContracts {
       const issue = await this.deps.store.readCard(repo, card.issueNumber)
       const plan: LabelPlan = {
         outcome: 'noop',
-        status: 'review',
+        status: card.status,
         releaseLease: false,
         addLabels: [],
         removeLabels: [],
-        comment: contractAttentionComment(reason, prNumber)
+        comment: contractAttentionComment(reason, prNumber, card.status)
       }
       await this.deps.store.applyPlan(repo, card.issueNumber, issue ?? { labels: [], state: 'open' }, plan)
     } catch (err) {

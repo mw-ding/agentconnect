@@ -392,7 +392,16 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
   - the `pull_request` and `check_suite` doorbells;
   - any run end that leaves the card in `review` (the verifier approving after the PR
     finished, or a worker reporting after its PR merged);
+  - any run end that moves the card from `review` to `ready` or `triage` (a
+    `changes_requested` verdict, including at the round limit). Only the binding is
+    judged there: an unbound linked PR is flagged `pr_unbound` once, in that status,
+    with the same CAS and one comment naming it; nothing settles outside `review`.
   - the dispatcher tick's bounded sweep: 25 cards per board, with a cursor.
+- A run end's status label write, which clears `labelWritePending` (the claim's last
+  gate), waits until its own re-check has finished (#602). So no verify or rework claim
+  in this CP process can take the card before its flag lands. A CP restart in between, or
+  a sync repair of the label during the re-check, falls back to the tick, whose sweep
+  runs before its claim. Both paths still fail closed.
 
 ### Deploy order
 

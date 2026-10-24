@@ -1941,7 +1941,8 @@ export function buildContainer(
         ...(kanbanPrReader ? { prs: kanbanPrReader } : {}),
         contracts: {
           sweep: async (boardId): Promise<void> => kanbanPrContracts?.sweep(boardId),
-          onReview: async (cardId): Promise<unknown> => kanbanPrContracts?.onVerified(cardId)
+          onReview: async (cardId): Promise<unknown> => kanbanPrContracts?.onVerified(cardId),
+          onLeftReview: async (cardId): Promise<unknown> => kanbanPrContracts?.onLeftReview(cardId)
         },
         send: (daemonId, d) => sender.kanbanDispatch(daemonId, d),
         isDaemonLive: (daemonId) => connReg.get(daemonId)?.state === 'READY',

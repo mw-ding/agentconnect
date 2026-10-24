@@ -8655,6 +8655,8 @@ export interface KanbanContractFlagInput {
   expectedStateRevision: bigint
   reason: string
   prNumber: number
+  /** The status the card was judged in (default `review`); a run end also flags a card it moved to ready or triage. */
+  status?: KanbanStatus
 }
 
 export interface KanbanContractRepo {
@@ -8664,6 +8666,8 @@ export interface KanbanContractRepo {
     opts: { prNumbers?: readonly number[]; afterIssueNumber?: number; limit?: number }
   ): Promise<KanbanContractCard[]>
   getContractCard(cardId: string): Promise<KanbanContractCard | null>
+  /** An unleased, unflagged `ready`/`triage` card that still holds its episode's linked PR under a PR contract. */
+  getLeftReviewCard(cardId: string): Promise<KanbanContractCard | null>
   /** CAS review → done/triage with an audit row; false when the card moved, was leased or held, or the board changed. */
   settleContract(input: KanbanContractSettleInput): Promise<boolean>
   /** Set needsAttention for a stuck contract once per (card, reason, PR); true only for the write that flagged it. */

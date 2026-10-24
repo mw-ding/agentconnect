@@ -66,8 +66,12 @@ export interface KanbanDispatcherDeps {
   >
   /** Live write check for the human whose status label un-parks a card (the comment-command gate); the container always wires it. */
   humanAuthz?: { permissions: RepoPermissionLookup; appSlug: string | undefined }
-  /** PR completion contracts: the tick's bounded backstop sweep, and a re-check when a run leaves its card in review. */
-  contracts?: { sweep(boardId: string): Promise<void>; onReview(cardId: string): Promise<unknown> }
+  /** PR completion contracts: the tick's sweep, and a run end's re-check in review or after a move out of it to ready/triage. */
+  contracts?: {
+    sweep(boardId: string): Promise<void>
+    onReview(cardId: string): Promise<unknown>
+    onLeftReview?(cardId: string): Promise<unknown>
+  }
   /** The read-only PR reader: a write run's claim re-validates the card branch's open PR, which a restart may have dropped. */
   prs?: Pick<PrReader, 'listOpenPullRequestsByHead'>
   /** The daemon's live control connection; throws when it is gone. */
@@ -680,40 +684,71 @@ export class KanbanDispatcher {
       ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
       plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx)
     })
-    if (result.accepted && result.card.from !== result.card.to) {
-      const repo = await this.repoRef(result.card)
-      if (repo) this.writeStatus(result.card, repo, result.card.to)
-    }
+    if (!result.accepted) return result
+    const { card } = result
     // A verifier's approval, or a worker whose PR already finished, completes the contract now rather than on the next event.
-    if (result.accepted && result.card.to === 'review' && this.deps.contracts) this.recheckContract(result.card.cardId)
+    const recheck = this.recheckContract(card)
+    if (card.from !== card.to) {
+      const repo = await this.repoRef(card)
+      // The status write clears the claim's last gate, so it waits for the re-check: no claim beats its flag (#602).
+      if (repo) this.writeStatus(card, repo, card.to, undefined, recheck)
+    }
     return result
   }
 
-  private recheckContract(cardId: string): void {
-    const task = this.deps
-      .contracts!.onReview(cardId)
+  // In review, or moved from review to ready/triage, where a verdict must not carry an unbound PR back to work unflagged.
+  private recheckContract(card: {
+    cardId: string
+    from: KanbanStatus
+    to: KanbanStatus
+  }): Promise<unknown> | undefined {
+    const contracts = this.deps.contracts
+    if (!contracts) return undefined
+    const { cardId } = card
+    const leftReview = card.from === 'review' && (card.to === 'ready' || card.to === 'triage')
+    if (card.to !== 'review' && !(leftReview && contracts.onLeftReview)) return undefined
+    const task: Promise<unknown> = (leftReview ? contracts.onLeftReview!(cardId) : contracts.onReview(cardId))
       .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
       .finally(() => this.background.delete(task))
     this.background.add(task)
+    return task
   }
 
-  /** Best-effort label write after the CP state committed; a failure leaves drift for the reconciler to repair. */
+  /** Best-effort label write after the CP state committed, once `after` settles; a failure leaves drift for the reconciler. */
   private writeStatus(
     card: { issueNumber: number; cardId: string; boardId: string },
     repo: KanbanRepoRef,
     status: KanbanStatus,
-    observed?: ObservedIssue
+    observed?: ObservedIssue,
+    after?: Promise<unknown>
   ): void {
     this.projectCommitted(card.boardId, card.issueNumber, observed)
     if (this.deps.sync) {
-      const task = this.deps.sync
-        .projectStatus(card.boardId, card.issueNumber, status)
+      // The sync projects the card's live status, so a contract settle during `after` is written, not overwritten.
+      const task = Promise.resolve(after)
+        .then(() => this.deps.sync!.projectStatus(card.boardId, card.issueNumber, status))
         .then(() => this.poke(card.boardId))
         .catch((err: unknown) => this.deps.log.warn({ err, cardId: card.cardId }, 'kanban: status projection failed'))
         .finally(() => this.background.delete(task))
       this.background.add(task)
       return
     }
+    if (!after) return this.queueStatusWrite(card, repo, status, observed)
+    // Queued once `after` settles, as a contract settle inside it holds this queue; a settle writes its own status.
+    const deferred = after
+      .then((outcome) => {
+        if (outcome !== 'done' && outcome !== 'triage') this.queueStatusWrite(card, repo, status, observed)
+      })
+      .finally(() => this.background.delete(deferred))
+    this.background.add(deferred)
+  }
+
+  private queueStatusWrite(
+    card: { issueNumber: number; cardId: string; boardId: string },
+    repo: KanbanRepoRef,
+    status: KanbanStatus,
+    observed?: ObservedIssue
+  ): void {
     const task = (this.statusWrites.get(card.cardId) ?? Promise.resolve())
       .then(async () => {
         const current = observed ?? (await this.deps.store.readCard(repo, card.issueNumber))

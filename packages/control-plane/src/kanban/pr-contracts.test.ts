@@ -75,6 +75,11 @@ function make(
           .slice(0, q.limit ?? Infinity)
     ),
     getContractCard: vi.fn(async (id: string) => cards.find((c) => c.cardId === id) ?? null),
+    getLeftReviewCard: vi.fn(
+      async (id: string) =>
+        cards.find((c) => c.cardId === id && (c.status === 'ready' || c.status === 'triage') && !c.needsAttention) ??
+        null
+    ),
     settleContract: vi.fn(async (input: KanbanContractSettleInput) => {
       settles.push(input)
       return opts.settle ?? true
@@ -308,7 +313,9 @@ it('vera-415b3: pr_unbound is raised once per (card, PR) across doorbells, sweep
     await h.contracts.sweep(BOARD.id)
     await h.contracts.onVerified('c1')
   }
-  expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'pr_unbound', prNumber: 12 }])
+  expect(h.flags).toEqual([
+    { cardId: 'c1', expectedStateRevision: 5n, reason: 'pr_unbound', prNumber: 12, status: 'review' }
+  ])
   expect(h.plans).toHaveLength(1)
   expect(h.plans[0]).toMatchObject({ outcome: 'noop', status: 'review', addLabels: [], removeLabels: [] })
   expect(h.plans[0]!.comment).toContain('#12')
@@ -338,6 +345,35 @@ it('vera-415b3: a lost flag CAS posts no comment', async () => {
   expect(h.plans).toEqual([])
 })
 
+describe('#602: a run that moves a card out of review re-checks its PR binding', () => {
+  it.each(['ready', 'triage'] as const)('flags an unbound PR once on a %s card, naming that status', async (status) => {
+    const h = make({ cards: [card({ status, verifierAgentId: 'v1' })], pr: UNBOUND })
+    expect(await h.contracts.onLeftReview('c1')).toBe('wait')
+    expect(await h.contracts.onLeftReview('c1')).toBeNull()
+    expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'pr_unbound', prNumber: 12, status }])
+    expect(h.plans).toHaveLength(1)
+    expect(h.plans[0]).toMatchObject({ outcome: 'noop', status, addLabels: [], removeLabels: [] })
+    expect(h.plans[0]!.comment).toContain(`stays in \`ac/status:${status}\``)
+    expect(h.plans[0]!.comment).toContain('(pr_unbound)')
+    expect(h.settles).toEqual([])
+  })
+
+  it('a bound PR, even merged, is only judged in review: no flag, no settle, no read of its checks', async () => {
+    const h = make({ cards: [card({ status: 'ready', completionContract: 'pr_checks_green' })] })
+    expect(await h.contracts.onLeftReview('c1')).toBe('wait')
+    expect(h.flags).toEqual([])
+    expect(h.settles).toEqual([])
+    expect(h.prs.readCheckRuns).not.toHaveBeenCalled()
+  })
+
+  it('a card that is not due (still in review, or gone) reads nothing', async () => {
+    const h = make({ pr: UNBOUND })
+    expect(await h.contracts.onLeftReview('c1')).toBeNull()
+    expect(await h.contracts.onLeftReview('missing')).toBeNull()
+    expect(h.prs.readPullRequest).not.toHaveBeenCalled()
+  })
+})
+
 it('vera-415 actions:read: an unreadable workflow list flags pr_checks_green once as actions_read_missing', async () => {
   const h = make({
     cards: [card({ completionContract: 'pr_checks_green' })],
@@ -348,7 +384,9 @@ it('vera-415 actions:read: an unreadable workflow list flags pr_checks_green onc
   })
   for (let i = 0; i < 2; i++) await h.contracts.sweep(BOARD.id)
   expect(h.settles).toEqual([])
-  expect(h.flags).toEqual([{ cardId: 'c1', expectedStateRevision: 5n, reason: 'actions_read_missing', prNumber: 12 }])
+  expect(h.flags).toEqual([
+    { cardId: 'c1', expectedStateRevision: 5n, reason: 'actions_read_missing', prNumber: 12, status: 'review' }
+  ])
   expect(h.plans[0]!.comment).toContain('(actions_read_missing)')
 })
 
