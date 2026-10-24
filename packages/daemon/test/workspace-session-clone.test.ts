@@ -36,7 +36,7 @@ import {
 } from '../src/workspace/git-runner.js'
 import { ALLOWED_GIT_SUBCOMMANDS, createExecHandler } from '../src/shim/exec-handler.js'
 import { ShimGitRunner, type GitExecPayload } from '../src/shim/git-exec.js'
-import type { ShimRequester } from '../src/shim/channels.js'
+import { ShimChannelLostError, type ShimRequester } from '../src/shim/channels.js'
 import { buildWorkspaceRootsAppend } from '../src/session/turn/standing-context.js'
 import { sessionHomeIn } from '../src/workspace/session-layout.js'
 import { WorkspaceManager, type PrepareSessionWorkspaceRequest } from '../src/workspace/workspace-manager.js'
@@ -254,12 +254,18 @@ function wireEnv(env: Record<string, string>): Record<string, string> {
 }
 
 /** The pool's own runner against the pod's own handler, so the daemon's argv crosses the real exec channel and meets the real inventory — the enforcement a permissive stand-in hides, which is how `checkout` reached the field. */
-function shimRunner(workspaceRoot: string, cwd: string | undefined, abort: AbortSignal | undefined): GitRunner {
+function shimRunner(
+  workspaceRoot: string,
+  cwd: string | undefined,
+  abort: AbortSignal | undefined,
+  lose?: (args: string[]) => boolean
+): GitRunner {
   const handle = createExecHandler({ workspaceRoot, log: { info: () => {}, warn: () => {} } })
   const requester: ShimRequester = {
     request: async (capability, payload, options) => {
       const sent = payload as GitExecPayload
       gitRuns.push({ args: sent.args, env: sent.env ?? {} })
+      if (lose?.(sent.args)) throw new ShimChannelLostError('test channel lost')
       const wire: GitExecPayload = {
         ...sent,
         args: sent.args.map(substitute),
@@ -287,10 +293,13 @@ function serveAll(agent: Agent, branches: Record<string, string> = {}): Record<s
 }
 
 /** The same fixtures on the pool's shape: every daemon-run Git for this agent goes through the sandbox handler rooted at its directory. */
-function serveAllThroughShim(agent: Agent): Record<string, ReturnType<typeof bareRepo>> {
+function serveAllThroughShim(
+  agent: Agent,
+  lose?: (args: string[]) => boolean
+): Record<string, ReturnType<typeof bareRepo>> {
   const served = serveAll(agent)
   const root = workspaces.agentRootFor(agent)
-  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort) })
+  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort, lose) })
   return served
 }
 
@@ -2017,4 +2026,25 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
       expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
     }
   )
+
+  it('590: a sandboxed card-branch probe that loses its channel refuses the switch instead of resetting local-only commits', async () => {
+    const agent = agentFixture()
+    let losing = false
+    serveAllThroughShim(agent, (args) => losing && args[0] === 'show-ref')
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const head = git(cwd, ['symbolic-ref', 'HEAD'])
+    git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+    git(cwd, ['checkout', '-q', 'ac/card-7'])
+    writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+    git(cwd, ['add', 'local-only.md'])
+    git(cwd, ['commit', '-q', '-m', 'local card work'])
+    const localTip = git(cwd, ['rev-parse', 'HEAD'])
+    git(cwd, ['checkout', '-q', head.replace('refs/heads/', '')])
+    losing = true
+    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
+      /git show-ref lost its sandbox channel/
+    )
+    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+  })
 })

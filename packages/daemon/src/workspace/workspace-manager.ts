@@ -61,6 +61,7 @@ import {
   type GitCredRepository,
   type ManagedCredentialScope
 } from './git-injection.js'
+import { GitExecError } from './command-git-runner.js'
 import { GitTransportError, LocalGitRunner, type GitCloneOutput, type GitRunner } from './git-runner.js'
 import { cloneFromBundle, type BundleFallbackReason, type BundledCloneReport } from './bundled-clone.js'
 import type { SourceCacheShape } from '../source-cache/keys.js'
@@ -309,6 +310,16 @@ const reviewHeadRefFor = (id: string): string => `refs/agentconnect/reviews/${id
 /** Git this daemon runs on its own disk, with no plane between. */
 function hostGitRunner(cwd?: string, abort?: AbortSignal): GitRunner {
   return new LocalGitRunner(gitFor(cwd, abort), cwd, (env) => gitFor(cwd, abort, env))
+}
+
+/** Whether `refs/heads/<branch>` exists; only show-ref's silent exit 1 is a miss, so a failed probe throws instead of reading as absent. */
+async function localBranchExists(git: GitRunner, branch: string): Promise<boolean> {
+  const ref = `refs/heads/${branch}`
+  const listed = await git.raw(['show-ref', ref]).catch((err: unknown) => {
+    if (err instanceof GitExecError && err.code === 1 && `${err.stdout}${err.stderr}`.trim() === '') return ''
+    throw err
+  })
+  return listed.split('\n').some((line) => line.trimEnd().endsWith(` ${ref}`))
 }
 
 // Instance state, not module state: a process can hold more than one daemon (the test suite routinely does), and a k8s daemon and a local one place every scope differently.
@@ -2393,10 +2404,7 @@ export class WorkspaceManager {
     const git = () => this.runnerFor(agentId, root.path).withEnv(workspaceGitLocalEnv())
     // A fixed card branch is created from the root's default branch on first use and reused on later attempts.
     if (branch !== undefined) {
-      const exists = await git()
-        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-        .then(() => true)
-        .catch(() => false)
+      const exists = await localBranchExists(git(), branch)
       // Only a removed daemon session can release a card branch; an existing worktree may still be live.
       if (exists) await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
       // A card branch pushed from another clone or daemon resumes from origin; no upstream, so a push never targets the default branch.
@@ -2476,10 +2484,7 @@ export class WorkspaceManager {
     }
     const repository = tier === 'clone' ? cwd : root.path
     const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
-    const exists = await git()
-      .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-      .then(() => true)
-      .catch(() => false)
+    const exists = await localBranchExists(git(), branch)
     if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
     const start = remote ?? target
     // Reset only when every local commit is reachable from the start; rev-list, not merge-base, is what the sandbox admits.
@@ -3009,10 +3014,7 @@ export class WorkspaceManager {
     // Three admitted subcommands rather than `checkout -b`, which the sandbox refuses by design: create the branch, point HEAD at it, then materialize the tree HEAD now names.
     const git = this.runnerFor(agentId, cwd).withEnv(this.sessionCloneGitEnv(agentId, root, cwd))
     if (branch !== undefined) {
-      const exists = await git
-        .raw(['show-ref', '--verify', `refs/heads/${branch}`])
-        .then(() => true)
-        .catch(() => false)
+      const exists = await localBranchExists(git, branch)
       if (!exists) {
         const start = (await this.fetchRemoteCardBranch(agentId, root, cwd, branch, true)) ?? target
         await git.raw(['branch', '--no-track', branch, start])
