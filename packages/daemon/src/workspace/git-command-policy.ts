@@ -166,17 +166,6 @@ export function validateGitArgs(args: string[]): void {
   }
 }
 
-/** The policy's refusal of `args` when `err` is that refusal, thrown in-process or relayed over the exec channel; else undefined. */
-export function policyRefusalOf(args: string[], err: unknown): string | undefined {
-  if (!(err instanceof Error)) return undefined
-  try {
-    validateGitArgs(args)
-  } catch (refusal) {
-    if (refusal instanceof ExecRefusedError && err.message.includes(refusal.message)) return refusal.message
-  }
-  return undefined
-}
-
 // config is admitted only for the daemon's managed-credential writes and its read-only .gitmodules listing.
 function validateConfigArgs(rest: string[]): void {
   const refuse = (): never => {

@@ -1862,12 +1862,19 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
       const { primary } = serveAll(agent)
       const request = tier === 'confined' ? confined : unconfined
       const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      // The worktree tier's `config --local` is the root's, shared by every worktree of it.
+      const repository = tier === 'confined' ? cwd : workspaces.primaryRoot(agent).path
+      const mappings = () => git(repository, ['config', '--local', '--get-all', 'remote.origin.fetch'])
+      const before = mappings()
       const tip = pushCardBranch(primary!.seed, 7)
       const next = await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
       expect(next).toBe(cwd)
       expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
       expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
-      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/ac/card-7')
+      // 590: no upstream and no per-card refspec, so a plain fetch survives the branch's deletion after merge.
+      expect(mappings()).toBe(before)
+      expect(git(repository, ['config', '--local', '--list'])).not.toContain('ac/card-7')
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
     }
   )
 
@@ -1955,33 +1962,59 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
   })
 
-  it('416r4: an existing sandboxed checkout reports the policy refusing a pushed card branch switch, untouched', async () => {
+  it.each(['remote', 'local'] as const)(
+    '590: an existing sandboxed checkout switches to a %s card branch with only admitted Git',
+    async (kind) => {
+      const agent = agentFixture()
+      const { primary } = serveAllThroughShim(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+      const config = readFileSync(join(cwd, '.git', 'config'), 'utf8')
+      // A local card branch at the default tip has nothing local-only, so the switch must accept it.
+      const tip = kind === 'remote' ? pushCardBranch(primary!.seed, 7) : git(cwd, ['rev-parse', 'origin/main'])
+      if (kind === 'local') git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+      gitRuns.length = 0
+      expect(await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+      expect(readFileSync(join(cwd, '.git', 'config'), 'utf8')).toBe(config)
+      const issued = [...new Set(gitRuns.map((run) => run.args[0]!))]
+      expect(issued).toEqual(expect.arrayContaining(['ls-remote', 'checkout']))
+      expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+    }
+  )
+
+  it('590: an existing sandboxed checkout over a pushed card branch accepts a local branch the remote contains', async () => {
     const agent = agentFixture()
     const { primary } = serveAllThroughShim(agent)
     const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
-    const head = git(cwd, ['symbolic-ref', 'HEAD'])
-    const tip = git(cwd, ['rev-parse', 'HEAD'])
-    pushCardBranch(primary!.seed, 7)
-    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
-      /not supported on the sandboxed tier: the sandbox git policy refuses git config/
-    )
-    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+    const tip = pushCardBranch(primary!.seed, 7)
+    await workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
     expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
-    expect(() => git(cwd, ['rev-parse', '--verify', 'refs/heads/ac/card-7'])).toThrow()
   })
 
-  it('416r4: an existing sandboxed checkout reports the policy refusing merge-base, never local-only commits', async () => {
-    const agent = agentFixture()
-    serveAllThroughShim(agent)
-    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
-    const head = git(cwd, ['symbolic-ref', 'HEAD'])
-    // A card branch at the default tip has no local-only commits, so only the refused ancestry check can stop the switch.
-    git(cwd, ['branch', 'ac/card-7', 'origin/main'])
-    const cardTip = git(cwd, ['rev-parse', 'ac/card-7'])
-    await expect(workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))).rejects.toThrow(
-      /not supported on the sandboxed tier: the sandbox git policy refuses git merge-base/
-    )
-    expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
-    expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(cardTip)
-  })
+  it.each(['without', 'with'] as const)(
+    '590: an existing sandboxed checkout still refuses a local-only card commit %s a pushed card branch',
+    async (remote) => {
+      const agent = agentFixture()
+      const { primary } = serveAllThroughShim(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+      const head = git(cwd, ['symbolic-ref', 'HEAD'])
+      if (remote === 'with') pushCardBranch(primary!.seed, 7)
+      git(cwd, ['branch', '--no-track', 'ac/card-7', 'origin/main'])
+      git(cwd, ['checkout', '-q', 'ac/card-7'])
+      writeFileSync(join(cwd, 'local-only.md'), 'keep local commit')
+      git(cwd, ['add', 'local-only.md'])
+      git(cwd, ['commit', '-q', '-m', 'local card work'])
+      const localTip = git(cwd, ['rev-parse', 'HEAD'])
+      git(cwd, ['checkout', '-q', head.replace('refs/heads/', '')])
+      await expect(
+        workspaces.prepareSessionWorkspace(agent, confined({ branch: kanbanCardBranch(7) }))
+      ).rejects.toThrow(/card branch ac\/card-7 has local-only commits; refusing to reset it/)
+      expect(git(cwd, ['rev-parse', 'ac/card-7'])).toBe(localTip)
+      expect(git(cwd, ['symbolic-ref', 'HEAD'])).toBe(head)
+    }
+  )
 })

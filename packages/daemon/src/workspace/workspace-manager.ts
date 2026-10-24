@@ -63,7 +63,6 @@ import {
 } from './git-injection.js'
 import { GitTransportError, LocalGitRunner, type GitCloneOutput, type GitRunner } from './git-runner.js'
 import { cloneFromBundle, type BundleFallbackReason, type BundledCloneReport } from './bundled-clone.js'
-import { policyRefusalOf } from './git-command-policy.js'
 import type { SourceCacheShape } from '../source-cache/keys.js'
 import type { SourceCacheWorkspaceReader, WorkspaceCachePlan } from '../source-cache/read-plan.js'
 import type { SourceCacheWriteRequest, SourceCacheWriter } from '../source-cache/write-back.js'
@@ -2475,15 +2474,6 @@ export class WorkspaceManager {
     if ((await git().raw(['status', '--porcelain'])).trim() !== '') {
       throw new Error(`session checkout has uncommitted or untracked changes; refusing to switch it to ${branch}`)
     }
-    // Full sandboxed switch support is #590; until then a policy refusal is reported as such, before the checkout moves.
-    const refuseIfPolicy = (args: string[], err: unknown): void => {
-      const refusal = policyRefusalOf(args, err)
-      if (refusal === undefined) return
-      throw new Error(
-        `switching an existing session checkout to ${branch} is not supported on the sandboxed tier: ` +
-          `the sandbox git policy refuses git ${args[0]} (${refusal})`
-      )
-    }
     const repository = tier === 'clone' ? cwd : root.path
     const remote = await this.fetchRemoteCardBranch(agentId, root, repository, branch, tier === 'clone')
     const exists = await git()
@@ -2492,45 +2482,12 @@ export class WorkspaceManager {
       .catch(() => false)
     if (exists && tier === 'worktree') await this.releaseCardBranchRegistrations(agentId, root, cwd, branch)
     const start = remote ?? target
-    if (exists) {
-      const localTip = (await git().raw(['rev-parse', `refs/heads/${branch}`])).trim()
-      // Reset only when every local commit is reachable from the intended starting point.
-      const ancestry = ['merge-base', '--is-ancestor', localTip, start]
-      const retained = await git()
-        .raw(ancestry)
-        .then(
-          () => true,
-          (err: unknown) => {
-            refuseIfPolicy(ancestry, err)
-            return false
-          }
-        )
-      if (!retained) throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
+    // Reset only when every local commit is reachable from the start; rev-list, not merge-base, is what the sandbox admits.
+    if (exists && (await git().raw(['rev-list', '--count', `refs/heads/${branch}`, `^${start}`])).trim() !== '0') {
+      throw new Error(`card branch ${branch} has local-only commits; refusing to reset it`)
     }
-    if (remote) {
-      // Exact-refspec fetches need a matching origin mapping before Git can configure branch tracking.
-      const refspec = `+refs/heads/${branch}:refs/remotes/origin/${branch}`
-      const mappings = await git()
-        .raw(['config', '--local', '--get-all', 'remote.origin.fetch'])
-        .catch(() => '')
-      if (!mappings.split('\n').includes(refspec)) {
-        const mapping = ['config', '--local', '--add', 'remote.origin.fetch', refspec]
-        await git()
-          .raw(mapping)
-          .catch((err: unknown) => {
-            refuseIfPolicy(mapping, err)
-            throw err
-          })
-      }
-    }
-    await git().raw([
-      'checkout',
-      '--no-overwrite-ignore',
-      '-B',
-      branch,
-      ...(remote ? ['--track'] : ['--no-track']),
-      start
-    ])
+    // No upstream and no per-card refspec: the worktree tier's config is the shared root's, and the branch is deleted after merge.
+    await git().raw(['checkout', '--no-overwrite-ignore', '-B', branch, '--no-track', start])
   }
 
   /** Fetch a fixed card branch an earlier attempt pushed into `refs/remotes/origin/<branch>` of the repository at `path`; undefined when origin has none. */
