@@ -906,9 +906,13 @@ describe("vera-415b3: the PR binding follows the card's work episode (real Postg
     issue = c.issueNumber
     await h.dispatcher.reconcileBoard(h.board.id)
     await h.dispatcher.settle()
+    // A label-write poke racing the run end's re-check could claim a verify first (#600), so only explicit ticks claim.
+    h.dispatcher.stop()
     h.clock.advance(30_000)
     await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
     await h.dispatcher.settle()
+    // The run end's own re-check raised the flag, before any tick could claim a verify.
+    expect(await h.card(c.id)).toMatchObject({ needsAttention: true, contractFlags: ['pr_unbound#12'] })
     for (let i = 0; i < 3; i++) {
       await h.contracts!.sweep(h.board.id)
       await h.dispatcher.reconcileBoard(h.board.id)
