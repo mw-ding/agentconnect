@@ -38,8 +38,12 @@ class FakeGithub {
   readonly writes: LabelPlan[] = []
   readonly issues = new Map<number, { labels: string[]; state: 'open' | 'closed'; stateReason: string | null }>()
   readonly events = new Map<number, LabelEvent[]>()
+  /** Posted comments; a keyed one is skipped when its key is already on the issue, as the label writer's marker scan does. */
+  readonly comments: Array<{ n: number; body: string; key: string | null }> = []
   /** The next this-many label writes fail, as a GitHub outage would. */
   failWrites = 0
+  /** The next this-many writes land in full and then throw, as a lost response would. */
+  lostAcks = 0
   private eventId = 0
 
   open(n: number, labels: string[]): void {
@@ -98,6 +102,13 @@ class FakeGithub {
     if (plan.issueState) {
       i.state = plan.issueState.state
       i.stateReason = plan.issueState.state === 'closed' ? plan.issueState.reason : null
+    }
+    const key = plan.commentKey ?? null
+    if (plan.comment && !(key && this.comments.some((c) => c.n === n && c.key === key)))
+      this.comments.push({ n, body: plan.comment, key })
+    if (this.lostAcks > 0) {
+      this.lostAcks -= 1
+      throw new Error('GitHub response lost')
     }
   }
 }
@@ -277,5 +288,59 @@ describe('590: Kanban composed like the container (real Postgres)', () => {
     await h.dispatcher.settle()
     expect(h.sent.map(({ d }) => d.role ?? 'work')).toEqual(['work', 'verify', 'work'])
     expect(await h.card(c.id)).toMatchObject({ status: 'running', labelWritePending: false })
+  })
+})
+
+describe('598: a label-sync repair re-posts the control comment once (real Postgres)', () => {
+  it('a restart whose write failed is repaired with its comment, and a repeated repair posts it once', async () => {
+    const h = await harness()
+    const c = await h.addCard('triage')
+    h.github.failWrites = 1
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.github.comments).toEqual([])
+
+    // The first repair lands, comment included, but its response is lost, so the next tick repairs again.
+    h.github.lostAcks = 1
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'ready', controlWrittenVersion: 0n })
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', controlWrittenVersion: 1n })
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'restarted via AgentConnect', key: `control:${c.id}:1` }
+    ])
+  })
+
+  it("a skip whose write failed is repaired with the actor's comment", async () => {
+    const h = await harness()
+    const c = await h.addCard('ready')
+    h.github.failWrites = 1
+    expect((await h.controls.skip(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(h.github.comments).toEqual([])
+
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'archived', controlWrittenVersion: 1n })
+    expect(h.github.issues.get(c.issueNumber)).toMatchObject({ state: 'closed', stateReason: 'not_planned' })
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'skipped by @maintainer via AgentConnect', key: `control:${c.id}:1` }
+    ])
+  })
+
+  it('a control write that landed but lost its response is repaired without a second comment', async () => {
+    const h = await harness()
+    const c = await h.addCard('triage')
+    h.github.lostAcks = 1
+    expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ controlWrittenVersion: 0n })
+
+    await h.dispatcher.tick()
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({ status: 'running', controlWrittenVersion: 1n })
+    expect(h.github.comments.map(({ body }) => body)).toEqual(['restarted via AgentConnect'])
   })
 })

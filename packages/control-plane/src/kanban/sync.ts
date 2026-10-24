@@ -33,6 +33,7 @@ import {
   type LabelPlan
 } from './card-state.js'
 import { planReassign } from './reassign.js'
+import { controlComment } from './controls.js'
 import type { KanbanProjectHook } from './project-writer.js'
 
 export interface SyncCard {
@@ -50,6 +51,11 @@ export interface SyncCard {
   /** The card's latest skip/restart version; an ack of this snapshot's projection records GitHub reflects it. */
   controlVersion: bigint
   controlWrittenVersion: bigint
+  /** The latest control's comment facts; null kind for a control committed before they were stored. */
+  controlKind: 'skip' | 'restart' | null
+  controlActorLogin: string | null
+  controlAt: Date | null
+  supersededPrNumber: number | null
   syncEventCursor: bigint
   syncAgentCursor: bigint
   syncDeferredAt: Date | null
@@ -365,7 +371,20 @@ export class KanbanSync {
       const current = await this.deps.repo.get(boardId, issueNumber)
       if (!current || current.controlVersion !== card.controlVersion || current.stateRevision !== card.stateRevision)
         return done(false)
-      await this.deps.store.applyPlan(repo, issueNumber, issue, planStatusWrite(card.status, issue))
+      // The control's comment rides under its key, so neither its own landed write nor a repeat repair duplicates it.
+      const comment =
+        card.controlKind && card.controlAt
+          ? controlComment({
+              cardId: card.id,
+              issueNumber,
+              controlVersion: card.controlVersion,
+              kind: card.controlKind,
+              actorLogin: card.controlActorLogin,
+              supersededPrNumber: card.supersededPrNumber,
+              at: card.controlAt
+            })
+          : {}
+      await this.deps.store.applyPlan(repo, issueNumber, issue, { ...planStatusWrite(card.status, issue), ...comment })
       await this.deps.repo.ack(card, card.syncEventCursor, card.syncAgentCursor)
       return done(false)
     }

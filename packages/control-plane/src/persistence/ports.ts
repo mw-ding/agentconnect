@@ -8568,6 +8568,8 @@ export interface KanbanCardControlOutcome {
   controlVersion: bigint
   /** The card's state revision right after this move; a later move still owes its own label write. */
   stateRevision: bigint
+  /** When this control committed; its keyed comment is searched for from then on. */
+  controlAt: Date
 }
 
 export type KanbanCardControlRefusal = 'not_found' | 'illegal_transition'
@@ -8581,6 +8583,8 @@ export interface KanbanCardControlInput {
   cardId: string
   actorUserId: string
   source: string
+  /** The actor's GitHub login for a skip's comment, stored so a label-sync repair re-posts the same comment. */
+  actorLogin?: string | null
 }
 
 export interface KanbanRestartInput extends KanbanCardControlInput {

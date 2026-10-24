@@ -33,6 +33,10 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
         labelWritePending: true,
         controlVersion: true,
         controlWrittenVersion: true,
+        controlKind: true,
+        controlActorLogin: true,
+        controlAt: true,
+        supersededPrNumber: true,
         syncEventCursor: true,
         syncAgentCursor: true,
         syncDeferredAt: true,
@@ -53,6 +57,7 @@ export class PgKanbanSyncRepo implements KanbanSyncRepo {
     return {
       ...card,
       status: row.status,
+      controlKind: row.controlKind === 'skip' || row.controlKind === 'restart' ? row.controlKind : null,
       orgId: board.orgId,
       assigneeName: assigneeAgent?.name ?? null,
       lease: run ? { ...run, runId: run.id } : null
