@@ -155,6 +155,10 @@ describe('gateHint', () => {
     expect(gateHint('status_not_claimable', facts)).toContain('todo')
   })
 
+  it('590: says a control write that can never land needs a human', () => {
+    expect(gateHint('control_write_pending', claimFactsOf(input()))).toMatch(/deleted or transferred.*needs a human/)
+  })
+
   it('words a cap deferral as eligible now, blocked after the cards ahead', () => {
     const hint = capDeferralHint('agent_cap', claimFactsOf(input()))
     expect(hint).toMatch(/^eligible now, but .* once the cards ahead of it are dispatched$/)

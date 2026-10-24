@@ -982,11 +982,13 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
     return (await this.db.kanbanCard.count({ where: { id: cardId, controlVersion: version } })) === 1
   }
 
-  async markControlWritten(cardId: string, version: bigint): Promise<boolean> {
-    const { count } = await this.db.kanbanCard.updateMany({
-      where: { id: cardId, controlVersion: version, controlWrittenVersion: { lt: version } },
-      data: { controlWrittenVersion: version, labelWritePending: false }
-    })
+  async markControlWritten(cardId: string, version: bigint, stateRevision: bigint): Promise<boolean> {
+    // The control's write only settles its own move: a later move keeps the label write it still owes.
+    const count = await this.db.$executeRaw(Prisma.sql`
+      UPDATE "kanban_card" SET "controlWrittenVersion" = ${version},
+        "labelWritePending" = CASE WHEN "stateRevision" = ${stateRevision} THEN false ELSE "labelWritePending" END
+      WHERE "id" = ${cardId}::uuid AND "controlVersion" = ${version} AND "controlWrittenVersion" < ${version}
+    `)
     return count === 1
   }
 
@@ -1032,15 +1034,17 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         repoId: row.repoId,
         repoFullName: row.repoFullName,
         supersededPrNumber: null,
-        controlVersion: row.controlVersion
+        controlVersion: row.controlVersion,
+        stateRevision: row.stateRevision
       }
       // A repeated skip is idempotent: an archived card holds no lease, so there is nothing to revoke, move, audit or write.
       if (to === 'archived' && row.status === 'archived')
         return { ok: true, value: { ...outcome, changed: false, revokedLease: null } }
-      // Restart routes archived→triage→ready (the table's two-hop path) in one write; everything else honors the table directly.
+      // Restart routes archived→triage→ready (the table's two-hop path) in one write and never lifts a todo card past its blockers.
       const legal =
         to === 'ready'
-          ? canTransition(row.status, to) || row.status === 'archived' || row.status === 'ready'
+          ? row.status !== 'todo' &&
+            (canTransition(row.status, to) || row.status === 'archived' || row.status === 'ready')
           : canTransition(row.status, to)
       if (!legal) return { ok: false, reason: 'illegal_transition' }
       const [open] = await tx.$queryRaw<KanbanLeaseRef[]>(Prisma.sql`
@@ -1073,7 +1077,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         row.status === 'ready' &&
         !open &&
         (await tx.kanbanCard.findFirst({
-          where: { id: row.id, ...reset, contractFlags: { equals: [] } },
+          // A retry keeps the first restart's close target, so the target is no part of "already reset".
+          where: { id: row.id, ...reset, contractFlags: { equals: [] }, supersededPrNumber: undefined },
           select: { id: true }
         }))
       )
@@ -1090,14 +1095,13 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
         data: {
           status: to,
           controlVersion,
-          ...(to === 'ready' ? { supersededPrNumber: superseded } : {}),
           stateRevision: { increment: 1 },
           dispatchRevision: { increment: 1 },
           githubSyncedAt: new Date(),
           // The GitHub write runs after commit; a failed one stays pending for the label sync's repair.
           labelWritePending: true,
           // A skip also drops any open promotion intent: recovery and the label sync never revisit an archived card.
-          ...(to === 'ready' ? reset : PROMOTION_CLEARED)
+          ...(to === 'ready' ? { ...reset, supersededPrNumber: superseded } : PROMOTION_CLEARED)
         }
       })
       if (count !== 1) throw new Error('kanban control version moved under the card lock')
@@ -1147,7 +1151,8 @@ export class PgKanbanCardRepo implements KanbanCardRepo, KanbanCardControlRepo {
           changed: true,
           revokedLease: open ?? null,
           supersededPrNumber: superseded,
-          controlVersion
+          controlVersion,
+          stateRevision: row.stateRevision + 1n
         }
       }
     })

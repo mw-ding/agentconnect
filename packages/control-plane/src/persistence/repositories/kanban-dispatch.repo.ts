@@ -481,6 +481,14 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
     })
   }
 
+  async markStatusWritten(cardId: string, status: KanbanStatus): Promise<boolean> {
+    const { count } = await this.db.kanbanCard.updateMany({
+      where: { id: cardId, status, labelWritePending: true },
+      data: { labelWritePending: false, githubSyncedAt: new Date() }
+    })
+    return count === 1
+  }
+
   async deferRecovery(cardId: string, now: Date, observed?: string): Promise<void> {
     // A fingerprint that differs from the last read means GitHub changed, so the backoff starts over at one step.
     const seen = observed ?? null
@@ -812,6 +820,11 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
           ...(plan.status !== row.status ? { labelWritePending: true } : {}),
           // A verifier report never replaces the linked PR.
           ...(row.role === 'work' && input.prNumber !== undefined ? { linkedPrNumber: input.prNumber } : {}),
+          // A restart's close target is spent once a work run reports done or binds a PR; a failed run's retry still needs it.
+          ...(row.role === 'work' &&
+          (input.prNumber !== undefined || input.outcome === 'completed' || input.outcome === 'review_requested')
+            ? { supersededPrNumber: null }
+            : {}),
           consecutiveFailures: plan.consecutiveFailures,
           protocolViolations: plan.protocolViolations,
           blockRecurrence: plan.blockRecurrence,
