@@ -11,6 +11,21 @@ description: Deploy the service safely.
 `
 
 describe('packageSkillBundle', () => {
+  it('packages to the same digest in every timezone, including west of UTC', () => {
+    const files = [{ path: 'SKILL.md', encoding: 'utf8' as const, content: manifest }]
+    const original = process.env.TZ
+    try {
+      const digests = ['UTC', 'America/Los_Angeles', 'Pacific/Honolulu', 'Asia/Tokyo'].map((tz) => {
+        process.env.TZ = tz
+        return packageSkillBundle(files, 'deploy-helper').digest
+      })
+      expect(new Set(digests).size).toBe(1)
+    } finally {
+      if (original === undefined) delete process.env.TZ
+      else process.env.TZ = original
+    }
+  })
+
   it('produces a deterministic official one-root .skill ZIP', () => {
     const files = [
       { path: 'scripts/deploy.sh', encoding: 'utf8' as const, content: '#!/bin/sh\necho deploy\n' },

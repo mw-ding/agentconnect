@@ -11,7 +11,8 @@ export const MAX_MANAGED_SKILL_FILE_BYTES = 512 * 1024
 export const MAX_MANAGED_SKILL_COMPRESSION_RATIO = 200
 
 const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/
-const ZIP_MTIME = new Date('1980-01-01T00:00:00.000Z')
+// fflate writes DOS time from local fields, so build the epoch in local time to stay in range and TZ-independent
+const ZIP_MTIME = new Date(1980, 0, 1, 0, 0, 0)
 const ZIP_EOCD_SIGNATURE = 0x06054b50
 const ZIP_CENTRAL_SIGNATURE = 0x02014b50
 
