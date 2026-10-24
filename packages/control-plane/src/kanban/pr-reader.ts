@@ -11,6 +11,8 @@ const MAX_CHECK_PAGES = 3
 export interface PrReader {
   // A missing or non-PR number returns null; binding metadata is projected from live GitHub reads.
   readPullRequest(repo: KanbanRepoRef, prNumber: number): Promise<LivePullRequest | null>
+  // Open PRs from this repository's `headRef` (first page; GitHub allows one open PR per head and base), defaultBranch null.
+  listOpenPullRequestsByHead(repo: KanbanRepoRef, headRef: string): Promise<LivePullRequest[]>
   // Truncating either the check or workflow list sets complete=false; actionsUnreadable means no actions:read.
   readCheckRuns(
     repo: KanbanRepoRef,
@@ -87,6 +89,24 @@ export function newestPerCheck<T extends GhCheckRun>(
   return [...newest.values()]
 }
 
+function livePull(pull: GhPull, headSha: string, defaultBranch: string | null): LivePullRequest {
+  return {
+    number: pull.number,
+    state: pull.state,
+    merged: pull.merged === true || !!pull.merged_at,
+    headSha,
+    authorLogin: pull.user?.login ?? null,
+    authorType: pull.user?.type ?? null,
+    headRef: pull.head?.ref ?? null,
+    headRepoId:
+      Number.isSafeInteger(pull.head?.repo?.id) && pull.head!.repo!.id! > 0 ? BigInt(pull.head!.repo!.id!) : null,
+    baseRef: pull.base?.ref ?? null,
+    defaultBranch,
+    createdAt: pull.created_at ? new Date(pull.created_at) : null,
+    mergedByLogin: pull.merged_by?.login ?? null
+  }
+}
+
 export class GithubPrReader implements PrReader {
   constructor(private readonly deps: GithubPrReaderDeps) {}
 
@@ -100,21 +120,17 @@ export class GithubPrReader implements PrReader {
     }
     if (pull.number !== prNumber || !pull.head?.sha) return null
     const repository = await this.get<{ default_branch?: string }>(repo, '')
-    return {
-      number: pull.number,
-      state: pull.state,
-      merged: pull.merged === true || !!pull.merged_at,
-      headSha: pull.head.sha,
-      authorLogin: pull.user?.login ?? null,
-      authorType: pull.user?.type ?? null,
-      headRef: pull.head.ref ?? null,
-      headRepoId:
-        Number.isSafeInteger(pull.head.repo?.id) && pull.head.repo!.id! > 0 ? BigInt(pull.head.repo!.id!) : null,
-      baseRef: pull.base?.ref ?? null,
-      defaultBranch: repository.default_branch ?? null,
-      createdAt: pull.created_at ? new Date(pull.created_at) : null,
-      mergedByLogin: pull.merged_by?.login ?? null
-    }
+    return livePull(pull, pull.head.sha, repository.default_branch ?? null)
+  }
+
+  async listOpenPullRequestsByHead(repo: KanbanRepoRef, headRef: string): Promise<LivePullRequest[]> {
+    const owner = repo.repoFullName.split('/', 1)[0]
+    if (!owner) return []
+    const head = encodeURIComponent(`${owner}:${headRef}`)
+    const pulls = await this.get<GhPull[]>(repo, `/pulls?state=open&head=${head}&per_page=${PAGE}`)
+    return pulls.flatMap((pull) =>
+      pull.state === 'open' && pull.head?.ref === headRef && pull.head.sha ? [livePull(pull, pull.head.sha, null)] : []
+    )
   }
 
   async readCheckRuns(

@@ -7997,6 +7997,8 @@ export interface KanbanClaimedLease extends KanbanBoardRef {
   sessionKeyPrefix: string
   /** A write-mode work run's validated superseded PR from the card's last restart; the worker may close only this one. */
   supersededPrNumber?: number
+  /** A write-mode work run with no close target and no linked PR: an open card-branch PR created before this episode start can never bind, so the dispatcher looks one up. */
+  staleCardPrBefore?: Date
 }
 
 /** A review card the claim refused to dispatch because its verifier is the worker (B8); flagged once, never claimed. */
