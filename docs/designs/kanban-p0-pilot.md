@@ -592,10 +592,12 @@ card. Re-validating at claim time needs a PR lookup by head branch that the
 read-only PR reader does not have, so it is not done.
 
 Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.
-A daemon older than #416 decodes that frame strictly and rejects a dispatch that
-carries it, so the card fails to dispatch and retries after a cooldown until its
-daemon is upgraded. Upgrade every daemon before restarting a card whose linked PR
-is still open.
+A daemon older than #416 reads CP frames tolerantly (`decodeCpEnvelope` strips
+unknown keys), so it accepts such a dispatch, silently drops the field, and runs
+without the close instruction. Nothing fails: the superseded PR stays open, and
+once that run reports `completed` or `review_requested`, or binds a PR, the CP
+spends the close target, so no later dispatch closes it either. Upgrade every
+daemon before restarting a card whose linked PR is still open.
 
 Known gaps (M4 controls): a half-landed synthesis promotion is not adopted by
 the attributed pending-promotion recovery (the graph reconciler's adoption rule
