@@ -895,6 +895,7 @@ export class PgKanbanDispatchRepo implements KanbanDispatchRepo, KanbanContractR
           tripped: plan.tripped,
           mention: decision.mention
         })
+      input.beforeCommit?.({ cardId: row.cardId, boardId: row.boardId, from: row.status, to: plan.status })
       return {
         accepted: true,
         plan,

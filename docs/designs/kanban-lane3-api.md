@@ -398,16 +398,23 @@ The pure planner is in `cp/src/kanban/contracts.ts`:
     with the same CAS and one comment naming it; nothing settles outside `review`.
   - the dispatcher tick's bounded sweep: 25 cards per board, with a cursor.
 - A run end's re-check holds its card's claim in the CP process that ended the run
-  (#602). From the run end's commit until the re-check settles, every claim in that
-  process skips the card, even when another sync's label ack has already cleared
-  `labelWritePending`. A claim skipped this way is retried as soon as the hold lifts. The
-  run end's own status label write also waits for the re-check. The hold is in memory and
-  lapses after 5 minutes; the re-check's GitHub reads time out long before that. A re-check
-  that fails lifts the hold without a flag.
+  (#602). The dispatcher installs the hold inside the run end's transaction, under the
+  card's row lock and before the commit makes the card claimable, and drops it if the end
+  is not accepted or the transaction rolls back. From then until the re-check settles,
+  every claim in that process skips the card. This holds even for a `review` to `review`
+  end, which owes no label write, and when another sync's label ack has already cleared
+  `labelWritePending`. The run end's own status label write also waits for the re-check.
+  A re-check that fails lifts the hold without a flag.
+- When the re-check settles, flagged or not, a claim it skipped is retried at once by a
+  board poke. The hold is in memory and lapses 5 minutes after it was installed; the
+  re-check's GitHub reads time out long before that. Nothing pokes the board when the hold
+  lapses: the lapse is checked lazily by the next claim (the 60s tick or any other event),
+  which may then start a run before a still-pending re-check flags the card.
 - Nothing holds the card in another CP replica, or after a CP restart before the re-check
   settles. A claim there can still start a run before the flag lands. That fails closed:
   nothing completes on an unbound PR, and the run's own end re-checks it. The 60s tick's
-  sweep flags `review` cards before its claim; `ready` and `triage` cards are not swept.
+  sweep flags only `review` cards before its claim; `ready` and `triage` cards are not
+  swept, so an unflagged rework claim there is caught only at that run's end.
 
 ### Deploy order
 

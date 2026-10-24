@@ -598,9 +598,11 @@ lease is checked again before dispatch. This adds one bounded list request on
 such claims and no PR-number migration. An absent reader or ambiguous matches
 still require human recovery. Episode binding and completion fences remain in
 force. Within the CP process that ended a run, its contract re-check now holds the
-card's claim until the re-check settles, so a verify or rework claim there cannot
-start before a `pr_unbound` flag lands (#600/#601, fixed by #602). Another replica, or
-a restart before the re-check settles, can still race it and fail closed; see
+card's claim from before the run end's commit until the re-check settles, for at most
+5 minutes. A verify or rework claim there cannot start while the re-check is pending,
+so a `pr_unbound` flag it raises lands first (#600/#601, fixed by #602). Another
+replica, a restart before the re-check settles, or a re-check that outlives the
+5-minute hold can still race it and fail closed; see
 [kanban-lane3-api.md](kanban-lane3-api.md) for the bounds.
 
 Version skew (#590): `supersededPrNumber` is an optional `kanban/dispatch` field.

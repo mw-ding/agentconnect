@@ -236,3 +236,58 @@ describe('dispatcher Projects v2 projection seam', () => {
     expect(h.store.applyPlan).toHaveBeenCalledTimes(2)
   })
 })
+
+describe('#602: a run end holds its card for the contract re-check from before its commit', () => {
+  const VERIFIED = { cardId: 'card-1', boardId: 'board-1', from: 'review' as const, to: 'review' as const }
+  type EndRunInput = Parameters<KanbanDispatcherDeps['repo']['endRun']>[0]
+  // The repo's commit step: the hold is installed under the row locks, a claim then runs, and the commit ends as `commit` says.
+  function harness(commit: () => Promise<unknown>) {
+    const h = dispatcher()
+    const internals = h.d as unknown as {
+      deps: KanbanDispatcherDeps
+      endRun(leaseId: string, end: { outcome: 'reclaimed' }, reasonCode: string | null): Promise<unknown>
+      recheckHolds(cardId: string): boolean
+    }
+    const onReview = vi.fn(async () => 'wait')
+    internals.deps.contracts = { sweep: vi.fn(async () => {}), onReview }
+    internals.deps.clock = { now: () => NOW.getTime() } as KanbanDispatcherDeps['clock']
+    const skippedBeforeCommit: boolean[] = []
+    h.repo.endRun.mockImplementation((async (input: EndRunInput) => {
+      input.beforeCommit?.(VERIFIED)
+      skippedBeforeCommit.push(internals.recheckHolds('card-1'))
+      return commit()
+    }) as never)
+    return { ...h, internals, onReview, skippedBeforeCommit }
+  }
+
+  it('a rolled-back end drops the hold and retries the claim it skipped', async () => {
+    const h = harness(async () => {
+      throw new Error('could not serialize access')
+    })
+    await expect(h.internals.endRun('lease-1', { outcome: 'reclaimed' }, null)).rejects.toThrow('serialize')
+    expect(h.skippedBeforeCommit).toEqual([true])
+    expect(h.internals.recheckHolds('card-1')).toBe(false)
+    expect(h.poke).toHaveBeenCalledWith('board-1')
+    expect(h.onReview).not.toHaveBeenCalled()
+  })
+
+  it('an end the repo did not accept drops the hold and retries the claim it skipped', async () => {
+    const h = harness(async () => ({ accepted: false }))
+    expect(await h.internals.endRun('lease-1', { outcome: 'reclaimed' }, null)).toEqual({ accepted: false })
+    expect(h.skippedBeforeCommit).toEqual([true])
+    expect(h.internals.recheckHolds('card-1')).toBe(false)
+    expect(h.poke).toHaveBeenCalledWith('board-1')
+    expect(h.onReview).not.toHaveBeenCalled()
+  })
+
+  it('an accepted end keeps the same hold until its re-check settles', async () => {
+    const h = harness(async () => ({ accepted: true, card: { ...BOARD_REF, ...VERIFIED, issueNumber: 11 }, plan: {} }))
+    await h.internals.endRun('lease-1', { outcome: 'reclaimed' }, null)
+    expect(h.skippedBeforeCommit).toEqual([true])
+    expect(h.onReview).toHaveBeenCalledWith('card-1')
+    expect(h.internals.recheckHolds('card-1')).toBe(true)
+    await h.d.settle()
+    expect(h.internals.recheckHolds('card-1')).toBe(false)
+    expect(h.poke).toHaveBeenCalledWith('board-1')
+  })
+})

@@ -8051,6 +8051,8 @@ export interface KanbanRunEndInput {
   now: Date
   /** Pure accounting, evaluated under the row locks. */
   plan(card: AccountingCard, board: AccountingBoard, ctx: RunEndContext): RunEndPlan
+  /** Called synchronously under the row locks once the end is accepted, before its commit; a rollback throws from `endRun`. */
+  beforeCommit?(card: { cardId: string; boardId: string; from: KanbanStatus; to: KanbanStatus }): void
 }
 
 export type KanbanRunEndResult =

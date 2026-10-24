@@ -204,6 +204,26 @@ async function harness(opts: { verifier?: boolean; sync?: boolean; contract?: bo
   }
   const repo = new PgKanbanDispatchRepo(prisma)
   vi.spyOn(repo, 'now').mockImplementation(async () => new Date(clock.now()))
+  // While armed, a run end's committed result reaches the dispatcher only once the test releases it.
+  let afterCommit: (() => Promise<void>) | undefined
+  const endRun = repo.endRun.bind(repo)
+  vi.spyOn(repo, 'endRun').mockImplementation(async (input) => {
+    const result = await endRun(input)
+    await afterCommit?.()
+    return result
+  })
+  const pauseAfterCommit = () => {
+    let reached!: () => void
+    let open!: () => void
+    const committed = new Promise<void>((resolve) => (reached = resolve))
+    const gate = new Promise<void>((resolve) => (open = resolve))
+    afterCommit = () => {
+      afterCommit = undefined
+      reached()
+      return gate
+    }
+    return { committed, release: () => open() }
+  }
   // The container's wiring: the sync holds the dispatcher's per-card write queue, and the dispatcher projects through the sync.
   const sync =
     opts.sync === false
@@ -291,7 +311,21 @@ async function harness(opts: { verifier?: boolean; sync?: boolean; contract?: bo
   })
   const card = (id: string) => prisma.kanbanCard.findUniqueOrThrow({ where: { id } })
   const labels = (n: number) => github.issues.get(n)!.labels.filter((l) => l.startsWith('ac/status:'))
-  return { board, clock, github, prs, warn, sent, dispatcher, controls, addCard, reportFor, card, labels }
+  return {
+    board,
+    clock,
+    github,
+    prs,
+    warn,
+    sent,
+    dispatcher,
+    controls,
+    addCard,
+    reportFor,
+    card,
+    labels,
+    pauseAfterCommit
+  }
 }
 
 describe('590: Kanban composed like the container (real Postgres)', () => {
@@ -639,6 +673,79 @@ describe("602: another sync's label ack cannot free a card before its run end's 
     release()
     await h.dispatcher.settle()
     expect(roles(h)).toEqual(['work', 'verify', 'verify'])
+  })
+
+  it('602: a reclaimed verify is held from before its commit, so a claim before endRun returns cannot outrun the flag', async () => {
+    const h = await harness({ verifier: true, contract: true })
+    const c = await h.addCard('ready')
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const pr = cardPr(12, c.issueNumber, T0 + 1_000, { defaultBranch: 'main' })
+    h.prs.pulls.push(pr)
+    h.clock.advance(30_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    expect(roles(h)).toEqual(['work', 'verify'])
+    // Retargeted while the verifier runs, the PR no longer binds; then the stale verify run is reclaimed review to review.
+    h.prs.pulls[0] = { ...pr, baseRef: 'release' }
+    h.clock.advance(4 * 60 * 60_000 + 60_000)
+    const paused = h.pauseAfterCommit()
+    const reaped = h.dispatcher.reap()
+    await paused.committed
+    // Committed with no label write owed, so only the hold keeps this claim off the card.
+    expect(await h.card(c.id)).toMatchObject({ status: 'review', labelWritePending: false, needsAttention: false })
+    await h.dispatcher.reconcileBoard(h.board.id)
+    expect(roles(h)).toEqual(['work', 'verify'])
+    paused.release()
+    expect(await reaped).toBe(1)
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'review',
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#12']
+    })
+    for (let i = 0; i < 3; i++) {
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+    }
+    expect(roles(h)).toEqual(['work', 'verify'])
+    expect(h.github.comments.filter((cm) => cm.body.includes('(pr_unbound)'))).toHaveLength(1)
+  })
+
+  it('602: a verdict to ready acked by another sync before endRun returns is not claimed for rework', async () => {
+    const h = await harness({ verifier: true, contract: true })
+    const c = await h.addCard('ready')
+    await h.dispatcher.reconcileBoard(h.board.id)
+    await h.dispatcher.settle()
+    const pr = cardPr(12, c.issueNumber, T0 + 1_000, { defaultBranch: 'main' })
+    h.prs.pulls.push(pr)
+    h.clock.advance(30_000)
+    await h.dispatcher.onReport(D1, 4, h.reportFor(h.sent[0]!.d, { outcome: 'review_requested', prNumber: 12 }))
+    await h.dispatcher.settle()
+    expect(roles(h)).toEqual(['work', 'verify'])
+    h.prs.pulls[0] = { ...pr, baseRef: 'release' }
+    const paused = h.pauseAfterCommit()
+    const reported = h.dispatcher.onReport(D2, 2, h.reportFor(h.sent[1]!.d, { outcome: 'changes_requested' }))
+    await paused.committed
+    await doorbellThenClaim(h, c)
+    expect(h.labels(c.issueNumber)).toEqual(['ac/status:ready'])
+    expect(roles(h)).toEqual(['work', 'verify'])
+    paused.release()
+    await reported
+    await h.dispatcher.settle()
+    expect(await h.card(c.id)).toMatchObject({
+      status: 'ready',
+      needsAttention: true,
+      attentionReason: 'pr_unbound',
+      contractFlags: ['pr_unbound#12']
+    })
+    for (let i = 0; i < 3; i++) {
+      await h.dispatcher.tick()
+      await h.dispatcher.settle()
+    }
+    expect(roles(h)).toEqual(['work', 'verify'])
+    expect(h.github.comments.filter((cm) => cm.body.includes('(pr_unbound)'))).toHaveLength(1)
   })
 
   it('602: a re-check still pending after the hold bound no longer blocks the claim', async () => {

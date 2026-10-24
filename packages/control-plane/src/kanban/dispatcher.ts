@@ -104,6 +104,14 @@ export const MAX_PROMOTION_AGE_MS = 6 * 60 * 60_000
 /** A pending run-end contract re-check holds its card's claim at most this long; its GitHub reads time out far sooner. */
 export const RECHECK_HOLD_MS = 5 * 60_000
 
+type RunEndCard = Pick<Extract<KanbanRunEndResult, { accepted: true }>['card'], 'cardId' | 'boardId' | 'from' | 'to'>
+/** A run end's contract re-check, holding its card's claim in this process from before the end's commit until it settles. */
+interface RecheckHold {
+  card: RunEndCard
+  leftReview: boolean
+  since: number
+}
+
 /** Why recovery gave a pending promotion up to a human. */
 export type PromotionAttention = 'unattributed' | 'unexpected_labels' | 'blockers_reopened' | 'unresolved'
 
@@ -160,7 +168,7 @@ export class KanbanDispatcher {
   private readonly recoveryDue = new Set<string>()
   private readonly background = new Set<Promise<unknown>>()
   private readonly statusWrites = new Map<string, Promise<void>>()
-  private readonly rechecks = new Map<string, { since: number }>()
+  private readonly rechecks = new Map<string, RecheckHold>()
   private readonly recheckSkipped = new Set<string>()
 
   constructor(private readonly deps: KanbanDispatcherDeps) {}
@@ -680,19 +688,35 @@ export class KanbanDispatcher {
   ): Promise<KanbanRunEndResult> {
     const now = await this.deps.repo.now()
     const outcome: KanbanRunOutcomeValue = end.outcome
-    const result = await this.deps.repo.endRun({
-      leaseId,
-      outcome,
-      reasonCode,
-      now,
-      ...extra,
-      ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
-      plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx)
-    })
-    if (!result.accepted) return result
+    let held: RecheckHold | undefined
+    let result: KanbanRunEndResult
+    try {
+      result = await this.deps.repo.endRun({
+        leaseId,
+        outcome,
+        reasonCode,
+        now,
+        ...extra,
+        ...(end.outcome === 'blocked' ? { reportedBlockKind: end.blockKind } : {}),
+        plan: (card, board, ctx) => planRunEnd(card, board, end, now, ctx),
+        // Held under the card's row lock, before the commit makes it claimable, so no claim here can take it first (#602).
+        beforeCommit: (card) => {
+          if (held) this.releaseHold(held)
+          held = this.holdForRecheck(card)
+        }
+      })
+    } catch (err) {
+      if (held) this.releaseHold(held)
+      throw err
+    }
+    if (!result.accepted) {
+      if (held) this.releaseHold(held)
+      return result
+    }
     const { card } = result
     // A verifier's approval, or a worker whose PR already finished, completes the contract now rather than on the next event.
-    const recheck = this.recheckContract(card)
+    // A repo that never called beforeCommit (a test double) still gets its hold here, after the commit.
+    const recheck = this.recheckContract(card, held ?? this.holdForRecheck(card))
     if (card.from !== card.to) {
       const repo = await this.repoRef(card)
       // The status write also waits for the re-check, so its own ack never frees the card ahead of the flag (#602).
@@ -702,30 +726,35 @@ export class KanbanDispatcher {
   }
 
   // In review, or moved from review to ready/triage, where a verdict must not carry an unbound PR back to work unflagged.
-  private recheckContract(card: {
-    cardId: string
-    boardId: string
-    from: KanbanStatus
-    to: KanbanStatus
-  }): Promise<unknown> | undefined {
+  private holdForRecheck(card: RunEndCard): RecheckHold | undefined {
     const contracts = this.deps.contracts
     if (!contracts) return undefined
-    const { cardId } = card
     const leftReview = card.from === 'review' && (card.to === 'ready' || card.to === 'triage')
     if (card.to !== 'review' && !(leftReview && contracts.onLeftReview)) return undefined
-    const hold = { since: this.deps.clock.now() }
-    const task: Promise<unknown> = (leftReview ? contracts.onLeftReview!(cardId) : contracts.onReview(cardId))
+    const hold: RecheckHold = { card, leftReview, since: this.deps.clock.now() }
+    this.rechecks.set(card.cardId, hold)
+    return hold
+  }
+
+  private recheckContract(card: RunEndCard, hold: RecheckHold | undefined): Promise<unknown> | undefined {
+    if (!hold) return undefined
+    const contracts = this.deps.contracts!
+    const { cardId } = card
+    const task: Promise<unknown> = (hold.leftReview ? contracts.onLeftReview!(cardId) : contracts.onReview(cardId))
       .catch((err: unknown) => this.deps.log.warn({ err, cardId }, 'kanban: contract re-check failed'))
       .finally(() => {
         this.background.delete(task)
-        if (this.rechecks.get(cardId) === hold) this.rechecks.delete(cardId)
-        // A claim skipped the card while it was held: retry it now rather than on the next event.
-        if (this.recheckSkipped.delete(cardId)) this.poke(card.boardId)
+        this.releaseHold(hold)
       })
-    // Held from the commit, so no claim here takes the card before its flag, whichever sync acks its label first (#602).
-    this.rechecks.set(cardId, hold)
     this.background.add(task)
     return task
+  }
+
+  private releaseHold(hold: RecheckHold): void {
+    const { cardId, boardId } = hold.card
+    if (this.rechecks.get(cardId) === hold) this.rechecks.delete(cardId)
+    // A claim skipped the card while it was held: retry it now rather than on the next event.
+    if (this.recheckSkipped.delete(cardId)) this.poke(boardId)
   }
 
   private recheckHolds(cardId: string): boolean {
