@@ -94,7 +94,8 @@ function make(
         outcome: input.to ? 'applied' : input.refusal!,
         fromStatus: input.from,
         toStatus: input.to ?? null,
-        settledAt: null
+        settledAt: null,
+        createdAt: new Date('2026-01-01T00:00:00Z')
       }
       ledger.set(input.commentId, record)
       if (input.to) {

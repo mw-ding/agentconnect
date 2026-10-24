@@ -374,7 +374,7 @@ behavior. Workers still cannot mutate any `ac/*` label.
 ## M3 — App installation tokens and webhook delivery
 
 App mode is on only when `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`, and
-`GITHUB_APP_SLUG` are all set (a partial set fails boot). `GITHUB_APP_CLIENT_ID`,
+`GITHUB_APP_SLUG` are all set (a partial set, or a blank slug, fails boot; the slug is how the bot recognises its own comments, so refusal comments need it). `GITHUB_APP_CLIENT_ID`,
 when set, is the App JWT issuer. Install that App on the board repository
 (`mw-ding/agentconnect` for this pilot) and grant:
 

@@ -418,6 +418,26 @@ in the same repository, and creation must follow the seeded work start. This
 avoids merging scratch commits into the real default branch. Production never
 reads a binding override from configuration or environment.
 
+### Deploy runbook (#415)
+
+Order: migrations, then the CP, then the relay, then daemons.
+
+1. Apply the four #415 migrations before starting the new CP: `20261123200100_kanban_m4_contracts`, `20261123200110_kanban_pr_binding`, `20261123200120_kanban_work_episode`, `20261123200130_kanban_command_effect_claim`.
+2. Before the CP roll, set `GITHUB_APP_SLUG` (with `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_B64`) wherever the GitHub App is enabled: `compose.env.example`, the Compose `control-plane` environment, or the deployment document's `github.slug`. The CP refuses to boot when the App is partly configured, and a blank slug counts as missing; without the slug the bot cannot tell its own comments from a copied marker and would never post refusal comments. When a persisted deployment document exists, `applyDeploymentEnvironment` (`packages/control-plane/src/config/deployment.ts`) clears the managed env keys, including `GITHUB_APP_SLUG`, so `github.slug` in the document is the authoritative source and the env var has no effect. Deployments with no App vars set are unaffected.
+3. Roll the CP. The protocol additions are additive, so the CP must decode them before anything sends them.
+4. Roll the relay. It emits the new `rc/github-graph` event values and the optional `command.viaApp` boolean.
+5. Roll daemons last; #415 adds no daemon-side frame requirement.
+
+### #415 release record
+
+The PR body of #415 predates several facts. Updating that merged PR body (issue #589 item 4) is not done in this PR and is pending MD's decision: either MD edits #415's body with the proposed text, or MD/Ash waive item 4. This subsection is the corrected record.
+
+- **#416 dependency.** #416 (Lane 3c) merged main at `e494a5b71` (#415) via `5f9d65faf`, and its migrations are ordered after main's. Functionally, #415's PR completion contracts need #416's `ac/card-<n>` branches (see "PR completion contracts" above); without #416, sessions on older branches wait on `pr_unbound`. The #415 body names only #414 as a dependency.
+- **`actions:read` and the re-consent gate.** The workflow lookup behind `pr_checks_green` mints its own CP-only `actions:read` token. The setup manifest already grants `actions`, but an App or installation created before that grant needs permission re-consent: MD approves the permission change and every installation accepts it before this deploys. Without it `pr_merged` still works, and `pr_checks_green` cards with Actions checks wait as `actions_read_missing` (flagged `needsAttention`). The #415 body omits this gate.
+- **Migrations.** `20261123200100_kanban_m4_contracts`, `20261123200110_kanban_pr_binding`, `20261123200120_kanban_work_episode`, `20261123200130_kanban_command_effect_claim`. The #415 body lists only the first.
+- **Deploy order.** Migrations, CP, relay, daemons (above). The #415 body says "CP first, then the relay, then daemons" without the migration step.
+- **Refusal comments.** The duplicate-refusal scan reads comments with `since=` set to the command row's creation time, so most long threads cannot hide an existing marker. `since=` filters on `updated_at`, so more than 1,000 comments created or edited after the cutoff can still exhaust the 10-page bound; the scan then fails closed (throws, no POST) (Refs #589).
+
 ## Changelog
 
 - **1.5 (2026-10-20):** exclude pending control and label projections from SQL,

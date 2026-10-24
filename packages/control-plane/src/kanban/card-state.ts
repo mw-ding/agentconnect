@@ -85,6 +85,8 @@ export interface LabelPlan {
   comment?: string
   // Stable effect identity: retry only after checking this App's existing marked comments.
   commentKey?: string
+  // Only comments updated at or after this can hold the marker; bounds the recovery scan on huge issues.
+  commentSince?: Date
 }
 
 /** Split an issue's labels into recognized statuses and malformed `ac/status:*` labels. */

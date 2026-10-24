@@ -8675,6 +8675,7 @@ export interface KanbanCommandRecord {
   fromStatus: KanbanStatus
   toStatus: KanbanStatus | null
   settledAt: Date | null
+  createdAt: Date
 }
 
 export interface KanbanCommandInput {
