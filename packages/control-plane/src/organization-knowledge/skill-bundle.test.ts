@@ -1,6 +1,11 @@
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { unzipSync } from 'fflate'
 import { packageSkillBundle, SkillBundleValidationError } from './skill-bundle.js'
+
+const modulePath = fileURLToPath(new URL('./skill-bundle.ts', import.meta.url))
+const packageRoot = fileURLToPath(new URL('../..', import.meta.url))
 
 const manifest = `---
 name: deploy-helper
@@ -11,6 +16,25 @@ description: Deploy the service safely.
 `
 
 describe('packageSkillBundle', () => {
+  it.each(['UTC', 'America/Los_Angeles', 'Pacific/Honolulu', 'Asia/Tokyo', 'Pacific/Kiritimati'])(
+    'packages to the same digest under TZ=%s',
+    (tz) => {
+      // Date's local getters are fixed per process, so each zone needs its own node process
+      const script = `
+        import { packageSkillBundle } from ${JSON.stringify(modulePath)}
+        process.stdout.write(packageSkillBundle(JSON.parse(process.argv[1]), 'deploy-helper').digest)
+      `
+      const files = [{ path: 'SKILL.md', encoding: 'utf8', content: manifest }]
+      const out = execFileSync(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', script, JSON.stringify(files)],
+        { env: { ...process.env, TZ: tz }, cwd: packageRoot, encoding: 'utf8' }
+      )
+      expect(out).toBe(packageSkillBundle(files as never, 'deploy-helper').digest)
+    },
+    30_000
+  )
+
   it('produces a deterministic official one-root .skill ZIP', () => {
     const files = [
       { path: 'scripts/deploy.sh', encoding: 'utf8' as const, content: '#!/bin/sh\necho deploy\n' },
