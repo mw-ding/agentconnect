@@ -1996,6 +1996,105 @@ describe('416r2: a Kanban write session resumes a pushed ac/card-<n> from origin
     }
   )
 
+  function fetchFixtureOrigin(cwd: string, url: string, ...refspecs: string[]): void {
+    git(cwd, [
+      '-c',
+      `remote.origin.url=${PRIMARY_URL}`,
+      '-c',
+      `url.${url}.insteadOf=${PRIMARY_URL}`,
+      'fetch',
+      '-q',
+      'origin',
+      ...refspecs
+    ])
+  }
+
+  // What an older daemon's switch wrote: a per-card fetch refspec in the repository's config and a `--track` upstream.
+  function olderDaemonSwitch(cwd: string, repository: string, n: number, url: string): void {
+    const refspec = `+refs/heads/ac/card-${n}:refs/remotes/origin/ac/card-${n}`
+    git(repository, ['config', '--local', '--add', 'remote.origin.fetch', refspec])
+    fetchFixtureOrigin(cwd, url, refspec)
+    git(cwd, ['checkout', '-q', '-B', `ac/card-${n}`, '--track', `refs/remotes/origin/ac/card-${n}`])
+  }
+
+  it.each(['confined', 'unconfined'] as const)(
+    "598: an existing %s checkout an older daemon switched drops that daemon's refspecs and upstream, not the user's",
+    async (tier) => {
+      const agent = agentFixture()
+      const { primary } = serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      const repository = tier === 'confined' ? cwd : workspaces.primaryRoot(agent).path
+      const fetchSpecs = () => git(repository, ['config', '--local', '--get-all', 'remote.origin.fetch']).split('\n')
+      const user = [
+        '+refs/pull/*/head:refs/remotes/origin/pr/*',
+        '+refs/heads/ac/card-8:refs/remotes/origin/mine/ac/card-8',
+        'refs/heads/ac/card-5:refs/remotes/origin/ac/card-5',
+        '+refs/heads/ac/card-5:refs/remotes/origin/ac/card-8'
+      ]
+      for (const spec of user) git(repository, ['config', '--local', '--add', 'remote.origin.fetch', spec])
+      const kept = fetchSpecs()
+      const tip = git(primary!.seed, ['rev-parse', 'HEAD'])
+      git(primary!.seed, [
+        'push',
+        '-q',
+        'origin',
+        'HEAD:refs/heads/ac/card-7',
+        'HEAD:refs/heads/ac/card-9',
+        'HEAD:refs/heads/ac/card-5',
+        'HEAD:refs/heads/ac/card-8'
+      ])
+      olderDaemonSwitch(cwd, repository, 9, primary!.url)
+      git(cwd, ['checkout', '-q', '--detach'])
+      olderDaemonSwitch(cwd, repository, 7, primary!.url)
+      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/ac/card-7')
+
+      // Already on its card branch, so the switch itself returns early; the cleanup still runs.
+      expect(await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))).toBe(cwd)
+      expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+      expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(tip)
+      expect(fetchSpecs()).toEqual(kept)
+      expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+      expect(() => git(repository, ['config', '--local', '--get', 'branch.ac/card-9.remote'])).toThrow()
+      expect(() => git(repository, ['config', '--local', '--get', 'branch.ac/card-9.merge'])).toThrow()
+      await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(fetchSpecs()).toEqual(kept)
+      // The harm: once the merged card branch is deleted, a plain fetch no longer fails on its refspec.
+      git(primary!.seed, ['push', '-q', 'origin', '--delete', 'ac/card-7', 'ac/card-9'])
+      fetchFixtureOrigin(cwd, primary!.url)
+    }
+  )
+
+  it("598: a fresh card worktree drops the per-card refspecs an older daemon left in the shared root's config", async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const other = await workspaces.prepareSessionWorkspace(agent, unconfined({ sessionKey: 'kanban:other' }))
+    const root = workspaces.primaryRoot(agent).path
+    const kept = git(root, ['config', '--local', '--get-all', 'remote.origin.fetch'])
+    git(primary!.seed, ['push', '-q', 'origin', 'HEAD:refs/heads/ac/card-9'])
+    olderDaemonSwitch(other, root, 9, primary!.url)
+    git(primary!.seed, ['push', '-q', 'origin', '--delete', 'ac/card-9'])
+    expect(() => fetchFixtureOrigin(other, primary!.url)).toThrow(/couldn't find remote ref/)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, unconfined({ branch: kanbanCardBranch(7) }))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe('ac/card-7')
+    expect(git(root, ['config', '--local', '--get-all', 'remote.origin.fetch'])).toBe(kept)
+    fetchFixtureOrigin(other, primary!.url)
+  })
+
+  it.each(['confined', 'unconfined'] as const)(
+    '598: an existing %s checkout keeps a card-branch upstream no older daemon wrote',
+    async (tier) => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const request = tier === 'confined' ? confined : unconfined
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request())
+      git(cwd, ['checkout', '-q', '-b', 'ac/card-7', '--track', 'origin/main'])
+      await workspaces.prepareSessionWorkspace(agent, request({ branch: kanbanCardBranch(7) }))
+      expect(git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toBe('origin/main')
+    }
+  )
+
   it('416r2: a fresh confined session with no pushed card branch starts it at the default branch', async () => {
     const agent = agentFixture()
     const { primary } = serveAll(agent)

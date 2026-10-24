@@ -378,7 +378,9 @@ describe('598: a label-sync repair re-posts the control comment once (real Postg
     await h.dispatcher.tick()
     await h.dispatcher.settle()
     expect(await h.card(c.id)).toMatchObject({ status: 'running', controlWrittenVersion: 1n })
-    expect(h.github.comments.map(({ body }) => body)).toEqual(['restarted via AgentConnect'])
+    expect(h.github.comments).toEqual([
+      { n: c.issueNumber, body: 'restarted via AgentConnect', key: `control:${c.id}:1` }
+    ])
   })
 })
 
@@ -405,6 +407,37 @@ describe('598: a write claim re-validates the open card-branch PR a restart drop
       [1, undefined],
       [2, 12]
     ])
+  })
+
+  it('a restart during the head-branch lookup fences the old claim before sending its close target', async () => {
+    const { h, c } = await restartedWithOpenPr()
+    let enter!: () => void
+    let resume!: () => void
+    const entered = new Promise<void>((resolve) => (enter = resolve))
+    const held = new Promise<void>((resolve) => (resume = resolve))
+    const list = h.prs.listOpenPullRequestsByHead.bind(h.prs)
+    vi.spyOn(h.prs, 'listOpenPullRequestsByHead').mockImplementationOnce(async (...args) => {
+      enter()
+      await held
+      return list(...args)
+    })
+    try {
+      expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+      await entered
+      h.clock.advance(1_000)
+      expect((await h.controls.restart(DEFAULT_ORG_ID, h.board.id, c.id, DEFAULT_OWNER_ID)).ok).toBe(true)
+    } finally {
+      resume()
+    }
+    await h.dispatcher.settle()
+    expect(h.sent.map(({ d }) => [d.attempt, d.supersededPrNumber])).toEqual([
+      [1, undefined],
+      [3, 12]
+    ])
+    expect(await prisma.kanbanRun.findFirstOrThrow({ where: { cardId: c.id, attempt: 2 } })).toMatchObject({
+      outcome: 'reclaimed',
+      reasonCode: 'restarted'
+    })
   })
 
   it('a failed card-branch PR lookup ends the claim as transient, and the retry names the PR', async () => {
