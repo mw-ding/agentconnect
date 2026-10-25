@@ -17,6 +17,9 @@ For an org-owned App: org Settings → Developer settings → GitHub Apps.
 Give the App a name and a homepage URL. Any URL works; use the board
 repo or the deployment's public page.
 
+Under "Where can this GitHub App be installed?", choose Only on this
+account.
+
 Under Webhook: check Active and set the URL to the relay's
 `POST /webhooks/github`. In production that is e.g.
 `https://<relay-host>/webhooks/github`; behind the Caddy overlay it is
@@ -25,7 +28,8 @@ smee.io channel forwarded to the relay instead.
 
 Interim dev/E2E channel: `https://smee.io/wYHF8fyjxvqpq6yg`. This is a
 forwarder URL, not a secret; anyone with it can read deliveries, so do
-not use smee for production. Forward it to the relay:
+not use smee for production. Rotate the channel if it is ever used with
+sensitive repos. Forward it to the relay:
 
 ```bash
 npx smee-client --url https://smee.io/wYHF8fyjxvqpq6yg \
@@ -54,9 +58,6 @@ Subscribe to Issues, Issue comment, and Label. Also subscribe to
 Sub issues / Issue dependencies when GitHub offers them; both ride the
 Issues permission.
 
-Under "Where can this GitHub App be installed?", choose Only on this
-account.
-
 ## Private key
 
 Generate a private key on the App page. GitHub downloads a `.pem` file.
@@ -83,6 +84,19 @@ Confirm the repo appears under Install → Configure.
 
 ## Env / secret mapping
 
+When a Setup Server deployment document exists, configure the App in
+Setup Server's GitHub App section. CP startup calls
+[`applyDeploymentEnvironment`](../../packages/control-plane/src/index.ts),
+which clears the managed `GITHUB_APP_*` env vars and replaces them from
+`values.github.*` and the `github.privateKeyB64` / `github.clientSecret`
+secrets ([projection](../../packages/control-plane/src/config/deployment.ts)).
+Use the same App as console login
+([App identity contract](../../packages/control-plane/src/github/config.ts)).
+The relay takes its webhook secret from CP `github.webhookSecret`
+([snapshot projection](../../packages/control-plane/src/config/deployment.ts),
+[relay consumer](../../packages/relay/src/index.ts)). The env vars below
+apply only to env-only deployments.
+
 | Var                               | Source                                           | Consumer                                                                |
 | --------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------- |
 | `GITHUB_APP_ID`                   | App settings → App ID                            | CP                                                                      |
@@ -98,13 +112,14 @@ only; logged).
 
 ## Where secrets live
 
-Production values live in the deployment secret store. Local dev uses
-`.env`, which is gitignored (`.env`/`.env.*` in `.gitignore`). The E2E
+For Setup Server deployments, production values live in Setup Server's
+GitHub App settings and secret store. Env-only local dev uses `.env`,
+which is gitignored (`.env`/`.env.*` in `.gitignore`). The E2E
 uses GitHub Actions repository secrets. Secrets are never committed and
 never appear in issues, PRs, chat, or logs.
 
-Live values for the pilot App are handed off through Ash's Secure Form;
-ask Ash/MD. This doc carries names only.
+Live values for the pilot App are handed off through the team's secret
+hand-off channel (ask the deployment owner). This doc carries names only.
 
 Rotation: regenerate the key (or change the webhook secret) in App
 settings, update the store, restart CP and relay, then delete the old
@@ -131,7 +146,12 @@ key.
 3. Ping: App settings → Advanced → Recent Deliveries → redeliver the
    `ping` (or send a test). The relay answers 204 (2xx) for a valid
    `X-Hub-Signature-256`. A 404 means the relay has no webhook secret
-   configured.
+   configured. If CP has a deployment document (revision > 0) without
+   `github.webhookSecret`, its snapshot clears the relay secret; setting
+   `GITHUB_APP_WEBHOOK_SECRET` will not help. Set the webhook secret in
+   Setup Server, then restart CP and relay (see
+   [snapshot handling](../../packages/relay/src/relay-cp-client.ts) and
+   [secret assignment](../../packages/relay/src/index.ts)).
 4. Bad signature → 401 (nothing forwarded to CP):
 
    ```bash
@@ -152,15 +172,19 @@ key.
 - `github app config is partial — missing ... (set all three or none; ...)`: one of `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`,
   `GITHUB_APP_SLUG` is missing or the slug is blank. Set all three or
   none.
-- `GITHUB_APP_PRIVATE_KEY_B64 is not valid base64`: re-encode the
+- `GITHUB_APP_PRIVATE_KEY_B64 does not decode to a parsable private key: …`: re-encode the
   `.pem` with `base64 -w0` on one line; check for truncation or line
   breaks.
 - `... must be an RSA key (got ...)`: the value is not an RSA
   private key. Generate the key from the App page and store the fresh
   `.pem`.
-- 401 on every delivery: secret mismatch. The relay env secret and
-  the App's webhook secret must match, and note the CP
-  `github.webhookSecret` overrides the relay env once a snapshot
-  arrives.
+- 401 on every delivery: secret mismatch. The secret configured in
+  Setup Server (or `GITHUB_APP_WEBHOOK_SECRET` for env-only deployments)
+  must match the App's webhook secret. CP `github.webhookSecret`
+  overrides the relay env once a deployment document snapshot arrives.
 - 404 on every delivery: the relay has no webhook secret configured.
-  Set `GITHUB_APP_WEBHOOK_SECRET` and restart the relay.
+  If CP has a deployment document (revision > 0) without
+  `github.webhookSecret`, its snapshot clears the relay secret even if
+  `GITHUB_APP_WEBHOOK_SECRET` is set. Set the webhook secret in Setup
+  Server, then restart CP and relay. For env-only deployments, set
+  `GITHUB_APP_WEBHOOK_SECRET` and restart the relay.
