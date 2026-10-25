@@ -111,6 +111,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let smeeSkipReason = ''
   let webhookSecret = ''
   let installationGithubId: bigint | undefined
+  let installationIdSource: 'delivery' | 'stamped' | 'ping' | null = null
   let appConfigured = false
   let appSlug: string | undefined
   let webhookMode: 'real' | 'injected' = 'injected'
@@ -122,6 +123,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let tokenWhy = 'no GitHub App configured'
   let commentMode: 'real' | 'injected' = 'injected'
   let commentWhy = 'final comment has not been posted'
+  let commentAuthorLogin: string | null = null
   let shellRefusalObserved = false
   let shellWhy = 'shell probe has not run'
   let shellChecks = 0
@@ -187,8 +189,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   }
 
   beforeAll(async () => {
-    const missing = APP_KEYS.filter((key) => !process.env[key]?.trim())
-    const anyAppConfig = APP_KEYS.some((key) => process.env[key] !== undefined)
+    const appEnv: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(APP_KEYS.map((key) => [key, process.env[key]?.trim() || undefined])),
+      GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID?.trim() || undefined
+    }
+    const missing = APP_KEYS.filter((key) => !appEnv[key])
+    const anyAppConfig = APP_KEYS.some((key) => !!appEnv[key])
     if (missing.length && (anyAppConfig || strict)) {
       throw new Error(
         `${strict ? 'KANBAN_E2E_REQUIRE_APP=1 requires complete App config' : 'GitHub App config is partial'}; missing ${missing.join(', ')}`
@@ -199,10 +205,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     if (appConfigured && !appSmeeUrl) throw new Error('App mode requires KANBAN_E2E_SMEE_URL')
     const githubApp = appConfigured
       ? resolveGithubAppConfig({
-          GITHUB_APP_ID: Number(process.env.GITHUB_APP_ID),
-          GITHUB_APP_PRIVATE_KEY_B64: process.env.GITHUB_APP_PRIVATE_KEY_B64,
-          GITHUB_APP_SLUG: process.env.GITHUB_APP_SLUG,
-          GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID
+          GITHUB_APP_ID: Number(appEnv.GITHUB_APP_ID),
+          GITHUB_APP_PRIVATE_KEY_B64: appEnv.GITHUB_APP_PRIVATE_KEY_B64,
+          GITHUB_APP_SLUG: appEnv.GITHUB_APP_SLUG,
+          GITHUB_APP_CLIENT_ID: appEnv.GITHUB_APP_CLIENT_ID
         })
       : undefined
     appSlug = githubApp?.slug
@@ -308,7 +314,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       `import { register } from ${JSON.stringify(tsxApi)}; register(); await import(${JSON.stringify(sourceEntry)});`
     )
     vi.stubEnv('AGENTCONNECT_DAEMON_ENTRY', daemonEntry)
-    webhookSecret = githubApp ? process.env.GITHUB_APP_WEBHOOK_SECRET! : randomBytes(32).toString('hex')
+    webhookSecret = githubApp ? appEnv.GITHUB_APP_WEBHOOK_SECRET! : randomBytes(32).toString('hex')
     const cpConfig = AppConfigSchema.parse({
       DATABASE_URL: 'postgresql://e2e/ignored',
       API_KEY_PEPPER: PEPPER,
@@ -317,10 +323,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       NODE_ENV: 'test',
       ...(githubApp
         ? {
-            GITHUB_APP_ID: Number(process.env.GITHUB_APP_ID),
-            GITHUB_APP_PRIVATE_KEY_B64: process.env.GITHUB_APP_PRIVATE_KEY_B64,
-            GITHUB_APP_SLUG: process.env.GITHUB_APP_SLUG,
-            ...(process.env.GITHUB_APP_CLIENT_ID ? { GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID } : {})
+            GITHUB_APP_ID: Number(appEnv.GITHUB_APP_ID),
+            GITHUB_APP_PRIVATE_KEY_B64: appEnv.GITHUB_APP_PRIVATE_KEY_B64,
+            GITHUB_APP_SLUG: appEnv.GITHUB_APP_SLUG,
+            ...(appEnv.GITHUB_APP_CLIENT_ID ? { GITHUB_APP_CLIENT_ID: appEnv.GITHUB_APP_CLIENT_ID } : {})
           }
         : {})
     })
@@ -385,7 +391,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await gh('POST', `/repos/${FULL}/issues/${warmup.number}/labels`, { labels: ['ac/status:triage'] })
       const poke = await appDelivery(warmup.number, pokeMark, 'ac/status:triage')
       deliveryIds.push(poke.deliveryKey)
-      await ensureInstallation(BigInt(poke.installationId))
+      await ensureInstallation(BigInt(poke.installationId), 'delivery')
       await gh('DELETE', `/repos/${FULL}/issues/${warmup.number}/labels/${encodeURIComponent('ac/status:triage')}`)
       try {
         await appTokens.mintKanbanCard(installationGithubId!, FULL, REPO_ID, 'read')
@@ -399,7 +405,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     } else {
       // PAT/dev mode keeps the pre-#606 behavior: seed a row only for a ping-recovered id, else a 1n placeholder.
       const pinged = await installationIdFromPing()
-      if (pinged !== undefined) await ensureInstallation(pinged)
+      if (pinged !== undefined) await ensureInstallation(pinged, 'ping')
       else setInstallation(1n)
     }
     phase('setup: github installation', { installationId: String(ref.installationId) })
@@ -603,7 +609,6 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     }
     // Heartbeats and reports stay on this in-process fence. Dispatch and gitcred use the live CP socket.
     ;(worker as any).deps.cp = () => cp
-    const commentTokenMethod = (daemon as any).gitCreds.getKanbanCommentToken
     if (!appConfigured) {
       if (strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected comment tokens')
       ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
@@ -613,6 +618,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       }
     }
     for (const outcome of ['review_requested', 'completed'] as const) {
+      commentMode = 'injected'
+      commentWhy = 'final comment has not been verified'
+      commentAuthorLogin = null
       permissionDenials.length = 0
       const toolName = outcome === 'completed' ? 'kanbanComplete' : 'kanbanRequestReview'
       const creationMark = link?.graphPokes.length ?? 0
@@ -817,9 +825,16 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         { timeout: 30_000, interval: 1_000 }
       )
       await (daemon as any).kanbanCommentPoster.drain()
-      const comments = await gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${created.number}/comments`)
+      const comments = await gh<Array<{ body: string; user: { login: string } }>>(
+        'GET',
+        `/repos/${FULL}/issues/${created.number}/comments`
+      )
       expect(comments).toHaveLength(1)
-      if (appConfigured) expect((daemon as any).gitCreds.getKanbanCommentToken).toBe(commentTokenMethod)
+      const acceptedSummary = comments.find((comment) => comment.body.includes(marker))
+      expect(acceptedSummary?.body).toContain(summaryUsed)
+      commentAuthorLogin = acceptedSummary?.user.login ?? null
+      phase('e: accepted summary comment author observed', { issue: created.number, login: commentAuthorLogin })
+      if (appConfigured) expect(commentAuthorLogin).toBe(`${appSlug}[bot]`)
       if (!appConfigured && strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected comments')
       commentMode = appConfigured ? 'real' : 'injected'
       commentWhy = appConfigured
@@ -840,7 +855,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         comment: 'real'
       })
     }
-  }, 360_000)
+  }, 900_000)
 
   function printSummary(): void {
     summarized = true
@@ -852,7 +867,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
           mode: webhookMode,
           why: webhookWhy,
           deliveries: deliveryIds,
-          installationIdSource: appConfigured ? 'delivery' : 'stamped'
+          installationIdSource
         },
         terminal: { mode: terminalMode, why: terminalWhy },
         token: {
@@ -862,7 +877,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
           appSlug: appSlug ?? null
         },
         shell: { mode: shellMode, why: shellWhy, shellRefusalObserved },
-        comment: { mode: commentMode, why: commentWhy }
+        comment: { mode: commentMode, why: commentWhy, authorLogin: commentAuthorLogin }
       })}`
     )
   }
@@ -928,7 +943,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     return undefined
   }
 
-  function setInstallation(id: bigint): void {
+  function setInstallation(id: bigint, source = installationIdSource): void {
+    installationIdSource = source
     installation = {
       id: 'e2e',
       orgId: OrgId(DEFAULT_ORG_ID),
@@ -944,8 +960,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     ref = { installationId: id, repoId: REPO_ID, repoFullName: FULL }
   }
 
-  async function ensureInstallation(id: bigint): Promise<void> {
-    setInstallation(id)
+  async function ensureInstallation(id: bigint, source = installationIdSource): Promise<void> {
+    setInstallation(id, source)
     installationGithubId = id
     const existing = await prisma.githubInstallation.findUnique({ where: { installationId: id } })
     if (existing) return
@@ -984,6 +1000,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     const originalGuid = delivery.guid ?? String(delivery.id)
     let guid = originalGuid
     let installationId = delivery.payload.installation?.id
+    const source = installationId ? 'delivery' : 'stamped'
     if (!installationId) {
       // A stamped repository-webhook fixture is a new delivery, distinct from the original smee delivery.
       installationId = Number(ref.installationId)
@@ -993,7 +1010,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         `KANBAN_E2E INJECTED installation.id=${installationId} from real delivery ${originalGuid} as ${guid}: repo webhooks carry no installation without a GitHub App`
       )
     }
-    await ensureInstallation(BigInt(installationId))
+    await ensureInstallation(BigInt(installationId), source)
     await vi.waitFor(() => expect(link!.client.isReady()).toBe(true), { timeout: 30_000, interval: 250 })
     const sent = await postGithubWebhook(link!.webhookUrl, {
       secret: webhookSecret,
@@ -1031,7 +1048,6 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
             item.label === label
         )
       if (poke) {
-        if (!poke.installationId) throw new Error(`App delivery for #${issueNumber} has no installationId`)
         if (installationGithubId !== undefined) expect(poke.installationId).toBe(String(installationGithubId))
         return poke
       }

@@ -481,7 +481,8 @@ Known gaps (M3 worker additions):
   smee → relay. `KANBAN_E2E_SMEE_URL` selects the App's smee channel;
   `KANBAN_E2E_REQUIRE_APP=1` requires doorbell, token, and comment modes to be
   `real`. With all four App vars unset, PAT/dev mode remains labeled `injected`.
-  See the [GitHub App runbook](../runbooks/kanban-github-app.md). The worker M3
+  Heartbeats and reports still use the in-process dispatcher seam; the background
+  CP tick is not started. See the [GitHub App runbook](../runbooks/kanban-github-app.md). The worker M3
   E2E (`kanban-worker-m3.e2e.test.ts`) still uses an injected PAT and fake ACP
   agent, exercising real GitHub issues, Postgres, daemon admission, nudge turns,
   the MCP control socket, and fenced card reads. It does not validate a real App
