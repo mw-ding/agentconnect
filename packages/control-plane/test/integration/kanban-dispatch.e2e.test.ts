@@ -14,10 +14,10 @@ import { buildApp, type App } from '../../src/app.js'
 import { AppConfigSchema } from '../../src/config/env.js'
 import { systemClock } from '../../src/domain/clock.js'
 import { OrgId } from '../../src/domain/ids.js'
-import { mintAppJwt } from '../../src/github/api.js'
-import { resolveGithubAppConfig, type GithubAppConfig } from '../../src/github/config.js'
+import { GithubApiError } from '../../src/github/api.js'
+import { resolveGithubAppConfig } from '../../src/github/config.js'
 import { InstallationTokenService } from '../../src/github/installation-token.service.js'
-import { GithubCardStore } from '../../src/kanban/card-store.js'
+import { GithubCardStore, type KanbanRepoRef } from '../../src/kanban/card-store.js'
 import { GithubRepoPermission } from '../../src/github/repo-permission.js'
 import { KanbanDispatcher } from '../../src/kanban/dispatcher.js'
 import { PgKanbanDispatchRepo } from '../../src/persistence/repositories/kanban-dispatch.repo.js'
@@ -37,24 +37,18 @@ import { prisma } from '../setup.db.js'
 
 const TOKEN = process.env.GITHUB_TOKEN
 const enabled = !process.env.CI && process.env.KANBAN_E2E === '1' && !!TOKEN
+const strict = process.env.KANBAN_E2E_REQUIRE_APP === '1'
+const APP_KEYS = [
+  'GITHUB_APP_ID',
+  'GITHUB_APP_PRIVATE_KEY_B64',
+  'GITHUB_APP_SLUG',
+  'GITHUB_APP_WEBHOOK_SECRET'
+] as const
 const OWNER = 'mw-ding'
 const FULL = `${OWNER}/agentconnect`
 const REPO_ID = 1332342098n
 const PEPPER = 'kanban-e2e-pepper-0123456789abcdef'
 const RELAY_TOKEN = 'kanban-e2e-relay-token-0123456789ab'
-
-function githubAppFromEnv(): GithubAppConfig | undefined {
-  const id = process.env.GITHUB_APP_ID
-  const key = process.env.GITHUB_APP_PRIVATE_KEY_B64
-  const slug = process.env.GITHUB_APP_SLUG
-  if (!id || !key || !slug) return undefined
-  return resolveGithubAppConfig({
-    GITHUB_APP_ID: Number(id),
-    GITHUB_APP_PRIVATE_KEY_B64: key,
-    GITHUB_APP_SLUG: slug,
-    GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID
-  })
-}
 
 function agentEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return stripLeakedAgentEnv({
@@ -118,6 +112,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   let webhookSecret = ''
   let installationGithubId: bigint | undefined
   let appConfigured = false
+  let appSlug: string | undefined
   let webhookMode: 'real' | 'injected' = 'injected'
   let webhookWhy = 'webhook path has not run'
   let terminalMode: 'real' | 'injected' = 'injected'
@@ -150,27 +145,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     info: (_obj: unknown, message?: string) => phase(message ?? 'info'),
     warn: (_obj: unknown, message?: string) => phase(`WARN ${message ?? ''}`)
   }
-  const installation: GithubInstallationRecord = {
-    id: 'e2e',
-    orgId: OrgId(DEFAULT_ORG_ID),
-    installationId: 1n,
-    accountLogin: OWNER,
-    accountType: 'User',
-    permissions: { issues: 'write' },
-    repositorySelection: 'selected',
-    suspendedAt: null,
-    revokedAt: null,
-    createdAt: new Date(0)
-  }
-  // App minting when GITHUB_APP_* is complete; otherwise the PAT, logged as injected.
-  let store = new GithubCardStore({
-    tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
-    permissions: new GithubRepoPermission({
-      tokens: { mintKanbanCard: async () => ({ token: TOKEN! }) } as never,
-      ttlMs: 0
-    })
-  })
-  const ref = { installationId: 1n, repoId: REPO_ID, repoFullName: FULL }
+  let installation: GithubInstallationRecord
+  let ref: KanbanRepoRef
+  let store: GithubCardStore
   let host: any = {
     start: vi.fn(async () => {}),
     newSession: vi.fn(async () => randomUUID()),
@@ -210,6 +187,40 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   }
 
   beforeAll(async () => {
+    const missing = APP_KEYS.filter((key) => !process.env[key]?.trim())
+    const anyAppConfig = APP_KEYS.some((key) => process.env[key] !== undefined)
+    if (missing.length && (anyAppConfig || strict)) {
+      throw new Error(
+        `${strict ? 'KANBAN_E2E_REQUIRE_APP=1 requires complete App config' : 'GitHub App config is partial'}; missing ${missing.join(', ')}`
+      )
+    }
+    appConfigured = missing.length === 0
+    const appSmeeUrl = process.env.KANBAN_E2E_SMEE_URL?.trim()
+    if (appConfigured && !appSmeeUrl) throw new Error('App mode requires KANBAN_E2E_SMEE_URL')
+    const githubApp = appConfigured
+      ? resolveGithubAppConfig({
+          GITHUB_APP_ID: Number(process.env.GITHUB_APP_ID),
+          GITHUB_APP_PRIVATE_KEY_B64: process.env.GITHUB_APP_PRIVATE_KEY_B64,
+          GITHUB_APP_SLUG: process.env.GITHUB_APP_SLUG,
+          GITHUB_APP_CLIENT_ID: process.env.GITHUB_APP_CLIENT_ID
+        })
+      : undefined
+    appSlug = githubApp?.slug
+    const appTokens = githubApp ? new InstallationTokenService(githubApp, systemClock) : undefined
+    if (appTokens) {
+      store = new GithubCardStore({
+        tokens: appTokens,
+        appSlug,
+        permissions: new GithubRepoPermission({ tokens: appTokens, ttlMs: 0 })
+      })
+    } else {
+      if (strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected card/comment tokens')
+      const tokens = { mintKanbanCard: async () => ({ token: TOKEN! }) } as never
+      store = new GithubCardStore({ tokens, permissions: new GithubRepoPermission({ tokens, ttlMs: 0 }) })
+      tokenMode = 'injected'
+      tokenWhy = 'no GitHub App configured'
+      console.log('KANBAN_E2E INJECTED token: no GitHub App configured')
+    }
     phase('setup: live repository and human token')
     expect(BigInt((await gh<{ id: number }>('GET', `/repos/${FULL}`)).id)).toBe(REPO_ID)
     expect((await gh<{ type: string }>('GET', '/user')).type).toBe('User')
@@ -297,26 +308,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       `import { register } from ${JSON.stringify(tsxApi)}; register(); await import(${JSON.stringify(sourceEntry)});`
     )
     vi.stubEnv('AGENTCONNECT_DAEMON_ENTRY', daemonEntry)
-    appConfigured = !!githubAppFromEnv()
-    if (!appConfigured) {
-      tokenMode = 'injected'
-      tokenWhy = 'no GitHub App configured'
-      console.log('KANBAN_E2E INJECTED token: no GitHub App configured')
-    } else {
-      tokenMode = 'real'
-      tokenWhy = 'card and comment tokens are repository-scoped installation tokens'
-      phase('setup: GitHub App configured; card and comment tokens are installation tokens')
-    }
-    const githubApp = githubAppFromEnv()
-    if (githubApp) {
-      const appTokens = new InstallationTokenService(githubApp, systemClock)
-      store = new GithubCardStore({
-        tokens: appTokens,
-        appSlug: process.env.GITHUB_APP_SLUG,
-        permissions: new GithubRepoPermission({ tokens: appTokens, ttlMs: 0 })
-      })
-    }
-    webhookSecret = randomBytes(32).toString('hex')
+    webhookSecret = githubApp ? process.env.GITHUB_APP_WEBHOOK_SECRET! : randomBytes(32).toString('hex')
     const cpConfig = AppConfigSchema.parse({
       DATABASE_URL: 'postgresql://e2e/ignored',
       API_KEY_PEPPER: PEPPER,
@@ -353,9 +345,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       }
     })
     phase('setup: real relay linked to the CP doorbell', { webhookUrl: link.webhookUrl })
-    installationGithubId = await discoverInstallationId(githubApp)
     try {
-      const channel = await newSmeeChannel()
+      const channel = appConfigured ? appSmeeUrl! : await newSmeeChannel()
       smee = new SmeeClient({
         source: channel,
         target: link.webhookUrl,
@@ -370,8 +361,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       webhookWhy =
         'GitHub delivers to smee, which forwards to the relay; the relay verifies the signature and rings the CP'
       phase('setup: smee channel forwarding to the relay', { channel })
-      await createHook(channel)
+      if (!appConfigured) await createHook(channel)
     } catch (err) {
+      if (appConfigured || strict) {
+        const reason = err instanceof Error ? err.message : String(err)
+        throw new Error(`App smee forwarding could not start (${reason}); injected webhook refused`)
+      }
       smeeUp = false
       smeeSkipReason = err instanceof Error ? err.message : String(err)
       webhookMode = 'injected'
@@ -380,12 +375,31 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       phase('setup: smee unreachable', { reason: smeeSkipReason })
       await createHook('https://example.invalid/kanban-e2e-webhook')
     }
-    if (installationGithubId === undefined) installationGithubId = await installationIdFromPing()
-    if (installationGithubId !== undefined) {
-      installation.installationId = installationGithubId
-      ref.installationId = installationGithubId
-      phase('setup: github installation', { installationId: String(installationGithubId) })
+    if (appTokens) {
+      const warmup = await gh<Issue>('POST', `/repos/${FULL}/issues`, {
+        title: `[kanban-e2e] App delivery warm-up ${started}`,
+        body: 'Scratch issue to verify the signed App delivery through smee and the relay.'
+      })
+      issues.push(warmup.number)
+      const pokeMark = link.graphPokes.length
+      await gh('POST', `/repos/${FULL}/issues/${warmup.number}/labels`, { labels: ['ac/status:triage'] })
+      const poke = await appDelivery(warmup.number, pokeMark, 'ac/status:triage')
+      deliveryIds.push(poke.deliveryKey)
+      await ensureInstallation(BigInt(poke.installationId))
+      await gh('DELETE', `/repos/${FULL}/issues/${warmup.number}/labels/${encodeURIComponent('ac/status:triage')}`)
+      try {
+        await appTokens.mintKanbanCard(installationGithubId!, FULL, REPO_ID, 'read')
+      } catch (err) {
+        const status = err instanceof GithubApiError ? `HTTP ${err.status}: ` : ''
+        const message = err instanceof Error ? err.message : 'unknown mint error'
+        throw new Error(`App token mint failed: ${status}${message}`)
+      }
+      tokenMode = 'real'
+      tokenWhy = 'verified mint; card and comment tokens are repository-scoped installation tokens'
+    } else {
+      await ensureInstallation((await installationIdFromPing()) ?? 1n)
     }
+    phase('setup: github installation', { installationId: String(installationGithubId) })
     // The daemon starts in the test, after the truncated database has the API key.
     selectedRuntime = selected
     cpOrigin = cpUrl
@@ -552,7 +566,8 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     // The integration harness truncates before each test, so seed all DB fixtures here.
     await seedDaemon(prisma, daemonId, { sessionEpoch: BigInt(epoch) })
     await seedAgent(prisma, agentId, { daemonId, runtime: runtimeId })
-    if (installationGithubId !== undefined) await ensureInstallation(installationGithubId)
+    if (installationGithubId === undefined) throw new Error('installation id was not established during setup')
+    await ensureInstallation(installationGithubId)
     await startLinkedDaemon()
     const board = await prisma.kanbanBoard.create({
       data: { orgId: DEFAULT_ORG_ID, name: `dispatch-e2e ${started}`, repoId: REPO_ID, repoFullName: FULL }
@@ -583,7 +598,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     }
     // Heartbeats and reports stay on this in-process fence. Dispatch and gitcred use the live CP socket.
     ;(worker as any).deps.cp = () => cp
+    const commentTokenMethod = (daemon as any).gitCreds.getKanbanCommentToken
     if (!appConfigured) {
+      if (strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected comment tokens')
       ;(daemon as any).gitCreds.getKanbanCommentToken = async (id: string, repo: string, leaseId: string) => {
         const allowed = await dispatcher!.commentGrant(daemonId, id, leaseId, repo)
         if (!allowed) throw new Error(`kanban comment refused for lease ${leaseId} on ${repo}`)
@@ -790,7 +807,9 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       await (daemon as any).kanbanCommentPoster.drain()
       const comments = await gh<Array<{ body: string }>>('GET', `/repos/${FULL}/issues/${created.number}/comments`)
       expect(comments).toHaveLength(1)
-      commentMode = 'real'
+      if (appConfigured) expect((daemon as any).gitCreds.getKanbanCommentToken).toBe(commentTokenMethod)
+      if (!appConfigured && strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected comments')
+      commentMode = appConfigured ? 'real' : 'injected'
       commentWhy = appConfigured
         ? 'the daemon posted the accepted summary with a kanban_card_write installation token'
         : 'the daemon posted the accepted summary; the token itself is the injected PAT'
@@ -802,6 +821,13 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       console.log(`KANBAN_E2E shell refusal unobserved: ${shellWhy}`)
     }
     printSummary()
+    if (strict) {
+      expect({ doorbell: webhookMode, token: tokenMode, comment: commentMode }).toEqual({
+        doorbell: 'real',
+        token: 'real',
+        comment: 'real'
+      })
+    }
   }, 360_000)
 
   function printSummary(): void {
@@ -809,9 +835,20 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     const shellMode = !realAgent ? 'injected' : shellRefusalObserved ? 'real' : 'unobserved'
     console.log(
       `KANBAN_E2E_SUMMARY ${JSON.stringify({
-        doorbell: { mode: webhookMode, why: webhookWhy, deliveries: deliveryIds },
+        strict,
+        doorbell: {
+          mode: webhookMode,
+          why: webhookWhy,
+          deliveries: deliveryIds,
+          installationIdSource: appConfigured ? 'delivery' : 'stamped'
+        },
         terminal: { mode: terminalMode, why: terminalWhy },
-        token: { mode: tokenMode, why: tokenWhy },
+        token: {
+          mode: tokenMode,
+          why: tokenWhy,
+          installationId: installationGithubId?.toString() ?? '',
+          appSlug: appSlug ?? null
+        },
         shell: { mode: shellMode, why: shellWhy, shellRefusalObserved },
         comment: { mode: commentMode, why: commentWhy }
       })}`
@@ -857,35 +894,6 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     phase('setup: temporary repository webhook created', { hookId, url: marked })
   }
 
-  async function discoverInstallationId(appCfg: GithubAppConfig | undefined): Promise<bigint | undefined> {
-    const headers = { accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' }
-    const read = async (authorization: string): Promise<bigint | undefined> => {
-      const response = await fetch(`https://api.github.com/repos/${FULL}/installation`, {
-        headers: { ...headers, authorization },
-        signal: AbortSignal.timeout(15_000)
-      })
-      if (!response.ok) {
-        phase('setup: installation lookup', { status: response.status })
-        return undefined
-      }
-      const body = (await response.json()) as { id?: number }
-      return body.id ? BigInt(body.id) : undefined
-    }
-    if (appCfg) {
-      try {
-        const id = await read(`Bearer ${await mintAppJwt(appCfg)}`)
-        if (id !== undefined) return id
-      } catch (err) {
-        phase('setup: app installation lookup failed', { error: err instanceof Error ? err.message : String(err) })
-      }
-    }
-    try {
-      return await read(`Bearer ${TOKEN}`)
-    } catch {
-      return undefined
-    }
-  }
-
   async function installationIdFromPing(): Promise<bigint | undefined> {
     if (hookId === undefined) return undefined
     const deadline = Date.now() + 20_000
@@ -909,8 +917,19 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   }
 
   async function ensureInstallation(id: bigint): Promise<void> {
-    installation.installationId = id
-    ref.installationId = id
+    installation = {
+      id: 'e2e',
+      orgId: OrgId(DEFAULT_ORG_ID),
+      installationId: id,
+      accountLogin: OWNER,
+      accountType: 'User',
+      permissions: { issues: 'write' },
+      repositorySelection: 'selected',
+      suspendedAt: null,
+      revokedAt: null,
+      createdAt: new Date(0)
+    }
+    ref = { installationId: id, repoId: REPO_ID, repoFullName: FULL }
     installationGithubId = id
     const existing = await prisma.githubInstallation.findUnique({ where: { installationId: id } })
     if (existing) return
@@ -944,6 +963,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
   }
 
   async function replayReady(issueNumber: number): Promise<string> {
+    if (appConfigured || strict) throw new Error('App mode refuses injected webhook replay')
     const delivery = await labeledDelivery(issueNumber)
     const originalGuid = delivery.guid ?? String(delivery.id)
     let guid = originalGuid
@@ -981,7 +1001,43 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     return guid
   }
 
+  async function appDelivery(issueNumber: number, pokeMark: number, label: string) {
+    const deadline = Date.now() + 45_000
+    while (Date.now() < deadline) {
+      const poke = link!.graphPokes
+        .slice(pokeMark)
+        .find(
+          (item) =>
+            item.repoId === String(REPO_ID) &&
+            item.event === 'issues' &&
+            item.action === 'labeled' &&
+            item.numbers.includes(issueNumber) &&
+            item.label === label
+        )
+      if (poke) {
+        if (!poke.installationId) throw new Error(`App delivery for #${issueNumber} has no installationId`)
+        if (installationGithubId !== undefined) expect(poke.installationId).toBe(String(installationGithubId))
+        return poke
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    throw new Error(`App delivery for #${issueNumber} not observed via smee within 45s`)
+  }
+
   async function deliverReady(issueNumber: number, pokeMark: number): Promise<string> {
+    if (appConfigured) {
+      const poke = await appDelivery(issueNumber, pokeMark, 'ac/status:ready')
+      await vi.waitFor(
+        async () => {
+          const row = await prisma.kanbanCard.findFirst({ where: { boardId, issueNumber } })
+          expect(row?.status).toBeTruthy()
+          expect(row?.status).not.toBe('triage')
+        },
+        { timeout: 20_000, interval: 250 }
+      )
+      return poke.deliveryKey
+    }
+    if (strict) throw new Error('KANBAN_E2E_REQUIRE_APP=1 refuses injected webhook delivery')
     if (!smeeUp) {
       console.error('KANBAN_E2E FALLBACK webhook')
       phase('KANBAN_E2E FALLBACK webhook', { reason: smeeSkipReason, issue: issueNumber })
