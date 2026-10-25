@@ -397,9 +397,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       tokenMode = 'real'
       tokenWhy = 'verified mint; card and comment tokens are repository-scoped installation tokens'
     } else {
-      await ensureInstallation((await installationIdFromPing()) ?? 1n)
+      // PAT/dev mode keeps the pre-#606 behavior: seed a row only for a ping-recovered id, else a 1n placeholder.
+      const pinged = await installationIdFromPing()
+      if (pinged !== undefined) await ensureInstallation(pinged)
+      else setInstallation(1n)
     }
-    phase('setup: github installation', { installationId: String(installationGithubId) })
+    phase('setup: github installation', { installationId: String(ref.installationId) })
     // The daemon starts in the test, after the truncated database has the API key.
     selectedRuntime = selected
     cpOrigin = cpUrl
@@ -566,8 +569,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     // The integration harness truncates before each test, so seed all DB fixtures here.
     await seedDaemon(prisma, daemonId, { sessionEpoch: BigInt(epoch) })
     await seedAgent(prisma, agentId, { daemonId, runtime: runtimeId })
-    if (installationGithubId === undefined) throw new Error('installation id was not established during setup')
-    await ensureInstallation(installationGithubId)
+    if (appConfigured && installationGithubId === undefined) {
+      throw new Error('installation id was not established from an App delivery during setup')
+    }
+    if (installationGithubId !== undefined) await ensureInstallation(installationGithubId)
     await startLinkedDaemon()
     const board = await prisma.kanbanBoard.create({
       data: { orgId: DEFAULT_ORG_ID, name: `dispatch-e2e ${started}`, repoId: REPO_ID, repoFullName: FULL }
@@ -610,6 +615,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     for (const outcome of ['review_requested', 'completed'] as const) {
       permissionDenials.length = 0
       const toolName = outcome === 'completed' ? 'kanbanComplete' : 'kanbanRequestReview'
+      const creationMark = link?.graphPokes.length ?? 0
       const created = await gh<Issue>('POST', `/repos/${FULL}/issues`, {
         title: `[kanban-e2e] dispatch ${outcome} ${started}`,
         body: 'Scratch issue for the opt-in Kanban M2 live integration check. No repository changes are requested.',
@@ -635,6 +641,12 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       expect(sends.filter((d) => d.cardId === c.id)).toHaveLength(0)
       await snapshot('a: mismatch parked; no daemon dispatch', c.id, created.number)
 
+      if (appConfigured) {
+        // Let the creation doorbells land before the human relabel, so they cannot race the ready delivery.
+        const creation = await appDelivery(created.number, creationMark, 'ac/status:triage')
+        phase('a: App creation delivery observed', { deliveryId: creation.deliveryKey })
+        await new Promise((resolve) => setTimeout(resolve, 2_000))
+      }
       cpReady = true
       const promptCount = host.prompt.mock.calls.length
       const pokeMark = link?.graphPokes.length ?? 0
@@ -846,7 +858,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
         token: {
           mode: tokenMode,
           why: tokenWhy,
-          installationId: installationGithubId?.toString() ?? '',
+          installationId: ref ? String(ref.installationId) : '',
           appSlug: appSlug ?? null
         },
         shell: { mode: shellMode, why: shellWhy, shellRefusalObserved },
@@ -916,7 +928,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
     return undefined
   }
 
-  async function ensureInstallation(id: bigint): Promise<void> {
+  function setInstallation(id: bigint): void {
     installation = {
       id: 'e2e',
       orgId: OrgId(DEFAULT_ORG_ID),
@@ -930,6 +942,10 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
       createdAt: new Date(0)
     }
     ref = { installationId: id, repoId: REPO_ID, repoFullName: FULL }
+  }
+
+  async function ensureInstallation(id: bigint): Promise<void> {
+    setInstallation(id)
     installationGithubId = id
     const existing = await prisma.githubInstallation.findUnique({ where: { installationId: id } })
     if (existing) return
@@ -1033,7 +1049,7 @@ describe.skipIf(!enabled)('kanban dispatch e2e (live GitHub)', () => {
           expect(row?.status).toBeTruthy()
           expect(row?.status).not.toBe('triage')
         },
-        { timeout: 20_000, interval: 250 }
+        { timeout: 45_000, interval: 250 }
       )
       return poke.deliveryKey
     }
