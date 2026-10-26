@@ -167,6 +167,10 @@ key.
 5. Optional: add or remove an `ac/*` label on a card and see 202 in
    Recent Deliveries.
 
+## Live smoke
+
+After the Verify steps pass, run the recorded end-to-end card → dispatch → terminal → Status check in [kanban-live-smoke.md](kanban-live-smoke.md).
+
 ## Troubleshooting
 
 - `github app config is partial — missing ... (set all three or none; ...)`: one of `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`,

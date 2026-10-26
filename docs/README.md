@@ -14,6 +14,7 @@ cross-references inside it.
 - [config-file-secrets.md](config-file-secrets.md) — The `*_DATA` secret convention for file-shaped credentials (Docker config, kubeconfig).
 - [self-host-caddy-https.md](self-host-caddy-https.md) — Publishing a self-hosted stack behind Caddy HTTPS.
 - [runbooks/kanban-github-app.md](runbooks/kanban-github-app.md) — Creating, installing and verifying the GitHub App that backs the Kanban board (App mode).
+- [runbooks/kanban-live-smoke.md](runbooks/kanban-live-smoke.md) — Recorded prod-shaped live-board smoke: card, webhook, dispatch, terminal, Status.
 
 ## Designs
 

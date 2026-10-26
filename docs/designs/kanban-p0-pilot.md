@@ -373,7 +373,7 @@ behavior. Workers still cannot mutate any `ac/*` label.
 
 ## M3 — App installation tokens and webhook delivery
 
-Operator steps (create, install, secrets, verify): [runbooks/kanban-github-app.md](../runbooks/kanban-github-app.md).
+Operator steps (create, install, secrets, verify): [runbooks/kanban-github-app.md](../runbooks/kanban-github-app.md). Recorded prod-shaped live-board smoke (M-live): [runbooks/kanban-live-smoke.md](../runbooks/kanban-live-smoke.md).
 
 App mode is on only when `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_B64`, and
 `GITHUB_APP_SLUG` are all set (a partial set, or a blank slug, fails boot; the slug is how the bot recognises its own comments, so refusal comments need it). `GITHUB_APP_CLIENT_ID`,
