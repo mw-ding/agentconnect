@@ -38,6 +38,7 @@ redact() {
 
 # The state dir holds sourced state and the daemon key: private, owned by us, never a symlink.
 ensure_dir() {
+  case "/$DIR/" in */./* | */../*) die "$DIR has a . or .. component; use a plain path" ;; esac # -L on link/. tests the target, not the link
   [ ! -L "$DIR" ] || die "$DIR is a symlink; refusing to use it"
   [ -d "$DIR" ] || { mkdir -p "$(dirname "$DIR")" && mkdir -m 700 "$DIR"; }
   [ -O "$DIR" ] || die "$DIR is not owned by the current user; refusing to use it"

@@ -70,8 +70,8 @@ confirm any value you are handed with `GET /app` (see
 `scripts/kanban-live-smoke.sh up` starts, each in its own process group with
 redacted output in `$SMOKE_DIR/logs/<name>.log`. The default `SMOKE_DIR` is
 `${XDG_RUNTIME_DIR:-$HOME/.cache}/kanban-live-smoke`, created mode 0700; the
-script refuses a state dir that is a symlink or not owned by you, before it
-sources `state.env`. The human `GITHUB_TOKEN` is not passed to these processes:
+script refuses a state dir that is a symlink, has a `.` or `..` path component,
+or is not owned by you, before it sources `state.env`. The human `GITHUB_TOKEN` is not passed to these processes:
 
 | Process | Command                                                                       | Port                         |
 | ------- | ----------------------------------------------------------------------------- | ---------------------------- |
