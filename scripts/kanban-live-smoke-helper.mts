@@ -1,4 +1,4 @@
-// Helper for scripts/kanban-live-smoke.sh (DB create/drop/seed, App delivery lookup): run with tsx from packages/control-plane; env only, prints no secrets.
+// Helper for scripts/kanban-live-smoke.sh (scratch DB url/create/drop/seed, App delivery lookup): run with tsx from packages/control-plane; env only, prints no secrets.
 import { createSign } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -18,6 +18,15 @@ const dbName = (): string => {
   return name
 }
 
+// The scratch URL is the admin URL with only the path swapped (query kept); the result must name the ac_kanban_smoke_* database.
+export function scratchUrl(adminUrl: string, name: string): string {
+  const url = new URL(adminUrl)
+  url.pathname = `/${name}`
+  if (decodeURIComponent(url.pathname.slice(1)) !== name || !/^ac_kanban_smoke_[a-z0-9_]+$/.test(name))
+    throw new Error('scratch database URL does not name an ac_kanban_smoke_* database')
+  return url.href
+}
+
 async function createOrDropDb(action: 'create-db' | 'drop-db'): Promise<void> {
   const admin = createPrisma(env('SMOKE_ADMIN_URL'), { poolMax: 1 })
   try {
@@ -31,9 +40,12 @@ async function createOrDropDb(action: 'create-db' | 'drop-db'): Promise<void> {
   }
 }
 
-// Seeds what the interactive console flow would: installation row, daemon + key, agent. Board is created over REST.
+// Seeds what the interactive console flow would: installation row, daemon + key, agent, board.
 async function seed(): Promise<void> {
-  const prisma = createPrisma(env('DATABASE_URL'), { poolMax: 2 })
+  const databaseUrl = env('DATABASE_URL')
+  if (databaseUrl !== scratchUrl(databaseUrl, dbName()))
+    throw new Error('DATABASE_URL is not the scratch database; refusing to seed')
+  const prisma = createPrisma(databaseUrl, { poolMax: 2 })
   try {
     await ensureDefaultTenant(prisma, { presetAgents: false })
     const installationId = BigInt(env('GITHUB_APP_INSTALLATION_ID'))
@@ -88,6 +100,7 @@ async function seed(): Promise<void> {
     // Daemon root: config.json carries the key (mode 0600, state dir only) and agent.json is the local agent definition.
     const root = env('SMOKE_DAEMON_ROOT')
     const workspace = join(root, 'agents', agentId, 'workspace')
+    mkdirSync(root, { recursive: true, mode: 0o700 })
     mkdirSync(workspace, { recursive: true })
     const configFile = join(root, 'config.json')
     writeFileSync(
@@ -97,9 +110,10 @@ async function seed(): Promise<void> {
         daemonId,
         controlPlane: { enabled: true, url: env('SMOKE_CP_URL'), key: minted.token },
         logging: { level: 'info' }
-      })
+      }),
+      { mode: 0o600 }
     )
-    chmodSync(configFile, 0o600)
+    chmodSync(configFile, 0o600) // covers a pre-existing file
     writeFileSync(
       join(root, 'agents', agentId, 'agent.json'),
       JSON.stringify({
@@ -169,7 +183,11 @@ async function deliveries(issue: number, since: string): Promise<void> {
 }
 
 const command = process.argv[2]
-if (command === 'create-db' || command === 'drop-db') await createOrDropDb(command)
+if (command === 'scratch-url') console.log(scratchUrl(env('SMOKE_ADMIN_URL'), dbName()))
+else if (command === 'create-db' || command === 'drop-db') await createOrDropDb(command)
 else if (command === 'seed') await seed()
 else if (command === 'deliveries') await deliveries(Number(process.argv[3]), process.argv[4] ?? '')
-else throw new Error('usage: kanban-live-smoke-helper.mts create-db|drop-db|seed|deliveries <issue> [since-iso]')
+else
+  throw new Error(
+    'usage: kanban-live-smoke-helper.mts scratch-url|create-db|drop-db|seed|deliveries <issue> [since-iso]'
+  )

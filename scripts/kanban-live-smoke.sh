@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIR="${SMOKE_DIR:-/tmp/kanban-live-smoke}"
+DIR="${SMOKE_DIR:-${XDG_RUNTIME_DIR:-${HOME:?HOME is required}/.cache}/kanban-live-smoke}"
 REPO="${SMOKE_REPO:-mw-ding/agentconnect}"
 CP_PORT="${SMOKE_CP_PORT:-18080}"
 RELAY_PORT="${SMOKE_RELAY_PORT:-18090}"
@@ -14,11 +14,12 @@ ORG_ID="org_default00000000000000000"
 STATE="$DIR/state.env"
 EVIDENCE="${SMOKE_EVIDENCE:-$DIR/evidence.md}"
 TIMEOUT_SEC="${SMOKE_TIMEOUT_SEC:-420}"
+SUMMARY_WAIT_SEC="${SMOKE_SUMMARY_WAIT_SEC:-120}"
+CURL_OPTS=(--connect-timeout 3 --max-time 15)
 
 export SMOKE_ADMIN_URL="${SMOKE_ADMIN_URL:-postgresql://postgres@127.0.0.1:54454/postgres}"
 export SMOKE_DB_NAME="${SMOKE_DB_NAME:-ac_kanban_smoke_607}"
 export SMOKE_REPO_ID="${SMOKE_REPO_ID:-1332342098}" SMOKE_REPO="$REPO" SMOKE_CP_URL="http://127.0.0.1:${CP_PORT}" SMOKE_DAEMON_ROOT="$DIR/daemon-root" SMOKE_AGENT_NAME="$AGENT_NAME"
-export DATABASE_URL="${SMOKE_ADMIN_URL%/*}/${SMOKE_DB_NAME}"
 export SMOKE_REPO_OWNER="${REPO%%/*}"
 
 log() { printf '%s smoke: %s\n' "$(date -u +%H:%M:%S)" "$*"; }
@@ -34,28 +35,37 @@ redact() {
     for my $v (@s) { s/\Q$v\E/[REDACTED]/g } s/gh[psour]_[A-Za-z0-9]+/[REDACTED]/g; s/github_[p]at_\w+/[REDACTED]/g; print'
 }
 
+# The state dir holds sourced state and the daemon key: private, owned by us, never a symlink.
+ensure_dir() {
+  [ ! -L "$DIR" ] || die "$DIR is a symlink; refusing to use it"
+  [ -d "$DIR" ] || { mkdir -p "$(dirname "$DIR")" && mkdir -m 700 "$DIR"; }
+  [ -O "$DIR" ] || die "$DIR is not owned by the current user; refusing to use it"
+  chmod 700 "$DIR"
+}
+
 save() { printf '%s=%q\n' "$1" "$2" >> "$STATE"; }
 # shellcheck disable=SC1090
 load() { if [ -f "$STATE" ]; then . "$STATE"; fi; }
 gh_human() { GH_TOKEN="$GITHUB_TOKEN" gh "$@"; }
-cp_get() { curl -fsS "http://127.0.0.1:${CP_PORT}/api/v1/orgs/${ORG_ID}$1"; }
-helper() { (cd "$ROOT/packages/control-plane" && ./node_modules/.bin/tsx ../../scripts/kanban-live-smoke-helper.mts "$@"); }
+cp_get() { curl -fsS "${CURL_OPTS[@]}" "http://127.0.0.1:${CP_PORT}/api/v1/orgs/${ORG_ID}$1"; }
+helper() { (cd "$ROOT/packages/control-plane" && exec env -u GITHUB_TOKEN ./node_modules/.bin/tsx ../../scripts/kanban-live-smoke-helper.mts "$@"); }
 
-# Starts a long-lived process in its own process group with redacted output in $DIR/logs/<name>.log.
+# Starts a long-lived process (in <cwd>, without the human token) in its own process group; redacted output goes to $DIR/logs/<name>.log.
+# The pid file holds the pid and <marker>, a substring of the process args that `down` requires before it signals.
 start_bg() {
-  local name="$1"
-  shift
+  local name="$1" cwd="$2" marker="$3"
+  shift 3
   mkdir -p "$DIR/logs" "$DIR/pids"
   # The inner 2>&1 and </dev/null keep a caller's pipe from staying open on the long-lived children.
-  setsid "$@" < /dev/null > >(redact >> "$DIR/logs/$name.log" 2>&1) 2>&1 &
-  echo $! > "$DIR/pids/$name"
+  (cd "$cwd" && exec setsid env -u GITHUB_TOKEN "$@") < /dev/null > >(redact >> "$DIR/logs/$name.log" 2>&1) 2>&1 &
+  printf '%s\n%s\n' "$!" "$marker" > "$DIR/pids/$name"
   log "started $name (pid $!, log $DIR/logs/$name.log)"
 }
 
 wait_http() {
   local url="$1" name="$2" i
   for i in $(seq 1 90); do
-    curl -fsS -o /dev/null "$url" 2> /dev/null && return 0
+    curl -fsS "${CURL_OPTS[@]}" -o /dev/null "$url" 2> /dev/null && return 0
     sleep 1
   done
   die "$name did not come up at $url (see $DIR/logs)"
@@ -64,6 +74,7 @@ wait_http() {
 preflight() {
   local v
   for v in GITHUB_APP_ID GITHUB_APP_SLUG GITHUB_APP_INSTALLATION_ID GITHUB_APP_WEBHOOK_SECRET GITHUB_APP_PRIVATE_KEY_B64 GITHUB_TOKEN; do need "$v"; done
+  [[ "$GITHUB_APP_SLUG" =~ ^[A-Za-z0-9-]+$ ]] || die "GITHUB_APP_SLUG has unexpected characters"
   export GITHUB_APP_ID GITHUB_APP_SLUG GITHUB_APP_INSTALLATION_ID GITHUB_APP_WEBHOOK_SECRET GITHUB_APP_PRIVATE_KEY_B64 GITHUB_TOKEN
   for v in node gh curl openssl; do command -v "$v" > /dev/null || die "$v is required"; done
   [ -x "$ROOT/packages/control-plane/node_modules/.bin/tsx" ] || die "run pnpm install first"
@@ -76,7 +87,7 @@ preflight() {
 
 cmd_up() {
   preflight
-  mkdir -p "$DIR"
+  ensure_dir
   : > "$STATE"
   API_KEY_PEPPER="$(openssl rand -hex 32)"
   RELAY_TOKEN="$(openssl rand -hex 32)"
@@ -88,29 +99,38 @@ cmd_up() {
   save DAEMON_ID "$SMOKE_DAEMON_ID"
   save AGENT_ID "$SMOKE_AGENT_ID"
   save BOARD_ID "$SMOKE_BOARD_ID"
+  # The helper parses the admin URL, swaps only the path, keeps the query, and refuses any name but ac_kanban_smoke_*.
+  DATABASE_URL="$(helper scratch-url)"
+  export DATABASE_URL
   log "database $SMOKE_DB_NAME: create, migrate, seed"
   helper create-db
   (cd "$ROOT/packages/control-plane" && ./node_modules/.bin/prisma migrate deploy > /dev/null)
   helper seed
 
   # CP in App mode (all three GITHUB_APP_* set), no OIDC: loopback no-auth with the default org.
-  start_bg cp env NODE_ENV=production PORT="$CP_PORT" HOST=127.0.0.1 \
-    bash -c "cd '$ROOT/packages/control-plane' && exec node dist/index.js"
+  start_bg cp "$ROOT/packages/control-plane" "$ROOT/packages/control-plane/dist/index.js" \
+    env NODE_ENV=production PORT="$CP_PORT" HOST=127.0.0.1 node "$ROOT/packages/control-plane/dist/index.js"
   wait_http "http://127.0.0.1:${CP_PORT}/readyz" control-plane
 
   cp_get "/kanban/boards/$SMOKE_BOARD_ID" > /dev/null || die "seeded board is not readable over REST (see $DIR/logs/cp.log)"
   log "board $SMOKE_BOARD_ID for $REPO is readable over the CP REST API"
 
-  start_bg relay env NODE_ENV=production PORT="$RELAY_PORT" HOST=127.0.0.1 CP_URL="http://127.0.0.1:${CP_PORT}" \
-    RELAY_NAME=kanban-smoke-relay DAEMON_DIAL_URL="ws://127.0.0.1:${RELAY_PORT}" \
-    bash -c "cd '$ROOT/packages/relay' && exec node dist/index.js"
+  start_bg relay "$ROOT/packages/relay" "$ROOT/packages/relay/dist/index.js" \
+    env NODE_ENV=production PORT="$RELAY_PORT" HOST=127.0.0.1 CP_URL="http://127.0.0.1:${CP_PORT}" \
+    RELAY_NAME=kanban-smoke-relay DAEMON_DIAL_URL="ws://127.0.0.1:${RELAY_PORT}" node "$ROOT/packages/relay/dist/index.js"
   wait_http "http://127.0.0.1:${RELAY_PORT}/readyz" relay
-  start_bg smee "$ROOT/packages/control-plane/node_modules/.bin/smee" --url "$SMEE_URL" --target "http://127.0.0.1:${RELAY_PORT}/webhooks/github"
-  start_bg daemon node "$ROOT/packages/daemon/dist/index.js" run --root "$DIR/daemon-root"
-  for _ in $(seq 1 60); do
-    [ "$(cp_get /daemons 2> /dev/null | node -pe 'try{JSON.parse(require("fs").readFileSync(0))[0]?.status}catch{""}')" = "ready" ] && break
+  start_bg smee "$ROOT" "--target http://127.0.0.1:${RELAY_PORT}/webhooks/github" \
+    "$ROOT/packages/control-plane/node_modules/.bin/smee" --url "$SMEE_URL" --target "http://127.0.0.1:${RELAY_PORT}/webhooks/github"
+  start_bg daemon "$ROOT" "$ROOT/packages/daemon/dist/index.js" node "$ROOT/packages/daemon/dist/index.js" run --root "$DIR/daemon-root"
+  local i ready=0
+  for i in $(seq 1 60); do
+    if [ "$(cp_get /daemons 2> /dev/null | node -pe 'try{JSON.parse(require("fs").readFileSync(0))[0]?.status}catch{""}')" = "ready" ]; then
+      ready=1
+      break
+    fi
     sleep 1
   done
+  [ "$ready" = 1 ] || die "daemon did not reach status ready in 60s (see $DIR/logs/daemon.log)"
   log "stack up: cp :$CP_PORT relay :$RELAY_PORT smee -> $SMEE_URL daemon root $DIR/daemon-root"
 }
 
@@ -164,13 +184,28 @@ cmd_watch() {
   die "no terminal status in ${TIMEOUT_SEC}s (last: $status)"
 }
 
+# The bot summary lands after the CP sees the terminal, so wait (bounded) for an ac-kanban-lease: comment authored by the App bot.
+wait_bot_summary() {
+  local deadline=$((SECONDS + SUMMARY_WAIT_SEC)) found=""
+  while :; do
+    found="$(gh_human api "repos/$REPO/issues/$ISSUE/comments?per_page=100" \
+      --jq ".[] | select(.user.login == \"${GITHUB_APP_SLUG}[bot]\" and (.body | contains(\"ac-kanban-lease:\"))) | .id" | head -n 1)"
+    [ -z "$found" ] || return 0
+    [ "$SECONDS" -lt "$deadline" ] || die "no ac-kanban-lease: comment by ${GITHUB_APP_SLUG}[bot] on #$ISSUE within ${SUMMARY_WAIT_SEC}s"
+    log "waiting for the bot summary comment on #$ISSUE"
+    sleep 5
+  done
+}
+
 cmd_evidence() {
   preflight
   load
+  [ -n "${ISSUE:-}" ] || die "no card; run: $0 card"
+  wait_bot_summary
   local card comments issue_json deliveries
   deliveries="$(helper deliveries "$ISSUE" "$CARD_AT")"
   card="$(card_json)"
-  comments="$(gh_human api "repos/$REPO/issues/$ISSUE/comments")"
+  comments="$(gh_human api "repos/$REPO/issues/$ISSUE/comments?per_page=100")"
   issue_json="$(gh_human api "repos/$REPO/issues/$ISSUE")"
   {
     echo "# Kanban live smoke evidence ($(date -u +%FT%TZ))"
@@ -203,12 +238,18 @@ cmd_evidence() {
 
 cmd_down() {
   load
-  local f pid
+  local f pid marker info pgid args
   for f in "$DIR"/pids/*; do
     [ -e "$f" ] || continue
-    pid="$(cat "$f")"
-    kill -TERM -- "-$pid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
+    { read -r pid && read -r marker; } < "$f" || true
     rm -f "$f"
+    info="$(ps -o pgid=,args= -p "${pid:-0}" 2> /dev/null || true)"
+    read -r pgid args <<< "$info"
+    if [ -z "$info" ] || [ "$pgid" != "$pid" ] || [ -z "$marker" ] || [[ "$args" != *"$marker"* ]]; then
+      log "skipping $(basename "$f"): pid ${pid:-?} is not a live process of ours (stale entry)"
+      continue
+    fi
+    kill -TERM -- "-$pid" 2> /dev/null || true
   done
   sleep 2
   # A card that reached done is already closed as completed; only a still-open scratch card gets closed here.
@@ -223,6 +264,9 @@ cmd_drop_db() {
   rm -rf "$DIR/daemon-root"
 }
 
+case "${1:-}" in
+  up | card | watch | evidence | down | drop-db | run) ensure_dir ;;
+esac
 case "${1:-}" in
   up) cmd_up ;;
   card) cmd_card ;;

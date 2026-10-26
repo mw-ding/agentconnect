@@ -68,8 +68,10 @@ confirm any value you are handed with `GET /app` (see
 ## The prod-shaped local stack
 
 `scripts/kanban-live-smoke.sh up` starts, each in its own process group with
-redacted output in `$SMOKE_DIR/logs/<name>.log` (default
-`/tmp/kanban-live-smoke`):
+redacted output in `$SMOKE_DIR/logs/<name>.log`. The default `SMOKE_DIR` is
+`${XDG_RUNTIME_DIR:-$HOME/.cache}/kanban-live-smoke`, created mode 0700; the
+script refuses a state dir that is a symlink or not owned by you, before it
+sources `state.env`. The human `GITHUB_TOKEN` is not passed to these processes:
 
 | Process | Command                                                                       | Port                         |
 | ------- | ----------------------------------------------------------------------------- | ---------------------------- |
@@ -77,6 +79,11 @@ redacted output in `$SMOKE_DIR/logs/<name>.log` (default
 | relay   | `node packages/relay/dist/index.js`                                           | `18090` (`SMOKE_RELAY_PORT`) |
 | smee    | `smee-client --url <channel> --target http://127.0.0.1:18090/webhooks/github` | none                         |
 | daemon  | `node packages/daemon/dist/index.js run --root $SMOKE_DIR/daemon-root`        | none                         |
+
+The scratch database URL is `SMOKE_ADMIN_URL` with only its path replaced
+(query string kept); the script refuses any name but `ac_kanban_smoke_*`
+before it migrates or seeds. Every REST call to the CP uses curl timeouts
+(3 s connect, 15 s total).
 
 Use ports that are free on your host; another relay or smee client may
 already be running and is none of this run's business.
@@ -99,7 +106,7 @@ directly in the scratch database or read back over the real CP REST API.
 | GitHub installation row                     | **Seeded** (`github_installation`: installation id, account `mw-ding`, `User`, selected repos). The install-callback flow needs a browser sign-in.                                                                 |
 | Board                                       | **Seeded** (`kanban_board`: org, repo id, `mw-ding/agentconnect`, default read mode). `POST .../kanban/boards` is `interactiveOnly` (OIDC), so devAuth gets 403 `INTERACTIVE_AUTH_REQUIRED`. Read back with `GET`. |
 | Daemon row, agent row, daemon API key       | **Seeded** (`daemon`, `agent` with runtime `claude-acp`, `api_key` with `principalType: daemon`, hashed with the run's `API_KEY_PEPPER`).                                                                          |
-| Daemon `config.json` and local `agent.json` | Written by the helper under `$SMOKE_DIR/daemon-root`. `config.json` (mode 0600) carries the daemon key; the dir is outside the repo and removed by `drop-db`.                                                      |
+| Daemon `config.json` and local `agent.json` | Written by the helper under `$SMOKE_DIR/daemon-root`. `config.json` is created mode 0600 under a 0700 root and carries the daemon key; the dir is outside the repo and removed by `drop-db`.                       |
 | Card, labels                                | Real GitHub API calls as the human token.                                                                                                                                                                          |
 | Everything after the card exists            | Real: GitHub App webhook, smee, relay, CP import and dispatch, daemon, ACP agent, App-token comment.                                                                                                               |
 
@@ -121,12 +128,16 @@ curl -fsS http://127.0.0.1:18090/readyz # {"status":"ready","relayId":"..."}
 curl -fsS "http://127.0.0.1:18080/api/v1/orgs/org_default00000000000000000/daemons"
 ```
 
-The daemon `status` must be `ready`.
+The daemon `status` must be `ready`; `up` fails if it is not within 60 s.
 
 ## The run
 
 `scripts/kanban-live-smoke.sh run` does steps 1 to 4 and writes the evidence;
 the steps can be run one at a time with `card`, `watch` and `evidence`.
+`watch` stops at the CP terminal status, but the bot summary comment lands
+after that, so `evidence` first polls (default 120 s, `SMOKE_SUMMARY_WAIT_SEC`)
+for a comment containing `ac-kanban-lease:` authored by
+`${GITHUB_APP_SLUG}[bot]` and fails if none appears.
 
 1. **File a card and move it to ready.** Create an issue titled
    `[kanban-live-smoke] #607 recorded run <timestamp>` whose body asks the
@@ -197,7 +208,7 @@ Result:        PASS | FAIL (with the follow-up issue link)
 ## Cleanup
 
 ```bash
-scripts/kanban-live-smoke.sh down    # stops cp, relay, smee, daemon; closes the card if it is still open
+scripts/kanban-live-smoke.sh down    # stops cp, relay, smee, daemon (only pids whose process group and args still match); closes the card if it is still open
 scripts/kanban-live-smoke.sh drop-db # drops the scratch database and the daemon root
 ```
 
