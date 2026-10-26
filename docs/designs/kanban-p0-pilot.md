@@ -473,12 +473,20 @@ Known gaps (M3 worker additions):
   Retrying can duplicate that progress note. This does not affect the separate
   terminal summary marker. The per-lease cap bounds acknowledged and in-flight
   notes, rather than ambiguous writes GitHub accepted without acknowledgement.
-- **The worker E2E uses an injected PAT and fake ACP agent.** It exercises real
-  GitHub issues, Postgres, daemon admission, nudge turns, the MCP control socket,
-  and the fenced card-read RPC. Heartbeats/reports use the same in-process
-  dispatcher seam as the existing dispatch E2E so one queue owns label writes;
-  token minting reuses the repository's PAT injection. It does not validate a
-  real App installation or a provider's live ACP error format.
+- **Dispatch and worker E2Es have different token coverage.** The dispatch E2E
+  (`kanban-dispatch.e2e.test.ts`) runs App-only when `GITHUB_APP_ID`,
+  `GITHUB_APP_PRIVATE_KEY_B64`, `GITHUB_APP_SLUG`, and `GITHUB_APP_WEBHOOK_SECRET`
+  are complete: card/comment tokens are installation tokens, and a mint failure
+  fails the run. The installation id comes from a real App delivery via
+  smee → relay. `KANBAN_E2E_SMEE_URL` selects the App's smee channel;
+  `KANBAN_E2E_REQUIRE_APP=1` requires doorbell, token, and comment modes to be
+  `real`. With all four App vars unset, PAT/dev mode remains labeled `injected`.
+  Heartbeats and reports still use the in-process dispatcher seam; the background
+  CP tick is not started. See the [GitHub App runbook](../runbooks/kanban-github-app.md). The worker M3
+  E2E (`kanban-worker-m3.e2e.test.ts`) still uses an injected PAT and fake ACP
+  agent, exercising real GitHub issues, Postgres, daemon admission, nudge turns,
+  the MCP control socket, and fenced card reads. It does not validate a real App
+  installation or a provider's live ACP error format.
 - **Provider-outage triage is quiet.** When run-accounting trips
   `transient_limit` (a provider outage routed to `ac/status:triage`), the only
   signal beyond the label is a warn log line — the card's `needsAttention` flag
