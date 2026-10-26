@@ -20,7 +20,12 @@ const dbName = (): string => {
 
 // The scratch URL is the admin URL with only the path swapped (query kept); the result must name the ac_kanban_smoke_* database.
 export function scratchUrl(adminUrl: string, name: string): string {
-  const url = new URL(adminUrl)
+  let url: URL
+  try {
+    url = new URL(adminUrl)
+  } catch {
+    throw new Error('SMOKE_ADMIN_URL is not a valid URL (contents withheld)')
+  }
   url.pathname = `/${name}`
   if (decodeURIComponent(url.pathname.slice(1)) !== name || !/^ac_kanban_smoke_[a-z0-9_]+$/.test(name))
     throw new Error('scratch database URL does not name an ac_kanban_smoke_* database')

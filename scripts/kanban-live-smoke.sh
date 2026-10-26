@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR="${SMOKE_DIR:-${XDG_RUNTIME_DIR:-${HOME:?HOME is required}/.cache}/kanban-live-smoke}"
+while [ "${#DIR}" -gt 1 ] && [ "${DIR%/}" != "$DIR" ]; do DIR="${DIR%/}"; done # trailing slashes would hide a symlink from -L
 REPO="${SMOKE_REPO:-mw-ding/agentconnect}"
 CP_PORT="${SMOKE_CP_PORT:-18080}"
 RELAY_PORT="${SMOKE_RELAY_PORT:-18090}"
@@ -76,7 +77,7 @@ preflight() {
   for v in GITHUB_APP_ID GITHUB_APP_SLUG GITHUB_APP_INSTALLATION_ID GITHUB_APP_WEBHOOK_SECRET GITHUB_APP_PRIVATE_KEY_B64 GITHUB_TOKEN; do need "$v"; done
   [[ "$GITHUB_APP_SLUG" =~ ^[A-Za-z0-9-]+$ ]] || die "GITHUB_APP_SLUG has unexpected characters"
   export GITHUB_APP_ID GITHUB_APP_SLUG GITHUB_APP_INSTALLATION_ID GITHUB_APP_WEBHOOK_SECRET GITHUB_APP_PRIVATE_KEY_B64 GITHUB_TOKEN
-  for v in node gh curl openssl; do command -v "$v" > /dev/null || die "$v is required"; done
+  for v in node gh curl openssl setsid; do command -v "$v" > /dev/null || die "$v is required$([ "$v" = setsid ] && echo ' (util-linux; Linux only)')"; done
   [ -x "$ROOT/packages/control-plane/node_modules/.bin/tsx" ] || die "run pnpm install first"
   for v in control-plane relay daemon; do
     [ -f "$ROOT/packages/$v/dist/index.js" ] || die "$v is not built; run: pnpm --filter '@agentconnect.md/daemon...' --filter '@agentconnect.md/relay...' --filter '@agentconnect.md/control-plane...' build:package"
@@ -121,16 +122,16 @@ cmd_up() {
   wait_http "http://127.0.0.1:${RELAY_PORT}/readyz" relay
   start_bg smee "$ROOT" "--target http://127.0.0.1:${RELAY_PORT}/webhooks/github" \
     "$ROOT/packages/control-plane/node_modules/.bin/smee" --url "$SMEE_URL" --target "http://127.0.0.1:${RELAY_PORT}/webhooks/github"
-  start_bg daemon "$ROOT" "$ROOT/packages/daemon/dist/index.js" node "$ROOT/packages/daemon/dist/index.js" run --root "$DIR/daemon-root"
-  local i ready=0
-  for i in $(seq 1 60); do
+  start_bg daemon "$ROOT" "$ROOT/packages/daemon/dist/index.js run --root $DIR/daemon-root" node "$ROOT/packages/daemon/dist/index.js" run --root "$DIR/daemon-root"
+  local ready=0 deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     if [ "$(cp_get /daemons 2> /dev/null | node -pe 'try{JSON.parse(require("fs").readFileSync(0))[0]?.status}catch{""}')" = "ready" ]; then
       ready=1
       break
     fi
     sleep 1
   done
-  [ "$ready" = 1 ] || die "daemon did not reach status ready in 60s (see $DIR/logs/daemon.log)"
+  [ "$ready" = 1 ] || die "daemon did not reach status ready within 60s (checked after each request) (see $DIR/logs/daemon.log)"
   log "stack up: cp :$CP_PORT relay :$RELAY_PORT smee -> $SMEE_URL daemon root $DIR/daemon-root"
 }
 
@@ -238,19 +239,23 @@ cmd_evidence() {
 
 cmd_down() {
   load
-  local f pid marker info pgid args
+  local f pid marker info pgid args failed=0
   for f in "$DIR"/pids/*; do
     [ -e "$f" ] || continue
     { read -r pid && read -r marker; } < "$f" || true
-    rm -f "$f"
-    info="$(ps -o pgid=,args= -p "${pid:-0}" 2> /dev/null || true)"
+    info="$(ps -ww -o pgid=,args= -p "${pid:-0}" 2> /dev/null || true)"
     read -r pgid args <<< "$info"
     if [ -z "$info" ] || [ "$pgid" != "$pid" ] || [ -z "$marker" ] || [[ "$args" != *"$marker"* ]]; then
       log "skipping $(basename "$f"): pid ${pid:-?} is not a live process of ours (stale entry)"
+      rm -f "$f"
       continue
     fi
-    kill -TERM -- "-$pid" 2> /dev/null || true
+    if kill -TERM -- "-$pid" 2> /dev/null; then rm -f "$f"; else
+      log "could not signal $(basename "$f") (pid $pid); keeping its pid file"
+      failed=1
+    fi
   done
+  [ "$failed" = 0 ] || die "some processes were not stopped; fix and rerun: $0 down"
   sleep 2
   # A card that reached done is already closed as completed; only a still-open scratch card gets closed here.
   if [ -n "${ISSUE:-}" ] && [ -n "${GITHUB_TOKEN:-}" ] && [ "$(gh_human api "repos/$REPO/issues/$ISSUE" --jq .state)" = open ]; then

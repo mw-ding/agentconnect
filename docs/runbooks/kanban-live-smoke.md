@@ -21,7 +21,7 @@ to record. Failures are not fixed in this run: see
 ## Prerequisites
 
 - Node >= 24.12.0 and pnpm 11 (see the repo `CLAUDE.md`), `gh`, `curl`,
-  `openssl`, `perl`.
+  `openssl`, `perl`, `setsid` (util-linux; Linux only).
 - A Postgres server you can create a database on. The script creates its own
   fresh database (`ac_kanban_smoke_607` by default) and never touches others.
   No Docker is needed.
@@ -128,7 +128,7 @@ curl -fsS http://127.0.0.1:18090/readyz # {"status":"ready","relayId":"..."}
 curl -fsS "http://127.0.0.1:18080/api/v1/orgs/org_default00000000000000000/daemons"
 ```
 
-The daemon `status` must be `ready`; `up` fails if it is not within 60 s.
+The daemon `status` must be `ready`; `up` fails if it is not ready within 60 s of elapsed time (the deadline is checked after each request, which can take up to 15 s, so the worst case is about 76 s).
 
 ## The run
 
